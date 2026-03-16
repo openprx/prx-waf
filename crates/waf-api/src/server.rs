@@ -43,6 +43,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/status", get(get_status))
         // Rule reload
         .route("/api/reload", post(reload_rules))
+        // Phase 3: Custom rules
+        .route("/api/custom-rules", get(list_custom_rules).post(create_custom_rule))
+        .route("/api/custom-rules/:id", delete(delete_custom_rule))
+        // Phase 3: Sensitive patterns
+        .route("/api/sensitive-patterns", get(list_sensitive_patterns).post(create_sensitive_pattern))
+        .route("/api/sensitive-patterns/:id", delete(delete_sensitive_pattern))
+        // Phase 3: Hotlink config
+        .route("/api/hotlink-config", get(get_hotlink_config).post(upsert_hotlink_config))
+        // Phase 3: LB backends
+        .route("/api/lb-backends", get(list_lb_backends).post(create_lb_backend))
+        .route("/api/lb-backends/:id", delete(delete_lb_backend))
+        // Phase 3: Certificates
+        .route("/api/certificates", get(list_certificates).post(upload_certificate))
+        .route("/api/certificates/:id", delete(delete_certificate))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

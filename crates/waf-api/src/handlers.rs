@@ -8,7 +8,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use waf_storage::models::{
-    AttackLogQuery, CreateHost, CreateIpRule, CreateUrlRule, SecurityEventQuery, UpdateHost,
+    AttackLogQuery, CreateCertificate, CreateCustomRule, CreateHost, CreateIpRule,
+    CreateLbBackend, CreateSensitivePattern, CreateUrlRule, SecurityEventQuery, UpdateHost,
+    UpsertHotlinkConfig,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -290,4 +292,185 @@ pub async fn reload_rules(State(state): State<Arc<AppState>>) -> ApiResult<Json<
         .await
         .map_err(|e| ApiError::Internal(e))?;
     Ok(Json(json!({ "success": true, "data": "Rules reloaded" })))
+}
+
+// ─── Custom Rules ─────────────────────────────────────────────────────────────
+
+pub async fn list_custom_rules(
+    State(state): State<Arc<AppState>>,
+    Query(filter): Query<HostCodeFilter>,
+) -> ApiResult<Json<Value>> {
+    let rows = state.db.list_custom_rules(filter.host_code.as_deref()).await?;
+    Ok(Json(json!({ "success": true, "data": rows })))
+}
+
+pub async fn create_custom_rule(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateCustomRule>,
+) -> ApiResult<Json<Value>> {
+    let row = state.db.create_custom_rule(req.clone()).await?;
+    // Hot-add to engine
+    use waf_engine::rules::engine::{from_db_rule};
+    if let Ok(rule) = from_db_rule(&row) {
+        state.engine.custom_rules.add_rule(rule);
+    }
+    Ok(Json(json!({ "success": true, "data": row })))
+}
+
+pub async fn delete_custom_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let rule = state.db.get_custom_rule(id).await?.ok_or_else(|| ApiError::NotFound(format!("Rule {} not found", id)))?;
+    let deleted = state.db.delete_custom_rule(id).await?;
+    if !deleted {
+        return Err(ApiError::NotFound(format!("Rule {} not found", id)));
+    }
+    state.engine.custom_rules.remove_rule(&rule.host_code, &rule.id.to_string());
+    Ok(Json(json!({ "success": true, "data": null })))
+}
+
+// ─── Sensitive Patterns ───────────────────────────────────────────────────────
+
+pub async fn list_sensitive_patterns(
+    State(state): State<Arc<AppState>>,
+    Query(filter): Query<HostCodeFilter>,
+) -> ApiResult<Json<Value>> {
+    let rows = state.db.list_sensitive_patterns(filter.host_code.as_deref()).await?;
+    Ok(Json(json!({ "success": true, "data": rows })))
+}
+
+pub async fn create_sensitive_pattern(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateSensitivePattern>,
+) -> ApiResult<Json<Value>> {
+    let row = state.db.create_sensitive_pattern(req).await?;
+    // Trigger a full reload to rebuild the AhoCorasick automaton
+    if let Err(e) = state.engine.reload_rules().await {
+        tracing::warn!("Failed to reload after pattern add: {}", e);
+    }
+    Ok(Json(json!({ "success": true, "data": row })))
+}
+
+pub async fn delete_sensitive_pattern(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let deleted = state.db.delete_sensitive_pattern(id).await?;
+    if !deleted {
+        return Err(ApiError::NotFound(format!("Pattern {} not found", id)));
+    }
+    if let Err(e) = state.engine.reload_rules().await {
+        tracing::warn!("Failed to reload after pattern delete: {}", e);
+    }
+    Ok(Json(json!({ "success": true, "data": null })))
+}
+
+// ─── Hotlink Config ───────────────────────────────────────────────────────────
+
+pub async fn get_hotlink_config(
+    State(state): State<Arc<AppState>>,
+    Query(filter): Query<HostCodeFilter>,
+) -> ApiResult<Json<Value>> {
+    let host_code = filter.host_code.ok_or_else(|| ApiError::BadRequest("host_code required".into()))?;
+    let config = state.db.get_hotlink_config(&host_code).await?;
+    Ok(Json(json!({ "success": true, "data": config })))
+}
+
+pub async fn upsert_hotlink_config(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<UpsertHotlinkConfig>,
+) -> ApiResult<Json<Value>> {
+    let row = state.db.upsert_hotlink_config(req.clone()).await?;
+    // Hot-update engine
+    let domains = req.allowed_domains.unwrap_or_default();
+    let config = waf_engine::checks::anti_hotlink::HotlinkConfig {
+        enabled: row.enabled,
+        allow_empty_referer: row.allow_empty_referer,
+        allowed_domains: domains,
+        redirect_url: row.redirect_url.clone(),
+    };
+    state.engine.hotlink.set_config(&row.host_code, config);
+    Ok(Json(json!({ "success": true, "data": row })))
+}
+
+// ─── LB Backends ─────────────────────────────────────────────────────────────
+
+pub async fn list_lb_backends(
+    State(state): State<Arc<AppState>>,
+    Query(filter): Query<HostCodeFilter>,
+) -> ApiResult<Json<Value>> {
+    let rows = state.db.list_lb_backends(filter.host_code.as_deref()).await?;
+    Ok(Json(json!({ "success": true, "data": rows })))
+}
+
+pub async fn create_lb_backend(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateLbBackend>,
+) -> ApiResult<Json<Value>> {
+    let row = state.db.create_lb_backend(req).await?;
+    Ok(Json(json!({ "success": true, "data": row })))
+}
+
+pub async fn delete_lb_backend(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let deleted = state.db.delete_lb_backend(id).await?;
+    if !deleted {
+        return Err(ApiError::NotFound(format!("Backend {} not found", id)));
+    }
+    Ok(Json(json!({ "success": true, "data": null })))
+}
+
+// ─── Certificates ─────────────────────────────────────────────────────────────
+
+pub async fn list_certificates(
+    State(state): State<Arc<AppState>>,
+    Query(filter): Query<HostCodeFilter>,
+) -> ApiResult<Json<Value>> {
+    let rows = state.db.list_certificates(filter.host_code.as_deref()).await?;
+    // Don't expose private keys in list response
+    let safe: Vec<Value> = rows.iter().map(|c| json!({
+        "id": c.id,
+        "host_code": c.host_code,
+        "domain": c.domain,
+        "issuer": c.issuer,
+        "subject": c.subject,
+        "not_before": c.not_before,
+        "not_after": c.not_after,
+        "auto_renew": c.auto_renew,
+        "status": c.status,
+        "error_msg": c.error_msg,
+        "created_at": c.created_at,
+        "updated_at": c.updated_at,
+    })).collect();
+    Ok(Json(json!({ "success": true, "data": safe })))
+}
+
+pub async fn upload_certificate(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateCertificate>,
+) -> ApiResult<Json<Value>> {
+    let row = state.db.create_certificate(req.clone()).await?;
+    state.db.update_certificate_status(row.id, "active", None).await?;
+    Ok(Json(json!({
+        "success": true,
+        "data": {
+            "id": row.id,
+            "domain": row.domain,
+            "status": "active",
+        }
+    })))
+}
+
+pub async fn delete_certificate(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let deleted = state.db.delete_certificate(id).await?;
+    if !deleted {
+        return Err(ApiError::NotFound(format!("Certificate {} not found", id)));
+    }
+    Ok(Json(json!({ "success": true, "data": null })))
 }

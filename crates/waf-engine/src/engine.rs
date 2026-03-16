@@ -13,9 +13,10 @@ use crate::checker::{
     check_ip_blacklist, check_ip_whitelist, check_url_blacklist, check_url_whitelist, RuleStore,
 };
 use crate::checks::{
-    BotCheck, CcCheck, Check, DirTraversalCheck, RceCheck, ScannerCheck, SqlInjectionCheck,
-    XssCheck,
+    AntiHotlinkCheck, BotCheck, CcCheck, Check, DirTraversalCheck, OWASPCheck, RceCheck,
+    ScannerCheck, SensitiveCheck, SqlInjectionCheck, XssCheck,
 };
+use crate::rules::engine::{from_db_rule, CustomRulesEngine};
 
 /// WAF engine configuration
 #[derive(Debug, Clone, Default)]
@@ -28,18 +29,30 @@ pub struct WafEngineConfig {
 ///
 /// Phase 1-4  : IP / URL whitelist + blacklist (fast-path)
 /// Phase 5-11 : Attack detection (CC, scanner, bot, SQLi, XSS, RCE, traversal)
+/// Phase 12   : Custom rules engine (Rhai scripting)
+/// Phase 13   : OWASP CRS subset
+/// Phase 14   : Sensitive data detection
+/// Phase 15   : Anti-hotlinking
 pub struct WafEngine {
     pub store: Arc<RuleStore>,
+    pub custom_rules: Arc<CustomRulesEngine>,
+    pub sensitive: Arc<SensitiveCheck>,
+    pub hotlink: Arc<AntiHotlinkCheck>,
     db: Arc<Database>,
     #[allow(dead_code)]
     config: WafEngineConfig,
     /// Dynamic checker pipeline (Phase 2 detectors).
     checkers: Vec<Box<dyn Check>>,
+    owasp: Arc<OWASPCheck>,
 }
 
 impl WafEngine {
     pub fn new(db: Arc<Database>, config: WafEngineConfig) -> Self {
         let store = Arc::new(RuleStore::new(Arc::clone(&db)));
+        let custom_rules = Arc::new(CustomRulesEngine::new());
+        let sensitive = Arc::new(SensitiveCheck::new());
+        let hotlink = Arc::new(AntiHotlinkCheck::new());
+        let owasp = Arc::new(OWASPCheck::new());
 
         // Build the Phase 2 checker pipeline.
         // CC runs first to shed flood traffic before expensive pattern checks.
@@ -55,15 +68,82 @@ impl WafEngine {
 
         Self {
             store,
+            custom_rules,
+            sensitive,
+            hotlink,
             db,
             config,
             checkers,
+            owasp,
         }
     }
 
     /// Reload all rules from the database
     pub async fn reload_rules(&self) -> anyhow::Result<()> {
-        self.store.reload_all().await
+        // Reload IP/URL rules
+        self.store.reload_all().await?;
+
+        // Reload custom rules
+        let custom_rules = self.db.list_custom_rules(None).await?;
+        {
+            let mut by_host: std::collections::HashMap<String, Vec<_>> =
+                std::collections::HashMap::new();
+            for row in &custom_rules {
+                match from_db_rule(row) {
+                    Ok(rule) => {
+                        by_host
+                            .entry(row.host_code.clone())
+                            .or_default()
+                            .push(rule);
+                    }
+                    Err(e) => warn!("Failed to parse custom rule {}: {}", row.id, e),
+                }
+            }
+            for (host_code, rules) in by_host {
+                self.custom_rules.load_host(&host_code, rules);
+            }
+        }
+
+        // Reload sensitive patterns
+        let patterns = self.db.list_sensitive_patterns(None).await?;
+        {
+            let mut by_host: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for row in &patterns {
+                if row.check_request {
+                    by_host
+                        .entry(row.host_code.clone())
+                        .or_default()
+                        .push(row.pattern.clone());
+                }
+            }
+            for (host_code, pats) in by_host {
+                self.sensitive.load_host(&host_code, pats);
+            }
+        }
+
+        // Reload hotlink configs
+        let hotlink_configs = self.db.list_hotlink_configs().await?;
+        for row in &hotlink_configs {
+            let domains: Vec<String> = row
+                .allowed_domains
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let config = crate::checks::anti_hotlink::HotlinkConfig {
+                enabled: row.enabled,
+                allow_empty_referer: row.allow_empty_referer,
+                allowed_domains: domains,
+                redirect_url: row.redirect_url.clone(),
+            };
+            self.hotlink.set_config(&row.host_code, config);
+        }
+
+        Ok(())
     }
 
     /// Run the full WAF inspection pipeline.
@@ -126,6 +206,58 @@ impl WafEngine {
             }
         }
 
+        // ── Phase 12: Custom rules engine ─────────────────────────────────────
+        if let Some(result) = self.custom_rules.check(ctx) {
+            let rule_name = result.rule_name.clone();
+            let decision = if ctx.host_config.log_only_mode {
+                WafDecision { action: WafAction::LogOnly, result: Some(result) }
+            } else {
+                let body = render_block_page(ctx, &rule_name);
+                WafDecision::block(403, Some(body), result)
+            };
+            self.log_security_event(ctx, &decision).await;
+            return decision;
+        }
+
+        // ── Phase 13: OWASP CRS ────────────────────────────────────────────────
+        if let Some(result) = self.owasp.check(ctx) {
+            let rule_name = result.rule_name.clone();
+            let decision = if ctx.host_config.log_only_mode {
+                WafDecision { action: WafAction::LogOnly, result: Some(result) }
+            } else {
+                let body = render_block_page(ctx, &rule_name);
+                WafDecision::block(403, Some(body), result)
+            };
+            self.log_security_event(ctx, &decision).await;
+            return decision;
+        }
+
+        // ── Phase 14: Sensitive data ───────────────────────────────────────────
+        if let Some(result) = self.sensitive.check(ctx) {
+            let rule_name = result.rule_name.clone();
+            let decision = if ctx.host_config.log_only_mode {
+                WafDecision { action: WafAction::LogOnly, result: Some(result) }
+            } else {
+                let body = render_block_page(ctx, &rule_name);
+                WafDecision::block(403, Some(body), result)
+            };
+            self.log_security_event(ctx, &decision).await;
+            return decision;
+        }
+
+        // ── Phase 15: Anti-hotlinking ──────────────────────────────────────────
+        if let Some(result) = self.hotlink.check(ctx) {
+            let rule_name = result.rule_name.clone();
+            let decision = if ctx.host_config.log_only_mode {
+                WafDecision { action: WafAction::LogOnly, result: Some(result) }
+            } else {
+                let body = render_block_page(ctx, &rule_name);
+                WafDecision::block(403, Some(body), result)
+            };
+            self.log_security_event(ctx, &decision).await;
+            return decision;
+        }
+
         WafDecision::allow()
     }
 
@@ -174,7 +306,7 @@ impl WafEngine {
         });
     }
 
-    /// Log a Phase 2 security event to the `security_events` table (fire-and-forget).
+    /// Log a Phase 2+ security event to the `security_events` table (fire-and-forget).
     async fn log_security_event(&self, ctx: &RequestCtx, decision: &WafDecision) {
         let result = match &decision.result {
             Some(r) => r,

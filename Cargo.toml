@@ -55,6 +55,14 @@ async-trait = "0.1"
 bytes = "1"
 http = "1"
 
+# Phase 3 additions
+rhai = { version = "1", features = ["sync"] }
+aho-corasick = "1"
+serde_yaml = "0.9"
+instant-acme = "0.7"
+rcgen = "0.13"
+base64 = "0.22"
+
 [profile.release]
 opt-level = 3
 lto = true

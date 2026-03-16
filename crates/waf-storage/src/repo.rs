@@ -398,6 +398,246 @@ impl Database {
         Ok(())
     }
 
+    // ─── Certificates ─────────────────────────────────────────────────────────
+
+    pub async fn list_certificates(&self, host_code: Option<&str>) -> Result<Vec<Certificate>, StorageError> {
+        let rows = match host_code {
+            Some(code) => sqlx::query_as::<_, Certificate>(
+                "SELECT * FROM certificates WHERE host_code = $1 ORDER BY created_at DESC"
+            ).bind(code).fetch_all(&self.pool).await?,
+            None => sqlx::query_as::<_, Certificate>(
+                "SELECT * FROM certificates ORDER BY created_at DESC"
+            ).fetch_all(&self.pool).await?,
+        };
+        Ok(rows)
+    }
+
+    pub async fn get_certificate(&self, id: Uuid) -> Result<Option<Certificate>, StorageError> {
+        Ok(sqlx::query_as::<_, Certificate>("SELECT * FROM certificates WHERE id = $1")
+            .bind(id).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn get_certificate_by_domain(&self, domain: &str) -> Result<Option<Certificate>, StorageError> {
+        Ok(sqlx::query_as::<_, Certificate>(
+            "SELECT * FROM certificates WHERE domain = $1 ORDER BY created_at DESC LIMIT 1"
+        ).bind(domain).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn create_certificate(&self, req: CreateCertificate) -> Result<Certificate, StorageError> {
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let row = sqlx::query_as::<_, Certificate>(
+            r#"INSERT INTO certificates (id, host_code, domain, cert_pem, key_pem, chain_pem, auto_renew, status, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$8) RETURNING *"#
+        )
+        .bind(id).bind(&req.host_code).bind(&req.domain)
+        .bind(&req.cert_pem).bind(&req.key_pem).bind(&req.chain_pem)
+        .bind(req.auto_renew.unwrap_or(true)).bind(now)
+        .fetch_one(&self.pool).await?;
+        Ok(row)
+    }
+
+    pub async fn update_certificate_status(&self, id: Uuid, status: &str, error_msg: Option<&str>) -> Result<(), StorageError> {
+        sqlx::query("UPDATE certificates SET status=$2, error_msg=$3, updated_at=NOW() WHERE id=$1")
+            .bind(id).bind(status).bind(error_msg).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn update_certificate_pem(
+        &self, id: Uuid,
+        cert_pem: &str, key_pem: &str, chain_pem: Option<&str>,
+        not_before: chrono::DateTime<chrono::Utc>, not_after: chrono::DateTime<chrono::Utc>,
+        issuer: &str, subject: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"UPDATE certificates SET cert_pem=$2, key_pem=$3, chain_pem=$4,
+               not_before=$5, not_after=$6, issuer=$7, subject=$8,
+               status='active', error_msg=NULL, updated_at=NOW() WHERE id=$1"#
+        )
+        .bind(id).bind(cert_pem).bind(key_pem).bind(chain_pem)
+        .bind(not_before).bind(not_after).bind(issuer).bind(subject)
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn list_certificates_due_renewal(&self, days_before: i64) -> Result<Vec<Certificate>, StorageError> {
+        let threshold = chrono::Utc::now() + chrono::Duration::days(days_before);
+        let rows = sqlx::query_as::<_, Certificate>(
+            r#"SELECT * FROM certificates
+               WHERE auto_renew = TRUE AND status = 'active'
+                 AND not_after IS NOT NULL AND not_after < $1"#
+        ).bind(threshold).fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
+    pub async fn delete_certificate(&self, id: Uuid) -> Result<bool, StorageError> {
+        let r = sqlx::query("DELETE FROM certificates WHERE id = $1").bind(id).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    // ─── Custom Rules ─────────────────────────────────────────────────────────
+
+    pub async fn list_custom_rules(&self, host_code: Option<&str>) -> Result<Vec<CustomRule>, StorageError> {
+        let rows = match host_code {
+            Some(code) => sqlx::query_as::<_, CustomRule>(
+                "SELECT * FROM custom_rules WHERE host_code = $1 ORDER BY priority, created_at"
+            ).bind(code).fetch_all(&self.pool).await?,
+            None => sqlx::query_as::<_, CustomRule>(
+                "SELECT * FROM custom_rules ORDER BY priority, created_at"
+            ).fetch_all(&self.pool).await?,
+        };
+        Ok(rows)
+    }
+
+    pub async fn get_custom_rule(&self, id: Uuid) -> Result<Option<CustomRule>, StorageError> {
+        Ok(sqlx::query_as::<_, CustomRule>("SELECT * FROM custom_rules WHERE id = $1")
+            .bind(id).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn create_custom_rule(&self, req: CreateCustomRule) -> Result<CustomRule, StorageError> {
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let row = sqlx::query_as::<_, CustomRule>(
+            r#"INSERT INTO custom_rules
+               (id, host_code, name, description, priority, enabled, condition_op, conditions,
+                action, action_status, action_msg, script, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13) RETURNING *"#
+        )
+        .bind(id).bind(&req.host_code).bind(&req.name).bind(&req.description)
+        .bind(req.priority.unwrap_or(100)).bind(req.enabled.unwrap_or(true))
+        .bind(req.condition_op.as_deref().unwrap_or("and"))
+        .bind(&req.conditions)
+        .bind(req.action.as_deref().unwrap_or("block"))
+        .bind(req.action_status.unwrap_or(403))
+        .bind(&req.action_msg).bind(&req.script).bind(now)
+        .fetch_one(&self.pool).await?;
+        Ok(row)
+    }
+
+    pub async fn delete_custom_rule(&self, id: Uuid) -> Result<bool, StorageError> {
+        let r = sqlx::query("DELETE FROM custom_rules WHERE id = $1").bind(id).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    pub async fn set_custom_rule_enabled(&self, id: Uuid, enabled: bool) -> Result<bool, StorageError> {
+        let r = sqlx::query("UPDATE custom_rules SET enabled=$2, updated_at=NOW() WHERE id=$1")
+            .bind(id).bind(enabled).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    // ─── Sensitive Patterns ───────────────────────────────────────────────────
+
+    pub async fn list_sensitive_patterns(&self, host_code: Option<&str>) -> Result<Vec<SensitivePattern>, StorageError> {
+        let rows = match host_code {
+            Some(code) => sqlx::query_as::<_, SensitivePattern>(
+                "SELECT * FROM sensitive_patterns WHERE host_code = $1 AND enabled = TRUE ORDER BY created_at"
+            ).bind(code).fetch_all(&self.pool).await?,
+            None => sqlx::query_as::<_, SensitivePattern>(
+                "SELECT * FROM sensitive_patterns WHERE enabled = TRUE ORDER BY created_at"
+            ).fetch_all(&self.pool).await?,
+        };
+        Ok(rows)
+    }
+
+    pub async fn create_sensitive_pattern(&self, req: CreateSensitivePattern) -> Result<SensitivePattern, StorageError> {
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let row = sqlx::query_as::<_, SensitivePattern>(
+            r#"INSERT INTO sensitive_patterns
+               (id, host_code, pattern, pattern_type, check_request, check_response, action, remarks, enabled, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,$9,$9) RETURNING *"#
+        )
+        .bind(id).bind(&req.host_code).bind(&req.pattern)
+        .bind(req.pattern_type.as_deref().unwrap_or("word"))
+        .bind(req.check_request.unwrap_or(true))
+        .bind(req.check_response.unwrap_or(false))
+        .bind(req.action.as_deref().unwrap_or("block"))
+        .bind(&req.remarks).bind(now)
+        .fetch_one(&self.pool).await?;
+        Ok(row)
+    }
+
+    pub async fn delete_sensitive_pattern(&self, id: Uuid) -> Result<bool, StorageError> {
+        let r = sqlx::query("DELETE FROM sensitive_patterns WHERE id = $1").bind(id).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    // ─── Hotlink Configs ──────────────────────────────────────────────────────
+
+    pub async fn get_hotlink_config(&self, host_code: &str) -> Result<Option<HotlinkConfig>, StorageError> {
+        Ok(sqlx::query_as::<_, HotlinkConfig>(
+            "SELECT * FROM hotlink_configs WHERE host_code = $1"
+        ).bind(host_code).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn list_hotlink_configs(&self) -> Result<Vec<HotlinkConfig>, StorageError> {
+        Ok(sqlx::query_as::<_, HotlinkConfig>("SELECT * FROM hotlink_configs ORDER BY created_at")
+            .fetch_all(&self.pool).await?)
+    }
+
+    pub async fn upsert_hotlink_config(&self, req: UpsertHotlinkConfig) -> Result<HotlinkConfig, StorageError> {
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let domains = serde_json::to_value(&req.allowed_domains.unwrap_or_default())
+            .unwrap_or(serde_json::Value::Array(vec![]));
+        let row = sqlx::query_as::<_, HotlinkConfig>(
+            r#"INSERT INTO hotlink_configs (id, host_code, enabled, allow_empty_referer, allowed_domains, redirect_url, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$7)
+               ON CONFLICT (host_code) DO UPDATE SET
+                 enabled=EXCLUDED.enabled, allow_empty_referer=EXCLUDED.allow_empty_referer,
+                 allowed_domains=EXCLUDED.allowed_domains, redirect_url=EXCLUDED.redirect_url,
+                 updated_at=NOW()
+               RETURNING *"#
+        )
+        .bind(id).bind(&req.host_code).bind(req.enabled.unwrap_or(true))
+        .bind(req.allow_empty_referer.unwrap_or(true))
+        .bind(domains).bind(&req.redirect_url).bind(now)
+        .fetch_one(&self.pool).await?;
+        Ok(row)
+    }
+
+    // ─── LB Backends ─────────────────────────────────────────────────────────
+
+    pub async fn list_lb_backends(&self, host_code: Option<&str>) -> Result<Vec<LbBackend>, StorageError> {
+        let rows = match host_code {
+            Some(code) => sqlx::query_as::<_, LbBackend>(
+                "SELECT * FROM lb_backends WHERE host_code = $1 ORDER BY weight DESC, created_at"
+            ).bind(code).fetch_all(&self.pool).await?,
+            None => sqlx::query_as::<_, LbBackend>(
+                "SELECT * FROM lb_backends ORDER BY created_at"
+            ).fetch_all(&self.pool).await?,
+        };
+        Ok(rows)
+    }
+
+    pub async fn create_lb_backend(&self, req: CreateLbBackend) -> Result<LbBackend, StorageError> {
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let row = sqlx::query_as::<_, LbBackend>(
+            r#"INSERT INTO lb_backends
+               (id, host_code, backend_host, backend_port, weight, enabled, health_check_url, health_check_interval_secs, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *"#
+        )
+        .bind(id).bind(&req.host_code).bind(&req.backend_host).bind(req.backend_port)
+        .bind(req.weight.unwrap_or(1)).bind(req.enabled.unwrap_or(true))
+        .bind(&req.health_check_url)
+        .bind(req.health_check_interval_secs.unwrap_or(30))
+        .bind(now)
+        .fetch_one(&self.pool).await?;
+        Ok(row)
+    }
+
+    pub async fn delete_lb_backend(&self, id: Uuid) -> Result<bool, StorageError> {
+        let r = sqlx::query("DELETE FROM lb_backends WHERE id = $1").bind(id).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    pub async fn update_lb_backend_health(&self, id: Uuid, is_healthy: bool) -> Result<(), StorageError> {
+        sqlx::query("UPDATE lb_backends SET is_healthy=$2, last_health_check=NOW(), updated_at=NOW() WHERE id=$1")
+            .bind(id).bind(is_healthy).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn list_security_events(
         &self,
         query: &SecurityEventQuery,

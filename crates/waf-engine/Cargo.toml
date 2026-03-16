@@ -20,3 +20,6 @@ ipnet = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+rhai = { workspace = true }
+aho-corasick = { workspace = true }
+serde_yaml = { workspace = true }

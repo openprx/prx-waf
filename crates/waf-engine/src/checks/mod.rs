@@ -1,16 +1,22 @@
+pub mod anti_hotlink;
 pub mod bot;
 pub mod cc;
 pub mod dir_traversal;
+pub mod owasp;
 pub mod rce;
 pub mod scanner;
+pub mod sensitive;
 pub mod sql_injection;
 pub mod xss;
 
+pub use anti_hotlink::AntiHotlinkCheck;
 pub use bot::BotCheck;
 pub use cc::CcCheck;
 pub use dir_traversal::DirTraversalCheck;
+pub use owasp::OWASPCheck;
 pub use rce::RceCheck;
 pub use scanner::ScannerCheck;
+pub use sensitive::SensitiveCheck;
 pub use sql_injection::SqlInjectionCheck;
 pub use xss::XssCheck;
 

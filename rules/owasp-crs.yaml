@@ -1,0 +1,191 @@
+version: "1.0"
+description: "OWASP Core Rule Set (CRS) - Native subset implementation"
+paranoia_level: 1
+
+rules:
+  # ── Protocol Violations (OWASP-PROTO) ───────────────────────────────────────
+
+  - id: "OWASP-PROTO-001"
+    name: "Invalid HTTP method"
+    category: "protocol"
+    severity: "high"
+    paranoia: 1
+    field: "method"
+    operator: "not_in"
+    value: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"]
+    action: "block"
+
+  - id: "OWASP-PROTO-002"
+    name: "HTTP version mismatch in request line"
+    category: "protocol"
+    severity: "medium"
+    paranoia: 2
+    field: "path"
+    operator: "regex"
+    value: "(?i)HTTP/[0-9]\\.[0-9]"
+    action: "block"
+
+  - id: "OWASP-PROTO-003"
+    name: "Null byte in request"
+    category: "protocol"
+    severity: "high"
+    paranoia: 1
+    field: "path"
+    operator: "contains"
+    value: "\u0000"
+    action: "block"
+
+  # ── Request Size Limits (OWASP-SIZE) ────────────────────────────────────────
+
+  - id: "OWASP-SIZE-001"
+    name: "Request body too large"
+    category: "limits"
+    severity: "medium"
+    paranoia: 1
+    field: "content_length"
+    operator: "gt"
+    value: 10485760
+    action: "block"
+
+  - id: "OWASP-SIZE-002"
+    name: "Too many query string arguments"
+    category: "limits"
+    severity: "low"
+    paranoia: 2
+    field: "query_arg_count"
+    operator: "gt"
+    value: 128
+    action: "block"
+
+  - id: "OWASP-SIZE-003"
+    name: "URI length too long"
+    category: "limits"
+    severity: "medium"
+    paranoia: 1
+    field: "path_length"
+    operator: "gt"
+    value: 4096
+    action: "block"
+
+  # ── HTTP Policy (OWASP-HTTP) ─────────────────────────────────────────────────
+
+  - id: "OWASP-HTTP-001"
+    name: "Disallowed Content-Type"
+    category: "policy"
+    severity: "medium"
+    paranoia: 2
+    field: "content_type"
+    operator: "not_in"
+    value:
+      - ""
+      - "application/x-www-form-urlencoded"
+      - "multipart/form-data"
+      - "application/json"
+      - "application/xml"
+      - "text/xml"
+      - "text/plain"
+      - "application/octet-stream"
+      - "application/graphql"
+    action: "block"
+
+  # ── Common Attack Patterns (OWASP-ATTACK) ───────────────────────────────────
+
+  - id: "OWASP-ATTACK-001"
+    name: "CRLF injection in path"
+    category: "attack"
+    severity: "high"
+    paranoia: 1
+    field: "path"
+    operator: "regex"
+    value: "(?:%0[Dd]%0[Aa]|%0[Aa]%0[Dd]|\\r\\n|\\r|\\n)"
+    action: "block"
+
+  - id: "OWASP-ATTACK-002"
+    name: "HTTP response splitting"
+    category: "attack"
+    severity: "high"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?:%0[Dd]%0[Aa]|%0[Aa]%0[Dd]|\\r\\n|\\r|\\n)"
+    action: "block"
+
+  - id: "OWASP-ATTACK-003"
+    name: "Remote file inclusion attempt"
+    category: "attack"
+    severity: "critical"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:https?|ftp|php)://"
+    action: "block"
+
+  - id: "OWASP-ATTACK-004"
+    name: "Shell injection via query"
+    category: "attack"
+    severity: "critical"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?:;|\\||`|\\$\\(|&&|\\|\\|)\\s*(?:cat|ls|id|uname|whoami|wget|curl|bash|sh|zsh|python|perl|php|ruby)"
+    action: "block"
+
+  - id: "OWASP-ATTACK-005"
+    name: "PHP code injection"
+    category: "attack"
+    severity: "critical"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)<\\?php|<\\?=|\\$_(?:GET|POST|REQUEST|SERVER|FILES|COOKIE|SESSION|ENV)"
+    action: "block"
+
+  - id: "OWASP-ATTACK-006"
+    name: "Java serialization attack"
+    category: "attack"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?:rO0AB|H4sI|aced0005)"
+    action: "block"
+
+  - id: "OWASP-ATTACK-007"
+    name: "Log4Shell exploitation attempt"
+    category: "attack"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)\\$\\{(?:jndi|lower|upper|:-|:-).*?\\}"
+    action: "block"
+
+  - id: "OWASP-ATTACK-008"
+    name: "Server-side template injection"
+    category: "attack"
+    severity: "high"
+    paranoia: 2
+    field: "query"
+    operator: "regex"
+    value: "(?:\\{\\{.*?\\}\\}|\\{%.*?%\\}|\\$\\{.*?\\}|<%.*?%>)"
+    action: "block"
+
+  - id: "OWASP-ATTACK-009"
+    name: "XXE injection"
+    category: "attack"
+    severity: "high"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)<!(?:DOCTYPE|ENTITY).*?(?:SYSTEM|PUBLIC).*?['\"].*?['\"]"
+    action: "block"
+
+  - id: "OWASP-ATTACK-010"
+    name: "SSRF via URL parameters"
+    category: "attack"
+    severity: "high"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:url|redirect|next|link|dest|destination|redir|go|return|returnto|return_to|checkout_url|continue|forward|goto|target|image_url|load|file)=https?://"
+    action: "block"

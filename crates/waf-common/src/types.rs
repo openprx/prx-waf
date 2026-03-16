@@ -78,6 +78,14 @@ pub enum Phase {
     DirTraversal = 9,
     Bot = 10,
     RateLimit = 11,
+    /// Custom scripted rules engine
+    CustomRule = 12,
+    /// OWASP Core Rule Set checks
+    Owasp = 13,
+    /// Sensitive word / data-leak detection
+    Sensitive = 14,
+    /// Anti-hotlinking (Referer check)
+    AntiHotlink = 15,
 }
 
 impl std::fmt::Display for Phase {
@@ -94,6 +102,10 @@ impl std::fmt::Display for Phase {
             Phase::DirTraversal => write!(f, "Directory Traversal"),
             Phase::Bot => write!(f, "Bot"),
             Phase::RateLimit => write!(f, "Rate Limit"),
+            Phase::CustomRule => write!(f, "Custom Rule"),
+            Phase::Owasp => write!(f, "OWASP CRS"),
+            Phase::Sensitive => write!(f, "Sensitive Data"),
+            Phase::AntiHotlink => write!(f, "Anti-Hotlink"),
         }
     }
 }
@@ -164,6 +176,7 @@ pub enum LoadBalanceStrategy {
     RoundRobin,
     IpHash,
     WeightedRoundRobin,
+    LeastConnections,
 }
 
 /// Defense configuration per host

@@ -109,6 +109,92 @@ pub struct SecurityEvent {
     pub created_at: DateTime<Utc>,
 }
 
+/// SSL Certificate entry
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Certificate {
+    pub id: Uuid,
+    pub host_code: String,
+    pub domain: String,
+    pub cert_pem: Option<String>,
+    pub key_pem: Option<String>,
+    pub chain_pem: Option<String>,
+    pub issuer: Option<String>,
+    pub subject: Option<String>,
+    pub not_before: Option<DateTime<Utc>>,
+    pub not_after: Option<DateTime<Utc>>,
+    pub auto_renew: bool,
+    pub acme_account: Option<serde_json::Value>,
+    pub status: String,
+    pub error_msg: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Custom WAF rule entry
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct CustomRule {
+    pub id: Uuid,
+    pub host_code: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub priority: i32,
+    pub enabled: bool,
+    pub condition_op: String,
+    pub conditions: serde_json::Value,
+    pub action: String,
+    pub action_status: i32,
+    pub action_msg: Option<String>,
+    pub script: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Sensitive pattern entry
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct SensitivePattern {
+    pub id: Uuid,
+    pub host_code: String,
+    pub pattern: String,
+    pub pattern_type: String,
+    pub check_request: bool,
+    pub check_response: bool,
+    pub action: String,
+    pub remarks: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Hotlink configuration entry
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct HotlinkConfig {
+    pub id: Uuid,
+    pub host_code: String,
+    pub enabled: bool,
+    pub allow_empty_referer: bool,
+    pub allowed_domains: serde_json::Value,
+    pub redirect_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Load balancer backend entry
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LbBackend {
+    pub id: Uuid,
+    pub host_code: String,
+    pub backend_host: String,
+    pub backend_port: i32,
+    pub weight: i32,
+    pub enabled: bool,
+    pub health_check_url: Option<String>,
+    pub health_check_interval_secs: i32,
+    pub last_health_check: Option<DateTime<Utc>>,
+    pub is_healthy: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 // ─── Request / Input types ────────────────────────────────────────────────────
 
 /// Create host request
@@ -195,4 +281,65 @@ pub struct SecurityEventQuery {
     pub action: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
+}
+
+/// Create custom rule request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateCustomRule {
+    pub host_code: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub priority: Option<i32>,
+    pub enabled: Option<bool>,
+    pub condition_op: Option<String>,
+    pub conditions: serde_json::Value,
+    pub action: Option<String>,
+    pub action_status: Option<i32>,
+    pub action_msg: Option<String>,
+    pub script: Option<String>,
+}
+
+/// Create sensitive pattern request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSensitivePattern {
+    pub host_code: String,
+    pub pattern: String,
+    pub pattern_type: Option<String>,
+    pub check_request: Option<bool>,
+    pub check_response: Option<bool>,
+    pub action: Option<String>,
+    pub remarks: Option<String>,
+}
+
+/// Create/update hotlink config request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertHotlinkConfig {
+    pub host_code: String,
+    pub enabled: Option<bool>,
+    pub allow_empty_referer: Option<bool>,
+    pub allowed_domains: Option<Vec<String>>,
+    pub redirect_url: Option<String>,
+}
+
+/// Create LB backend request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateLbBackend {
+    pub host_code: String,
+    pub backend_host: String,
+    pub backend_port: i32,
+    pub weight: Option<i32>,
+    pub enabled: Option<bool>,
+    pub health_check_url: Option<String>,
+    pub health_check_interval_secs: Option<i32>,
+}
+
+/// Create certificate request (manual upload)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateCertificate {
+    pub host_code: String,
+    pub domain: String,
+    pub cert_pem: Option<String>,
+    pub key_pem: Option<String>,
+    pub chain_pem: Option<String>,
+    pub auto_renew: Option<bool>,
 }
