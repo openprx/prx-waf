@@ -7,8 +7,8 @@
 
 - **Active Phase:** P2
 - **Phase Status:** IN_PROGRESS
-- **Claude Process:** wild-valley (PID 314076)
-- **Last Check:** 2026-03-16 11:54 EDT
+- **Claude Process:** dawn-kelp (PID 347845)
+- **Last Check:** 2026-03-16 12:06 EDT
 - **Next Action:** Wait for P2 Claude to finish, then verify
 
 ---
@@ -115,3 +115,5 @@
 | 2026-03-16 11:54 | P1 | tide-claw completed — verified: cargo check clean, 85 tests pass, committed 3628cfd | DONE |
 | 2026-03-16 11:54 | P2 | Dispatched Claude (wild-valley PID 314076) for Rule & Config Sync | IN_PROGRESS |
 | 2026-03-16 12:05 | P1 | Killed stale processes, re-dispatched focused Claude | IN_PROGRESS |
+| 2026-03-16 12:06 | P2 | wild-valley finished (code 0) — partial P2 committed bee3ae2 (428 lines). cargo check+test pass | PARTIAL |
+| 2026-03-16 12:06 | P2 | Re-dispatched Claude (dawn-kelp PID 347845) for remaining P2: RuleReloader, worker apply, stats datagram send, integration test | IN_PROGRESS |
