@@ -37,6 +37,9 @@ pub struct AppState {
     pub crowdsec_client: Option<Arc<CrowdSecClient>>,
     /// LAPI base URL (for display in status endpoint)
     pub crowdsec_lapi_url: Option<String>,
+    // ── Phase 7: Cluster ─────────────────────────────────────────────────────
+    /// Shared cluster node state (None when running in standalone mode)
+    pub cluster_state: Option<Arc<waf_cluster::NodeState>>,
 }
 
 impl AppState {
@@ -59,6 +62,7 @@ impl AppState {
             crowdsec_cache: None,
             crowdsec_client: None,
             crowdsec_lapi_url: None,
+            cluster_state: None,
         }
     }
 

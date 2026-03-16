@@ -5072,6 +5072,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "uuid",
+ "waf-cluster",
  "waf-common",
  "waf-engine",
  "waf-storage",

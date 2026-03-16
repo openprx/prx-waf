@@ -8,6 +8,7 @@ license.workspace = true
 waf-common = { path = "../waf-common" }
 waf-storage = { path = "../waf-storage" }
 waf-engine = { path = "../waf-engine" }
+waf-cluster = { path = "../waf-cluster" }
 gateway = { path = "../gateway" }
 tokio = { workspace = true }
 tower = { workspace = true }

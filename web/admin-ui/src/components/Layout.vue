@@ -17,6 +17,10 @@
         <NavItem to="/cc-protection" :icon="ShieldCheck">{{ $t('nav.ccProtection') }}</NavItem>
         <NavItem to="/notifications" :icon="Bell">{{ $t('nav.notifications') }}</NavItem>
         <NavItem to="/settings" :icon="Settings">{{ $t('nav.settings') }}</NavItem>
+        <div class="pt-2 pb-1 px-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ $t('nav.cluster') }}</div>
+        <NavItem to="/cluster" :icon="Network">{{ $t('nav.clusterOverview') }}</NavItem>
+        <NavItem to="/cluster/tokens" :icon="Key">{{ $t('nav.clusterTokens') }}</NavItem>
+        <NavItem to="/cluster/sync" :icon="RefreshCw">{{ $t('nav.clusterSync') }}</NavItem>
         <div class="pt-2 pb-1 px-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ $t('nav.crowdsec') }}</div>
         <NavItem to="/crowdsec-settings" :icon="Cloud">{{ $t('nav.csSettings') }}</NavItem>
         <NavItem to="/crowdsec-decisions" :icon="Ban">{{ $t('nav.csDecisions') }}</NavItem>
@@ -83,6 +87,9 @@ import {
   GitBranch,
   Bot as BotIcon,
   Languages,
+  Network,
+  Key,
+  RefreshCw,
 } from 'lucide-vue-next'
 
 const auth = useAuthStore()

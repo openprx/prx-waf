@@ -117,3 +117,12 @@ export const systemApi = {
   status: () => api.get('/api/status'),
   reload: () => api.post('/api/reload'),
 }
+
+// ─── Cluster ──────────────────────────────────────────────────────────────────
+export const clusterApi = {
+  status: () => api.get('/api/cluster/status'),
+  listNodes: () => api.get('/api/cluster/nodes'),
+  getNode: (id: string) => api.get(`/api/cluster/nodes/${id}`),
+  generateToken: (ttl_ms?: number) => api.post('/api/cluster/token', { ttl_ms }),
+  removeNode: (node_id: string) => api.post('/api/cluster/nodes/remove', { node_id }),
+}

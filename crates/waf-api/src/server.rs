@@ -12,6 +12,10 @@ use tracing::info;
 
 use crate::auth::{login, logout, refresh_token};
 use crate::cache_api::{cache_flush, cache_flush_host, cache_flush_key, cache_stats};
+use crate::cluster::{
+    cluster_status, generate_join_token, get_cluster_node, list_cluster_nodes,
+    remove_cluster_node,
+};
 use crate::crowdsec::{
     crowdsec_stats, crowdsec_status, delete_crowdsec_decision, get_crowdsec_config,
     list_crowdsec_decisions, list_crowdsec_events, test_crowdsec_connection,
@@ -109,6 +113,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/cache/key", delete(cache_flush_key))
         // Phase 5: Audit log
         .route("/api/audit-log", get(list_audit_log))
+        // Phase 7: Cluster
+        .route("/api/cluster/status", get(cluster_status))
+        .route("/api/cluster/nodes", get(list_cluster_nodes))
+        .route("/api/cluster/nodes/:id", get(get_cluster_node))
+        .route("/api/cluster/token", post(generate_join_token))
+        .route("/api/cluster/nodes/remove", post(remove_cluster_node))
         // Phase 6: CrowdSec
         .route("/api/crowdsec/status", get(crowdsec_status))
         .route("/api/crowdsec/decisions", get(list_crowdsec_decisions))
