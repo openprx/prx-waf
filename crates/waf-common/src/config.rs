@@ -377,6 +377,11 @@ pub struct ClusterCryptoConfig {
     /// Path to CA certificate PEM file
     #[serde(default = "default_ca_cert_path")]
     pub ca_cert: String,
+    /// Path to CA private key PEM file.
+    /// Required on the main node only; leave empty on worker nodes.
+    /// Used when `auto_generate = false` to load a pre-generated CA key.
+    #[serde(default)]
+    pub ca_key: String,
     /// Path to node certificate PEM file
     #[serde(default = "default_node_cert_path")]
     pub node_cert: String,
@@ -412,6 +417,7 @@ impl Default for ClusterCryptoConfig {
     fn default() -> Self {
         Self {
             ca_cert: default_ca_cert_path(),
+            ca_key: String::new(),
             node_cert: default_node_cert_path(),
             node_key: default_node_key_path(),
             auto_generate: true,

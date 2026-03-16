@@ -81,6 +81,24 @@ enum ClusterCommands {
         /// Node ID to remove
         node_id: String,
     },
+    /// Generate cluster CA and per-node certificates for offline provisioning
+    ///
+    /// Run this once before starting a new cluster. The generated certificates
+    /// are written to OUTPUT_DIR and then mounted into each node's container.
+    CertInit {
+        /// Comma-separated list of node names to generate certificates for
+        #[arg(long, default_value = "node-a,node-b,node-c")]
+        nodes: String,
+        /// Output directory for certificate files
+        #[arg(long, default_value = "/certs")]
+        output_dir: String,
+        /// CA certificate validity in days
+        #[arg(long, default_value_t = 3650)]
+        ca_validity_days: u32,
+        /// Node certificate validity in days
+        #[arg(long, default_value_t = 365)]
+        node_validity_days: u32,
+    },
 }
 
 /// Cluster token sub-commands
@@ -418,8 +436,8 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
             };
 
             println!(
-                "{:<20} {:<35} {:<12} {:<16} {:<8} {}",
-                "ID", "Name", "Category", "Source", "Status", "Action"
+                "{:<20} {:<35} {:<12} {:<16} {:<8} Action",
+                "ID", "Name", "Category", "Source", "Status"
             );
             println!("{}", "-".repeat(100));
             for rule in &rules {
@@ -587,7 +605,7 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
 fn run_sources_cmd(cmd: SourcesCommands, config: &AppConfig) -> anyhow::Result<()> {
     match cmd {
         SourcesCommands::List => {
-            println!("{:<20} {:<12} {}", "Name", "Type", "URL/Path");
+            println!("{:<20} {:<12} URL/Path", "Name", "Type");
             println!("{}", "-".repeat(80));
             for src in &config.rules.sources {
                 let type_str = if src.url.is_some() { "remote_url" } else { "local" };
@@ -643,8 +661,8 @@ fn run_bot_cmd(cmd: BotCommands, config: &AppConfig) -> anyhow::Result<()> {
             let bot_rules = reg.filter_by_category("bot");
 
             println!(
-                "{:<20} {:<40} {:<8} {}",
-                "ID", "Name", "Action", "Tags"
+                "{:<20} {:<40} {:<8} Tags",
+                "ID", "Name", "Action"
             );
             println!("{}", "-".repeat(100));
             for rule in bot_rules {
@@ -683,16 +701,15 @@ fn run_bot_cmd(cmd: BotCommands, config: &AppConfig) -> anyhow::Result<()> {
 
             let mut matched = false;
             for rule in bot_rules {
-                if let Some(pattern) = &rule.pattern {
-                    if let Ok(re) = regex::Regex::new(pattern.as_str()) {
-                        if re.is_match(user_agent.as_str()) {
-                            println!(
-                                "MATCH: {} — {} (action: {})",
-                                rule.id, rule.name, rule.action
-                            );
-                            matched = true;
-                        }
-                    }
+                if let Some(pattern) = &rule.pattern
+                    && let Ok(re) = regex::Regex::new(pattern.as_str())
+                    && re.is_match(user_agent.as_str())
+                {
+                    println!(
+                        "MATCH: {} — {} (action: {})",
+                        rule.id, rule.name, rule.action
+                    );
+                    matched = true;
                 }
             }
             if !matched {
@@ -775,7 +792,84 @@ fn run_cluster_cmd(cmd: ClusterCommands, config: &AppConfig) -> anyhow::Result<(
             println!("Remove node '{node_id}' from cluster");
             println!("Note: use the management API: DELETE /api/v1/cluster/nodes/{node_id}");
         }
+
+        ClusterCommands::CertInit {
+            nodes,
+            output_dir,
+            ca_validity_days,
+            node_validity_days,
+        } => {
+            run_cert_init(&nodes, &output_dir, ca_validity_days, node_validity_days)?;
+        }
     }
+
+    Ok(())
+}
+
+/// Generate cluster CA and per-node certificates and write them to `output_dir`.
+fn run_cert_init(
+    nodes: &str,
+    output_dir: &str,
+    ca_validity_days: u32,
+    node_validity_days: u32,
+) -> anyhow::Result<()> {
+    use std::fs;
+    use std::path::Path;
+
+    use waf_cluster::crypto::ca::CertificateAuthority;
+    use waf_cluster::crypto::node_cert::NodeCertificate;
+
+    let output = Path::new(output_dir);
+    fs::create_dir_all(output).map_err(|e| {
+        anyhow::anyhow!("failed to create output directory '{output_dir}': {e}")
+    })?;
+
+    // Generate cluster CA.
+    let ca = CertificateAuthority::generate(ca_validity_days)
+        .map_err(|e| anyhow::anyhow!("failed to generate cluster CA: {e}"))?;
+
+    let ca_cert_path = output.join("cluster-ca.pem");
+    let ca_key_path = output.join("cluster-ca.key");
+    fs::write(&ca_cert_path, ca.cert_pem())
+        .map_err(|e| anyhow::anyhow!("failed to write CA cert to '{}': {e}", ca_cert_path.display()))?;
+    fs::write(&ca_key_path, ca.key_pem())
+        .map_err(|e| anyhow::anyhow!("failed to write CA key to '{}': {e}", ca_key_path.display()))?;
+
+    println!("Generated cluster CA:");
+    println!("  Cert: {}", ca_cert_path.display());
+    println!("  Key:  {} (keep this secret)", ca_key_path.display());
+    println!();
+
+    // Generate per-node certificates.
+    let node_names: Vec<&str> = nodes.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if node_names.is_empty() {
+        anyhow::bail!("--nodes must contain at least one node name");
+    }
+
+    for node_name in &node_names {
+        let node_cert = NodeCertificate::generate(node_name, &ca, node_validity_days)
+            .map_err(|e| anyhow::anyhow!("failed to generate certificate for node '{node_name}': {e}"))?;
+
+        let cert_path = output.join(format!("{node_name}.pem"));
+        let key_path = output.join(format!("{node_name}.key"));
+        fs::write(&cert_path, &node_cert.cert_pem)
+            .map_err(|e| anyhow::anyhow!("failed to write cert for '{node_name}': {e}"))?;
+        fs::write(&key_path, &node_cert.key_pem)
+            .map_err(|e| anyhow::anyhow!("failed to write key for '{node_name}': {e}"))?;
+
+        println!("  Node '{node_name}':");
+        println!("    Cert: {}", cert_path.display());
+        println!("    Key:  {}", key_path.display());
+    }
+
+    println!();
+    println!(
+        "Certificates generated for nodes: {}",
+        node_names.join(", ")
+    );
+    println!("Distribute 'cluster-ca.pem' to all nodes (read-only mount).");
+    println!("Each node loads its own cert/key pair from the output directory.");
+    println!("The CA key 'cluster-ca.key' is only needed on the main node.");
 
     Ok(())
 }
@@ -843,8 +937,8 @@ async fn run_crowdsec_cmd(cmd: CrowdSecCommands, config: &AppConfig) -> anyhow::
             let decisions = stream.new.unwrap_or_default();
             println!("Active decisions ({}):", decisions.len());
             println!(
-                "{:<18} {:<12} {:<40} {:<12} {}",
-                "Value", "Type", "Scenario", "Origin", "Duration"
+                "{:<18} {:<12} {:<40} {:<12} Duration",
+                "Value", "Type", "Scenario", "Origin"
             );
             println!("{}", "-".repeat(100));
             for d in &decisions {
@@ -1055,25 +1149,25 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
     }
 
     // Optionally start cluster node
-    if let Some(cluster_cfg) = config.cluster.clone() {
-        if cluster_cfg.enabled {
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build cluster runtime");
-                rt.block_on(async move {
-                    match waf_cluster::ClusterNode::new(cluster_cfg) {
-                        Ok(node) => {
-                            if let Err(e) = node.run().await {
-                                tracing::error!("Cluster node error: {e}");
-                            }
+    if let Some(cluster_cfg) = config.cluster.clone()
+        && cluster_cfg.enabled
+    {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build cluster runtime");
+            rt.block_on(async move {
+                match waf_cluster::ClusterNode::new(cluster_cfg) {
+                    Ok(node) => {
+                        if let Err(e) = node.run().await {
+                            tracing::error!("Cluster node error: {e}");
                         }
-                        Err(e) => tracing::error!("Failed to create cluster node: {e}"),
                     }
-                });
+                    Err(e) => tracing::error!("Failed to create cluster node: {e}"),
+                }
             });
-        }
+        });
     }
 
     // Build and run Pingora proxy (blocks forever)

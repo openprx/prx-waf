@@ -1,0 +1,218 @@
+version: "3.9"
+
+# PRX-WAF 3-node cluster setup.
+#
+# USAGE:
+#   1. Build the binary first:
+#        cargo build --release
+#
+#   2. Generate cluster certificates (one-time setup):
+#        podman-compose -f docker-compose.cluster.yml run --rm cluster-init
+#
+#   3. Start the cluster:
+#        podman-compose -f docker-compose.cluster.yml up -d
+#
+#   4. Verify all nodes are healthy:
+#        tests/e2e-cluster.sh
+#
+# Admin UI:  http://localhost:16827/ui/  (admin / admin123)
+# Node B UI: http://localhost:16828/ui/
+# Node C UI: http://localhost:16829/ui/
+
+services:
+  # ── PostgreSQL (shared across all nodes) ─────────────────────────────────────
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    container_name: cluster-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: prx_waf
+      POSTGRES_PASSWORD: prx_waf
+      POSTGRES_DB: prx_waf
+    volumes:
+      - cluster_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prx_waf -d prx_waf"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cluster_net
+
+  # ── Certificate Initialisation (one-shot) ────────────────────────────────────
+  #
+  # Generates the cluster CA and per-node certificates, then exits.
+  # Certificates are written to the `cluster_certs` named volume which is
+  # mounted read-only into each node container.
+  #
+  # Run manually before starting the cluster:
+  #   podman-compose -f docker-compose.cluster.yml run --rm cluster-init
+  cluster-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.prebuilt
+    container_name: cluster-init
+    command:
+      - "/usr/local/bin/prx-waf"
+      - "cluster"
+      - "cert-init"
+      - "--nodes"
+      - "node-a,node-b,node-c"
+      - "--output-dir"
+      - "/certs"
+    volumes:
+      - cluster_certs:/certs
+    restart: "no"
+    networks:
+      - cluster_net
+
+  # ── Node A — Main ─────────────────────────────────────────────────────────────
+  node-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.prebuilt
+    container_name: cluster-node-a
+    hostname: node-a
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-cluster-demo-jwt-secret-change-in-production}
+      DATABASE_URL: postgresql://prx_waf:prx_waf@postgres:5432/prx_waf
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./rules:/app/rules:ro
+      - ./data:/app/data:ro
+      - ./web/admin-ui/dist:/app/web/admin-ui/dist:ro
+      - cluster_certs:/certs:ro
+    command:
+      - "/usr/local/bin/prx-waf"
+      - "--config"
+      - "/app/configs/cluster-node-a.toml"
+      - "run"
+    ports:
+      - "16880:80"    # HTTP proxy
+      - "16843:443"   # HTTPS proxy
+      - "16827:9527"  # Admin UI (main node)
+    expose:
+      - "16851"       # QUIC cluster port (internal network only)
+    networks:
+      - cluster_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9527/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+  # ── Node B — Worker 1 ─────────────────────────────────────────────────────────
+  node-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.prebuilt
+    container_name: cluster-node-b
+    hostname: node-b
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      node-a:
+        condition: service_healthy
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-cluster-demo-jwt-secret-change-in-production}
+      DATABASE_URL: postgresql://prx_waf:prx_waf@postgres:5432/prx_waf
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./rules:/app/rules:ro
+      - ./data:/app/data:ro
+      - ./web/admin-ui/dist:/app/web/admin-ui/dist:ro
+      - cluster_certs:/certs:ro
+    command:
+      - "/usr/local/bin/prx-waf"
+      - "--config"
+      - "/app/configs/cluster-node-b.toml"
+      - "run"
+    ports:
+      - "16828:9527"  # Admin UI (worker 1)
+    expose:
+      - "16851"
+    networks:
+      - cluster_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9527/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+  # ── Node C — Worker 2 ─────────────────────────────────────────────────────────
+  node-c:
+    build:
+      context: .
+      dockerfile: Dockerfile.prebuilt
+    container_name: cluster-node-c
+    hostname: node-c
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      node-a:
+        condition: service_healthy
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-cluster-demo-jwt-secret-change-in-production}
+      DATABASE_URL: postgresql://prx_waf:prx_waf@postgres:5432/prx_waf
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./rules:/app/rules:ro
+      - ./data:/app/data:ro
+      - ./web/admin-ui/dist:/app/web/admin-ui/dist:ro
+      - cluster_certs:/certs:ro
+    command:
+      - "/usr/local/bin/prx-waf"
+      - "--config"
+      - "/app/configs/cluster-node-c.toml"
+      - "run"
+    ports:
+      - "16829:9527"  # Admin UI (worker 2)
+    expose:
+      - "16851"
+    networks:
+      - cluster_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9527/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+networks:
+  cluster_net:
+    driver: bridge
+
+volumes:
+  cluster_postgres_data:
+    driver: local
+  cluster_certs:
+    driver: local

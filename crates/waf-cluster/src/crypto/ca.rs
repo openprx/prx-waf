@@ -60,6 +60,18 @@ impl CertificateAuthority {
         Self { cert_pem, key_pem }
     }
 
+    /// Load only the CA certificate PEM without the private key.
+    ///
+    /// Useful for nodes that only need to verify peer certificates (e.g. worker
+    /// nodes loading a pre-generated CA cert). Calling [`Self::as_rcgen_issuer`]
+    /// on a cert-only instance will return an error.
+    pub fn from_cert_pem(cert_pem: String) -> Self {
+        Self {
+            cert_pem,
+            key_pem: String::new(),
+        }
+    }
+
     /// CA certificate as PEM string.
     pub fn cert_pem(&self) -> &str {
         &self.cert_pem
@@ -84,7 +96,14 @@ impl CertificateAuthority {
     /// signed node certificates pass chain verification against the stored CA cert.
     /// (The Subject Key Identifier is derived from the public key, so it matches
     /// regardless of whether serial number / timestamps differ.)
+    ///
+    /// Returns an error if this CA was constructed without a private key
+    /// (e.g. via [`Self::from_cert_pem`]).
     pub fn as_rcgen_issuer(&self) -> Result<(rcgen::Certificate, rcgen::KeyPair)> {
+        anyhow::ensure!(
+            !self.key_pem.is_empty(),
+            "CA private key is not available — this CA was loaded without a key (cert-only mode)"
+        );
         let ca_key =
             KeyPair::from_pem(&self.key_pem).context("failed to load CA private key PEM")?;
 
