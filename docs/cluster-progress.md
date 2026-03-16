@@ -5,11 +5,11 @@
 
 ## Current State
 
-- **Active Phase:** P3
+- **Active Phase:** P4
 - **Phase Status:** IN_PROGRESS
-- **Claude Process:** fresh-bison (PID 398876)
-- **Last Check:** 2026-03-16 12:32 EDT
-- **Next Action:** Wait for P3 Claude to finish, then verify
+- **Claude Process:** nova-fjord (PID 495404)
+- **Last Check:** 2026-03-16 12:55 EDT
+- **Next Action:** Wait for P4 Claude to finish, then verify
 
 ---
 
@@ -68,17 +68,20 @@
   - [x] API write forwarding
   - [x] Integration test: rule sync (2 tests — full + incremental + fallback)
 
-### P3: Election + Failover (est. 16h)
-- **Status:** PENDING
+### P3: Election + Failover (est. 16h) ✅
+- **Status:** DONE
 - **Depends on:** P2
+- **Completed:** 2026-03-16 12:55 EDT
+- **Commit:** a2ea69e
+- **Tests:** 20 pass (`cargo test -p waf-cluster`)
 - **Tasks:**
-  - [ ] Raft-lite state machine
-  - [ ] Phi-accrual failure detector
-  - [ ] Role demotion/promotion
-  - [ ] CA key replication
-  - [ ] Split-brain prevention
-  - [ ] CLI subcommands
-  - [ ] Integration tests (election, chaos, concurrent)
+  - [x] Raft-lite state machine (ElectionManager + run_election_loop)
+  - [x] Phi-accrual failure detector (health/detector.rs)
+  - [x] Role demotion/promotion (node.rs promote/demote)
+  - [x] CA key replication (AES-256-GCM encrypted in JoinResponse)
+  - [x] Split-brain prevention (term fencing, N/2+1 majority)
+  - [x] CLI subcommands (cluster status/nodes/token/promote/demote/remove)
+  - [x] Integration tests (4 election tests)
 
 ### P4: Admin UI Cluster Panel (est. 8h)
 - **Status:** PENDING
@@ -123,6 +126,8 @@
 | 2026-03-16 12:19 | P2 | dawn-kelp completed — all P2 tasks done, 16 cluster tests pass, committed d466c08 | DONE |
 | 2026-03-16 12:19 | P3 | Dispatched Claude (fresh-bison PID 398876) for Election + Failover | IN_PROGRESS |
 | 2026-03-16 12:32 | P3 | fresh-bison still running (PID 398878, 3.3% CPU, 369MB) — waiting | IN_PROGRESS |
+| 2026-03-16 12:55 | P3 | fresh-bison completed — 20 cluster tests pass, committed a2ea69e (1225 lines) | DONE |
+| 2026-03-16 12:55 | P4 | Dispatched Claude (nova-fjord PID 495404) for Admin UI Cluster Panel | IN_PROGRESS |
 
 ---
 
