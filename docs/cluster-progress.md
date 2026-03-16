@@ -114,3 +114,4 @@
 | 2026-03-16 11:32 | P1 | Re-dispatched Claude (tide-claw PID 269301) for remaining P1 tasks | IN_PROGRESS |
 | 2026-03-16 11:54 | P1 | tide-claw completed — verified: cargo check clean, 85 tests pass, committed 3628cfd | DONE |
 | 2026-03-16 11:54 | P2 | Dispatched Claude (wild-valley PID 314076) for Rule & Config Sync | IN_PROGRESS |
+| 2026-03-16 12:05 | P1 | Killed stale processes, re-dispatched focused Claude | IN_PROGRESS |
