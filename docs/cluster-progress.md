@@ -5,12 +5,11 @@
 
 ## Current State
 
-- **Active Phase:** P1
-- **Phase Status:** IN_PROGRESS
-- **Claude Process:** tide-claw (PID 269301)
-- **Started:** 2026-03-16 11:32 EDT (re-dispatched; sharp-falcon completed partial)
-- **Last Check:** 2026-03-16 11:32 EDT
-- **Next Action:** Wait for P1 Claude to finish, then verify cargo check + test
+- **Active Phase:** P2
+- **Phase Status:** PENDING
+- **Claude Process:** (tide-claw completed P1)
+- **Last Check:** 2026-03-16 (P1 complete)
+- **Next Action:** Begin P2 — Rule & Config Sync
 
 ---
 
@@ -31,22 +30,24 @@
 - **Commit:** 6cb1f26
 - **Files:** 23 files, 1289 lines added
 
-### P1: QUIC Transport + mTLS (est. 12h)
-- **Status:** PENDING
+### P1: QUIC Transport + mTLS (est. 12h) ✅
+- **Status:** DONE
 - **Depends on:** P0
+- **Completed:** 2026-03-16
+- **Tests:** 12/12 pass (`cargo test -p waf-cluster`)
 - **Tasks:**
-  - [ ] Protocol message types with serde
-  - [ ] Length-prefixed JSON frame codec
-  - [ ] QUIC server with mTLS
-  - [ ] QUIC client dialer
-  - [ ] CA certificate generation (rcgen)
-  - [ ] Node certificate signing
-  - [ ] Encrypted CA key storage
-  - [ ] Join token (HMAC-SHA256)
-  - [ ] Heartbeat send/receive
-  - [ ] Static seed discovery
-  - [ ] Thread launch in main.rs
-  - [ ] Integration test: 2-node heartbeat
+  - [x] Protocol message types with serde
+  - [x] Length-prefixed JSON frame codec
+  - [x] QUIC server with mTLS (WebPkiClientVerifier, ALPN prx-cluster/1)
+  - [x] QUIC client dialer (exponential back-off reconnect)
+  - [x] CA certificate generation (rcgen Ed25519)
+  - [x] Node certificate signing (CA-signed, CLUSTER_SERVER_NAME SAN)
+  - [x] Encrypted CA key storage (AES-256-GCM)
+  - [x] Join token (HMAC-SHA256)
+  - [x] Heartbeat send/receive (periodic mpsc broadcast)
+  - [x] Static seed discovery
+  - [x] Thread launch in main.rs (conditional on cluster.enabled)
+  - [x] Integration test: 2-node heartbeat
 
 ### P2: Rule & Config Sync (est. 14h)
 - **Status:** PENDING
@@ -110,3 +111,4 @@
 | 2026-03-16 11:12 | P1 | Launching Claude CLI for QUIC+mTLS (sharp-falcon) | STARTING |
 | 2026-03-16 11:32 | P1 | sharp-falcon finished — partial: crypto+server done (510 lines). Committed 7d57e3f | PARTIAL |
 | 2026-03-16 11:32 | P1 | Re-dispatched Claude (tide-claw PID 269301) for remaining P1 tasks | IN_PROGRESS |
+| 2026-03-16       | P1 | tide-claw completed all P1 tasks — cargo test 12/12 pass | DONE |

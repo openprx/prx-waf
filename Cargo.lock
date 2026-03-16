@@ -3224,6 +3224,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "waf-api",
+ "waf-cluster",
  "waf-common",
  "waf-engine",
  "waf-storage",

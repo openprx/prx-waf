@@ -13,6 +13,7 @@ waf-common = { path = "../waf-common" }
 waf-storage = { path = "../waf-storage" }
 waf-engine = { path = "../waf-engine" }
 waf-api = { path = "../waf-api" }
+waf-cluster = { path = "../waf-cluster" }
 gateway = { path = "../gateway" }
 
 tokio = { workspace = true }

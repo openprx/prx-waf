@@ -931,6 +931,28 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
         });
     }
 
+    // Optionally start cluster node
+    if let Some(cluster_cfg) = config.cluster.clone() {
+        if cluster_cfg.enabled {
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build cluster runtime");
+                rt.block_on(async move {
+                    match waf_cluster::ClusterNode::new(cluster_cfg) {
+                        Ok(node) => {
+                            if let Err(e) = node.run().await {
+                                tracing::error!("Cluster node error: {e}");
+                            }
+                        }
+                        Err(e) => tracing::error!("Failed to create cluster node: {e}"),
+                    }
+                });
+            });
+        }
+    }
+
     // Build and run Pingora proxy (blocks forever)
     let mut server = Server::new(None)?;
     server.bootstrap();
