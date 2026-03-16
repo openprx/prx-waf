@@ -6,10 +6,10 @@
 ## Current State
 
 - **Active Phase:** P2
-- **Phase Status:** PENDING
-- **Claude Process:** (tide-claw completed P1)
-- **Last Check:** 2026-03-16 (P1 complete)
-- **Next Action:** Begin P2 — Rule & Config Sync
+- **Phase Status:** IN_PROGRESS
+- **Claude Process:** wild-valley (PID 314076)
+- **Last Check:** 2026-03-16 11:54 EDT
+- **Next Action:** Wait for P2 Claude to finish, then verify
 
 ---
 
@@ -33,8 +33,9 @@
 ### P1: QUIC Transport + mTLS (est. 12h) ✅
 - **Status:** DONE
 - **Depends on:** P0
-- **Completed:** 2026-03-16
-- **Tests:** 12/12 pass (`cargo test -p waf-cluster`)
+- **Completed:** 2026-03-16 11:54 EDT
+- **Commits:** 7d57e3f (partial), 3628cfd (complete)
+- **Tests:** 14 pass (`cargo test -p waf-cluster`)
 - **Tasks:**
   - [x] Protocol message types with serde
   - [x] Length-prefixed JSON frame codec
@@ -111,4 +112,5 @@
 | 2026-03-16 11:12 | P1 | Launching Claude CLI for QUIC+mTLS (sharp-falcon) | STARTING |
 | 2026-03-16 11:32 | P1 | sharp-falcon finished — partial: crypto+server done (510 lines). Committed 7d57e3f | PARTIAL |
 | 2026-03-16 11:32 | P1 | Re-dispatched Claude (tide-claw PID 269301) for remaining P1 tasks | IN_PROGRESS |
-| 2026-03-16       | P1 | tide-claw completed all P1 tasks — cargo test 12/12 pass | DONE |
+| 2026-03-16 11:54 | P1 | tide-claw completed — verified: cargo check clean, 85 tests pass, committed 3628cfd | DONE |
+| 2026-03-16 11:54 | P2 | Dispatched Claude (wild-valley PID 314076) for Rule & Config Sync | IN_PROGRESS |
