@@ -98,6 +98,7 @@ notify = { version = "6", default-features = false, features = ["macos_fsevent"]
 lz4_flex = "0.11"
 hmac = "0.12"
 time = { version = "0.3", default-features = false, features = ["std"] }
+parking_lot = "0.12"
 
 [profile.release]
 opt-level = 3

@@ -23,6 +23,7 @@ use tracing::{info, warn};
 
 use crate::crypto::ca::CertificateAuthority;
 use crate::crypto::node_cert::NodeCertificate;
+use crate::election::run_election_loop;
 use crate::health::run_heartbeat_sender;
 use crate::transport::client::ClusterClient;
 use crate::transport::server::ClusterServer;
@@ -42,7 +43,7 @@ impl ClusterNode {
     }
 
     /// Start the cluster node: generate certificates, launch QUIC server, dial
-    /// seed peers, and run the heartbeat loop.
+    /// seed peers, and run the heartbeat and election loops.
     ///
     /// This function does not return under normal operation.
     pub async fn run(self) -> Result<()> {
@@ -54,7 +55,6 @@ impl ClusterNode {
 
         // ── Certificate setup ──────────────────────────────────────────────
 
-        // In P3 this will load from disk / join-handshake; for now always generate fresh.
         let ca = CertificateAuthority::generate(self.config.crypto.ca_validity_days)
             .context("failed to generate cluster CA")?;
         let ca_cert_der = ca.cert_der().context("failed to DER-encode cluster CA")?;
@@ -65,6 +65,9 @@ impl ClusterNode {
             NodeState::new(self.config.clone(), storage_mode)
                 .context("failed to initialise cluster node state")?,
         );
+
+        // Store CA private key in node state for replication to workers at join time.
+        *node_state.ca_key_pem.lock() = Some(ca.key_pem().to_string());
 
         let node_cert = NodeCertificate::generate(
             &node_state.node_id,
@@ -99,6 +102,9 @@ impl ClusterNode {
             }
 
             let (tx, rx) = mpsc::channel::<ClusterMessage>(256);
+
+            // Register channel with NodeState so broadcast() reaches this peer.
+            node_state.add_peer_channel(tx.clone());
             peer_senders.push(tx);
 
             let client = ClusterClient::new(
@@ -126,6 +132,13 @@ impl ClusterNode {
                 run_heartbeat_sender(state_hb, interval_ms, peer_senders).await;
             });
         }
+
+        // ── Election loop ──────────────────────────────────────────────────
+
+        let state_election = Arc::clone(&node_state);
+        tokio::spawn(async move {
+            run_election_loop(state_election).await;
+        });
 
         // ── QUIC server (blocks) ───────────────────────────────────────────
 

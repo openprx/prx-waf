@@ -49,6 +49,49 @@ enum Commands {
     /// GeoIP database management (download, update, status)
     #[command(subcommand)]
     Geoip(GeoIpCommands),
+    /// Cluster management (status, nodes, token, promote/demote/remove)
+    #[command(subcommand)]
+    Cluster(ClusterCommands),
+}
+
+// ── Cluster sub-commands ──────────────────────────────────────────────────────
+
+/// Cluster management sub-commands
+#[derive(Subcommand, Debug)]
+enum ClusterCommands {
+    /// Show cluster status (role, term, nodes, health)
+    Status,
+    /// List cluster nodes and their roles
+    Nodes,
+    /// Cluster join-token management
+    #[command(subcommand)]
+    Token(ClusterTokenCommands),
+    /// Promote a node to Main
+    Promote {
+        /// Node ID to promote
+        node_id: String,
+    },
+    /// Demote a node to Worker
+    Demote {
+        /// Node ID to demote
+        node_id: String,
+    },
+    /// Remove a node from the cluster
+    Remove {
+        /// Node ID to remove
+        node_id: String,
+    },
+}
+
+/// Cluster token sub-commands
+#[derive(Subcommand, Debug)]
+enum ClusterTokenCommands {
+    /// Generate a cluster join token
+    Generate {
+        /// Token validity duration (e.g. 24h, 7d)
+        #[arg(long, default_value = "24h")]
+        ttl: String,
+    },
 }
 
 // ── CrowdSec sub-commands ─────────────────────────────────────────────────────
@@ -257,6 +300,9 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()?
                 .block_on(run_geoip_cmd(sub, &config))?;
+        }
+        Commands::Cluster(sub) => {
+            run_cluster_cmd(sub, &config)?;
         }
     }
 
@@ -654,6 +700,83 @@ fn run_bot_cmd(cmd: BotCommands, config: &AppConfig) -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+// ── Cluster commands ──────────────────────────────────────────────────────────
+
+fn run_cluster_cmd(cmd: ClusterCommands, config: &AppConfig) -> anyhow::Result<()> {
+    let cluster_addr = config
+        .cluster
+        .as_ref()
+        .map(|c| c.listen_addr.as_str())
+        .unwrap_or("(not configured)");
+
+    match cmd {
+        ClusterCommands::Status => {
+            println!("Cluster Status");
+            println!("==============");
+            println!();
+            if let Some(cluster) = &config.cluster {
+                println!("  Enabled:    {}", cluster.enabled);
+                println!("  Listen:     {}", cluster.listen_addr);
+                println!("  Role:       {}", cluster.role);
+                println!("  Node ID:    {}", cluster.node_id);
+                println!("  Seeds:      {}", cluster.seeds.join(", "));
+            } else {
+                println!("  [INFO] Cluster is not configured. Add a [cluster] section to your config.");
+            }
+        }
+
+        ClusterCommands::Nodes => {
+            println!("Cluster Nodes");
+            println!("=============");
+            println!();
+            if let Some(cluster) = &config.cluster {
+                println!("  This node:  {} ({})", cluster.node_id, cluster.listen_addr);
+                if cluster.seeds.is_empty() {
+                    println!("  Peers:      (none configured)");
+                } else {
+                    println!("  Configured seeds:");
+                    for seed in &cluster.seeds {
+                        println!("    - {seed}");
+                    }
+                }
+                println!();
+                println!("  Note: live node list is only available through the running cluster API.");
+            } else {
+                println!("  [INFO] Cluster is not configured.");
+            }
+        }
+
+        ClusterCommands::Token(ClusterTokenCommands::Generate { ttl }) => {
+            println!("Cluster Join Token");
+            println!("==================");
+            println!();
+            println!("  Listen addr: {cluster_addr}");
+            println!("  TTL:         {ttl}");
+            println!();
+            println!("  Note: token generation requires a running cluster node.");
+            println!("  Use the management API to generate tokens:");
+            println!("    POST /api/v1/cluster/tokens  {{ \"ttl\": \"{ttl}\" }}");
+        }
+
+        ClusterCommands::Promote { node_id } => {
+            println!("Promote node '{node_id}' to Main");
+            println!("Note: use the management API: POST /api/v1/cluster/nodes/{node_id}/promote");
+        }
+
+        ClusterCommands::Demote { node_id } => {
+            println!("Demote node '{node_id}' to Worker");
+            println!("Note: use the management API: POST /api/v1/cluster/nodes/{node_id}/demote");
+        }
+
+        ClusterCommands::Remove { node_id } => {
+            println!("Remove node '{node_id}' from cluster");
+            println!("Note: use the management API: DELETE /api/v1/cluster/nodes/{node_id}");
+        }
+    }
+
     Ok(())
 }
 

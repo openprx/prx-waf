@@ -98,6 +98,7 @@ impl PendingForwards {
 /// * `pending`    — Shared registry for correlating responses to requests.
 /// * `request_id` — A unique identifier for this request (e.g., UUID v4).
 /// * `timeout_ms` — Maximum wait time before returning an error.
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_write(
     sender: &tokio::sync::mpsc::Sender<ClusterMessage>,
     pending: &PendingForwards,

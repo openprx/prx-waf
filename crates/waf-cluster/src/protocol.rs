@@ -39,12 +39,19 @@ pub struct Heartbeat {
     pub config_version: u64,
 }
 
-/// Vote cast by a candidate during an election
+/// Vote cast by a candidate during an election, or a vote-grant echo from a peer.
+///
+/// When `voter_id` is `None` → this is a vote **request** from the candidate.
+/// When `voter_id` is `Some(id)` → this is a vote **grant** from `id`, echoed back
+/// to the candidate through the bidirectional stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElectionVote {
     pub term: u64,
     pub candidate_id: String,
     pub last_log_index: u64,
+    /// Present only in vote-grant responses; identifies the voter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voter_id: Option<String>,
 }
 
 /// Broadcast by the winner after receiving a majority of votes
@@ -71,6 +78,11 @@ pub struct JoinResponse {
     pub node_cert_pem: String,
     pub ca_cert_pem: String,
     pub cluster_state: ClusterState,
+    /// AES-GCM encrypted CA private key (base64-encoded), included when the
+    /// main has a `ca_passphrase` configured.  Workers store this so a new
+    /// main can take over CA duties after failover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_ca_key_b64: Option<String>,
 }
 
 /// Static metadata advertised by a node during join

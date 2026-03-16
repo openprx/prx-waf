@@ -5089,6 +5089,7 @@ dependencies = [
  "hex",
  "hmac",
  "lz4_flex",
+ "parking_lot",
  "quinn",
  "rand 0.8.5",
  "rcgen",

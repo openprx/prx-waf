@@ -38,6 +38,7 @@ base64   = { workspace = true }
 # Utilities — already in workspace
 rand = { workspace = true }
 time = { workspace = true }
+parking_lot = { workspace = true }
 
 # Compression — only genuinely new workspace dep
 lz4_flex = { workspace = true }

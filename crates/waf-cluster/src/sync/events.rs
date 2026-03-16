@@ -91,11 +91,11 @@ pub async fn run_event_batcher(
             event = event_rx.recv() => {
                 match event {
                     Some(ev) => {
-                        if let Some(batch) = batcher.push(ev) {
-                            if batch_tx.send(batch).await.is_err() {
-                                debug!("Event batch channel closed; stopping batcher");
-                                return;
-                            }
+                        if let Some(batch) = batcher.push(ev)
+                            && batch_tx.send(batch).await.is_err()
+                        {
+                            debug!("Event batch channel closed; stopping batcher");
+                            return;
                         }
                     }
                     None => {
@@ -109,11 +109,11 @@ pub async fn run_event_batcher(
             }
 
             _ = ticker.tick() => {
-                if let Some(batch) = batcher.flush() {
-                    if batch_tx.send(batch).await.is_err() {
-                        debug!("Event batch channel closed; stopping batcher");
-                        return;
-                    }
+                if let Some(batch) = batcher.flush()
+                    && batch_tx.send(batch).await.is_err()
+                {
+                    debug!("Event batch channel closed; stopping batcher");
+                    return;
                 }
             }
         }

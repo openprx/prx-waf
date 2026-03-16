@@ -69,11 +69,11 @@ impl KeyStore {
         data.extend_from_slice(&ciphertext);
 
         // Ensure parent directory exists
-        if let Some(parent) = Path::new(&self.path).parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create dir: {}", parent.display()))?;
-            }
+        if let Some(parent) = Path::new(&self.path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create dir: {}", parent.display()))?;
         }
 
         fs::write(&self.path, &data)
@@ -87,6 +87,38 @@ impl KeyStore {
     pub fn exists(&self) -> bool {
         Path::new(&self.path).exists()
     }
+}
+
+// ─── In-memory encrypt/decrypt helpers ───────────────────────────────────────
+
+/// Encrypt `plaintext` bytes with AES-256-GCM using `passphrase`.
+///
+/// Output format: 12-byte nonce || ciphertext.
+pub fn encrypt_blob(plaintext: &[u8], passphrase: &str) -> Result<Vec<u8>> {
+    let cipher = make_cipher(passphrase);
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| anyhow::anyhow!("blob encryption failed: {e}"))?;
+    let mut out = Vec::with_capacity(nonce.len() + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Decrypt a blob produced by [`encrypt_blob`].
+///
+/// Returns an error on wrong passphrase or corrupted data.
+pub fn decrypt_blob(data: &[u8], passphrase: &str) -> Result<Vec<u8>> {
+    if data.len() < 12 {
+        return Err(anyhow::anyhow!("encrypted blob too short (corrupt?)"));
+    }
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let cipher = make_cipher(passphrase);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| anyhow::anyhow!("blob decryption failed — wrong passphrase?"))
 }
 
 /// Derive a 32-byte AES-256 key from a passphrase using SHA-256.

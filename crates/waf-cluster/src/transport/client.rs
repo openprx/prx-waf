@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -192,30 +193,68 @@ async fn recv_loop(recv: &mut quinn::RecvStream, node_state: &Arc<NodeState>) ->
 async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
     match msg {
         ClusterMessage::Heartbeat(hb) => {
+            let now_ms = unix_ms();
+            {
+                let mut peers = node_state.peers.write().await;
+                if let Some(peer) = peers.iter_mut().find(|p| p.node_id == hb.node_id) {
+                    peer.last_seen_ms = now_ms;
+                }
+            }
+            node_state.heartbeat_tracker.lock().record(&hb.node_id, now_ms);
             debug!(
                 from = %hb.node_id,
                 seq = hb.sequence,
                 role = ?hb.role,
                 "Inbound heartbeat from peer"
             );
-            let now_ms = unix_ms();
-            let mut peers = node_state.peers.write().await;
-            if let Some(peer) = peers.iter_mut().find(|p| p.node_id == hb.node_id) {
-                peer.last_seen_ms = now_ms;
+        }
+
+        ClusterMessage::JoinResponse(resp) => {
+            if resp.accepted {
+                // Store encrypted CA key for failover if the main provided one.
+                if let Some(enc_b64) = resp.encrypted_ca_key_b64 {
+                    match base64::engine::general_purpose::STANDARD.decode(&enc_b64) {
+                        Ok(enc_bytes) => {
+                            *node_state.ca_key_encrypted.lock() = Some(enc_bytes);
+                            debug!("Stored encrypted CA key from JoinResponse");
+                        }
+                        Err(e) => warn!("Failed to decode encrypted_ca_key_b64: {e}"),
+                    }
+                }
+            } else {
+                warn!(
+                    reason = resp.reason.as_deref().unwrap_or("unknown"),
+                    "JoinRequest rejected by main"
+                );
             }
         }
-        ClusterMessage::JoinResponse(resp) => {
-            debug!(
-                accepted = resp.accepted,
-                "JoinResponse received (handled in P3)"
-            );
+
+        ClusterMessage::ElectionVote(vote) => {
+            if let Some(voter_id) = vote.voter_id {
+                // This is a vote-grant echo addressed to us as the candidate.
+                if vote.candidate_id == node_state.node_id {
+                    let recorded =
+                        node_state.election.record_vote_for_me(vote.term, voter_id.clone());
+                    if recorded {
+                        debug!(voter = %voter_id, term = vote.term, "Vote grant received");
+                    }
+                }
+            } else {
+                debug!(
+                    candidate = %vote.candidate_id,
+                    term = vote.term,
+                    "Unexpected vote request on client recv path"
+                );
+            }
         }
-        ClusterMessage::ElectionVote(v) => {
-            debug!(candidate = %v.candidate_id, term = v.term, "ElectionVote from peer");
+
+        ClusterMessage::ElectionResult(result) => {
+            match node_state.election.process_result(&result).await {
+                Ok(new_role) => node_state.transition_to(new_role).await,
+                Err(e) => warn!("process_result error: {e}"),
+            }
         }
-        ClusterMessage::ElectionResult(r) => {
-            debug!(elected = %r.elected_id, term = r.term, "ElectionResult from peer");
-        }
+
         other => {
             debug!(
                 msg_type = ?std::mem::discriminant(&other),

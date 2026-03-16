@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Top-level application configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     pub proxy: ProxyConfig,
     pub api: ApiConfig,
@@ -28,23 +28,6 @@ pub struct AppConfig {
     pub cluster: Option<ClusterConfig>,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            proxy: ProxyConfig::default(),
-            api: ApiConfig::default(),
-            storage: StorageConfig::default(),
-            hosts: Vec::new(),
-            cache: CacheConfig::default(),
-            http3: Http3Config::default(),
-            security: SecurityConfig::default(),
-            crowdsec: CrowdSecConfig::default(),
-            rules: RulesConfig::default(),
-            geoip: GeoIpConfig::default(),
-            cluster: None,
-        }
-    }
-}
 
 /// Rule source entry from configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +395,10 @@ pub struct ClusterCryptoConfig {
     /// Renew node cert this many days before expiry
     #[serde(default = "default_renewal_before_days")]
     pub renewal_before_days: u32,
+    /// Passphrase used to encrypt the CA private key for replication to workers.
+    /// If empty, CA key replication is disabled.
+    #[serde(default)]
+    pub ca_passphrase: String,
 }
 
 fn default_ca_cert_path() -> String { "/app/certs/cluster-ca.pem".to_string() }
@@ -431,6 +418,7 @@ impl Default for ClusterCryptoConfig {
             ca_validity_days: default_ca_validity_days(),
             node_validity_days: default_node_validity_days(),
             renewal_before_days: default_renewal_before_days(),
+            ca_passphrase: String::new(),
         }
     }
 }
