@@ -1,9 +1,9 @@
 # PRX-WAF Cluster Design Document
 
-**Author:** David (AI CEO)  
-**Date:** 2026-03-16  
-**Status:** Draft — Awaiting Review  
-**Version:** 1.0
+**Author:** David (AI CEO)
+**Date:** 2026-03-16
+**Status:** Draft — Awaiting Review
+**Version:** 2.0 (revised after codebase audit)
 
 ---
 
@@ -52,7 +52,7 @@ Data flows:
 | Role | Responsibilities | Database | API Mode |
 |------|-----------------|----------|----------|
 | **Main** | Rule authoring, config authority, certificate CA, log aggregation, stats dashboard | PostgreSQL (primary) | Read-Write |
-| **Worker** | Traffic processing, local rule cache, attack detection, log forwarding | SQLite (local cache) | Read-Only (writes forwarded to main) |
+| **Worker** | Traffic processing, in-memory rule cache, attack detection, log forwarding | None required (cache-only) | Read-Only (writes forwarded to main) |
 | **Candidate** | Transitional state during election | Depends on previous role | Read-Only |
 
 ### 2.2 Role Assignment
@@ -65,423 +65,721 @@ Three modes (configured via `cluster.role`):
 
 ---
 
-## 3. Technology Stack
+## 3. Codebase Audit Findings
 
-### 3.1 QUIC Transport
+> **This section documents the actual state of the codebase as of 2026-03-16 and corrects
+> assumptions made in the original v1.0 design draft. Read carefully before implementing.**
 
-| Component | Choice | Rationale |
-|-----------|--------|-----------|
-| QUIC implementation | **quinn** v0.11+ | Mature Rust QUIC, tokio-native, Mozilla-backed |
-| TLS backend | **rustls** v0.23+ | Already a Pingora dependency, no OpenSSL needed |
-| Certificate generation | **rcgen** v0.13+ | Self-signed CA + node certs at startup |
-| Serialization | **prost** v0.13+ | Protobuf — compact, versioned, language-neutral |
-| Compression | **lz4_flex** | Fast compression for rule/log bulk transfers |
+### 3.1 Actual Crate Structure
 
-### 3.2 Why QUIC Over Alternatives
+```
+crates/
+├── prx-waf/        # Binary entry point — sync fn main, NOT async
+├── gateway/        # Pingora reverse proxy + HTTP/3 listener (already uses quinn/rustls)
+├── waf-engine/     # WAF rule matching, detection pipeline, RuleRegistry
+├── waf-storage/    # PostgreSQL access via sqlx PgPool ONLY (no SQLite)
+├── waf-api/        # Axum REST API + Admin UI static file serving
+└── waf-common/     # Shared types: RequestCtx, HostConfig, AppConfig, crypto
+```
 
-| Feature | QUIC | WireGuard | Plain TCP+TLS | gRPC |
-|---------|------|-----------|---------------|------|
-| Built-in encryption | TLS 1.3 ✅ | Noise protocol ✅ | TLS 1.3 ✅ | TLS 1.3 ✅ |
-| Multiplexed streams | Native ✅ | No ❌ | No ❌ | HTTP/2 ✅ |
-| 0-RTT reconnection | Yes ✅ | Yes ✅ | No ❌ | No ❌ |
-| NAT traversal | UDP ✅ | UDP ✅ | TCP ❌ | TCP ❌ |
-| Head-of-line blocking | None ✅ | N/A | Yes ❌ | Partial |
-| Application-level control | Full ✅ | None ❌ | Full ✅ | Framework ⚠️ |
-| Extra dependencies | quinn only | kernel/boringtun | tokio-tls | tonic+hyper |
-| Connection migration | Yes ✅ | Yes ✅ | No ❌ | No ❌ |
+### 3.2 QUIC/TLS Dependencies Already Present — Not New
 
-**Verdict:** QUIC gives us encryption + multiplexing + NAT traversal + fast reconnection in one layer, with zero external dependencies.
+The original draft treated quinn, rustls, and rcgen as new dependencies. **They already
+exist** in workspace.dependencies as Phase 5 additions:
+
+```toml
+# Already in workspace Cargo.toml
+quinn          = { version = "0.11", features = ["rustls"] }
+rustls         = { version = "0.23", features = ["ring"] }
+rcgen          = "0.13"
+h3             = "0.0.8"
+h3-quinn       = "0.0.10"
+rustls-pemfile = "2"
+```
+
+The `gateway` crate already uses `quinn` + `rustls` + `h3` for HTTP/3 serving
+(`crates/gateway/src/http3.rs`). This file is a complete working reference for:
+
+- Building `rustls::ServerConfig` from PEM files
+- Wrapping it in `quinn::crypto::rustls::QuicServerConfig`
+- Creating `quinn::Endpoint` servers
+- Handling async QUIC connection streams with `tokio::spawn`
+
+The `waf-cluster` transport layer can adopt these patterns directly with minimal rework.
+
+### 3.3 Pingora Uses OpenSSL, Not rustls
+
+**Correction from v1.0 draft:** The claim "rustls is already a Pingora dependency" is
+incorrect.
+
+Inspecting `Cargo.lock`: `pingora-core` depends on `openssl-probe`, confirming Pingora
+0.8 uses **OpenSSL** for its proxy TLS. The `rustls` crate is present in the workspace
+independently for the HTTP/3 feature — the two TLS stacks coexist without conflict, as
+proven by the existing build. Do not assume rustls comes from Pingora.
+
+### 3.4 waf-storage: PostgreSQL Only — No SQLite
+
+`waf-storage/Cargo.toml` uses sqlx with only the `postgres` feature:
+
+```toml
+# workspace Cargo.toml
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "macros", "migrate", "chrono", "uuid"] }
+```
+
+The `Database` struct wraps `sqlx::PgPool` exclusively:
+
+```rust
+// crates/waf-storage/src/db.rs
+pub struct Database {
+    pub pool: PgPool,
+    event_tx: broadcast::Sender<serde_json::Value>,
+}
+```
+
+The original design proposed SQLite as a worker-side rule cache. This would require
+adding `sqlite` to sqlx features and significant conditional compilation across
+waf-storage. The **simpler and correct approach**:
+
+- Workers maintain an **in-memory `RuleRegistry`** populated via cluster sync
+- No SQLite needed — rules already live in-memory via `Arc<RwLock<RuleRegistry>>`
+- Workers connect to PostgreSQL only if explicitly configured (for local log writes)
+- Workers without a DB forward all write operations to main via the Forward stream
+
+### 3.5 Rules Are File-Based — Not Pure DB-Based
+
+Rules have two sources in the current system:
+
+1. **File-based** (YAML/JSON/ModSec in `rules/` directory) — loaded by `RuleManager`,
+   compiled into an in-memory `RuleRegistry` with `version: u64`
+2. **Database custom rules** — stored in PostgreSQL, loaded by `WafEngine`
+
+The `Rule` struct (`crates/waf-engine/src/rules/registry.rs`) already derives
+`Serialize + Deserialize`, making it trivially wire-serializable without protobuf.
+`RuleRegistry.version: u64` is the natural sync version tracker — it already increments
+on every `insert()` or `remove()`.
+
+### 3.6 Runtime Model: sync main() with Separate Thread-per-Runtime
+
+The actual startup flow (`crates/prx-waf/src/main.rs`):
+
+```rust
+fn main() -> anyhow::Result<()> {   // sync, NOT async
+    let config = load_config()?;
+    run_server(config)?;
+}
+
+fn run_server(config: AppConfig) -> anyhow::Result<()> {
+    // One shared init runtime
+    let rt = tokio::runtime::Builder::new_multi_thread()...build()?;
+    let (engine, router, api_state) = rt.block_on(init_async(&config))?;
+
+    // API server: own thread + own runtime
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()...build()?;
+        rt.block_on(start_api_server(...));
+    });
+
+    // HTTP/3 server: own thread + own runtime
+    if config.http3.enabled {
+        std::thread::spawn(move || {
+            let rt = ...;
+            rt.block_on(gateway::http3::start_http3_server(...));
+        });
+    }
+
+    // Pingora blocks the main thread forever
+    server.run_forever();
+}
+```
+
+**Impact on cluster design:** The cluster node cannot be started with `cluster.start().await`
+in the main async context because Pingora takes over the main thread. The cluster QUIC
+listener **must** follow the same `std::thread::spawn` + own-runtime pattern used by the
+API and HTTP/3 servers.
+
+### 3.7 WafEngine Component Architecture
+
+```rust
+// crates/waf-engine/src/engine.rs
+pub struct WafEngine {
+    pub store: Arc<RuleStore>,
+    pub custom_rules: Arc<CustomRulesEngine>,
+    crowdsec_checker: OnceLock<Arc<CrowdSecChecker>>,
+    appsec_client: OnceLock<Arc<AppSecClient>>,
+    geoip: OnceLock<Arc<GeoIpService>>,
+    // ...
+}
+// Rule reload: engine.reload_rules().await?
+```
+
+The `OnceLock` pattern for optional components is the established precedent. The cluster
+integration follows the same pattern.
+
+### 3.8 CrowdSec on Workers
+
+Workers run their own CrowdSec bouncer integration, each contacting its own CrowdSec LAPI
+independently. No cluster-level CrowdSec sync is needed.
+
+### 3.9 WASM Plugin Gap
+
+`WafEngine` loads WASM plugins from PostgreSQL via `db.list_wasm_plugins()`. Workers
+cannot receive WASM binaries without dedicated binary sync. **v1 decision:** Workers
+operate without WASM plugins. Explicitly documented as a v1 limitation.
+
+### 3.10 Dependency Gap Analysis
+
+| Dependency | Status | Notes |
+|-----------|--------|-------|
+| `quinn = "0.11"` | ✅ Already in workspace | Used in gateway (HTTP/3) |
+| `rustls = "0.23"` | ✅ Already in workspace | Used in gateway (HTTP/3) |
+| `rcgen = "0.13"` | ✅ Already in workspace | Used in gateway (ACME TLS) |
+| `rustls-pemfile = "2"` | ✅ Already in workspace | Used in gateway |
+| `serde_json` | ✅ Already in workspace | All cluster types use it |
+| `aes-gcm` | ✅ Already in waf-common | Reuse for CA key encryption |
+| `prost = "0.13"` | ❌ Not present | Avoided — use serde_json instead |
+| `prost-build = "0.13"` | ❌ Not present | Avoided — no protobuf |
+| `lz4_flex = "0.11"` | ❌ Not present | **Only genuinely new dep** |
+| SQLite sqlx feature | ❌ Not present | Not needed — in-memory cache |
+
+**Recommendation: Drop protobuf.** Use `serde_json` for wire encoding. All `Rule` and
+cluster message types already implement `Serialize + Deserialize`. JSON is adequate at
+cluster-internal LAN rates and eliminates a build.rs compilation step, prost-build, and
+proto file maintenance.
 
 ---
 
-## 4. Cryptography & Security
+## 4. Technology Stack
 
-### 4.1 Certificate Hierarchy
+### 4.1 Transport Components
+
+| Component | Choice | Status | Rationale |
+|-----------|--------|--------|-----------|
+| QUIC transport | **quinn** v0.11 | ✅ In workspace | Already proven in gateway/http3.rs |
+| TLS backend | **rustls** v0.23 | ✅ In workspace | Coexists with Pingora's OpenSSL |
+| Certificate generation | **rcgen** v0.13 | ✅ In workspace | Used in gateway for ACME |
+| Serialization | **serde_json** | ✅ In workspace | Rule/message types already serializable |
+| Compression | **lz4_flex** v0.11 | ❌ New dep | Full snapshot compression only |
+| CA key encryption | **aes-gcm** v0.10 | ✅ In waf-common | Reuse existing crypto.rs |
+
+### 4.2 Why QUIC Over Alternatives
+
+| Feature | QUIC | WireGuard | Plain TCP+TLS | gRPC |
+|---------|------|-----------|---------------|------|
+| Built-in encryption | TLS 1.3 ✅ | Noise ✅ | TLS 1.3 ✅ | TLS 1.3 ✅ |
+| Multiplexed streams | Native ✅ | No ❌ | No ❌ | HTTP/2 ✅ |
+| 0-RTT reconnection | Yes ✅ | Yes ✅ | No ❌ | No ❌ |
+| NAT traversal | UDP ✅ | UDP ✅ | TCP ❌ | TCP ❌ |
+| Already in codebase | Yes ✅ | No ❌ | Partial | No ❌ |
+| Extra dependencies | None ✅ | kernel/boringtun | tokio-tls | tonic+hyper |
+
+---
+
+## 5. Cryptography & Security
+
+### 5.1 Certificate Hierarchy
 
 ```
-Root CA (generated by first main node)
+Root CA (generated by first main node via rcgen — already in workspace)
 ├── Main Node Certificate (signed by CA)
 ├── Worker Node Certificate A (signed by CA)
-├── Worker Node Certificate B (signed by CA)
-└── ...
+└── Worker Node Certificate B (signed by CA)
 ```
 
-### 4.2 Certificate Lifecycle
+### 5.2 Certificate Lifecycle
 
 | Event | Action |
 |-------|--------|
-| **First main startup** | Generate CA keypair (Ed25519) + self-signed CA cert (10 year validity). Generate node cert signed by CA (1 year). Store CA key encrypted at rest. |
-| **Worker join** | Worker generates keypair + CSR. Sends CSR to main via join token. Main signs and returns node cert. |
+| **First main startup** | Generate CA keypair (Ed25519) + self-signed cert (10yr). Generate node cert signed by CA (1yr). Encrypt CA key with AES-GCM using cluster passphrase. |
+| **Worker join** | Worker generates keypair + CSR via rcgen. Sends CSR to main. Main signs and returns node cert + CA cert. |
 | **Certificate renewal** | Main auto-renews node certs 7 days before expiry. Pushes new cert via control stream. |
-| **Node removal** | Main adds cert serial to CRL. Broadcasts CRL update to all nodes. Revoked node immediately disconnected. |
-| **Main failover** | New main inherits CA key from cluster state (encrypted, replicated). |
+| **Node removal** | Add cert serial to CRL. Broadcast CRL to all nodes. Revoked node disconnected. |
+| **Main failover** | New main inherits CA key from cluster state (encrypted, replicated at join time). |
 
-### 4.3 Join Token Flow
+Note: `aes-gcm` is already a `waf-common` dependency, used in the existing `crypto.rs`.
+CA key encryption reuses those helpers directly.
+
+### 5.3 Join Token Flow
 
 ```
 1. Admin generates join token on main:
    $ prx-waf cluster token generate --ttl 1h
-   → abc123-def456-ghi789
+   → abc123-def456-ghi789  (HMAC-SHA256 signed, includes expiry)
 
 2. Worker starts with token:
    $ prx-waf run --cluster-join main.example.com:16851 --token abc123-def456-ghi789
 
-3. Worker connects to main via QUIC (server-only TLS initially)
-4. Worker sends: JoinRequest { token, csr, node_info }
-5. Main validates token, signs CSR, returns: JoinResponse { node_cert, ca_cert, cluster_config }
-6. Worker reconnects with mTLS (both sides verified)
-7. Main broadcasts: NodeJoined { node_id, address } to all peers
-```
-
-### 4.4 Data Encryption
-
-| Layer | Encryption | Key |
-|-------|-----------|-----|
-| Transport | TLS 1.3 (AES-256-GCM) | Per-session via QUIC handshake |
-| At rest (CA key) | ChaCha20-Poly1305 | Derived from cluster passphrase |
-| At rest (local DB) | SQLite encryption (optional) | Node-local key |
-
----
-
-## 5. QUIC Stream Protocol
-
-### 5.1 Stream Allocation
-
-QUIC multiplexes independent streams over a single connection. Each stream type has dedicated purpose and priority:
-
-| Stream Type | Direction | Priority | Reliability | Description |
-|-------------|-----------|----------|-------------|-------------|
-| **Control** (0) | Bidirectional | Highest | Reliable | Heartbeat, election, membership |
-| **RuleSync** (1) | Main → Worker | High | Reliable | Rule updates (incremental) |
-| **ConfigSync** (2) | Main → Worker | High | Reliable | Configuration updates |
-| **EventLog** (3) | Worker → Main | Medium | Reliable | Attack logs, security events |
-| **Stats** (4) | Worker → Main | Low | Unreliable* | Metrics, counters |
-| **Forward** (5+) | Bidirectional | Per-request | Reliable | API write forwarding |
-
-*Stats use QUIC datagrams (unreliable) for real-time metrics that tolerate loss.
-
-### 5.2 Message Format (Protobuf)
-
-```protobuf
-syntax = "proto3";
-package prx.cluster;
-
-// ─── Envelope ────────────────────────────────────────────────
-message ClusterMessage {
-  uint64 sequence = 1;
-  uint64 timestamp_ms = 2;
-  string source_node_id = 3;
-  oneof payload {
-    // Control
-    Heartbeat heartbeat = 10;
-    ElectionVote election_vote = 11;
-    ElectionResult election_result = 12;
-    JoinRequest join_request = 13;
-    JoinResponse join_response = 14;
-    NodeLeave node_leave = 15;
-    
-    // Sync
-    RuleSyncRequest rule_sync_request = 20;
-    RuleSyncResponse rule_sync_response = 21;
-    ConfigSync config_sync = 22;
-    
-    // Events
-    EventBatch event_batch = 30;
-    StatsBatch stats_batch = 31;
-    
-    // Forward
-    ApiForward api_forward = 40;
-    ApiForwardResponse api_forward_response = 41;
-  }
-}
-
-// ─── Control ─────────────────────────────────────────────────
-message Heartbeat {
-  string node_id = 1;
-  NodeRole role = 2;
-  uint64 uptime_secs = 3;
-  NodeHealth health = 4;
-  uint64 rules_version = 5;
-  uint64 config_version = 6;
-}
-
-message NodeHealth {
-  double cpu_percent = 1;
-  uint64 memory_used_bytes = 2;
-  uint64 total_requests = 3;
-  uint64 blocked_requests = 4;
-  uint32 active_connections = 5;
-}
-
-enum NodeRole {
-  NODE_ROLE_UNKNOWN = 0;
-  NODE_ROLE_MAIN = 1;
-  NODE_ROLE_WORKER = 2;
-  NODE_ROLE_CANDIDATE = 3;
-}
-
-// ─── Election (Raft-lite) ────────────────────────────────────
-message ElectionVote {
-  uint64 term = 1;
-  string candidate_id = 2;
-  uint64 last_log_index = 3;
-}
-
-message ElectionResult {
-  uint64 term = 1;
-  string elected_id = 2;
-  repeated string voter_ids = 3;
-}
-
-// ─── Join ────────────────────────────────────────────────────
-message JoinRequest {
-  string token = 1;
-  bytes csr_der = 2;        // DER-encoded CSR
-  NodeInfo node_info = 3;
-}
-
-message JoinResponse {
-  bool accepted = 1;
-  string reason = 2;        // rejection reason if not accepted
-  bytes node_cert_pem = 3;
-  bytes ca_cert_pem = 4;
-  ClusterState cluster_state = 5;
-}
-
-message NodeInfo {
-  string node_id = 1;
-  string hostname = 2;
-  string version = 3;
-  string listen_addr = 4;
-  repeated string capabilities = 5;  // e.g., "waf", "proxy", "api"
-}
-
-// ─── Sync ────────────────────────────────────────────────────
-message RuleSyncRequest {
-  uint64 current_version = 1;  // worker's current rules version
-}
-
-message RuleSyncResponse {
-  uint64 version = 1;
-  SyncType sync_type = 2;
-  repeated RuleChange changes = 3;  // incremental
-  bytes full_snapshot = 4;          // full sync (lz4 compressed YAML)
-}
-
-enum SyncType {
-  SYNC_INCREMENTAL = 0;
-  SYNC_FULL = 1;
-}
-
-message RuleChange {
-  ChangeOp op = 1;
-  string rule_id = 2;
-  bytes rule_data = 3;  // serialized rule
-}
-
-enum ChangeOp {
-  OP_UPSERT = 0;
-  OP_DELETE = 1;
-}
-
-message ConfigSync {
-  uint64 version = 1;
-  bytes config_toml = 2;  // full config (small enough)
-}
-
-// ─── Events ──────────────────────────────────────────────────
-message EventBatch {
-  repeated SecurityEvent events = 1;
-}
-
-message SecurityEvent {
-  uint64 timestamp_ms = 1;
-  string client_ip = 2;
-  string method = 3;
-  string path = 4;
-  string host = 5;
-  string rule_id = 6;
-  string action = 7;
-  string geo_country = 8;
-  string geo_region = 9;
-  string node_id = 10;
-}
-
-message StatsBatch {
-  string node_id = 1;
-  uint64 timestamp_ms = 2;
-  uint64 total_requests = 3;
-  uint64 blocked_requests = 4;
-  uint64 allowed_requests = 5;
-  map<string, uint64> top_ips = 6;
-  map<string, uint64> top_rules = 7;
-  map<string, uint64> top_countries = 8;
-}
-
-// ─── Cluster State ───────────────────────────────────────────
-message ClusterState {
-  string main_node_id = 1;
-  repeated NodeInfo nodes = 2;
-  uint64 rules_version = 3;
-  uint64 config_version = 4;
-  uint64 term = 5;
-}
+3. Worker connects to main via QUIC (server-only TLS initially — no client cert yet)
+4. Worker sends: JoinRequest { token, csr_pem, node_info }
+5. Main validates token + signs CSR → JoinResponse { node_cert_pem, ca_cert_pem, cluster_state }
+6. Worker reconnects with mTLS (both sides verified by CA)
+7. Main broadcasts: NodeJoined to all peers
 ```
 
 ---
 
-## 6. Crate Structure
+## 6. QUIC Stream Protocol
 
-### 6.1 New Crate: `waf-cluster`
+### 6.1 Stream Allocation
+
+| Stream | Direction | Priority | Description |
+|--------|-----------|----------|-------------|
+| **Control** | Bidirectional | Highest | Heartbeat, election, membership |
+| **RuleSync** | Main → Worker | High | Rule updates (incremental or full snapshot) |
+| **ConfigSync** | Main → Worker | High | TOML config updates |
+| **EventLog** | Worker → Main | Medium | Attack logs, security events |
+| **Stats** | Worker → Main | Low | Metrics via QUIC datagrams (unreliable OK) |
+| **Forward** | Bidirectional | Per-request | API write forwarding |
+
+### 6.2 Wire Format: Length-Prefixed JSON
+
+No protobuf. All message types use `serde_json`. Frame format:
+
+```
+┌──────────────────┬────────────────────────────────┐
+│  u32 (4 bytes)   │  JSON bytes (variable length)  │
+│  big-endian len  │  serde_json::to_vec(msg)        │
+└──────────────────┴────────────────────────────────┘
+```
+
+This is idiomatic over `quinn::SendStream` / `RecvStream` using `bytes::BufMut`.
+
+### 6.3 Message Type Definitions
+
+```rust
+// crates/waf-cluster/src/protocol/messages.rs
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClusterMessage {
+    Heartbeat(Heartbeat),
+    ElectionVote(ElectionVote),
+    ElectionResult(ElectionResult),
+    JoinRequest(JoinRequest),
+    JoinResponse(JoinResponse),
+    NodeLeave { node_id: String },
+    RuleSyncRequest(RuleSyncRequest),
+    RuleSyncResponse(RuleSyncResponse),
+    ConfigSync(ConfigSync),
+    EventBatch(EventBatch),
+    StatsBatch(StatsBatch),
+    ApiForward(ApiForward),
+    ApiForwardResponse(ApiForwardResponse),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Heartbeat {
+    pub sequence: u64,
+    pub timestamp_ms: u64,
+    pub node_id: String,
+    pub role: NodeRole,
+    pub uptime_secs: u64,
+    pub cpu_percent: f64,
+    pub memory_used_bytes: u64,
+    pub total_requests: u64,
+    pub blocked_requests: u64,
+    pub rules_version: u64,
+    pub config_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElectionVote {
+    pub term: u64,
+    pub candidate_id: String,
+    pub last_log_index: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElectionResult {
+    pub term: u64,
+    pub elected_id: String,
+    pub voter_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinRequest {
+    pub token: String,
+    pub csr_pem: String,
+    pub node_info: NodeInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinResponse {
+    pub accepted: bool,
+    pub reason: Option<String>,
+    pub node_cert_pem: String,
+    pub ca_cert_pem: String,
+    pub cluster_state: ClusterState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub hostname: String,
+    pub version: String,
+    pub listen_addr: String,
+    pub capabilities: Vec<String>,   // ["waf", "proxy", "api"]
+}
+
+/// Rule sync — reuses waf_engine::rules::registry::Rule directly (already Serialize+Deserialize).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleSyncRequest {
+    pub current_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleSyncResponse {
+    pub version: u64,
+    pub sync_type: SyncType,
+    /// Incremental: changed rules only (empty if full)
+    pub changes: Vec<RuleChange>,
+    /// Full: lz4-compressed JSON of Vec<Rule> (empty if incremental)
+    pub snapshot_lz4: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SyncType { Incremental, Full }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleChange {
+    pub op: ChangeOp,
+    pub rule_id: String,
+    /// Serialized Rule struct; None if op == Delete
+    pub rule_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ChangeOp { Upsert, Delete }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSync {
+    pub version: u64,
+    pub config_toml: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventBatch {
+    pub node_id: String,
+    pub events: Vec<SecurityEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityEvent {
+    pub timestamp_ms: u64,
+    pub client_ip: String,
+    pub method: String,
+    pub path: String,
+    pub host: String,
+    pub rule_id: Option<String>,
+    pub action: String,
+    pub geo_country: String,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsBatch {
+    pub node_id: String,
+    pub timestamp_ms: u64,
+    pub total_requests: u64,
+    pub blocked_requests: u64,
+    pub allowed_requests: u64,
+    pub top_ips: std::collections::HashMap<String, u64>,
+    pub top_rules: std::collections::HashMap<String, u64>,
+    pub top_countries: std::collections::HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterState {
+    pub main_node_id: String,
+    pub nodes: Vec<NodeInfo>,
+    pub rules_version: u64,
+    pub config_version: u64,
+    pub term: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiForward {
+    pub request_id: String,
+    pub method: String,
+    pub path: String,
+    pub body: Vec<u8>,
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiForwardResponse {
+    pub request_id: String,
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+```
+
+---
+
+## 7. Crate Structure
+
+### 7.1 New Crate: `waf-cluster`
 
 ```
 crates/waf-cluster/
 ├── Cargo.toml
 ├── src/
-│   ├── lib.rs              # Public API
-│   ├── node.rs             # NodeState, role state machine
+│   ├── lib.rs              # pub use ClusterNode, ClusterConfig, NodeRole
+│   ├── node.rs             # NodeState, NodeRole enum, role state machine
 │   ├── transport/
 │   │   ├── mod.rs          # QUIC connection manager
-│   │   ├── server.rs       # QUIC listener (accept peers)
-│   │   └── client.rs       # QUIC dialer (connect to peers)
+│   │   ├── server.rs       # QUIC mTLS listener (reuses gateway/http3.rs patterns)
+│   │   ├── client.rs       # QUIC dialer (connect to peer)
+│   │   └── frame.rs        # Length-prefixed JSON codec for quinn streams
 │   ├── crypto/
-│   │   ├── mod.rs          
-│   │   ├── ca.rs           # CA certificate generation/management
-│   │   ├── node_cert.rs    # Node certificate generation/signing
-│   │   └── store.rs        # Encrypted key storage
-│   ├── discovery/
 │   │   ├── mod.rs
-│   │   ├── static_seeds.rs # Static peer list from config
-│   │   └── mdns.rs         # mDNS auto-discovery (LAN)
+│   │   ├── ca.rs           # CA generation via rcgen (already in workspace)
+│   │   ├── node_cert.rs    # Node cert signing + CSR validation
+│   │   └── store.rs        # AES-GCM key storage (reuse waf-common::crypto)
+│   ├── discovery/
+│   │   └── static_seeds.rs # Static peer list from ClusterConfig.seeds (mDNS deferred)
 │   ├── sync/
 │   │   ├── mod.rs
-│   │   ├── rules.rs        # Rule sync (version vector, incremental)
-│   │   ├── config.rs       # Config sync
-│   │   └── events.rs       # Attack log aggregation
+│   │   ├── rules.rs        # Rule sync using RuleRegistry.version + serde_json + lz4
+│   │   ├── config.rs       # Config sync (TOML string)
+│   │   └── events.rs       # Attack log batching + forwarding to main
 │   ├── election/
-│   │   ├── mod.rs          # Raft-lite leader election
+│   │   ├── mod.rs          # Raft-lite leader election (term, vote, timeout)
 │   │   └── state.rs        # Election state machine
 │   ├── health/
 │   │   ├── mod.rs          # Heartbeat sender/receiver
-│   │   └── detector.rs     # Failure detection (phi-accrual)
+│   │   └── detector.rs     # Phi-accrual failure detector
 │   └── protocol/
-│       ├── mod.rs
-│       └── messages.proto   # Protobuf definitions
+│       └── messages.rs     # All ClusterMessage types (serde_json, no protobuf)
 │
-├── build.rs                 # prost protobuf compilation
 └── tests/
-    ├── integration.rs
-    ├── election_test.rs
-    └── sync_test.rs
+    ├── integration.rs      # 2-node QUIC connect + heartbeat
+    ├── election_test.rs    # State machine edge cases
+    └── sync_test.rs        # Rule version diff + full snapshot
 ```
 
-### 6.2 Dependency Graph
+### 7.2 Dependency Graph (Corrected)
 
 ```
 prx-waf (binary)
-├── gateway        (Pingora proxy)
-├── waf-engine     (rule matching)
-├── waf-storage    (PostgreSQL / SQLite)
+├── gateway        (Pingora proxy + HTTP/3; quinn/rustls/rcgen already here)
+├── waf-engine     (rule matching; RuleRegistry is the sync unit)
+├── waf-storage    (PostgreSQL; main only — workers optional)
 ├── waf-api        (Axum REST + Admin UI)
-├── waf-common     (shared types)
+├── waf-common     (AppConfig extended with ClusterConfig)
 └── waf-cluster    (NEW)
-    ├── quinn          (QUIC transport)
-    ├── rustls         (TLS — shared with Pingora)
-    ├── rcgen          (certificate generation)
-    ├── prost          (protobuf serialization)
-    ├── lz4_flex       (compression)
-    └── waf-common     (shared types)
+    ├── quinn          ✅ already workspace dep
+    ├── rustls         ✅ already workspace dep
+    ├── rcgen          ✅ already workspace dep
+    ├── rustls-pemfile ✅ already workspace dep
+    ├── serde_json     ✅ already workspace dep
+    ├── aes-gcm        ✅ already waf-common dep
+    ├── lz4_flex       ❌ ONLY GENUINELY NEW DEP
+    └── waf-common     ✅
 ```
 
-### 6.3 Changes to Existing Crates
+### 7.3 Cargo.toml for waf-cluster
 
-**waf-common** (small):
+```toml
+[package]
+name = "waf-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+waf-common  = { path = "../waf-common" }
+waf-engine  = { path = "../waf-engine" }
+waf-storage = { path = "../waf-storage" }
+
+quinn          = { workspace = true }
+rustls         = { workspace = true }
+rcgen          = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio          = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+tracing        = { workspace = true }
+anyhow         = { workspace = true }
+thiserror      = { workspace = true }
+rand           = { workspace = true }
+aes-gcm        = { workspace = true }
+bytes          = { workspace = true }
+dashmap        = { workspace = true }
+
+lz4_flex = "0.11"   # Only new dep — used for full rule snapshot compression
+```
+
+Add to workspace root `Cargo.toml`:
+```toml
+# [workspace.dependencies]
+lz4_flex = "0.11"
+
+# [workspace] members
+"crates/waf-cluster",
+```
+
+### 7.4 Changes to Existing Crates
+
+#### waf-common — Minimal (no breaking changes)
+
 ```rust
-// New types
-pub enum NodeRole { Main, Worker, Candidate }
-pub struct ClusterConfig { ... }
-pub struct NodeId(pub String);
-
-// Extend existing
+// crates/waf-common/src/config.rs — add field with Default
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    // ... existing fields ...
-    pub cluster: Option<ClusterConfig>,
+    pub proxy: ProxyConfig,
+    pub api: ApiConfig,
+    pub storage: StorageConfig,
+    // ... all existing fields unchanged ...
+    #[serde(default)]
+    pub cluster: ClusterConfig,   // NEW — default is disabled, zero behavior change
+}
+
+// New types in waf-common:
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    #[serde(default)]
+    pub enabled: bool,          // false by default
+    #[serde(default)]
+    pub node_id: String,        // auto-generated from hostname if empty
+    #[serde(default = "default_role")]
+    pub role: String,           // "auto" | "main" | "worker"
+    #[serde(default = "default_cluster_addr")]
+    pub listen_addr: String,
+    #[serde(default)]
+    pub seeds: Vec<String>,
+    #[serde(default)]
+    pub crypto: ClusterCryptoConfig,
+    #[serde(default)]
+    pub sync: ClusterSyncConfig,
+    #[serde(default)]
+    pub election: ClusterElectionConfig,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self { Self { enabled: false, /* all other defaults */ } }
 }
 ```
 
-**waf-storage** (medium):
 ```rust
-// Add StorageBackend trait
-pub enum StorageMode {
-    Primary(PostgresPool),     // Main node — full read-write
-    LocalCache(SqlitePool),    // Worker node — read-only cache
-}
+// crates/waf-common/src/lib.rs
+pub use config::ClusterConfig;
 
-// Worker sync interface
-pub trait SyncReceiver {
-    async fn apply_rule_changes(&self, changes: Vec<RuleChange>) -> Result<()>;
-    async fn apply_full_snapshot(&self, data: &[u8]) -> Result<()>;
-    async fn get_rules_version(&self) -> Result<u64>;
-}
-```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeRole { Main, Worker, Candidate }
 
-**waf-api** (medium):
-```rust
-// New endpoints
-GET  /api/cluster/status        // Cluster overview
-GET  /api/cluster/nodes         // List all nodes
-POST /api/cluster/token         // Generate join token
-POST /api/cluster/nodes/remove  // Remove a node
-GET  /api/cluster/nodes/:id     // Node detail + health
-
-// Worker mode: forward writes to main
-// Read endpoints work locally (cached data)
-```
-
-**waf-engine** (small):
-```rust
-// Add sync callback
-pub trait RuleReloader {
-    async fn on_rules_updated(&self, version: u64) -> Result<()>;
-}
-```
-
-**prx-waf** (medium):
-```rust
-// main.rs startup changes
-async fn main() {
-    let config = load_config()?;
-    
-    if let Some(cluster_cfg) = &config.cluster {
-        // Initialize cluster
-        let cluster = ClusterNode::new(cluster_cfg).await?;
-        
-        match cluster.determine_role().await? {
-            NodeRole::Main => {
-                let db = Database::connect_postgres(&config.storage).await?;
-                // ... start as main
-            }
-            NodeRole::Worker => {
-                let db = Database::connect_sqlite_cache().await?;
-                cluster.sync_from_main().await?;
-                // ... start as worker
-            }
-        }
-        
-        cluster.start_background_tasks().await;
-    } else {
-        // Standalone mode (current behavior, unchanged)
+pub struct NodeId(pub String);
+impl NodeId {
+    pub fn from_hostname() -> Self {
+        let host = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        Self(format!("{}-{}", host, &uuid::Uuid::new_v4().to_string()[..8]))
     }
+}
+```
+
+#### waf-engine — Minimal
+
+```rust
+// Add to crates/waf-engine/src/lib.rs
+#[async_trait::async_trait]
+pub trait RuleReloader: Send + Sync {
+    async fn on_rules_updated(&self, version: u64) -> anyhow::Result<()>;
+}
+
+// WafEngine gets a trivial impl — no structural change needed
+#[async_trait::async_trait]
+impl RuleReloader for WafEngine {
+    async fn on_rules_updated(&self, _version: u64) -> anyhow::Result<()> {
+        self.reload_rules().await
+    }
+}
+// RuleRegistry is already pub — cluster reads .version and .rules directly
+```
+
+#### waf-storage — None Required
+
+The `Database` struct is PostgreSQL-only and stays that way. Workers that have no
+database configured operate in **forward-only mode** — a lightweight enum in waf-cluster:
+
+```rust
+// crates/waf-cluster/src/node.rs — cluster-internal only, not in waf-storage
+pub enum StorageMode {
+    Full(Arc<waf_storage::Database>),   // main node (or worker with local DB)
+    ForwardOnly,                         // worker with no DB — forwards writes to main
+}
+```
+
+No changes to waf-storage's public API or types.
+
+#### waf-api — Medium
+
+```rust
+// New file: crates/waf-api/src/cluster.rs
+// Endpoints only active when cluster.enabled = true
+
+// GET  /api/cluster/status
+// GET  /api/cluster/nodes
+// GET  /api/cluster/nodes/:id
+// POST /api/cluster/token         (admin only — generate join token)
+// POST /api/cluster/nodes/remove  (admin only)
+
+// Worker API behavior:
+// - Read endpoints: served from local in-memory cache
+// - Write endpoints: forward via ClusterNode.forward_to_main(req) → HTTP 202
+// - On disconnect from main: return HTTP 503 with "cluster main unavailable"
+```
+
+#### prx-waf/src/main.rs — Medium (correct threading model)
+
+```rust
+fn run_server(config: AppConfig) -> anyhow::Result<()> {
+    // ... existing init (unchanged) ...
+
+    if config.cluster.enabled {
+        let cluster_cfg = config.cluster.clone();
+        let engine_ref = Arc::clone(&engine);
+        let storage_mode = if config.storage.database_url.is_empty() {
+            waf_cluster::StorageMode::ForwardOnly
+        } else {
+            waf_cluster::StorageMode::Full(Arc::clone(&db))
+        };
+
+        // Cluster MUST run in its own thread + runtime — same pattern as API server
+        // Cannot be awaited in main because Pingora blocks the main thread
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("BUG: failed to build cluster runtime");
+            rt.block_on(async move {
+                if let Err(e) = waf_cluster::ClusterNode::run(
+                    cluster_cfg,
+                    engine_ref,
+                    storage_mode,
+                ).await {
+                    tracing::error!("Cluster node exited with error: {e}");
+                }
+            });
+        });
+    }
+
+    // Pingora blocks the main thread forever (unchanged)
+    server.run_forever();
 }
 ```
 
 ---
 
-## 7. Election Protocol (Raft-lite)
+## 8. Election Protocol (Raft-lite)
 
-Simplified Raft — no log replication (rules sync handles data), only leader election:
+Simplified Raft — leader election only. Log replication is handled by the rules sync
+protocol, not Raft entries.
 
-### 7.1 States
+### 8.1 State Machine
 
 ```
                  timeout
@@ -498,7 +796,7 @@ Simplified Raft — no log replication (rules sync handles data), only leader el
                             └──────────┘
 ```
 
-### 7.2 Election Rules
+### 8.2 Election Rules
 
 1. Each node has a monotonically increasing **term** counter
 2. Worker starts election timeout (random 150-300ms)
@@ -506,62 +804,125 @@ Simplified Raft — no log replication (rules sync handles data), only leader el
 4. Candidate increments term, votes for self, requests votes from all peers
 5. Node grants vote if: candidate term > current term AND haven't voted this term
 6. Candidate wins if: receives majority votes (N/2 + 1)
-7. Winner becomes Main, broadcasts ElectionResult
+7. Winner becomes Main, broadcasts `ElectionResult`
 8. Losers reset to Worker, accept new Main
-9. If split vote (no majority) → random backoff, retry
+9. If split vote → random backoff, retry next term
 
-### 7.3 Failure Detection
+### 8.3 Failure Detection
 
-Use **phi-accrual failure detector** (Cassandra-style) instead of fixed timeout:
+**Phi-accrual failure detector** (Cassandra-style):
 
-- Track heartbeat inter-arrival times
-- Compute φ (phi) score = likelihood the node has failed
-- φ > 8 → suspect failure
+- Track heartbeat inter-arrival time distribution per peer
+- Compute φ = `−log10(P(t > now − last_heartbeat))`
+- φ > 8 → suspect failure, emit warning
 - φ > 12 → declare dead, trigger election if it was main
 
-Advantage: adapts to network jitter automatically.
+Advantage over fixed timeout: automatically adapts to network jitter.
 
 ---
 
-## 8. Rule Synchronization
+## 9. Rule Synchronization
 
-### 8.1 Version Vector
+### 9.1 Version Tracking
 
-Each rule change increments a global `rules_version` counter on main. Workers track their current version.
+`RuleRegistry.version: u64` (already in codebase) is the sync key. It increments on
+every `insert()` or `remove()`. No new versioning infrastructure needed.
 
 ```
-Worker request: "I have version 42"
-Main response:
-  - If diff is small (< 100 changes): send incremental changes [43..50]
-  - If diff is large or worker version unknown: send full snapshot (lz4 compressed)
+Worker request: RuleSyncRequest { current_version: 42 }
+
+Main logic:
+  registry = rule_manager.registry.read().unwrap()
+  if registry.version == 42 → send empty RuleSyncResponse (no-op)
+  else if changelog covers [42..registry.version] → send incremental
+  else (worker too far behind or changelog evicted) → send full snapshot
 ```
 
-### 8.2 Sync Triggers
+### 9.2 Full Snapshot Serialization
+
+```rust
+// Main: serialize + compress
+let registry = rule_manager.registry.read().unwrap();
+let rules: Vec<_> = registry.rules.values().collect();
+let json = serde_json::to_vec(&rules).context("rule snapshot serialize")?;
+let compressed = lz4_flex::compress_prepend_size(&json);
+// Send as RuleSyncResponse { sync_type: Full, snapshot_lz4: compressed, .. }
+
+// Worker: decompress + apply
+let json = lz4_flex::decompress_size_prepended(&msg.snapshot_lz4)
+    .context("rule snapshot decompress")?;
+let rules: Vec<waf_engine::rules::registry::Rule> = serde_json::from_slice(&json)
+    .context("rule snapshot deserialize")?;
+let mut registry = engine.rule_registry.write().unwrap();
+registry.rules.clear();
+registry.by_category.clear();
+registry.by_source.clear();
+for rule in rules { registry.insert(rule); }
+registry.version = msg.version;
+engine.on_rules_updated(msg.version).await?;
+```
+
+### 9.3 Incremental Change Log
+
+```rust
+// crates/waf-cluster/src/sync/rules.rs
+pub struct RuleChangelog {
+    /// Ring buffer: (version_after_change, RuleChange)
+    changes: std::collections::VecDeque<(u64, RuleChange)>,
+    /// Keep last N changes; if worker needs more → force full sync
+    max_retained: usize,  // default 500
+}
+
+impl RuleChangelog {
+    pub fn push(&mut self, version: u64, change: RuleChange) {
+        if self.changes.len() >= self.max_retained {
+            self.changes.pop_front();
+        }
+        self.changes.push_back((version, change));
+    }
+
+    pub fn delta_since(&self, from_version: u64) -> Option<Vec<RuleChange>> {
+        // Returns None if from_version is too old (evicted from ring buffer)
+        let first = self.changes.front().map(|(v, _)| *v).unwrap_or(0);
+        if from_version < first { return None; }
+        Some(
+            self.changes.iter()
+                .filter(|(v, _)| *v > from_version)
+                .map(|(_, c)| c.clone())
+                .collect()
+        )
+    }
+}
+```
+
+### 9.4 Sync Triggers
 
 | Trigger | Action |
 |---------|--------|
-| Worker connects | Full sync |
-| Admin creates/edits/deletes rule | Main pushes incremental to all workers |
-| Periodic (every `sync.rules_interval_secs`) | Worker pulls if version mismatch |
-| Worker receives push | Apply changes, update local version |
+| Worker connects to main | Full sync immediately |
+| Admin creates/edits/deletes rule via API | Main pushes incremental to all workers |
+| Periodic poll (every `sync.rules_interval_secs`) | Worker sends RuleSyncRequest; main responds if version differs |
+| Worker rejoins after disconnect | Full sync (safer than relying on stale changelog) |
 
-### 8.3 Conflict Resolution
+### 9.5 WASM Plugin Sync (v1 Limitation)
 
-No conflicts by design — only Main writes rules. Workers are read-only. If a worker receives an API write request, it forwards to Main via the Forward stream.
+WASM plugins are binary blobs stored in PostgreSQL. Worker nodes **do not receive WASM
+plugins** in v1. Workers run the WAF engine without plugin support. Add to deployment
+documentation: "WASM plugins require the main node; workers skip plugin execution in v1."
 
 ---
 
-## 9. Configuration
+## 10. Configuration
 
-### 9.1 Full Configuration Reference
+### 10.1 Full Configuration Reference
 
 ```toml
 # ─── Cluster Configuration ────────────────────────────────────
 [cluster]
-# Enable clustering. Default: false (standalone mode).
+# Enable clustering. Default: false — zero behavior change for existing deployments.
 enabled = false
 
-# Unique node identifier. Auto-generated from hostname if empty.
+# Unique node identifier. Auto-generated from hostname+uuid suffix if empty.
 node_id = ""
 
 # Role assignment. "auto" participates in election.
@@ -571,111 +932,76 @@ role = "auto"
 # QUIC listen address for cluster communication.
 listen_addr = "0.0.0.0:16851"
 
-# ─── Crypto ───────────────────────────────────────────────────
-[cluster.crypto]
-# Path to CA certificate (PEM). Generated automatically on first main startup.
-ca_cert = "/app/certs/cluster-ca.pem"
-
-# Path to node certificate (PEM). Signed by CA on join.
-node_cert = "/app/certs/node.pem"
-
-# Path to node private key (PEM).
-node_key = "/app/certs/node.key"
-
-# Auto-generate CA and node certificates on first startup.
-auto_generate = true
-
-# Certificate validity duration.
-ca_validity_days = 3650       # 10 years
-node_validity_days = 365      # 1 year
-renewal_before_days = 7       # Auto-renew 7 days before expiry
-
-# ─── Discovery ────────────────────────────────────────────────
-[cluster.discovery]
-# Static seed nodes. At least one must be reachable to join cluster.
+# Static seed nodes. At least one reachable seed required to join a cluster.
 seeds = []
 # Example: seeds = ["10.0.0.1:16851", "10.0.0.2:16851"]
 
-# Enable mDNS auto-discovery on LAN. Default: true.
-mdns_enabled = true
+# ─── Crypto ───────────────────────────────────────────────────
+[cluster.crypto]
+ca_cert    = "/app/certs/cluster-ca.pem"
+node_cert  = "/app/certs/node.pem"
+node_key   = "/app/certs/node.key"
 
-# mDNS service name.
-mdns_service = "_prx-waf._udp.local."
+# Auto-generate CA and node certs on first startup. Required for initial main.
+auto_generate       = true
+ca_validity_days    = 3650   # 10 years
+node_validity_days  = 365    # 1 year
+renewal_before_days = 7      # auto-renew 7 days before expiry
 
 # ─── Sync ─────────────────────────────────────────────────────
 [cluster.sync]
-# Rule sync check interval (seconds).
-rules_interval_secs = 10
-
-# Config sync check interval (seconds).
-config_interval_secs = 30
-
-# Attack event batch size before flush.
-events_batch_size = 100
-
-# Attack event flush interval (seconds), even if batch not full.
-events_flush_interval_secs = 5
-
-# Stats reporting interval (seconds).
-stats_interval_secs = 10
-
-# Maximum events queue size before dropping oldest.
-events_queue_size = 10000
+rules_interval_secs        = 10    # periodic rule version check
+config_interval_secs       = 30
+events_batch_size          = 100   # flush event batch at this count
+events_flush_interval_secs = 5     # flush even if batch not full
+stats_interval_secs        = 10
+events_queue_size          = 10000 # drop oldest if worker falls behind
 
 # ─── Election ─────────────────────────────────────────────────
 [cluster.election]
-# Election timeout range (milliseconds). Randomized per node.
-timeout_min_ms = 150
-timeout_max_ms = 300
-
-# Heartbeat interval from main to workers (milliseconds).
-heartbeat_interval_ms = 50
-
-# Phi-accrual failure detector threshold.
-phi_suspect = 8.0
-phi_dead = 12.0
+timeout_min_ms        = 150    # random election timeout range
+timeout_max_ms        = 300
+heartbeat_interval_ms = 50     # main → workers heartbeat
+phi_suspect           = 8.0
+phi_dead              = 12.0
 
 # ─── Health ───────────────────────────────────────────────────
 [cluster.health]
-# Health check interval (seconds).
-check_interval_secs = 5
-
-# Node considered unhealthy after N missed heartbeats.
+check_interval_secs   = 5
 max_missed_heartbeats = 3
 ```
 
-### 9.2 CLI Commands
+### 10.2 CLI Commands
 
 ```bash
-# Cluster management
-prx-waf cluster status              # Show cluster status
-prx-waf cluster nodes               # List all nodes
-prx-waf cluster token generate      # Generate join token
-prx-waf cluster token generate --ttl 1h  # With expiry
+prx-waf cluster status                    # Show cluster topology + health
+prx-waf cluster nodes                     # List all nodes
+prx-waf cluster token generate            # Generate join token (1h default TTL)
+prx-waf cluster token generate --ttl 24h
 
-# Node join
+# Node join (add to run command)
 prx-waf run --cluster-join <main_addr> --token <token>
 
-# Force role change (emergency)
-prx-waf cluster promote <node_id>   # Force node to main
-prx-waf cluster demote <node_id>    # Force node to worker
-prx-waf cluster remove <node_id>    # Remove node from cluster
+# Emergency role control
+prx-waf cluster promote <node_id>
+prx-waf cluster demote  <node_id>
+prx-waf cluster remove  <node_id>
 ```
 
 ---
 
-## 10. Admin UI — Cluster Dashboard
+## 11. Admin UI — Cluster Dashboard
 
-### 10.1 New Pages
+### 11.1 New Pages
 
 | Page | Route | Description |
 |------|-------|-------------|
 | Cluster Overview | `/cluster` | Mesh topology view, node status |
-| Node Detail | `/cluster/nodes/:id` | Health, stats, config, logs |
+| Node Detail | `/cluster/nodes/:id` | Health, stats, last sync times |
 | Join Tokens | `/cluster/tokens` | Generate/revoke join tokens |
-| Sync Status | `/cluster/sync` | Rule versions, last sync times |
+| Sync Status | `/cluster/sync` | Per-node rule version, drift alerts |
 
-### 10.2 Cluster Overview Wireframe
+### 11.2 Cluster Overview Wireframe
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -699,171 +1025,197 @@ prx-waf cluster remove <node_id>    # Remove node from cluster
 
 ---
 
-## 11. Implementation Phases
+## 12. Implementation Phases
 
-### Phase 1: Foundation (Week 1-2)
+> **Effort estimates use Claude-hours.** Claude AI performs all development 24/7 with no
+> context-switching overhead, roughly 3-5x faster than human-hours for comparable tasks.
+> Estimates assume no blocking external dependencies (network, hardware, vendor APIs).
 
-**Goal:** QUIC transport + mTLS + basic node communication
+### Phase 1: Foundation — QUIC Transport + mTLS (~14 Claude-hours)
 
-| Task | Est. | Crate |
-|------|------|-------|
-| Create `waf-cluster` crate scaffold | 2h | waf-cluster |
-| Protobuf message definitions + build.rs | 4h | waf-cluster |
-| QUIC server (quinn listener) | 8h | waf-cluster/transport |
-| QUIC client (quinn dialer) | 6h | waf-cluster/transport |
-| CA certificate generation (rcgen) | 4h | waf-cluster/crypto |
-| Node certificate signing + validation | 4h | waf-cluster/crypto |
-| Join token generation + validation | 3h | waf-cluster/crypto |
-| Heartbeat send/receive on control stream | 4h | waf-cluster/health |
-| Static seed discovery | 2h | waf-cluster/discovery |
-| ClusterConfig + NodeRole in waf-common | 2h | waf-common |
-| Integration test: 2-node connect + heartbeat | 4h | waf-cluster/tests |
-| **Phase 1 subtotal** | **43h** | |
+**Goal:** Two nodes can discover each other, establish mTLS QUIC connection, and exchange heartbeats.
 
-**Deliverable:** Two prx-waf instances can discover each other, establish mTLS QUIC connection, and exchange heartbeats.
+| Task | Est. | Crate | Notes |
+|------|------|-------|-------|
+| Create `waf-cluster` crate + Cargo.toml | 0.5h | waf-cluster | Module stubs, workspace registration |
+| ClusterConfig + NodeRole in waf-common | 0.5h | waf-common | Add optional field to AppConfig; Default = disabled |
+| Protocol message types (§6.3) | 1h | waf-cluster/protocol | All structs + serde derives |
+| Length-prefixed JSON frame codec | 1h | waf-cluster/transport/frame.rs | Read/write `u32 + JSON` over quinn streams |
+| QUIC mTLS server (reuse gateway/http3.rs pattern) | 2h | waf-cluster/transport/server.rs | Switch to `with_client_cert_verifier` for mTLS |
+| QUIC client dialer | 1.5h | waf-cluster/transport/client.rs | Connect to peer, send JoinRequest |
+| CA certificate generation (rcgen — already in workspace) | 1h | waf-cluster/crypto/ca.rs | Ed25519 + 10yr self-signed |
+| Node certificate signing + CSR validation | 1h | waf-cluster/crypto/node_cert.rs | |
+| AES-GCM CA key storage (reuse waf-common::crypto) | 0.5h | waf-cluster/crypto/store.rs | Passphrase-derived key |
+| Join token: HMAC-SHA256 generate + validate | 0.5h | waf-cluster/crypto | sha2 already in workspace |
+| Heartbeat send/receive on control stream | 1h | waf-cluster/health | Periodic tokio::time::interval |
+| Static seed discovery | 0.5h | waf-cluster/discovery | Read ClusterConfig.seeds |
+| Thread launch in prx-waf/main.rs | 0.5h | prx-waf | std::thread::spawn + own runtime |
+| Integration test: 2-node connect + heartbeat | 2h | waf-cluster/tests | |
+| **Phase 1 subtotal** | **~14h** | | |
 
-### Phase 2: Sync (Week 3-4)
+### Phase 2: Rule and Config Sync (~14 Claude-hours)
 
-**Goal:** Rules and config sync between main and workers
+**Goal:** Workers auto-sync rules from main; attack logs aggregated on main; API writes forwarded.
 
-| Task | Est. | Crate |
-|------|------|-------|
-| Rule version tracking in waf-storage | 4h | waf-storage |
-| SQLite local cache backend for workers | 8h | waf-storage |
-| StorageMode enum (Primary/LocalCache) | 4h | waf-storage |
-| Rule sync protocol (incremental + full) | 8h | waf-cluster/sync |
-| Config sync protocol | 4h | waf-cluster/sync |
-| Attack event batching + forwarding | 6h | waf-cluster/sync |
-| Stats aggregation (QUIC datagrams) | 4h | waf-cluster/sync |
-| LZ4 compression for bulk transfers | 2h | waf-cluster |
-| API write forwarding (worker → main) | 6h | waf-api |
-| Integration test: rule create on main → appears on worker | 4h | tests |
-| **Phase 2 subtotal** | **50h** | |
+| Task | Est. | Crate | Notes |
+|------|------|-------|-------|
+| RuleChangelog ring buffer on main | 1h | waf-cluster/sync/rules.rs | VecDeque, max 500 entries |
+| Full snapshot: serialize RuleRegistry → lz4 | 1h | waf-cluster/sync/rules.rs | lz4_flex::compress_prepend_size |
+| Incremental sync: send changelog delta | 1h | waf-cluster/sync/rules.rs | Filter by version |
+| Worker: receive + apply rule updates | 1.5h | waf-cluster/sync/rules.rs | RuleRegistry write lock + insert |
+| RuleReloader trait + WafEngine impl | 0.5h | waf-engine | Thin wrapper on reload_rules() |
+| Config sync protocol (TOML string) | 1h | waf-cluster/sync/config.rs | |
+| Attack event batching on worker | 1h | waf-cluster/sync/events.rs | tokio::time::interval flush |
+| Event forwarding to main (EventBatch stream) | 1h | waf-cluster/sync/events.rs | |
+| Main: write forwarded events to PostgreSQL | 0.5h | waf-cluster/sync/events.rs | Existing db.create_security_event() |
+| Stats aggregation via QUIC datagrams | 1h | waf-cluster/sync | Unreliable send — quinn::Connection::send_datagram |
+| API write forwarding: worker → main | 2h | waf-api | New cluster.rs handler; ApiForward stream |
+| StorageMode enum in waf-cluster | 0.5h | waf-cluster/node.rs | Internal enum; no waf-storage changes |
+| Integration test: create rule on main → synced to worker | 1.5h | tests | |
+| **Phase 2 subtotal** | **~14h** | | |
 
-**Deliverable:** Worker nodes auto-sync rules/config from main. Attack logs aggregated on main. API writes forwarded.
+### Phase 3: Election + Failover (~16 Claude-hours)
 
-### Phase 3: Election + Failover (Week 5-6)
+**Goal:** Cluster survives main failure with automatic re-election, no manual intervention.
 
-**Goal:** Automatic leader election and failure recovery
+| Task | Est. | Crate | Notes |
+|------|------|-------|-------|
+| Raft-lite election state machine (term, vote, timeout) | 3h | waf-cluster/election | All state transitions + split-vote handling |
+| Phi-accrual failure detector | 2h | waf-cluster/health/detector.rs | Sliding window + phi formula |
+| Main → Worker role demotion on new election | 1h | waf-cluster/node.rs | Role state machine |
+| Worker → Main promotion (connect DB if configured) | 2h | waf-cluster/node.rs | Conditional DB connect |
+| CA key replication to workers on join | 2h | waf-cluster/crypto | Encrypted quorum storage |
+| Split-brain prevention (fencing token / term check) | 1h | waf-cluster/election | Reject stale-term leaders |
+| CLI subcommands: cluster status/promote/demote/remove | 1h | prx-waf | Clap subcommands |
+| Integration test: kill main → worker promoted in < 500ms | 2h | tests | |
+| Chaos test: network partition + split-brain prevention | 1.5h | tests | Simulate packet drops |
+| Concurrent election test: single winner | 0.5h | tests | |
+| **Phase 3 subtotal** | **~16h** | | |
 
-| Task | Est. | Crate |
-|------|------|-------|
-| Raft-lite election state machine | 12h | waf-cluster/election |
-| Phi-accrual failure detector | 6h | waf-cluster/health |
-| Main → Worker demotion on new election | 4h | waf-cluster/node |
-| Worker → Main promotion (DB migration) | 8h | waf-cluster/node + waf-storage |
-| CA key replication (encrypted, quorum) | 6h | waf-cluster/crypto |
-| Split-brain prevention (fencing token) | 4h | waf-cluster/election |
-| mDNS auto-discovery | 4h | waf-cluster/discovery |
-| CLI: cluster status/promote/demote/remove | 4h | prx-waf |
-| Integration test: kill main → worker promoted | 6h | tests |
-| Chaos test: network partition handling | 4h | tests |
-| **Phase 3 subtotal** | **58h** | |
+### Phase 4: Admin UI + Polish (~10 Claude-hours)
 
-**Deliverable:** Cluster survives main node failure. Automatic re-election. No manual intervention needed.
+**Goal:** Full cluster management via Admin UI; 3-node cluster deployable with docker-compose.
 
-### Phase 4: Admin UI + Polish (Week 7)
+| Task | Est. | Crate | Notes |
+|------|------|-------|-------|
+| API endpoints /api/cluster/* | 2h | waf-api | Follow existing axum handler patterns |
+| Cluster Overview page (Vue 3 + Tailwind) | 2.5h | admin-ui | SVG mesh topology + node cards |
+| Node Detail page | 1h | admin-ui | Health chart, stats, sync status |
+| Join Token management page | 1h | admin-ui | Generate/list/revoke tokens |
+| Sync Status page | 1h | admin-ui | Per-node rule version, drift alerts |
+| i18n keys (en/zh/ru/ka) | 1h | admin-ui | Follow existing i18n pattern in en.ts etc. |
+| 3-node cluster docker-compose test + deployment docs | 1.5h | tests + docs | |
+| **Phase 4 subtotal** | **~10h** | | |
 
-**Goal:** Cluster management dashboard
-
-| Task | Est. | Crate |
-|------|------|-------|
-| API endpoints: /api/cluster/* | 6h | waf-api |
-| Cluster Overview page (Vue 3) | 8h | admin-ui |
-| Node Detail page | 4h | admin-ui |
-| Join Token management page | 3h | admin-ui |
-| Sync Status page | 3h | admin-ui |
-| i18n for cluster pages (en/zh/ru/ka) | 4h | admin-ui |
-| Documentation: deployment guide | 4h | docs |
-| Documentation: config reference | 2h | docs |
-| End-to-end: 3-node cluster deployment test | 4h | tests |
-| **Phase 4 subtotal** | **38h** | |
-
-**Deliverable:** Full cluster management via Admin UI. Deployment documentation complete.
+**Total: ~54 Claude-hours across 4 phases.**
 
 ---
 
-## 12. Testing Strategy
+## 13. Testing Strategy
 
-### 12.1 Unit Tests
+### 13.1 Unit Tests
 
-- Certificate generation/validation
-- Protobuf serialization/deserialization
-- Election state machine transitions
-- Failure detector phi calculation
-- Rule version diffing
+- Certificate generation round-trip (rcgen: generate CA → sign CSR → verify)
+- Join token HMAC: generate → validate → expire
+- JSON message serialization/deserialization for all `ClusterMessage` variants
+- Election state machine: all state transitions, split-vote recovery
+- Phi-accrual: verify φ increases correctly with delayed heartbeats
+- RuleChangelog: ring buffer eviction, delta_since boundary conditions
 
-### 12.2 Integration Tests
+### 13.2 Integration Tests
 
-- 2-node QUIC connection establishment
-- mTLS handshake with valid/invalid certs
-- Rule sync (incremental + full)
-- API write forwarding
-- Join token flow
+```rust
+// tests/integration.rs — example structure
+#[tokio::test]
+async fn two_nodes_connect_and_heartbeat() {
+    // Spawn main + worker in-process with ephemeral ports
+    // Assert worker receives heartbeat within 200ms
+}
 
-### 12.3 Chaos Tests
+#[tokio::test]
+async fn mtls_rejects_unknown_cert() {
+    // Worker with wrong CA cert → connection rejected
+}
 
-- Kill main node → verify election + promotion
-- Network partition → verify split-brain prevention
-- Slow network → verify phi-accrual adaptation
-- Concurrent elections → verify single winner
-- Node rejoin after partition heal
+#[tokio::test]
+async fn rule_created_on_main_appears_on_worker() {
+    // Create rule via main API → assert worker RuleRegistry updated within 5s
+}
 
-### 12.4 Performance Benchmarks
+#[tokio::test]
+async fn api_write_on_worker_forwarded_to_main() {
+    // POST to worker API → 202 Accepted → main DB has new record
+}
+```
+
+### 13.3 Chaos Tests
+
+- Kill main → verify election completes, new main elected within 500ms
+- Network partition: 3 nodes, disconnect node-a → [b, c] elect new main, node-a isolated
+- Split-brain: 2 partitions each with 1 node — neither can win (no majority of 3)
+- Slow network: delay heartbeats 200ms → phi-accrual adapts, no false election
+- Rejoin after partition heal → rule sync catches up
+
+### 13.4 Performance Benchmarks
 
 | Metric | Target |
 |--------|--------|
-| Heartbeat RTT | < 1ms (LAN), < 50ms (WAN) |
-| Rule sync latency | < 100ms for incremental |
-| Full rule snapshot | < 2s for 1000 rules |
-| Election completion | < 500ms |
+| Heartbeat RTT (LAN) | < 1ms |
+| Heartbeat RTT (WAN 50ms) | < 55ms |
+| Rule sync latency (incremental) | < 100ms |
+| Full rule snapshot (1000 rules) | < 2s |
+| Election completion (LAN 3-node) | < 500ms |
 | Event forwarding throughput | > 10,000 events/sec |
 
 ---
 
-## 13. Migration Path
+## 14. Migration Path
 
-### 13.1 Standalone → Cluster
+### 14.1 Standalone → Cluster (Zero Breaking Changes)
 
-Zero breaking changes. Existing standalone deployments continue to work unchanged. Cluster is opt-in via `[cluster] enabled = true`.
+`ClusterConfig::default()` has `enabled: false`. All existing deployments continue
+working without any configuration change. Cluster is strictly opt-in.
 
-### 13.2 Upgrade Path
+### 14.2 Upgrade Path for Existing Deployments
 
-1. Upgrade all nodes to cluster-capable version
-2. Choose one node as initial main
-3. Configure `[cluster]` on main, restart
-4. Generate join token
-5. Configure workers with join token, restart
-6. Workers auto-sync rules from main
-7. Verify cluster health via Admin UI
-
----
-
-## 14. Risk Assessment
-
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| Split-brain (two mains) | Data inconsistency | Fencing tokens + quorum requirement |
-| CA key compromise | Cluster-wide auth bypass | Encrypted storage + key rotation |
-| QUIC performance on lossy networks | Sync delays | Retry with backoff + full sync fallback |
-| Election storm (rapid main changes) | Service disruption | Exponential backoff + term dampening |
-| Worker cache stale after long partition | Outdated rules | Force full sync on rejoin + version check |
+1. Deploy cluster-capable binary to **all** nodes simultaneously (or rolling, but keep
+   `cluster.enabled = false` until all nodes are upgraded)
+2. On the designated main: add `[cluster] enabled = true; role = "main"`, restart
+3. Generate join token: `prx-waf cluster token generate --ttl 24h`
+4. On each worker: add `[cluster] enabled = true; seeds = ["<main>:16851"]`, set token, restart
+5. Workers auto-sync rules from main within `sync.rules_interval_secs`
+6. Verify all nodes healthy via Admin UI cluster dashboard
 
 ---
 
-## 15. Future Considerations (Post v1)
+## 15. Risk Assessment
 
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|------------|
+| Split-brain (two mains) | Low | High | Fencing tokens + quorum requirement (N/2+1) |
+| CA key loss on main failure | Low | Critical | CA key replicated (encrypted) to workers at join |
+| QUIC on lossy WAN | Medium | Medium | Retry with exponential backoff + full sync fallback |
+| Election storm (rapid role changes) | Low | Medium | Exponential backoff + term dampening |
+| Worker rule cache stale after long partition | Medium | Medium | Force full sync on rejoin + version assertion |
+| Pingora + cluster thread interference | None | None | Separate threads/runtimes — no shared state |
+| prost build system complexity | N/A | N/A | Avoided entirely by using serde_json |
+| SQLite complexity in waf-storage | N/A | N/A | Avoided entirely by using in-memory cache |
+| WASM plugins missing on workers | Certain (v1) | Low | Documented limitation; add in v2 |
+
+---
+
+## 16. Future Considerations (Post v1)
+
+- **mDNS auto-discovery:** LAN peer discovery without static seed configuration
+- **WASM plugin sync:** Binary blob distribution to workers via cluster stream
 - **Multi-region:** Cross-datacenter clustering with region-aware routing
+- **Distributed rate limiting:** Shared CC counters across cluster nodes
 - **Traffic load balancing:** Anycast + cluster-level request distribution
-- **Shared session state:** Distributed rate limiting across nodes
-- **Plugin sync:** WASM plugin distribution via cluster
-- **Observability:** Distributed tracing across cluster nodes
+- **Observability:** Distributed tracing across cluster nodes (OpenTelemetry)
 
 ---
 
 ## Appendix A: Port Allocation
-
-Following the 168xx convention:
 
 | Port | Service |
 |------|---------|
@@ -871,27 +1223,46 @@ Following the 168xx convention:
 | 16843 | HTTPS proxy |
 | 16827 | Management API + Admin UI |
 | **16851** | **QUIC cluster communication (NEW)** |
-| 16852 | mDNS discovery (UDP, optional) |
 
 ---
 
-## Appendix B: Dependencies Added
+## Appendix B: Final Dependency Delta
+
+The entire cluster feature adds exactly **one new workspace dependency**:
 
 ```toml
-# waf-cluster/Cargo.toml
-[dependencies]
-quinn = "0.11"
-rustls = { version = "0.23", features = ["ring"] }
-rcgen = "0.13"
-prost = "0.13"
+# workspace Cargo.toml — only change to [workspace.dependencies]
 lz4_flex = "0.11"
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-rand = "0.8"
-waf-common = { path = "../waf-common" }
-
-[build-dependencies]
-prost-build = "0.13"
 ```
 
-Estimated binary size increase: ~2-3 MB (quinn + rustls already partially shared with Pingora).
+All other required crates (quinn, rustls, rcgen, rustls-pemfile, serde_json, aes-gcm)
+are already in the workspace. Estimated binary size increase: **~1 MB** (lz4_flex +
+waf-cluster code), not the 2-3 MB estimated in v1.0 which assumed quinn/rustls were new.
+
+---
+
+## Appendix C: Reusing gateway/http3.rs Patterns
+
+The cluster QUIC transport differs from HTTP/3 in only one key way: mTLS (client cert
+verification). The existing `gateway/src/http3.rs` already shows the exact rustls +
+quinn setup. The cluster transport adapts it as follows:
+
+```rust
+// gateway/src/http3.rs (existing — no client cert):
+let mut tls_config = rustls::ServerConfig::builder()
+    .with_no_client_auth()      // HTTP/3: no mTLS
+    .with_single_cert(certs, key)?;
+tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+// waf-cluster/src/transport/server.rs (new — mTLS):
+let verifier = Arc::new(ClusterCaVerifier::new(ca_cert_der));
+let mut tls_config = rustls::ServerConfig::builder()
+    .with_client_cert_verifier(verifier)   // cluster: verify peer cert against cluster CA
+    .with_single_cert(node_certs, node_key)?;
+tls_config.alpn_protocols = vec![b"prx-cluster/1".to_vec()];
+// All remaining quinn setup is identical to http3.rs
+```
+
+`ClusterCaVerifier` implements `rustls::server::danger::ClientCertVerifier`, checking
+that the peer's certificate was signed by the cluster CA. This is well-documented in the
+rustls API and reduces implementation risk significantly.
