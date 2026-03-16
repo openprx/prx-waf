@@ -2,22 +2,22 @@
   <Layout>
     <div class="p-6">
       <div class="flex items-center justify-between mb-6">
-        <h2 class="text-xl font-semibold text-gray-800">SSL Certificates</h2>
-        <button @click="showForm = !showForm" class="btn-primary">+ Upload Cert</button>
+        <h2 class="text-xl font-semibold text-gray-800">{{ $t('certificates.title') }}</h2>
+        <button @click="showForm = !showForm" class="btn-primary">{{ $t('certificates.uploadCert') }}</button>
       </div>
 
       <!-- Upload form -->
       <div v-if="showForm" class="bg-white rounded-xl shadow-sm p-4 mb-6">
-        <h3 class="text-sm font-semibold mb-3">Upload Certificate</h3>
+        <h3 class="text-sm font-semibold mb-3">{{ $t('certificates.uploadTitle') }}</h3>
         <div class="grid grid-cols-2 gap-3 mb-3">
-          <input v-model="form.host_code" placeholder="Host code" class="input" />
-          <input v-model="form.domain" placeholder="Domain (e.g. example.com)" class="input" />
+          <input v-model="form.host_code" :placeholder="$t('certificates.host')" class="input" />
+          <input v-model="form.domain" :placeholder="$t('certificates.domain')" class="input" />
         </div>
-        <textarea v-model="form.cert_pem" placeholder="Certificate PEM" class="w-full input h-24 font-mono text-xs mb-2" />
-        <textarea v-model="form.key_pem" placeholder="Private Key PEM" class="w-full input h-24 font-mono text-xs mb-2" />
+        <textarea v-model="form.cert_pem" :placeholder="$t('certificates.certPem')" class="w-full input h-24 font-mono text-xs mb-2" />
+        <textarea v-model="form.key_pem" :placeholder="$t('certificates.keyPem')" class="w-full input h-24 font-mono text-xs mb-2" />
         <div class="flex gap-2">
-          <button @click="uploadCert" class="btn-primary text-sm">Upload</button>
-          <button @click="showForm = false" class="btn-secondary text-sm">Cancel</button>
+          <button @click="uploadCert" class="btn-primary text-sm">{{ $t('certificates.upload') }}</button>
+          <button @click="showForm = false" class="btn-secondary text-sm">{{ $t('common.cancel') }}</button>
         </div>
       </div>
 
@@ -26,11 +26,11 @@
         <table class="w-full text-sm">
           <thead class="bg-gray-50 border-b">
             <tr>
-              <th class="text-left px-4 py-3 font-medium text-gray-600">Domain</th>
-              <th class="text-left px-4 py-3 font-medium text-gray-600">Host</th>
-              <th class="text-left px-4 py-3 font-medium text-gray-600">Issuer</th>
-              <th class="text-left px-4 py-3 font-medium text-gray-600">Expires</th>
-              <th class="text-left px-4 py-3 font-medium text-gray-600">Status</th>
+              <th class="text-left px-4 py-3 font-medium text-gray-600">{{ $t('certificates.domain') }}</th>
+              <th class="text-left px-4 py-3 font-medium text-gray-600">{{ $t('certificates.host') }}</th>
+              <th class="text-left px-4 py-3 font-medium text-gray-600">{{ $t('certificates.issuer') }}</th>
+              <th class="text-left px-4 py-3 font-medium text-gray-600">{{ $t('certificates.expires') }}</th>
+              <th class="text-left px-4 py-3 font-medium text-gray-600">{{ $t('certificates.status') }}</th>
               <th class="px-4 py-3"></th>
             </tr>
           </thead>
@@ -45,11 +45,11 @@
                       class="text-xs px-2 py-0.5 rounded font-medium">{{ c.status }}</span>
               </td>
               <td class="px-4 py-3 text-right">
-                <button @click="deleteCert(c.id)" class="text-red-500 hover:text-red-700 text-xs">Delete</button>
+                <button @click="deleteCert(c.id)" class="text-red-500 hover:text-red-700 text-xs">{{ $t('common.delete') }}</button>
               </td>
             </tr>
             <tr v-if="!certs.length">
-              <td colspan="6" class="px-4 py-6 text-center text-gray-400">No certificates</td>
+              <td colspan="6" class="px-4 py-6 text-center text-gray-400">{{ $t('certificates.noCerts') }}</td>
             </tr>
           </tbody>
         </table>
@@ -60,8 +60,11 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { certsApi } from '../api'
 import Layout from '../components/Layout.vue'
+
+const { t } = useI18n()
 
 const certs = ref<any[]>([])
 const showForm = ref(false)
@@ -79,7 +82,7 @@ async function uploadCert() {
 }
 
 async function deleteCert(id: string) {
-  if (!confirm('Delete this certificate?')) return
+  if (!confirm(t('certificates.confirmDelete'))) return
   await certsApi.delete(id)
   load()
 }

@@ -358,4 +358,16 @@ export default {
     sourcePlaceholder: 'rules/custom.yaml ან https://...',
     formatLabel: 'ფორმატი',
   },
+  ipRules: {
+    title: 'IP წესები',
+    allowList: 'დაშვებულთა სია',
+    blockList: 'დაბლოკილთა სია',
+    ipCidr: 'IP / CIDR',
+  },
+  urlRules: {
+    title: 'URL წესები',
+    allowUrls: 'დაშვებული URL-ები',
+    blockUrls: 'დაბლოკილი URL-ები',
+    urlPattern: 'URL შაბლონი',
+  },
 }

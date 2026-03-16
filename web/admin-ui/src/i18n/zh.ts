@@ -358,4 +358,16 @@ export default {
     sourcePlaceholder: 'rules/custom.yaml 或 https://...',
     formatLabel: '格式',
   },
+  ipRules: {
+    title: 'IP规则',
+    allowList: '允许列表',
+    blockList: '拦截列表',
+    ipCidr: 'IP / CIDR',
+  },
+  urlRules: {
+    title: 'URL规则',
+    allowUrls: '允许URL',
+    blockUrls: '拦截URL',
+    urlPattern: 'URL模式',
+  },
 }

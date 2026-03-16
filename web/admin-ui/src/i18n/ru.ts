@@ -358,4 +358,16 @@ export default {
     sourcePlaceholder: 'rules/custom.yaml или https://...',
     formatLabel: 'Формат',
   },
+  ipRules: {
+    title: 'Правила IP',
+    allowList: 'Белый список',
+    blockList: 'Чёрный список',
+    ipCidr: 'IP / CIDR',
+  },
+  urlRules: {
+    title: 'Правила URL',
+    allowUrls: 'Разрешённые URL',
+    blockUrls: 'Заблокированные URL',
+    urlPattern: 'Шаблон URL',
+  },
 }

@@ -3,15 +3,15 @@
     <div class="p-6">
       <div class="mb-6 flex items-center justify-between">
         <div>
-          <h2 class="text-2xl font-bold text-gray-900">Rule Management</h2>
-          <p class="text-sm text-gray-500 mt-1">Manage WAF detection rules across all sources</p>
+          <h2 class="text-2xl font-bold text-gray-900">{{ $t('rules.title') }}</h2>
+          <p class="text-sm text-gray-500 mt-1">{{ $t('rules.manageRules') }}</p>
         </div>
         <div class="flex gap-2">
           <button @click="reloadRules" :disabled="loading" class="btn-secondary">
-            Reload Rules
+            {{ $t('rules.reloadRules') }}
           </button>
           <button @click="showImportModal = true" class="btn-primary">
-            Import Rules
+            {{ $t('rules.importRules') }}
           </button>
         </div>
       </div>
@@ -20,19 +20,19 @@
       <div class="grid grid-cols-4 gap-4 mb-6">
         <div class="bg-white rounded-lg p-4 border border-gray-200">
           <div class="text-2xl font-bold text-gray-900">{{ stats.total }}</div>
-          <div class="text-sm text-gray-500">Total Rules</div>
+          <div class="text-sm text-gray-500">{{ $t('rules.totalRules') }}</div>
         </div>
         <div class="bg-white rounded-lg p-4 border border-gray-200">
           <div class="text-2xl font-bold text-green-600">{{ stats.enabled }}</div>
-          <div class="text-sm text-gray-500">Enabled</div>
+          <div class="text-sm text-gray-500">{{ $t('rules.enabledRules') }}</div>
         </div>
         <div class="bg-white rounded-lg p-4 border border-gray-200">
           <div class="text-2xl font-bold text-gray-400">{{ stats.disabled }}</div>
-          <div class="text-sm text-gray-500">Disabled</div>
+          <div class="text-sm text-gray-500">{{ $t('rules.disabledRules') }}</div>
         </div>
         <div class="bg-white rounded-lg p-4 border border-gray-200">
           <div class="text-2xl font-bold text-blue-600">{{ Object.keys(stats.byCategory).length }}</div>
-          <div class="text-sm text-gray-500">Categories</div>
+          <div class="text-sm text-gray-500">{{ $t('rules.categories') }}</div>
         </div>
       </div>
 
@@ -41,21 +41,21 @@
         <input
           v-model="searchQuery"
           type="text"
-          placeholder="Search rules..."
+          :placeholder="$t('rules.searchRules')"
           class="input flex-1 min-w-48"
         />
         <select v-model="filterCategory" class="input w-40">
-          <option value="">All categories</option>
+          <option value="">{{ $t('rules.allCategories') }}</option>
           <option v-for="cat in categories" :key="cat" :value="cat">{{ cat }}</option>
         </select>
         <select v-model="filterSource" class="input w-40">
-          <option value="">All sources</option>
+          <option value="">{{ $t('rules.allSources') }}</option>
           <option v-for="src in sources" :key="src" :value="src">{{ src }}</option>
         </select>
         <select v-model="filterStatus" class="input w-32">
-          <option value="">All status</option>
-          <option value="enabled">Enabled</option>
-          <option value="disabled">Disabled</option>
+          <option value="">{{ $t('rules.allStatus') }}</option>
+          <option value="enabled">{{ $t('common.enabled') }}</option>
+          <option value="disabled">{{ $t('common.disabled') }}</option>
         </select>
       </div>
 
@@ -64,22 +64,22 @@
         <table class="min-w-full divide-y divide-gray-200">
           <thead class="bg-gray-50">
             <tr>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">ID</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Category</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Source</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Severity</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Ops</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('rules.ruleId') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('common.name') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('rules.category') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('common.source') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('rules.severity') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('security.action') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('common.status') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('rules.ops') }}</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-gray-100">
             <tr v-if="loading">
-              <td colspan="8" class="px-4 py-8 text-center text-gray-500">Loading rules...</td>
+              <td colspan="8" class="px-4 py-8 text-center text-gray-500">{{ $t('rules.loadingRules') }}</td>
             </tr>
             <tr v-else-if="filteredRules.length === 0">
-              <td colspan="8" class="px-4 py-8 text-center text-gray-400">No rules found</td>
+              <td colspan="8" class="px-4 py-8 text-center text-gray-400">{{ $t('rules.noRulesFound') }}</td>
             </tr>
             <tr
               v-for="rule in paginatedRules"
@@ -109,7 +109,7 @@
               </td>
               <td class="px-4 py-3">
                 <span :class="rule.enabled ? 'text-green-600' : 'text-gray-400'" class="text-xs font-medium">
-                  {{ rule.enabled ? '● Enabled' : '○ Disabled' }}
+                  {{ rule.enabled ? $t('botManagement.enabled') : $t('botManagement.disabled') }}
                 </span>
               </td>
               <td class="px-4 py-3">
@@ -117,7 +117,7 @@
                   @click.stop="toggleRule(rule)"
                   class="text-xs text-blue-600 hover:text-blue-800"
                 >
-                  {{ rule.enabled ? 'Disable' : 'Enable' }}
+                  {{ rule.enabled ? $t('rules.disable') : $t('rules.enable') }}
                 </button>
               </td>
             </tr>
@@ -126,10 +126,10 @@
 
         <!-- Pagination -->
         <div class="px-4 py-3 border-t flex items-center justify-between text-sm text-gray-500">
-          <span>Showing {{ paginationStart }}–{{ paginationEnd }} of {{ filteredRules.length }} rules</span>
+          <span>{{ $t('rules.showing') }} {{ paginationStart }}–{{ paginationEnd }} {{ $t('rules.of') }} {{ filteredRules.length }} {{ $t('common.total').toLowerCase() }}</span>
           <div class="flex gap-1">
-            <button @click="page--" :disabled="page <= 1" class="btn-page">Prev</button>
-            <button @click="page++" :disabled="page >= pageCount" class="btn-page">Next</button>
+            <button @click="page--" :disabled="page <= 1" class="btn-page">{{ $t('common.prev') }}</button>
+            <button @click="page++" :disabled="page >= pageCount" class="btn-page">{{ $t('common.next') }}</button>
           </div>
         </div>
       </div>
@@ -139,41 +139,43 @@
         <div class="bg-white rounded-xl shadow-2xl w-full max-w-2xl mx-4 overflow-hidden">
           <div class="px-6 py-4 border-b flex items-center justify-between">
             <h3 class="font-semibold text-gray-900">{{ selectedRule.name }}</h3>
-            <button @click="selectedRule = null" class="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
+            <button @click="selectedRule = null" class="text-gray-400 hover:text-gray-600">
+              <X :size="20" />
+            </button>
           </div>
           <div class="px-6 py-4 space-y-3 text-sm">
             <div class="grid grid-cols-2 gap-4">
               <div><span class="text-gray-500">ID:</span> <code class="text-xs bg-gray-100 px-1 rounded">{{ selectedRule.id }}</code></div>
-              <div><span class="text-gray-500">Category:</span> {{ selectedRule.category }}</div>
-              <div><span class="text-gray-500">Source:</span> {{ selectedRule.source }}</div>
-              <div><span class="text-gray-500">Action:</span>
+              <div><span class="text-gray-500">{{ $t('rules.category') }}:</span> {{ selectedRule.category }}</div>
+              <div><span class="text-gray-500">{{ $t('common.source') }}:</span> {{ selectedRule.source }}</div>
+              <div><span class="text-gray-500">{{ $t('security.action') }}:</span>
                 <span :class="actionClass(selectedRule.action)" class="px-2 py-0.5 rounded text-xs font-medium ml-1">{{ selectedRule.action }}</span>
               </div>
-              <div><span class="text-gray-500">Severity:</span> {{ selectedRule.severity ?? 'N/A' }}</div>
-              <div><span class="text-gray-500">Status:</span>
+              <div><span class="text-gray-500">{{ $t('rules.severity') }}:</span> {{ selectedRule.severity ?? 'N/A' }}</div>
+              <div><span class="text-gray-500">{{ $t('common.status') }}:</span>
                 <span :class="selectedRule.enabled ? 'text-green-600' : 'text-gray-400'" class="font-medium ml-1">
-                  {{ selectedRule.enabled ? 'Enabled' : 'Disabled' }}
+                  {{ selectedRule.enabled ? $t('common.enabled') : $t('common.disabled') }}
                 </span>
               </div>
             </div>
             <div v-if="selectedRule.description">
-              <span class="text-gray-500">Description:</span>
+              <span class="text-gray-500">{{ $t('common.description') }}:</span>
               <p class="mt-1 text-gray-700">{{ selectedRule.description }}</p>
             </div>
             <div v-if="selectedRule.pattern">
-              <span class="text-gray-500">Pattern:</span>
+              <span class="text-gray-500">{{ $t('botManagement.pattern') }}:</span>
               <pre class="mt-1 text-xs bg-gray-100 rounded p-2 overflow-x-auto">{{ selectedRule.pattern }}</pre>
             </div>
             <div v-if="selectedRule.tags?.length">
-              <span class="text-gray-500">Tags:</span>
+              <span class="text-gray-500">{{ $t('botManagement.tags') }}:</span>
               <span v-for="tag in selectedRule.tags" :key="tag" class="ml-1 px-2 py-0.5 bg-gray-100 rounded text-xs">{{ tag }}</span>
             </div>
           </div>
           <div class="px-6 py-4 border-t flex gap-2 justify-end">
             <button @click="toggleRule(selectedRule); selectedRule = null" class="btn-secondary">
-              {{ selectedRule.enabled ? 'Disable Rule' : 'Enable Rule' }}
+              {{ selectedRule.enabled ? $t('rules.disable') + ' ' + $t('nav.ruleManager') : $t('rules.enable') + ' ' + $t('nav.ruleManager') }}
             </button>
-            <button @click="selectedRule = null" class="btn-primary">Close</button>
+            <button @click="selectedRule = null" class="btn-primary">{{ $t('common.close') }}</button>
           </div>
         </div>
       </div>
@@ -182,15 +184,15 @@
       <div v-if="showImportModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50" @click.self="showImportModal = false">
         <div class="bg-white rounded-xl shadow-2xl w-full max-w-md mx-4">
           <div class="px-6 py-4 border-b">
-            <h3 class="font-semibold text-gray-900">Import Rules</h3>
+            <h3 class="font-semibold text-gray-900">{{ $t('ruleImport.title') }}</h3>
           </div>
           <div class="px-6 py-4 space-y-4">
             <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">Source (file path or URL)</label>
-              <input v-model="importSource" type="text" class="input w-full" placeholder="rules/custom.yaml or https://..." />
+              <label class="block text-sm font-medium text-gray-700 mb-1">{{ $t('ruleImport.sourceLabel') }}</label>
+              <input v-model="importSource" type="text" class="input w-full" :placeholder="$t('ruleImport.sourcePlaceholder')" />
             </div>
             <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">Format</label>
+              <label class="block text-sm font-medium text-gray-700 mb-1">{{ $t('ruleImport.formatLabel') }}</label>
               <select v-model="importFormat" class="input w-full">
                 <option value="yaml">YAML</option>
                 <option value="json">JSON</option>
@@ -199,8 +201,8 @@
             </div>
           </div>
           <div class="px-6 py-4 border-t flex gap-2 justify-end">
-            <button @click="showImportModal = false" class="btn-secondary">Cancel</button>
-            <button @click="importRules" class="btn-primary">Import</button>
+            <button @click="showImportModal = false" class="btn-secondary">{{ $t('common.cancel') }}</button>
+            <button @click="importRules" class="btn-primary">{{ $t('common.import') }}</button>
           </div>
         </div>
       </div>
@@ -210,8 +212,12 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { X } from 'lucide-vue-next'
 import Layout from '../components/Layout.vue'
 import axios from 'axios'
+
+useI18n()
 
 interface Rule {
   id: string

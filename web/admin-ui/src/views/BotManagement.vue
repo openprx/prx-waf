@@ -3,15 +3,15 @@
     <div class="p-6">
       <div class="mb-6 flex items-center justify-between">
         <div>
-          <h2 class="text-2xl font-bold text-gray-900">Bot Management</h2>
-          <p class="text-sm text-gray-500 mt-1">Manage bot detection patterns and test User-Agents</p>
+          <h2 class="text-2xl font-bold text-gray-900">{{ $t('botManagement.title') }}</h2>
+          <p class="text-sm text-gray-500 mt-1">{{ $t('botManagement.subtitle') }}</p>
         </div>
-        <button @click="showAddModal = true" class="btn-primary">Add Pattern</button>
+        <button @click="showAddModal = true" class="btn-primary">{{ $t('botManagement.addPattern') }}</button>
       </div>
 
       <!-- Test UA banner -->
       <div class="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
-        <div class="font-medium text-blue-800 text-sm mb-2">Test User-Agent</div>
+        <div class="font-medium text-blue-800 text-sm mb-2">{{ $t('botManagement.testUA') }}</div>
         <div class="flex gap-2">
           <input
             v-model="testUA"
@@ -19,11 +19,11 @@
             class="input flex-1"
             placeholder="Mozilla/5.0 ..."
           />
-          <button @click="testUserAgent" class="btn-primary">Test</button>
+          <button @click="testUserAgent" class="btn-primary">{{ $t('common.test') }}</button>
         </div>
         <div v-if="testResult !== null" class="mt-3 space-y-1">
           <div v-if="testResult.length === 0" class="text-sm text-green-700 font-medium">
-            No bot patterns matched — user-agent appears legitimate.
+            {{ $t('botManagement.noMatch') }}
           </div>
           <div v-for="match in testResult" :key="match.id" class="text-sm flex items-start gap-2">
             <span :class="match.action === 'block' ? 'text-red-600' : 'text-yellow-600'" class="font-semibold">
@@ -43,7 +43,7 @@
           :class="activeTab === tab.key ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-gray-700'"
           class="px-4 py-2 text-sm font-medium"
         >
-          {{ tab.label }}
+          {{ $t(tab.i18nKey) }}
           <span class="ml-1 text-xs bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded-full">
             {{ patternsByTab(tab.key).length }}
           </span>
@@ -55,17 +55,17 @@
         <table class="min-w-full divide-y divide-gray-200">
           <thead class="bg-gray-50">
             <tr>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">ID</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Pattern</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Tags</th>
-              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('botManagement.id') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('botManagement.name') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('botManagement.pattern') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('botManagement.action') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('botManagement.tags') }}</th>
+              <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ $t('botManagement.status') }}</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-gray-100">
             <tr v-if="patternsByTab(activeTab).length === 0">
-              <td colspan="6" class="px-4 py-8 text-center text-gray-400 text-sm">No patterns in this category.</td>
+              <td colspan="6" class="px-4 py-8 text-center text-gray-400 text-sm">{{ $t('botManagement.noPatterns') }}</td>
             </tr>
             <tr v-for="p in patternsByTab(activeTab)" :key="p.id" class="hover:bg-gray-50">
               <td class="px-4 py-3 font-mono text-xs text-gray-500">{{ p.id }}</td>
@@ -77,7 +77,7 @@
               <td class="px-4 py-3 text-xs text-gray-500">{{ p.tags?.join(', ') }}</td>
               <td class="px-4 py-3">
                 <button @click="togglePattern(p)" class="text-xs" :class="p.enabled ? 'text-green-600' : 'text-gray-400'">
-                  {{ p.enabled ? '● Enabled' : '○ Disabled' }}
+                  {{ p.enabled ? $t('botManagement.enabled') : $t('botManagement.disabled') }}
                 </button>
               </td>
             </tr>
@@ -89,33 +89,33 @@
       <div v-if="showAddModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50" @click.self="showAddModal = false">
         <div class="bg-white rounded-xl shadow-2xl w-full max-w-md mx-4">
           <div class="px-6 py-4 border-b">
-            <h3 class="font-semibold text-gray-900">Add Bot Pattern</h3>
+            <h3 class="font-semibold text-gray-900">{{ $t('botManagement.addPatternTitle') }}</h3>
           </div>
           <div class="px-6 py-4 space-y-4">
             <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">Pattern (regex) *</label>
+              <label class="block text-sm font-medium text-gray-700 mb-1">{{ $t('botManagement.patternRegex') }}</label>
               <input v-model="newPattern.pattern" type="text" class="input w-full font-mono" placeholder="(?i)\bMyBot\b" />
             </div>
             <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">Name *</label>
-              <input v-model="newPattern.name" type="text" class="input w-full" placeholder="My custom bot" />
+              <label class="block text-sm font-medium text-gray-700 mb-1">{{ $t('botManagement.nameRequired') }}</label>
+              <input v-model="newPattern.name" type="text" class="input w-full" :placeholder="$t('common.name')" />
             </div>
             <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">Action</label>
+              <label class="block text-sm font-medium text-gray-700 mb-1">{{ $t('botManagement.actionField') }}</label>
               <select v-model="newPattern.action" class="input w-full">
-                <option value="block">Block</option>
-                <option value="log">Log only</option>
-                <option value="allow">Allow (whitelist)</option>
+                <option value="block">{{ $t('botManagement.block') }}</option>
+                <option value="log">{{ $t('botManagement.logOnly') }}</option>
+                <option value="allow">{{ $t('botManagement.allowWhitelist') }}</option>
               </select>
             </div>
             <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">Description</label>
-              <input v-model="newPattern.description" type="text" class="input w-full" placeholder="Optional description" />
+              <label class="block text-sm font-medium text-gray-700 mb-1">{{ $t('botManagement.description') }}</label>
+              <input v-model="newPattern.description" type="text" class="input w-full" :placeholder="$t('common.description')" />
             </div>
           </div>
           <div class="px-6 py-4 border-t flex gap-2 justify-end">
-            <button @click="showAddModal = false" class="btn-secondary">Cancel</button>
-            <button @click="addPattern" :disabled="!newPattern.pattern || !newPattern.name" class="btn-primary">Add Pattern</button>
+            <button @click="showAddModal = false" class="btn-secondary">{{ $t('common.cancel') }}</button>
+            <button @click="addPattern" :disabled="!newPattern.pattern || !newPattern.name" class="btn-primary">{{ $t('botManagement.confirmAdd') }}</button>
           </div>
         </div>
       </div>
@@ -124,9 +124,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
+import { useI18n } from 'vue-i18n'
 import Layout from '../components/Layout.vue'
 import axios from 'axios'
+
+useI18n()
 
 interface BotPattern {
   id: string
@@ -151,11 +154,11 @@ const showAddModal = ref(false)
 const activeTab = ref('bad')
 
 const tabs = [
-  { key: 'good', label: 'Good Bots (Allow)' },
-  { key: 'bad', label: 'Bad Bots (Block)' },
-  { key: 'ai', label: 'AI Crawlers' },
-  { key: 'seo', label: 'SEO Tools' },
-  { key: 'custom', label: 'Custom' },
+  { key: 'good', i18nKey: 'botManagement.goodBots' },
+  { key: 'bad', i18nKey: 'botManagement.badBots' },
+  { key: 'ai', i18nKey: 'botManagement.aiCrawlers' },
+  { key: 'seo', i18nKey: 'botManagement.seoTools' },
+  { key: 'custom', i18nKey: 'botManagement.custom' },
 ]
 
 const newPattern = ref({ pattern: '', name: '', action: 'block', description: '' })
