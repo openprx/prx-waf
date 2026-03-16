@@ -414,6 +414,13 @@ impl WafEngine {
             phase: result.phase.to_string(),
             detail: Some(result.detail.clone()),
             request_headers: None,
+            geo_info: ctx.geo.as_ref().map(|g| serde_json::json!({
+                "country": g.country,
+                "province": g.province,
+                "city": g.city,
+                "isp": g.isp,
+                "iso_code": g.iso_code,
+            })),
             created_at: chrono::Utc::now(),
         };
 
@@ -448,7 +455,13 @@ impl WafEngine {
             rule_name: result.rule_name.clone(),
             action: action_str.to_string(),
             detail: Some(result.detail.clone()),
-            geo_info: None,
+            geo_info: ctx.geo.as_ref().map(|g| serde_json::json!({
+                "country": g.country,
+                "province": g.province,
+                "city": g.city,
+                "isp": g.isp,
+                "iso_code": g.iso_code,
+            })),
         };
 
         let db = Arc::clone(&self.db);

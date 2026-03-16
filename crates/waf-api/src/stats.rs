@@ -31,6 +31,8 @@ pub async fn stats_overview(State(state): State<Arc<AppState>>) -> ApiResult<Jso
             "hosts_count": overview.hosts_count,
             "top_ips": overview.top_ips,
             "top_rules": overview.top_rules,
+            "top_countries": overview.top_countries,
+            "top_isps": overview.top_isps,
         }
     })))
 }
@@ -46,4 +48,18 @@ pub async fn stats_timeseries(
         .get_stats_timeseries(q.host_code.as_deref(), hours)
         .await?;
     Ok(Json(serde_json::json!({ "success": true, "data": series })))
+}
+
+/// GET /api/stats/geo — GeoIP distribution of blocked requests
+pub async fn stats_geo(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let geo = state.db.get_geo_stats().await?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": {
+            "top_countries": geo.top_countries,
+            "top_cities": geo.top_cities,
+            "top_isps": geo.top_isps,
+            "country_distribution": geo.country_distribution,
+        }
+    })))
 }

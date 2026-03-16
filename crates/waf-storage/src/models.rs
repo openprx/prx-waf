@@ -90,6 +90,7 @@ pub struct AttackLog {
     pub phase: String,
     pub detail: Option<String>,
     pub request_headers: Option<serde_json::Value>,
+    pub geo_info: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -254,6 +255,8 @@ pub struct AttackLogQuery {
     pub host_code: Option<String>,
     pub client_ip: Option<String>,
     pub action: Option<String>,
+    pub country: Option<String>,
+    pub iso_code: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
 }
@@ -279,6 +282,8 @@ pub struct SecurityEventQuery {
     pub client_ip: Option<String>,
     pub rule_name: Option<String>,
     pub action: Option<String>,
+    pub country: Option<String>,
+    pub iso_code: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
 }
@@ -410,6 +415,25 @@ pub struct StatsOverview {
     pub hosts_count: i64,
     pub top_ips: Vec<TopEntry>,
     pub top_rules: Vec<TopEntry>,
+    pub top_countries: Vec<TopEntry>,
+    pub top_isps: Vec<TopEntry>,
+}
+
+/// GeoIP distribution statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoStats {
+    pub top_countries: Vec<TopEntry>,
+    pub top_cities: Vec<TopEntry>,
+    pub top_isps: Vec<TopEntry>,
+    pub country_distribution: Vec<GeoDistEntry>,
+}
+
+/// GeoIP country distribution entry (for map visualization)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoDistEntry {
+    pub iso_code: String,
+    pub country: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

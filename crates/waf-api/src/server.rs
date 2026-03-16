@@ -27,7 +27,7 @@ use crate::notifications::{
 use crate::plugins::{delete_plugin, disable_plugin, enable_plugin, list_plugins, upload_plugin};
 use crate::security::{list_audit_log, security_headers_middleware};
 use crate::state::AppState;
-use crate::stats::{stats_overview, stats_timeseries};
+use crate::stats::{stats_geo, stats_overview, stats_timeseries};
 use crate::static_files::static_handler;
 use crate::tunnels::{create_tunnel, delete_tunnel, list_tunnels, ws_tunnel};
 use crate::websocket::{ws_events, ws_logs};
@@ -88,6 +88,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Phase 4: Statistics
         .route("/api/stats/overview", get(stats_overview))
         .route("/api/stats/timeseries", get(stats_timeseries))
+        .route("/api/stats/geo", get(stats_geo))
         // Phase 4: Notifications
         .route("/api/notifications", get(list_notifications).post(create_notification))
         .route("/api/notifications/:id", delete(delete_notification))

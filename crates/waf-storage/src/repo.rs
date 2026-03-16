@@ -317,8 +317,8 @@ impl Database {
             r#"INSERT INTO attack_logs (
                 id, host_code, host, client_ip, method, path, query,
                 rule_id, rule_name, action, phase, detail,
-                request_headers, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"#
+                request_headers, geo_info, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"#
         )
         .bind(log.id)
         .bind(&log.host_code)
@@ -333,6 +333,7 @@ impl Database {
         .bind(&log.phase)
         .bind(&log.detail)
         .bind(&log.request_headers)
+        .bind(&log.geo_info)
         .bind(log.created_at)
         .execute(&self.pool)
         .await?;
@@ -349,11 +350,15 @@ impl Database {
             r#"SELECT COUNT(*) FROM attack_logs
                WHERE ($1::text IS NULL OR host_code = $1)
                  AND ($2::text IS NULL OR client_ip = $2)
-                 AND ($3::text IS NULL OR action = $3)"#
+                 AND ($3::text IS NULL OR action = $3)
+                 AND ($4::text IS NULL OR geo_info->>'iso_code' = $4)
+                 AND ($5::text IS NULL OR geo_info->>'country' ILIKE '%' || $5 || '%')"#
         )
         .bind(&query.host_code)
         .bind(&query.client_ip)
         .bind(&query.action)
+        .bind(&query.iso_code)
+        .bind(&query.country)
         .fetch_one(&self.pool)
         .await?;
 
@@ -362,12 +367,16 @@ impl Database {
                WHERE ($1::text IS NULL OR host_code = $1)
                  AND ($2::text IS NULL OR client_ip = $2)
                  AND ($3::text IS NULL OR action = $3)
+                 AND ($4::text IS NULL OR geo_info->>'iso_code' = $4)
+                 AND ($5::text IS NULL OR geo_info->>'country' ILIKE '%' || $5 || '%')
                ORDER BY created_at DESC
-               LIMIT $4 OFFSET $5"#
+               LIMIT $6 OFFSET $7"#
         )
         .bind(&query.host_code)
         .bind(&query.client_ip)
         .bind(&query.action)
+        .bind(&query.iso_code)
+        .bind(&query.country)
         .bind(page_size)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -809,6 +818,38 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        // Top attacking countries (from security_events.geo_info)
+        let top_countries: Vec<TopEntry> = sqlx::query(
+            "SELECT geo_info->>'country' AS entry_key, COUNT(*)::bigint AS cnt \
+             FROM security_events \
+             WHERE geo_info->>'country' IS NOT NULL AND geo_info->>'country' != '' \
+             GROUP BY entry_key \
+             ORDER BY cnt DESC \
+             LIMIT 10",
+        )
+        .map(|row: sqlx::postgres::PgRow| {
+            use sqlx::Row;
+            TopEntry { key: row.get("entry_key"), count: row.get("cnt") }
+        })
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Top ISPs
+        let top_isps: Vec<TopEntry> = sqlx::query(
+            "SELECT geo_info->>'isp' AS entry_key, COUNT(*)::bigint AS cnt \
+             FROM security_events \
+             WHERE geo_info->>'isp' IS NOT NULL AND geo_info->>'isp' != '' \
+             GROUP BY entry_key \
+             ORDER BY cnt DESC \
+             LIMIT 10",
+        )
+        .map(|row: sqlx::postgres::PgRow| {
+            use sqlx::Row;
+            TopEntry { key: row.get("entry_key"), count: row.get("cnt") }
+        })
+        .fetch_all(&self.pool)
+        .await?;
+
         Ok(StatsOverview {
             total_requests,
             total_blocked,
@@ -816,6 +857,8 @@ impl Database {
             hosts_count,
             top_ips,
             top_rules,
+            top_countries,
+            top_isps,
         })
     }
 
@@ -849,6 +892,86 @@ impl Database {
         .await?;
 
         Ok(rows)
+    }
+
+    pub async fn get_geo_stats(&self) -> Result<GeoStats, StorageError> {
+        // Top 20 countries by security event count
+        let top_countries: Vec<TopEntry> = sqlx::query(
+            "SELECT geo_info->>'country' AS entry_key, COUNT(*)::bigint AS cnt \
+             FROM security_events \
+             WHERE geo_info->>'country' IS NOT NULL AND geo_info->>'country' != '' \
+             GROUP BY entry_key \
+             ORDER BY cnt DESC \
+             LIMIT 20",
+        )
+        .map(|row: sqlx::postgres::PgRow| {
+            use sqlx::Row;
+            TopEntry { key: row.get("entry_key"), count: row.get("cnt") }
+        })
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Top 20 cities
+        let top_cities: Vec<TopEntry> = sqlx::query(
+            "SELECT geo_info->>'city' AS entry_key, COUNT(*)::bigint AS cnt \
+             FROM security_events \
+             WHERE geo_info->>'city' IS NOT NULL AND geo_info->>'city' != '' \
+             GROUP BY entry_key \
+             ORDER BY cnt DESC \
+             LIMIT 20",
+        )
+        .map(|row: sqlx::postgres::PgRow| {
+            use sqlx::Row;
+            TopEntry { key: row.get("entry_key"), count: row.get("cnt") }
+        })
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Top 20 ISPs
+        let top_isps: Vec<TopEntry> = sqlx::query(
+            "SELECT geo_info->>'isp' AS entry_key, COUNT(*)::bigint AS cnt \
+             FROM security_events \
+             WHERE geo_info->>'isp' IS NOT NULL AND geo_info->>'isp' != '' \
+             GROUP BY entry_key \
+             ORDER BY cnt DESC \
+             LIMIT 20",
+        )
+        .map(|row: sqlx::postgres::PgRow| {
+            use sqlx::Row;
+            TopEntry { key: row.get("entry_key"), count: row.get("cnt") }
+        })
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Country distribution with iso_code (for world map visualization)
+        let country_distribution: Vec<GeoDistEntry> = sqlx::query(
+            "SELECT \
+                COALESCE(geo_info->>'iso_code', '') AS iso_code, \
+                geo_info->>'country' AS country, \
+                COUNT(*)::bigint AS cnt \
+             FROM security_events \
+             WHERE geo_info->>'country' IS NOT NULL AND geo_info->>'country' != '' \
+             GROUP BY iso_code, country \
+             ORDER BY cnt DESC \
+             LIMIT 200",
+        )
+        .map(|row: sqlx::postgres::PgRow| {
+            use sqlx::Row;
+            GeoDistEntry {
+                iso_code: row.get("iso_code"),
+                country: row.get("country"),
+                count: row.get("cnt"),
+            }
+        })
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(GeoStats {
+            top_countries,
+            top_cities,
+            top_isps,
+            country_distribution,
+        })
     }
 
     pub async fn delete_old_stats(&self, days: i64) -> Result<u64, StorageError> {
@@ -995,12 +1118,16 @@ impl Database {
                WHERE ($1::text IS NULL OR host_code = $1)
                  AND ($2::text IS NULL OR client_ip = $2)
                  AND ($3::text IS NULL OR rule_name = $3)
-                 AND ($4::text IS NULL OR action = $4)"#,
+                 AND ($4::text IS NULL OR action = $4)
+                 AND ($5::text IS NULL OR geo_info->>'iso_code' = $5)
+                 AND ($6::text IS NULL OR geo_info->>'country' ILIKE '%' || $6 || '%')"#,
         )
         .bind(&query.host_code)
         .bind(&query.client_ip)
         .bind(&query.rule_name)
         .bind(&query.action)
+        .bind(&query.iso_code)
+        .bind(&query.country)
         .fetch_one(&self.pool)
         .await?;
 
@@ -1010,13 +1137,17 @@ impl Database {
                  AND ($2::text IS NULL OR client_ip = $2)
                  AND ($3::text IS NULL OR rule_name = $3)
                  AND ($4::text IS NULL OR action = $4)
+                 AND ($5::text IS NULL OR geo_info->>'iso_code' = $5)
+                 AND ($6::text IS NULL OR geo_info->>'country' ILIKE '%' || $6 || '%')
                ORDER BY created_at DESC
-               LIMIT $5 OFFSET $6"#,
+               LIMIT $7 OFFSET $8"#,
         )
         .bind(&query.host_code)
         .bind(&query.client_ip)
         .bind(&query.rule_name)
         .bind(&query.action)
+        .bind(&query.iso_code)
+        .bind(&query.country)
         .bind(page_size)
         .bind(offset)
         .fetch_all(&self.pool)
