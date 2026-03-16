@@ -14,6 +14,9 @@ pub struct AppConfig {
     pub http3: Http3Config,
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Phase 6: CrowdSec integration
+    #[serde(default)]
+    pub crowdsec: CrowdSecConfig,
 }
 
 impl Default for AppConfig {
@@ -26,8 +29,68 @@ impl Default for AppConfig {
             cache: CacheConfig::default(),
             http3: Http3Config::default(),
             security: SecurityConfig::default(),
+            crowdsec: CrowdSecConfig::default(),
         }
     }
+}
+
+/// CrowdSec integration configuration (mirrors waf-engine CrowdSecConfig but
+/// lives in waf-common so it can be loaded from the TOML without pulling in
+/// the full engine crate as a dep of prx-waf's config loader).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrowdSecConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: String,
+    pub lapi_url: String,
+    pub api_key: String,
+    #[serde(default = "default_cs_update_secs")]
+    pub update_frequency_secs: u64,
+    #[serde(default)]
+    pub cache_ttl_secs: u64,
+    #[serde(default = "default_cs_fallback")]
+    pub fallback_action: String,
+    #[serde(default)]
+    pub scenarios_containing: Vec<String>,
+    #[serde(default)]
+    pub scenarios_not_containing: Vec<String>,
+    pub appsec_endpoint: Option<String>,
+    pub appsec_key: Option<String>,
+    #[serde(default = "default_appsec_timeout")]
+    pub appsec_timeout_ms: u64,
+    pub pusher_login: Option<String>,
+    pub pusher_password: Option<String>,
+}
+
+impl Default for CrowdSecConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "bouncer".to_string(),
+            lapi_url: "http://127.0.0.1:8080".to_string(),
+            api_key: String::new(),
+            update_frequency_secs: default_cs_update_secs(),
+            cache_ttl_secs: 0,
+            fallback_action: default_cs_fallback(),
+            scenarios_containing: Vec::new(),
+            scenarios_not_containing: Vec::new(),
+            appsec_endpoint: None,
+            appsec_key: None,
+            appsec_timeout_ms: default_appsec_timeout(),
+            pusher_login: None,
+            pusher_password: None,
+        }
+    }
+}
+
+fn default_cs_update_secs() -> u64 {
+    10
+}
+fn default_cs_fallback() -> String {
+    "allow".to_string()
+}
+fn default_appsec_timeout() -> u64 {
+    500
 }
 
 /// Proxy listener configuration

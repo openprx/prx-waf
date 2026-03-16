@@ -14,6 +14,10 @@ const routes = [
   { path: '/cc-protection', component: () => import('../views/CCProtection.vue') },
   { path: '/notifications', component: () => import('../views/Notifications.vue') },
   { path: '/settings', component: () => import('../views/Settings.vue') },
+  // Phase 6: CrowdSec
+  { path: '/crowdsec-settings', component: () => import('../views/CrowdSecSettings.vue') },
+  { path: '/crowdsec-decisions', component: () => import('../views/CrowdSecDecisions.vue') },
+  { path: '/crowdsec-stats', component: () => import('../views/CrowdSecStats.vue') },
 ]
 
 const router = createRouter({

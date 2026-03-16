@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -16,6 +16,7 @@ use crate::checks::{
     AntiHotlinkCheck, BotCheck, CcCheck, Check, DirTraversalCheck, OWASPCheck, RceCheck,
     ScannerCheck, SensitiveCheck, SqlInjectionCheck, XssCheck,
 };
+use crate::crowdsec::{appsec_to_detection, AppSecClient, AppSecResult, CrowdSecChecker};
 use crate::rules::engine::{from_db_rule, CustomRulesEngine};
 
 /// WAF engine configuration
@@ -28,7 +29,9 @@ pub struct WafEngineConfig {
 /// Main WAF engine — runs all detection phases.
 ///
 /// Phase 1-4  : IP / URL whitelist + blacklist (fast-path)
+/// Phase 16   : CrowdSec bouncer (cache lookup — runs early for efficiency)
 /// Phase 5-11 : Attack detection (CC, scanner, bot, SQLi, XSS, RCE, traversal)
+/// Phase 16b  : CrowdSec AppSec (async HTTP check — runs after local detectors)
 /// Phase 12   : Custom rules engine (Rhai scripting)
 /// Phase 13   : OWASP CRS subset
 /// Phase 14   : Sensitive data detection
@@ -41,9 +44,14 @@ pub struct WafEngine {
     db: Arc<Database>,
     #[allow(dead_code)]
     config: WafEngineConfig,
-    /// Dynamic checker pipeline (Phase 2 detectors).
+    /// Dynamic checker pipeline (Phase 5-11 detectors).
     checkers: Vec<Box<dyn Check>>,
     owasp: Arc<OWASPCheck>,
+    // ── Phase 6: CrowdSec ────────────────────────────────────────────────────
+    /// Bouncer checker (set once after engine construction via set_crowdsec)
+    crowdsec_checker: OnceLock<Arc<CrowdSecChecker>>,
+    /// AppSec client (set once after engine construction via set_crowdsec)
+    appsec_client: OnceLock<Arc<AppSecClient>>,
 }
 
 impl WafEngine {
@@ -54,7 +62,7 @@ impl WafEngine {
         let hotlink = Arc::new(AntiHotlinkCheck::new());
         let owasp = Arc::new(OWASPCheck::new());
 
-        // Build the Phase 2 checker pipeline.
+        // Build the Phase 5-11 checker pipeline.
         // CC runs first to shed flood traffic before expensive pattern checks.
         let checkers: Vec<Box<dyn Check>> = vec![
             Box::new(CcCheck::new()),
@@ -75,6 +83,20 @@ impl WafEngine {
             config,
             checkers,
             owasp,
+            crowdsec_checker: OnceLock::new(),
+            appsec_client: OnceLock::new(),
+        }
+    }
+
+    /// Plug CrowdSec components into the engine (called once after init).
+    pub fn set_crowdsec(
+        &self,
+        checker: Arc<CrowdSecChecker>,
+        appsec: Option<Arc<AppSecClient>>,
+    ) {
+        let _ = self.crowdsec_checker.set(checker);
+        if let Some(ac) = appsec {
+            let _ = self.appsec_client.set(ac);
         }
     }
 
@@ -186,6 +208,24 @@ impl WafEngine {
             return url_bl;
         }
 
+        // ── Phase 16a: CrowdSec Bouncer — fast cache lookup ───────────────────
+        if let Some(cs) = self.crowdsec_checker.get() {
+            if let Some(result) = cs.check(ctx) {
+                let rule_name = result.rule_name.clone();
+                let decision = if ctx.host_config.log_only_mode {
+                    WafDecision {
+                        action: WafAction::LogOnly,
+                        result: Some(result),
+                    }
+                } else {
+                    let body = render_block_page(ctx, &rule_name);
+                    WafDecision::block(403, Some(body), result)
+                };
+                self.log_security_event(ctx, &decision).await;
+                return decision;
+            }
+        }
+
         // ── Phase 5-11: Attack detection pipeline ─────────────────────────────
         for checker in &self.checkers {
             if let Some(result) = checker.check(ctx) {
@@ -206,11 +246,36 @@ impl WafEngine {
             }
         }
 
+        // ── Phase 16b: CrowdSec AppSec — async per-request check ──────────────
+        if let Some(appsec) = self.appsec_client.get() {
+            match appsec.check_request(ctx).await {
+                AppSecResult::Block { message } => {
+                    let result = appsec_to_detection(message);
+                    let rule_name = result.rule_name.clone();
+                    let decision = if ctx.host_config.log_only_mode {
+                        WafDecision {
+                            action: WafAction::LogOnly,
+                            result: Some(result),
+                        }
+                    } else {
+                        let body = render_block_page(ctx, &rule_name);
+                        WafDecision::block(403, Some(body), result)
+                    };
+                    self.log_security_event(ctx, &decision).await;
+                    return decision;
+                }
+                AppSecResult::Allow | AppSecResult::Unavailable => {}
+            }
+        }
+
         // ── Phase 12: Custom rules engine ─────────────────────────────────────
         if let Some(result) = self.custom_rules.check(ctx) {
             let rule_name = result.rule_name.clone();
             let decision = if ctx.host_config.log_only_mode {
-                WafDecision { action: WafAction::LogOnly, result: Some(result) }
+                WafDecision {
+                    action: WafAction::LogOnly,
+                    result: Some(result),
+                }
             } else {
                 let body = render_block_page(ctx, &rule_name);
                 WafDecision::block(403, Some(body), result)
@@ -223,7 +288,10 @@ impl WafEngine {
         if let Some(result) = self.owasp.check(ctx) {
             let rule_name = result.rule_name.clone();
             let decision = if ctx.host_config.log_only_mode {
-                WafDecision { action: WafAction::LogOnly, result: Some(result) }
+                WafDecision {
+                    action: WafAction::LogOnly,
+                    result: Some(result),
+                }
             } else {
                 let body = render_block_page(ctx, &rule_name);
                 WafDecision::block(403, Some(body), result)
@@ -236,7 +304,10 @@ impl WafEngine {
         if let Some(result) = self.sensitive.check(ctx) {
             let rule_name = result.rule_name.clone();
             let decision = if ctx.host_config.log_only_mode {
-                WafDecision { action: WafAction::LogOnly, result: Some(result) }
+                WafDecision {
+                    action: WafAction::LogOnly,
+                    result: Some(result),
+                }
             } else {
                 let body = render_block_page(ctx, &rule_name);
                 WafDecision::block(403, Some(body), result)
@@ -249,7 +320,10 @@ impl WafEngine {
         if let Some(result) = self.hotlink.check(ctx) {
             let rule_name = result.rule_name.clone();
             let decision = if ctx.host_config.log_only_mode {
-                WafDecision { action: WafAction::LogOnly, result: Some(result) }
+                WafDecision {
+                    action: WafAction::LogOnly,
+                    result: Some(result),
+                }
             } else {
                 let body = render_block_page(ctx, &rule_name);
                 WafDecision::block(403, Some(body), result)

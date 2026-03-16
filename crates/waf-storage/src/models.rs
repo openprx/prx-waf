@@ -548,3 +548,71 @@ pub struct AuditLogQuery {
     pub page: Option<i64>,
     pub page_size: Option<i64>,
 }
+
+// ─── Phase 6: CrowdSec ────────────────────────────────────────────────────────
+
+/// CrowdSec integration configuration stored in database
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct CrowdSecConfigRow {
+    pub id: i32,
+    pub host_id: Option<Uuid>,
+    pub enabled: bool,
+    pub mode: String,
+    pub lapi_url: Option<String>,
+    /// AES-256-GCM encrypted API key (base64 encoded)
+    pub api_key_encrypted: Option<String>,
+    pub appsec_endpoint: Option<String>,
+    /// AES-256-GCM encrypted AppSec API key (base64 encoded)
+    pub appsec_key_encrypted: Option<String>,
+    pub update_frequency_secs: i32,
+    pub fallback_action: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Upsert CrowdSec config request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertCrowdSecConfig {
+    pub host_id: Option<Uuid>,
+    pub enabled: bool,
+    pub mode: String,
+    pub lapi_url: Option<String>,
+    /// Plaintext API key (will be encrypted before storage)
+    pub api_key: Option<String>,
+    pub appsec_endpoint: Option<String>,
+    /// Plaintext AppSec API key (will be encrypted before storage)
+    pub appsec_key: Option<String>,
+    pub update_frequency_secs: Option<i32>,
+    pub fallback_action: Option<String>,
+}
+
+/// A persisted CrowdSec event / detection log
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct CrowdSecEventRow {
+    pub id: i64,
+    pub host_id: Option<Uuid>,
+    pub client_ip: Option<String>,
+    pub decision_type: Option<String>,
+    pub scenario: Option<String>,
+    pub action_taken: Option<String>,
+    pub request_path: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert a new CrowdSec event
+#[derive(Debug, Clone)]
+pub struct CreateCrowdSecEvent {
+    pub host_id: Option<Uuid>,
+    pub client_ip: String,
+    pub decision_type: String,
+    pub scenario: String,
+    pub action_taken: String,
+    pub request_path: Option<String>,
+}
+
+/// Query params for listing CrowdSec events
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CrowdSecEventQuery {
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+}

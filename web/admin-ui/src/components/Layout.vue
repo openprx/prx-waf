@@ -17,6 +17,10 @@
         <NavItem to="/cc-protection" icon="🛡️">CC Protection</NavItem>
         <NavItem to="/notifications" icon="🔔">Notifications</NavItem>
         <NavItem to="/settings" icon="⚙️">Settings</NavItem>
+        <div class="pt-2 pb-1 px-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">CrowdSec</div>
+        <NavItem to="/crowdsec-settings" icon="🌩️">CS Settings</NavItem>
+        <NavItem to="/crowdsec-decisions" icon="🚫">CS Decisions</NavItem>
+        <NavItem to="/crowdsec-stats" icon="📈">CS Stats</NavItem>
       </nav>
       <div class="px-4 py-3 border-t border-gray-700">
         <div class="flex items-center justify-between">

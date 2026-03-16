@@ -86,6 +86,8 @@ pub enum Phase {
     Sensitive = 14,
     /// Anti-hotlinking (Referer check)
     AntiHotlink = 15,
+    /// CrowdSec bouncer / AppSec decision
+    CrowdSec = 16,
 }
 
 impl std::fmt::Display for Phase {
@@ -106,6 +108,7 @@ impl std::fmt::Display for Phase {
             Phase::Owasp => write!(f, "OWASP CRS"),
             Phase::Sensitive => write!(f, "Sensitive Data"),
             Phase::AntiHotlink => write!(f, "Anti-Hotlink"),
+            Phase::CrowdSec => write!(f, "CrowdSec"),
         }
     }
 }

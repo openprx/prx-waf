@@ -24,3 +24,4 @@ rhai = { workspace = true }
 aho-corasick = { workspace = true }
 serde_yaml = { workspace = true }
 wasmtime = { workspace = true }
+reqwest = { workspace = true }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use gateway::{HostRouter, ResponseCache, TunnelRegistry};
-use waf_engine::{PluginManager, WafEngine};
+use waf_engine::{CrowdSecClient, DecisionCache, PluginManager, WafEngine};
 use waf_storage::Database;
 
 use crate::notifications::NotifRateLimiter;
@@ -30,6 +30,13 @@ pub struct AppState {
     pub plugin_manager: Arc<PluginManager>,
     /// Reverse tunnel registry
     pub tunnel_registry: Arc<TunnelRegistry>,
+    // ── Phase 6: CrowdSec ────────────────────────────────────────────────────
+    /// In-memory decision cache (None if CrowdSec not enabled)
+    pub crowdsec_cache: Option<Arc<DecisionCache>>,
+    /// LAPI client for delete/test operations (None if CrowdSec not enabled)
+    pub crowdsec_client: Option<Arc<CrowdSecClient>>,
+    /// LAPI base URL (for display in status endpoint)
+    pub crowdsec_lapi_url: Option<String>,
 }
 
 impl AppState {
@@ -49,6 +56,9 @@ impl AppState {
             cache: ResponseCache::new(256, 60, 3600),
             plugin_manager: Arc::new(PluginManager::new()),
             tunnel_registry: TunnelRegistry::new(),
+            crowdsec_cache: None,
+            crowdsec_client: None,
+            crowdsec_lapi_url: None,
         }
     }
 

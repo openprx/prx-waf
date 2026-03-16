@@ -1230,4 +1230,106 @@ impl Database {
 
         Ok((rows, total))
     }
+
+    // ─── Phase 6: CrowdSec ───────────────────────────────────────────────────
+
+    pub async fn get_crowdsec_config(
+        &self,
+    ) -> Result<Option<CrowdSecConfigRow>, StorageError> {
+        Ok(sqlx::query_as::<_, CrowdSecConfigRow>(
+            "SELECT * FROM crowdsec_config ORDER BY id LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn upsert_crowdsec_config(
+        &self,
+        req: &UpsertCrowdSecConfig,
+        api_key_enc: Option<String>,
+        appsec_key_enc: Option<String>,
+    ) -> Result<CrowdSecConfigRow, StorageError> {
+        let now = chrono::Utc::now();
+        let freq = req.update_frequency_secs.unwrap_or(10);
+        let fallback = req
+            .fallback_action
+            .clone()
+            .unwrap_or_else(|| "allow".to_string());
+
+        let row = sqlx::query_as::<_, CrowdSecConfigRow>(
+            r#"INSERT INTO crowdsec_config
+               (host_id, enabled, mode, lapi_url, api_key_encrypted,
+                appsec_endpoint, appsec_key_encrypted,
+                update_frequency_secs, fallback_action, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+               ON CONFLICT (id) DO UPDATE SET
+                 enabled = EXCLUDED.enabled,
+                 mode = EXCLUDED.mode,
+                 lapi_url = EXCLUDED.lapi_url,
+                 api_key_encrypted = COALESCE(EXCLUDED.api_key_encrypted, crowdsec_config.api_key_encrypted),
+                 appsec_endpoint = EXCLUDED.appsec_endpoint,
+                 appsec_key_encrypted = COALESCE(EXCLUDED.appsec_key_encrypted, crowdsec_config.appsec_key_encrypted),
+                 update_frequency_secs = EXCLUDED.update_frequency_secs,
+                 fallback_action = EXCLUDED.fallback_action,
+                 updated_at = EXCLUDED.updated_at
+               RETURNING *"#,
+        )
+        .bind(req.host_id)
+        .bind(req.enabled)
+        .bind(&req.mode)
+        .bind(&req.lapi_url)
+        .bind(&api_key_enc)
+        .bind(&req.appsec_endpoint)
+        .bind(&appsec_key_enc)
+        .bind(freq)
+        .bind(&fallback)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn log_crowdsec_event(
+        &self,
+        req: &CreateCrowdSecEvent,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"INSERT INTO crowdsec_events
+               (host_id, client_ip, decision_type, scenario, action_taken, request_path)
+               VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind(req.host_id)
+        .bind(&req.client_ip)
+        .bind(&req.decision_type)
+        .bind(&req.scenario)
+        .bind(&req.action_taken)
+        .bind(&req.request_path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_crowdsec_events(
+        &self,
+        query: &CrowdSecEventQuery,
+    ) -> Result<(Vec<CrowdSecEventRow>, i64), StorageError> {
+        let page = query.page.unwrap_or(1).max(1);
+        let page_size = query.page_size.unwrap_or(50).min(200).max(1);
+        let offset = (page - 1) * page_size;
+
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM crowdsec_events")
+                .fetch_one(&self.pool)
+                .await?;
+
+        let rows = sqlx::query_as::<_, CrowdSecEventRow>(
+            "SELECT * FROM crowdsec_events ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+        )
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((rows, total))
+    }
 }

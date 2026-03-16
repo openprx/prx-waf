@@ -12,6 +12,11 @@ use tracing::info;
 
 use crate::auth::{login, logout, refresh_token};
 use crate::cache_api::{cache_flush, cache_flush_host, cache_flush_key, cache_stats};
+use crate::crowdsec::{
+    crowdsec_stats, crowdsec_status, delete_crowdsec_decision, get_crowdsec_config,
+    list_crowdsec_decisions, list_crowdsec_events, test_crowdsec_connection,
+    update_crowdsec_config,
+};
 use crate::handlers::*;
 use crate::health::health_check;
 use crate::middleware::require_auth;
@@ -103,6 +108,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/cache/key", delete(cache_flush_key))
         // Phase 5: Audit log
         .route("/api/audit-log", get(list_audit_log))
+        // Phase 6: CrowdSec
+        .route("/api/crowdsec/status", get(crowdsec_status))
+        .route("/api/crowdsec/decisions", get(list_crowdsec_decisions))
+        .route("/api/crowdsec/decisions/:id", delete(delete_crowdsec_decision))
+        .route("/api/crowdsec/test", post(test_crowdsec_connection))
+        .route("/api/crowdsec/config", get(get_crowdsec_config).put(update_crowdsec_config))
+        .route("/api/crowdsec/stats", get(crowdsec_stats))
+        .route("/api/crowdsec/events", get(list_crowdsec_events))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     // WebSocket routes (auth via query param, no layer middleware)
