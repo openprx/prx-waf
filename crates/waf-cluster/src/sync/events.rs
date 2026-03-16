@@ -1,10 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use crate::protocol::{EventBatch, SecurityEvent, StatsBatch};
+use crate::protocol::{ClusterMessage, EventBatch, SecurityEvent, StatsBatch};
 
 // ─── EventBatcher ─────────────────────────────────────────────────────────────
 
@@ -209,4 +210,60 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+// ─── Stats sender (QUIC datagrams) ────────────────────────────────────────────
+
+/// Periodically flush `collector` and ship the resulting [`StatsBatch`] to the
+/// main node as an unreliable QUIC datagram.
+///
+/// Datagram loss is acceptable — the main node uses a rolling window rather than
+/// an exact total, so a missed batch merely reduces precision.
+///
+/// The loop exits cleanly when the QUIC connection is closed.
+pub async fn run_stats_sender(
+    mut collector: StatsCollector,
+    interval_ms: u64,
+    conn: quinn::Connection,
+) {
+    let interval = interval_ms.max(1);
+    let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(interval));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = conn.closed() => {
+                debug!("Stats sender: QUIC connection closed, stopping");
+                return;
+            }
+
+            _ = ticker.tick() => {
+                let batch = collector.flush();
+                if batch.total_requests == 0 {
+                    continue;
+                }
+                let msg = ClusterMessage::StatsBatch(batch);
+                match serde_json::to_vec(&msg) {
+                    Ok(data) => {
+                        if let Err(e) = conn.send_datagram(Bytes::from(data)) {
+                            match e {
+                                quinn::SendDatagramError::ConnectionLost(_) => {
+                                    debug!("Stats sender: connection lost, stopping");
+                                    return;
+                                }
+                                other => {
+                                    tracing::warn!("Stats datagram send failed: {other}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to serialize StatsBatch: {e}");
+                    }
+                }
+            }
+        }
+    }
 }

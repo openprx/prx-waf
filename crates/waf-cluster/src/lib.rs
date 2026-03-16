@@ -12,6 +12,7 @@ pub use cluster_forward::PendingForwards;
 pub use node::{NodeState, PeerInfo, StorageMode};
 pub use protocol::ClusterMessage;
 pub use waf_common::config::{ClusterConfig, NodeRole};
+pub use waf_engine::RuleReloader;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

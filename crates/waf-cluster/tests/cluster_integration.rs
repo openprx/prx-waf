@@ -1,5 +1,6 @@
 //! Integration tests: two-node QUIC mTLS cluster — connect and exchange heartbeats.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,13 +14,46 @@ use tokio::sync::mpsc;
 fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
+
 use waf_cluster::{
-    ClusterMessage, NodeState, StorageMode,
+    ClusterMessage, NodeState, RuleReloader, StorageMode,
     crypto::{ca::CertificateAuthority, node_cert::NodeCertificate},
     node::PeerInfo,
+    protocol::{ChangeOp, RuleSyncRequest, SyncType},
+    sync::rules::{apply_sync_response, handle_sync_request, RuleChangelog},
     transport::{client::ClusterClient, server::ClusterServer},
 };
 use waf_common::config::{ClusterConfig, NodeRole};
+use waf_engine::{Rule, RuleRegistry};
+
+// ─── Shared test helpers ───────────────────────────────────────────────────────
+
+/// No-op [`RuleReloader`] used in rule-sync tests — accepts updates silently.
+struct NoopReloader;
+
+#[async_trait::async_trait]
+impl RuleReloader for NoopReloader {
+    async fn on_rules_updated(&self, _version: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Build a minimal [`Rule`] with the given id for use in tests.
+fn make_test_rule(id: &str) -> Rule {
+    Rule {
+        id: id.to_string(),
+        name: format!("Test Rule {id}"),
+        description: None,
+        category: "sqli".to_string(),
+        source: "test".to_string(),
+        enabled: true,
+        action: "block".to_string(),
+        severity: Some("high".to_string()),
+        pattern: Some(r"SELECT\s+.+\s+FROM".to_string()),
+        tags: vec![],
+        metadata: HashMap::new(),
+    }
+}
 
 /// Bind to a random available port on loopback and return its `SocketAddr`.
 fn random_loopback_addr() -> SocketAddr {
@@ -44,6 +78,8 @@ fn make_node_state(node_id: &str, config: ClusterConfig) -> Arc<NodeState> {
             .expect("NodeState::new failed"),
     )
 }
+
+// ─── QUIC transport tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn two_nodes_connect_and_exchange_heartbeat() {
@@ -167,4 +203,171 @@ async fn cert_generation_and_roundtrip() {
     let chain = node_cert.cert_chain_der().expect("cert chain DER");
     assert!(!chain.is_empty());
     node_cert.private_key_der().expect("private key DER");
+}
+
+// ─── Rule sync tests ───────────────────────────────────────────────────────────
+
+/// A rule created on the main node is correctly delivered to the worker.
+///
+/// This test exercises the full sync pipeline in-process:
+/// 1. Main: record a rule change in the `RuleChangelog`.
+/// 2. Worker: issue a `RuleSyncRequest` at version 0 (brand-new node).
+/// 3. Main: respond with `handle_sync_request` — expects a **Full** snapshot
+///    because the worker has never synced before.
+/// 4. Worker: apply via `apply_sync_response` + `NoopReloader`.
+/// 5. Assert the worker registry contains the rule at the correct version.
+///
+/// A second pass then exercises the **Incremental** path:
+/// 6. Main: add a second rule to the changelog.
+/// 7. Worker: re-request from its current version.
+/// 8. Main: responds with one incremental change.
+/// 9. Worker: applies and both rules are now present.
+#[tokio::test]
+async fn rule_created_on_main_synced_to_worker() {
+    // ── Main: build a rule and record it in the changelog ─────────────────
+    let rule_a = make_test_rule("sqli-001");
+    let mut changelog = RuleChangelog::new(500);
+    changelog.record_change(ChangeOp::Upsert, rule_a.id.clone(), Some(&rule_a));
+
+    // ── Worker: brand-new — current_version = 0 ───────────────────────────
+    let request_v0 = RuleSyncRequest { current_version: 0 };
+
+    // ── Main: respond to the request ──────────────────────────────────────
+    let resp_full =
+        handle_sync_request(&changelog, &request_v0, &[rule_a.clone()])
+            .expect("handle_sync_request (full) failed");
+
+    // A worker at version 0 is behind the first changelog entry (version 1),
+    // so the main must send a full snapshot.
+    assert!(
+        matches!(resp_full.sync_type, SyncType::Full),
+        "brand-new worker should receive a full snapshot"
+    );
+    assert!(
+        !resp_full.snapshot_lz4.is_empty(),
+        "full snapshot payload must not be empty"
+    );
+    let full_version = resp_full.version;
+
+    // ── Worker: apply the full snapshot ───────────────────────────────────
+    let mut worker_registry = RuleRegistry::new();
+    let reloader = NoopReloader;
+    apply_sync_response(resp_full, &mut worker_registry, &reloader)
+        .await
+        .expect("apply_sync_response (full) failed");
+
+    assert!(
+        worker_registry.rules.contains_key("sqli-001"),
+        "worker registry must contain the synced rule after full snapshot"
+    );
+    assert_eq!(
+        worker_registry.version,
+        full_version,
+        "worker version must match main's authoritative version after full sync"
+    );
+
+    // ── Main: add a second rule ────────────────────────────────────────────
+    let rule_b = make_test_rule("xss-001");
+    changelog.record_change(ChangeOp::Upsert, rule_b.id.clone(), Some(&rule_b));
+
+    // ── Worker: request from its current version ───────────────────────────
+    let request_v1 = RuleSyncRequest { current_version: worker_registry.version };
+
+    let all_rules = [rule_a.clone(), rule_b.clone()];
+    let resp_incr =
+        handle_sync_request(&changelog, &request_v1, &all_rules)
+            .expect("handle_sync_request (incremental) failed");
+
+    assert!(
+        matches!(resp_incr.sync_type, SyncType::Incremental),
+        "existing worker should receive incremental diff, not full snapshot"
+    );
+    assert_eq!(
+        resp_incr.changes.len(),
+        1,
+        "exactly one rule change since last sync"
+    );
+    assert_eq!(resp_incr.changes[0].rule_id, "xss-001");
+    let incr_version = resp_incr.version;
+
+    // ── Worker: apply the incremental diff ────────────────────────────────
+    apply_sync_response(resp_incr, &mut worker_registry, &reloader)
+        .await
+        .expect("apply_sync_response (incremental) failed");
+
+    assert!(
+        worker_registry.rules.contains_key("xss-001"),
+        "worker registry must contain the new rule after incremental sync"
+    );
+    assert!(
+        worker_registry.rules.contains_key("sqli-001"),
+        "worker registry must retain previously synced rules"
+    );
+    assert_eq!(
+        worker_registry.version,
+        incr_version,
+        "worker version must match main's authoritative version after incremental sync"
+    );
+
+    // ── Verify rule deletion is propagated ────────────────────────────────
+    changelog.record_change(ChangeOp::Delete, "sqli-001".to_string(), None);
+
+    let request_v2 = RuleSyncRequest { current_version: worker_registry.version };
+    let remaining_rules = [rule_b.clone()];
+    let resp_delete =
+        handle_sync_request(&changelog, &request_v2, &remaining_rules)
+            .expect("handle_sync_request (delete) failed");
+
+    assert!(
+        matches!(resp_delete.sync_type, SyncType::Incremental),
+        "delete should be delivered as incremental change"
+    );
+    assert_eq!(resp_delete.changes.len(), 1, "one deletion change");
+
+    apply_sync_response(resp_delete, &mut worker_registry, &reloader)
+        .await
+        .expect("apply_sync_response (delete) failed");
+
+    assert!(
+        !worker_registry.rules.contains_key("sqli-001"),
+        "deleted rule must be removed from worker registry"
+    );
+    assert!(
+        worker_registry.rules.contains_key("xss-001"),
+        "non-deleted rule must still be present"
+    );
+}
+
+/// When a worker is too far behind the changelog ring buffer it receives a full
+/// snapshot rather than stale incremental changes.
+#[tokio::test]
+async fn rule_sync_falls_back_to_full_when_worker_too_far_behind() {
+    // Fill the changelog to capacity (3 entries max), then request from 0.
+    let mut changelog = RuleChangelog::new(3);
+    for i in 0..3u32 {
+        let rule = make_test_rule(&format!("rule-{i:03}"));
+        changelog.record_change(ChangeOp::Upsert, rule.id.clone(), Some(&rule));
+    }
+
+    // Worker at version 0 is behind the oldest retained entry (version 1) once
+    // the ring buffer has been populated past its capacity.  With max_retained=3
+    // and 3 insertions, the oldest entry is version 1, so version 0 < 1 → Full.
+    let request = RuleSyncRequest { current_version: 0 };
+    let rules: Vec<Rule> = (0..3u32).map(|i| make_test_rule(&format!("rule-{i:03}"))).collect();
+    let resp = handle_sync_request(&changelog, &request, &rules)
+        .expect("handle_sync_request failed");
+
+    assert!(
+        matches!(resp.sync_type, SyncType::Full),
+        "worker too far behind should receive full snapshot"
+    );
+
+    let mut registry = RuleRegistry::new();
+    let reloader = NoopReloader;
+    apply_sync_response(resp, &mut registry, &reloader)
+        .await
+        .expect("apply full snapshot after fallback failed");
+
+    assert_eq!(registry.rules.len(), 3, "all 3 rules should be in worker registry");
+    assert_eq!(registry.version, changelog.current_version());
 }

@@ -43,4 +43,5 @@ time = { workspace = true }
 lz4_flex = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio       = { workspace = true }
+async-trait = { workspace = true }

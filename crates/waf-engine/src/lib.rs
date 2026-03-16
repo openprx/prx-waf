@@ -23,3 +23,23 @@ pub use rules::formats::{ExportFormat, RuleFormat, ValidationError};
 pub use rules::manager::RuleManager;
 pub use rules::registry::{Rule, RuleRegistry, RuleStats};
 pub use rules::sources::{RuleLoadReport, RuleReloadReport, RuleSource};
+
+/// Callback trait invoked by the cluster sync layer after rules are updated.
+///
+/// `WafEngine` provides the canonical implementation, which delegates to its
+/// existing `reload_rules()` method.  Test code (and workers without a live
+/// engine) can supply a no-op implementation.
+#[async_trait::async_trait]
+pub trait RuleReloader: Send + Sync {
+    /// Called after the local `RuleRegistry` has been mutated by a cluster
+    /// sync operation.  `version` is the authoritative version received from
+    /// the main node.
+    async fn on_rules_updated(&self, version: u64) -> anyhow::Result<()>;
+}
+
+#[async_trait::async_trait]
+impl RuleReloader for WafEngine {
+    async fn on_rules_updated(&self, _version: u64) -> anyhow::Result<()> {
+        self.reload_rules().await
+    }
+}

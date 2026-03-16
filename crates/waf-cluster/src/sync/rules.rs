@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use anyhow::{Context, Result};
-use waf_engine::{Rule, RuleRegistry};
+use waf_engine::{Rule, RuleRegistry, RuleReloader};
 
 use crate::protocol::{ChangeOp, RuleChange, RuleSyncRequest, RuleSyncResponse, SyncType};
 
@@ -165,6 +165,34 @@ pub fn apply_full_snapshot(registry: &mut RuleRegistry, data: &[u8]) -> Result<(
         registry.insert(rule);
     }
     Ok(())
+}
+
+/// Apply a `RuleSyncResponse` received from the main node to a local registry.
+///
+/// * `Incremental` — applies the embedded change list to the existing registry.
+/// * `Full` — decompresses the lz4 snapshot, clears the registry, and reloads
+///   all rules from scratch.
+///
+/// In both cases the registry version is set to the authoritative value carried
+/// by the response, and `reloader.on_rules_updated()` is called so the engine
+/// can react (e.g., hot-reload pattern matchers).
+pub async fn apply_sync_response(
+    response: RuleSyncResponse,
+    registry: &mut RuleRegistry,
+    reloader: &dyn RuleReloader,
+) -> Result<()> {
+    match response.sync_type {
+        SyncType::Incremental => {
+            apply_rule_changes(registry, response.changes)?;
+        }
+        SyncType::Full => {
+            apply_full_snapshot(registry, &response.snapshot_lz4)?;
+        }
+    }
+    // Override the version accumulated by individual insert/remove calls with
+    // the single authoritative version stamped by the main node.
+    registry.version = response.version;
+    reloader.on_rules_updated(response.version).await
 }
 
 // ─── Low-level compression helpers (kept for compatibility) ───────────────────
