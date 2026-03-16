@@ -152,7 +152,6 @@ impl Check for AntiHotlinkCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::IpAddr;
     use std::sync::Arc;
     use bytes::Bytes;
     use std::collections::HashMap;

@@ -374,11 +374,10 @@ pub fn from_db_rule(row: &DbCustomRule) -> anyhow::Result<CustomRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::IpAddr;
     use std::sync::Arc;
     use bytes::Bytes;
     use std::collections::HashMap;
-    use waf_common::{DefenseConfig, HostConfig, LoadBalanceStrategy};
+    use waf_common::HostConfig;
 
     fn make_ctx(path: &str, method: &str, ip: &str) -> RequestCtx {
         let host_config = Arc::new(HostConfig {
