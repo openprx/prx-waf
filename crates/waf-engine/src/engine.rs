@@ -13,10 +13,11 @@ use crate::checker::{
     check_ip_blacklist, check_ip_whitelist, check_url_blacklist, check_url_whitelist, RuleStore,
 };
 use crate::checks::{
-    AntiHotlinkCheck, BotCheck, CcCheck, Check, DirTraversalCheck, OWASPCheck, RceCheck,
+    AntiHotlinkCheck, BotCheck, CcCheck, Check, DirTraversalCheck, GeoCheck, OWASPCheck, RceCheck,
     ScannerCheck, SensitiveCheck, SqlInjectionCheck, XssCheck,
 };
 use crate::crowdsec::{appsec_to_detection, AppSecClient, AppSecResult, CrowdSecChecker};
+use crate::geoip::GeoIpService;
 use crate::rules::engine::{from_db_rule, CustomRulesEngine};
 
 /// WAF engine configuration
@@ -47,11 +48,16 @@ pub struct WafEngine {
     /// Dynamic checker pipeline (Phase 5-11 detectors).
     checkers: Vec<Box<dyn Check>>,
     owasp: Arc<OWASPCheck>,
+    /// GeoIP-based access control check (Phase 17).
+    geo_check: Arc<GeoCheck>,
     // ── Phase 6: CrowdSec ────────────────────────────────────────────────────
     /// Bouncer checker (set once after engine construction via set_crowdsec)
     crowdsec_checker: OnceLock<Arc<CrowdSecChecker>>,
     /// AppSec client (set once after engine construction via set_crowdsec)
     appsec_client: OnceLock<Arc<AppSecClient>>,
+    // ── GeoIP ────────────────────────────────────────────────────────────────
+    /// GeoIP lookup service (set once after engine construction via set_geoip)
+    geoip: OnceLock<Arc<GeoIpService>>,
 }
 
 impl WafEngine {
@@ -61,6 +67,7 @@ impl WafEngine {
         let sensitive = Arc::new(SensitiveCheck::new());
         let hotlink = Arc::new(AntiHotlinkCheck::new());
         let owasp = Arc::new(OWASPCheck::new());
+        let geo_check = Arc::new(GeoCheck::new());
 
         // Build the Phase 5-11 checker pipeline.
         // CC runs first to shed flood traffic before expensive pattern checks.
@@ -83,8 +90,10 @@ impl WafEngine {
             config,
             checkers,
             owasp,
+            geo_check,
             crowdsec_checker: OnceLock::new(),
             appsec_client: OnceLock::new(),
+            geoip: OnceLock::new(),
         }
     }
 
@@ -98,6 +107,19 @@ impl WafEngine {
         if let Some(ac) = appsec {
             let _ = self.appsec_client.set(ac);
         }
+    }
+
+    /// Plug the GeoIP lookup service into the engine (called once after init).
+    ///
+    /// After this call every request will have its `ctx.geo` populated before
+    /// the checker pipeline runs, enabling GeoIP-based rules.
+    pub fn set_geoip(&self, service: Arc<GeoIpService>) {
+        let _ = self.geoip.set(service);
+    }
+
+    /// Return a reference to the GeoCheck so callers can load rules.
+    pub fn geo_check(&self) -> &Arc<GeoCheck> {
+        &self.geo_check
     }
 
     /// Reload all rules from the database
@@ -170,11 +192,18 @@ impl WafEngine {
 
     /// Run the full WAF inspection pipeline.
     ///
-    /// Returns the WAF decision. Callers should check `decision.is_allowed()`.
-    pub async fn inspect(&self, ctx: &RequestCtx) -> WafDecision {
+    /// `ctx` is taken as `&mut` so the engine can enrich it with GeoIP data
+    /// before the checker pipeline runs.  Callers should check
+    /// `decision.is_allowed()`.
+    pub async fn inspect(&self, ctx: &mut RequestCtx) -> WafDecision {
         // Skip WAF if guard is disabled for this host
         if !ctx.host_config.guard_status {
             return WafDecision::allow();
+        }
+
+        // ── GeoIP enrichment — populate ctx.geo before any checks ────────────
+        if let Some(geoip) = self.geoip.get() {
+            ctx.geo = Some(geoip.lookup(ctx.client_ip));
         }
 
         // ── Phase 1: IP Whitelist — allow immediately if matched ──────────────
@@ -224,6 +253,22 @@ impl WafEngine {
                 self.log_security_event(ctx, &decision).await;
                 return decision;
             }
+        }
+
+        // ── Phase 17: GeoIP access control ────────────────────────────────────
+        if let Some(result) = self.geo_check.check(ctx) {
+            let rule_name = result.rule_name.clone();
+            let decision = if ctx.host_config.log_only_mode {
+                WafDecision {
+                    action: WafAction::LogOnly,
+                    result: Some(result),
+                }
+            } else {
+                let body = render_block_page(ctx, &rule_name);
+                WafDecision::block(403, Some(body), result)
+            };
+            self.log_security_event(ctx, &decision).await;
+            return decision;
         }
 
         // ── Phase 5-11: Attack detection pipeline ─────────────────────────────

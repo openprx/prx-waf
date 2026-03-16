@@ -1,0 +1,161 @@
+version: "1.0"
+description: "Advanced Deserialization Attack Detection - Java, PHP, Python, .NET, Ruby"
+source: "prx-waf community rules"
+license: "Apache-2.0"
+
+rules:
+  - id: "ADV-DSER-001"
+    name: "Java Deserialization - Magic Bytes (aced0005)"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:\\xac\\xed\\x00\\x05|rO0AB|%ac%ed%00%05|\\\\xac\\\\xed\\\\x00\\\\x05)"
+    action: "block"
+    tags: ["advanced", "deserialization", "java", "rce"]
+    reference: "https://portswigger.net/web-security/deserialization/exploiting"
+
+  - id: "ADV-DSER-002"
+    name: "Java Deserialization - Commons Collections Gadget Chain"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:org\\.apache\\.commons\\.collections|sun\\.reflect\\.annotation\\.AnnotationInvocationHandler|java\\.util\\.PriorityQueue|org\\.springframework\\.aop\\.framework\\.JdkDynamicAopProxy)"
+    action: "block"
+    tags: ["advanced", "deserialization", "java", "commons-collections", "rce"]
+    reference: "https://foxglovesecurity.com/2015/11/06/what-do-weblogic-websphere-jboss-jenkins-opennms-and-your-application-have-in-common-this-vulnerability/"
+
+  - id: "ADV-DSER-003"
+    name: "Java Deserialization - Spring Framework Gadgets"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:org\\.springframework\\.(?:core|beans|context|web|security)|org\\.springframework\\.aop|org\\.springframework\\.expression\\.spel)"
+    action: "block"
+    tags: ["advanced", "deserialization", "java", "spring", "rce"]
+    reference: "https://portswigger.net/research/pre-auth-rce-in-forgerock-openam"
+
+  - id: "ADV-DSER-004"
+    name: "Java Deserialization - Runtime.exec() Gadget Pattern"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:java\\.lang\\.Runtime|ProcessBuilder|groovy\\.lang\\.Binding|org\\.codehaus\\.groovy\\.runtime\\.MethodClosure|ScriptEngineManager)"
+    action: "block"
+    tags: ["advanced", "deserialization", "java", "rce"]
+    reference: "https://portswigger.net/web-security/deserialization/exploiting"
+
+  - id: "ADV-DSER-005"
+    name: "PHP Deserialization - unserialize() Injection"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:O:[0-9]+:\"[a-zA-Z_][a-zA-Z0-9_]*\":[0-9]+:\\{|a:[0-9]+:\\{|s:[0-9]+:\"|i:[0-9]+;|b:[01];|N;)(?:[a-zA-Z0-9:;\"{}_]){10,}"
+    action: "block"
+    tags: ["advanced", "deserialization", "php", "rce"]
+    reference: "https://owasp.org/www-community/vulnerabilities/PHP_Object_Injection"
+
+  - id: "ADV-DSER-006"
+    name: "PHP Object Injection - Magic Method Invocation"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)O:[0-9]+:\"(?:SplDoublyLinkedList|SplStack|SplQueue|SplMinHeap|SplMaxHeap|SplPriorityQueue|SplFixedArray|ArrayObject|SplObjectStorage|Exception|Error|RuntimeException|LogicException|GuzzleHttp|Symfony|Illuminate|Laravel|Yii|Zend|Cake|CodeIgniter)"
+    action: "block"
+    tags: ["advanced", "deserialization", "php", "rce"]
+    reference: "https://owasp.org/www-community/vulnerabilities/PHP_Object_Injection"
+
+  - id: "ADV-DSER-007"
+    name: "Python Pickle Deserialization Attack"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:\\x80\\x02|cos\\nsystem|csubprocess\\nPopen|cbuiltins\\nexec|cpickle\\nloads|cunpickle\\nloads|c__builtin__\\nexec|cos\\.popen)"
+    action: "block"
+    tags: ["advanced", "deserialization", "python", "pickle", "rce"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Deserialization_of_untrusted_data"
+
+  - id: "ADV-DSER-008"
+    name: "Python Pickle - Reduce Protocol Abuse"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:pickle\\.loads|cPickle\\.loads|yaml\\.load\\s*\\(|marshal\\.loads|jsonpickle\\.decode)\\s*(?:\\(|\\[)"
+    action: "block"
+    tags: ["advanced", "deserialization", "python", "pickle", "rce"]
+    reference: "https://portswigger.net/web-security/deserialization/exploiting"
+
+  - id: "ADV-DSER-009"
+    name: ".NET ViewState Deserialization Attack"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:__VIEWSTATE|__EVENTVALIDATION|__EVENTTARGET|__VIEWSTATEGENERATOR)=[^&]{200,}"
+    action: "log"
+    tags: ["advanced", "deserialization", "dotnet", "viewstate"]
+    reference: "https://portswigger.net/web-security/deserialization/exploiting"
+
+  - id: "ADV-DSER-010"
+    name: ".NET BinaryFormatter / TypeConfuseDelegateGadget"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:System\\.Runtime\\.Serialization\\.Formatters\\.Binary|System\\.Windows\\.Data\\.ObjectDataProvider|System\\.Management\\.Automation|ResourceSet|TextFormattingRunProperties|TypeConfuseDelegate)"
+    action: "block"
+    tags: ["advanced", "deserialization", "dotnet", "binary-formatter", "rce"]
+    reference: "https://github.com/pwntester/ysoserial.net"
+
+  - id: "ADV-DSER-011"
+    name: "Ruby Marshal Deserialization Attack"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:\\x04\\x08|Marshal\\.load\\s*\\(|Marshal\\.restore\\s*\\(|\\\\x04\\\\x08(?:o:|[0-9]:))"
+    action: "block"
+    tags: ["advanced", "deserialization", "ruby", "marshal", "rce"]
+    reference: "https://github.com/frohoff/ysoserial"
+
+  - id: "ADV-DSER-012"
+    name: "YAML Deserialization - Unsafe Load Patterns"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)!!(?:python/object|java\\.io\\.Serializable|javax\\.script\\.ScriptEngine|org\\.yaml\\.snakeyaml|ruby/object|ruby/hash-with-ivars)"
+    action: "block"
+    tags: ["advanced", "deserialization", "yaml", "rce"]
+    reference: "https://portswigger.net/web-security/deserialization/exploiting"
+
+  - id: "ADV-DSER-013"
+    name: "XStream XML Deserialization (Java)"
+    category: "deserialization"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)<(?:sorted-set|tree-map|linked-hash-map|linked-list|com\\.sun\\.jndi\\.ldap\\.LdapCtx|com\\.sun\\.xml\\.internal\\.ws|java\\.lang\\.ProcessBuilder|javax\\.swing\\.plaf\\.nimbus\\.DerivedColor)>"
+    action: "block"
+    tags: ["advanced", "deserialization", "java", "xstream", "rce"]
+    reference: "https://x-stream.github.io/CVE-2021-29505.html"

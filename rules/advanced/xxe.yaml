@@ -1,0 +1,161 @@
+version: "1.0"
+description: "Advanced XXE Detection - XML External Entity Injection (Comprehensive)"
+source: "prx-waf community rules"
+license: "Apache-2.0"
+
+rules:
+  - id: "ADV-XXE-001"
+    name: "XXE - DOCTYPE with SYSTEM Identifier"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)<!\\s*DOCTYPE\\s+[a-zA-Z_][a-zA-Z0-9_.-]*\\s+(?:SYSTEM\\s+[\"'][^\"']+[\"']|\\[\\s*<!\\s*ENTITY)"
+    action: "block"
+    tags: ["advanced", "xxe", "doctype", "rce"]
+    reference: "https://portswigger.net/web-security/xxe"
+
+  - id: "ADV-XXE-002"
+    name: "XXE - DOCTYPE with PUBLIC Identifier"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)<!\\s*DOCTYPE\\s+[a-zA-Z_][a-zA-Z0-9_.-]*\\s+PUBLIC\\s+[\"'][^\"']*[\"']\\s+[\"'][^\"']*[\"']"
+    action: "block"
+    tags: ["advanced", "xxe", "doctype", "public-identifier"]
+    reference: "https://portswigger.net/web-security/xxe"
+
+  - id: "ADV-XXE-003"
+    name: "XXE - External Entity Declaration with SYSTEM"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)<!\\s*ENTITY\\s+(?:%\\s+)?[a-zA-Z_][a-zA-Z0-9_.-]*\\s+SYSTEM\\s+[\"']"
+    action: "block"
+    tags: ["advanced", "xxe", "external-entity"]
+    reference: "https://portswigger.net/web-security/xxe"
+
+  - id: "ADV-XXE-004"
+    name: "XXE - Parameter Entity Injection"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)<!\\s*ENTITY\\s+%\\s+[a-zA-Z_][a-zA-Z0-9_.-]*\\s+(?:SYSTEM|PUBLIC)\\s"
+    action: "block"
+    tags: ["advanced", "xxe", "parameter-entity"]
+    reference: "https://portswigger.net/web-security/xxe/blind"
+
+  - id: "ADV-XXE-005"
+    name: "XXE - Billion Laughs / XML Bomb Attack"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)<!\\s*ENTITY\\s+[a-zA-Z0-9_]+\\s+[\"'](?:[a-zA-Z0-9&;]+){10,}[\"']>(?:[^<]*<!\\s*ENTITY\\s+[a-zA-Z0-9_]+\\s+[\"'](?:&[a-zA-Z0-9_]+;){2,}[\"']>){2,}"
+    action: "block"
+    tags: ["advanced", "xxe", "billion-laughs", "dos"]
+    reference: "https://en.wikipedia.org/wiki/Billion_laughs_attack"
+
+  - id: "ADV-XXE-006"
+    name: "XXE - External DTD Loading"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)<!DOCTYPE[^>]*SYSTEM\\s+[\"'](?:http|https|ftp|file|gopher|dict|expect|php)://"
+    action: "block"
+    tags: ["advanced", "xxe", "external-dtd"]
+    reference: "https://portswigger.net/web-security/xxe"
+
+  - id: "ADV-XXE-007"
+    name: "XXE - File Read via file:// Protocol"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)SYSTEM\\s+[\"']file://(?:/etc/passwd|/etc/shadow|/etc/hosts|/proc/|/var/|C:/Windows/|C:/Users/)"
+    action: "block"
+    tags: ["advanced", "xxe", "file-read", "lfi"]
+    reference: "https://portswigger.net/web-security/xxe"
+
+  - id: "ADV-XXE-008"
+    name: "XXE - Blind XXE via Out-of-Band (OOB) Exfiltration"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:<!ENTITY\\s+%\\s+[a-zA-Z_][a-zA-Z0-9_]*\\s+SYSTEM|<!ENTITY\\s+[a-zA-Z_][a-zA-Z0-9_]*\\s+SYSTEM)\\s+[\"'](?:http|https)://"
+    action: "block"
+    tags: ["advanced", "xxe", "blind-xxe", "oob"]
+    reference: "https://portswigger.net/web-security/xxe/blind"
+
+  - id: "ADV-XXE-009"
+    name: "XInclude Attack - xi:include Element"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)<\\s*(?:xi|xinclude)\\s*:\\s*include\\s+(?:[^>]*\\s+)?(?:href|parse)\\s*="
+    action: "block"
+    tags: ["advanced", "xxe", "xinclude"]
+    reference: "https://portswigger.net/web-security/xxe/blind#xinclude-attacks"
+
+  - id: "ADV-XXE-010"
+    name: "XInclude via Namespace Declaration"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)xmlns:(?:xi|xinclude)\\s*=\\s*[\"']http://www\\.w3\\.org/2001/XInclude[\"']"
+    action: "block"
+    tags: ["advanced", "xxe", "xinclude", "namespace"]
+    reference: "https://portswigger.net/web-security/xxe/blind#xinclude-attacks"
+
+  - id: "ADV-XXE-011"
+    name: "XXE via SVG File Upload"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)<svg[^>]*xmlns[^>]*>.*<!(?:DOCTYPE|ENTITY)[^>]*(?:SYSTEM|PUBLIC)"
+    action: "block"
+    tags: ["advanced", "xxe", "svg", "file-upload"]
+    reference: "https://portswigger.net/web-security/xxe"
+
+  - id: "ADV-XXE-012"
+    name: "XXE - Expect Wrapper (PHP RCE)"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)SYSTEM\\s+[\"']expect://[^\"']*[\"']"
+    action: "block"
+    tags: ["advanced", "xxe", "php-expect", "rce"]
+    reference: "https://portswigger.net/web-security/xxe"
+
+  - id: "ADV-XXE-013"
+    name: "XXE - PHP Wrapper (php://filter)"
+    category: "xxe"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)SYSTEM\\s+[\"']php://(?:filter|input|fd|memory|temp|stdin)[^\"']*[\"']"
+    action: "block"
+    tags: ["advanced", "xxe", "php-wrapper", "lfi"]
+    reference: "https://portswigger.net/web-security/xxe"

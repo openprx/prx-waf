@@ -32,6 +32,17 @@ pub enum ConditionField {
     Host,
     /// Arbitrary header — value is the header name (lowercased)
     Header(String),
+    // ── GeoIP fields (populated when GeoIP is enabled) ──────────────────────
+    /// Full country name (e.g. "China", "United States")
+    GeoCountry,
+    /// ISO 3166-1 alpha-2 country code (e.g. "CN", "US")
+    GeoIso,
+    /// Province / state
+    GeoProvince,
+    /// City
+    GeoCity,
+    /// ISP / organization
+    GeoIsp,
 }
 
 // ── Comparison operator ───────────────────────────────────────────────────────
@@ -321,6 +332,12 @@ impl CustomRulesEngine {
             ConditionField::UserAgent     => ctx.headers.get("user-agent").cloned(),
             ConditionField::ContentType   => ctx.headers.get("content-type").cloned(),
             ConditionField::Header(name)  => ctx.headers.get(&name.to_lowercase()).cloned(),
+            // ── GeoIP fields ────────────────────────────────────────────────
+            ConditionField::GeoCountry  => ctx.geo.as_ref().map(|g| g.country.clone()),
+            ConditionField::GeoIso      => ctx.geo.as_ref().map(|g| g.iso_code.clone()),
+            ConditionField::GeoProvince => ctx.geo.as_ref().map(|g| g.province.clone()),
+            ConditionField::GeoCity     => ctx.geo.as_ref().map(|g| g.city.clone()),
+            ConditionField::GeoIsp      => ctx.geo.as_ref().map(|g| g.isp.clone()),
         }
     }
 }

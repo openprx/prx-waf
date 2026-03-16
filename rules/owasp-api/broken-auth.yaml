@@ -1,0 +1,185 @@
+version: "1.0"
+description: "OWASP API Security - Broken Authentication (API2:2023)"
+source: "prx-waf community rules"
+license: "Apache-2.0"
+
+rules:
+  - id: "API-AUTH-001"
+    name: "JWT None Algorithm Attack"
+    category: "broken-authentication"
+    severity: "critical"
+    paranoia: 1
+    field: "headers"
+    operator: "regex"
+    value: "(?i)eyJ[a-zA-Z0-9_-]*\\.eyJ[a-zA-Z0-9_-]*\\.(?:\\s*$|,|\\s)"
+    action: "block"
+    tags: ["owasp-api", "broken-auth", "jwt", "api2-2023"]
+    reference: "https://portswigger.net/web-security/jwt/algorithm-confusion"
+
+  - id: "API-AUTH-002"
+    name: "JWT Algorithm None in Header (Base64 decoded pattern)"
+    category: "broken-authentication"
+    severity: "critical"
+    paranoia: 1
+    field: "headers"
+    operator: "regex"
+    value: "(?i)(?:eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0|eyJhbGciOiJOT05FIiwidHlwIjoiSldUIn0|eyJhbGciOiJub25lIn0)"
+    action: "block"
+    tags: ["owasp-api", "broken-auth", "jwt", "none-algorithm", "api2-2023"]
+    reference: "https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/"
+
+  - id: "API-AUTH-003"
+    name: "JWT None Algorithm via alg Claim Manipulation"
+    category: "broken-authentication"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)\"alg\"\\s*:\\s*\"(?:none|NONE|None|nOnE)\""
+    action: "block"
+    tags: ["owasp-api", "broken-auth", "jwt", "none-algorithm", "api2-2023"]
+    reference: "https://portswigger.net/web-security/jwt"
+
+  - id: "API-AUTH-004"
+    name: "JWT Signature Bypass - Empty Signature Segment"
+    category: "broken-authentication"
+    severity: "critical"
+    paranoia: 1
+    field: "headers"
+    operator: "regex"
+    value: "(?i)(?:Bearer|JWT)\\s+eyJ[a-zA-Z0-9_-]+\\.eyJ[a-zA-Z0-9_-]+\\.$"
+    action: "block"
+    tags: ["owasp-api", "broken-auth", "jwt", "signature-bypass", "api2-2023"]
+    reference: "https://portswigger.net/web-security/jwt"
+
+  - id: "API-AUTH-005"
+    name: "JWT HS256/RS256 Algorithm Confusion Attack"
+    category: "broken-authentication"
+    severity: "high"
+    paranoia: 2
+    field: "all"
+    operator: "regex"
+    value: "(?i)\"alg\"\\s*:\\s*\"(?:hs(?:256|384|512)|rs(?:256|384|512)|es(?:256|384|512)|ps(?:256|384|512))\""
+    action: "log"
+    tags: ["owasp-api", "broken-auth", "jwt", "algorithm-confusion", "api2-2023"]
+    reference: "https://portswigger.net/web-security/jwt/algorithm-confusion"
+
+  - id: "API-AUTH-006"
+    name: "Bearer Token Leaked in URL Query String"
+    category: "broken-authentication"
+    severity: "high"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:^|&)(?:access_token|bearer_token|auth_token|id_token|jwt_token)=(?:eyJ[a-zA-Z0-9_-]+\\.){2}[a-zA-Z0-9_-]+"
+    action: "log"
+    tags: ["owasp-api", "broken-auth", "token-leakage", "api2-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/"
+
+  - id: "API-AUTH-007"
+    name: "API Key Exposed in URL Query Parameter"
+    category: "broken-authentication"
+    severity: "medium"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:^|&)(?:api[_-]?key|apikey|app[_-]?key|client[_-]?secret|access[_-]?key|secret[_-]?key)=[^&]{8,}"
+    action: "log"
+    tags: ["owasp-api", "broken-auth", "api-key-exposure", "api2-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/"
+
+  - id: "API-AUTH-008"
+    name: "Missing Authorization Header on Sensitive Endpoint"
+    category: "broken-authentication"
+    severity: "medium"
+    paranoia: 3
+    field: "path"
+    operator: "regex"
+    value: "(?i)/(?:api/v[0-9]+/)?(?:admin|users?/(?:me|profile|settings)|account|billing|payment|dashboard|secrets?|keys?|tokens?|credentials?)(?:/|$|\\?)"
+    action: "log"
+    tags: ["owasp-api", "broken-auth", "missing-auth", "api2-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/"
+
+  - id: "API-AUTH-009"
+    name: "Brute Force Login - High Frequency Login Endpoint Access"
+    category: "broken-authentication"
+    severity: "high"
+    paranoia: 1
+    field: "path"
+    operator: "regex"
+    value: "(?i)/(?:api/v[0-9]+/)?(?:auth/(?:login|signin|token|password)|login|signin|authenticate|oauth/token|api/login|user/login)(?:/|$|\\?)"
+    action: "log"
+    tags: ["owasp-api", "broken-auth", "brute-force", "api2-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/"
+
+  - id: "API-AUTH-010"
+    name: "Credential Stuffing - Suspicious Login Payload Pattern"
+    category: "broken-authentication"
+    severity: "high"
+    paranoia: 2
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"(?:username|email|login)\"\\s*:\\s*\"[^\"]{3,}\".*\"(?:password|passwd|pass|pwd)\"\\s*:\\s*\"[^\"]{3,}\""
+    action: "log"
+    tags: ["owasp-api", "broken-auth", "credential-stuffing", "api2-2023"]
+    reference: "https://owasp.org/www-community/attacks/Credential_stuffing"
+
+  - id: "API-AUTH-011"
+    name: "OAuth Token Endpoint Abuse - Suspicious Grant Type"
+    category: "broken-authentication"
+    severity: "high"
+    paranoia: 2
+    field: "body"
+    operator: "regex"
+    value: "(?i)grant_type=(?:password|client_credentials|urn:ietf:params:oauth)"
+    action: "log"
+    tags: ["owasp-api", "broken-auth", "oauth", "api2-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/"
+
+  - id: "API-AUTH-012"
+    name: "JWT kid Header Injection (SQL/Path Traversal)"
+    category: "broken-authentication"
+    severity: "critical"
+    paranoia: 1
+    field: "headers"
+    operator: "regex"
+    value: "(?i)\"kid\"\\s*:\\s*\"(?:[^\"]*(?:--|;|union|select|insert|drop|delete|update|'|/\\.\\./|\\.\\.\\\\)[^\"]*)\""
+    action: "block"
+    tags: ["owasp-api", "broken-auth", "jwt", "kid-injection", "api2-2023"]
+    reference: "https://portswigger.net/web-security/jwt"
+
+  - id: "API-AUTH-013"
+    name: "JWT jwk Header Injection (Embedded Public Key)"
+    category: "broken-authentication"
+    severity: "critical"
+    paranoia: 1
+    field: "headers"
+    operator: "regex"
+    value: "(?i)\"jwk\"\\s*:\\s*\\{[^}]*\"(?:kty|n|e|x|y|crv)\"\\s*:"
+    action: "block"
+    tags: ["owasp-api", "broken-auth", "jwt", "jwk-injection", "api2-2023"]
+    reference: "https://portswigger.net/web-security/jwt"
+
+  - id: "API-AUTH-014"
+    name: "API Password Reset Token in URL"
+    category: "broken-authentication"
+    severity: "medium"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:^|&)(?:reset_token|password_reset|forgot_token|verify_token|activation_token)=[a-zA-Z0-9_-]{16,}"
+    action: "log"
+    tags: ["owasp-api", "broken-auth", "password-reset", "api2-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/"
+
+  - id: "API-AUTH-015"
+    name: "HTTP Basic Auth Credentials Exposed in URL"
+    category: "broken-authentication"
+    severity: "high"
+    paranoia: 1
+    field: "path"
+    operator: "regex"
+    value: "(?i)https?://[a-zA-Z0-9_.-]+:[^@/]{3,}@"
+    action: "block"
+    tags: ["owasp-api", "broken-auth", "basic-auth-exposure", "api2-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/"

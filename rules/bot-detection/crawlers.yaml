@@ -1,0 +1,185 @@
+version: "1.0"
+description: "Bot Detection - Malicious Crawlers, Headless Browsers, and WebDriver"
+source: "prx-waf community rules"
+license: "Apache-2.0"
+
+rules:
+  - id: "BOT-CRAWL-001"
+    name: "Empty or Missing User-Agent"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 2
+    field: "user_agent"
+    operator: "regex"
+    value: "^\\s*$"
+    action: "log"
+    tags: ["bot-detection", "crawlers", "empty-ua"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-CRAWL-002"
+    name: "Headless Chrome Browser Detected"
+    category: "bot-detection"
+    severity: "high"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)HeadlessChrome|Headless(?:ium|Firefox)|headless"
+    action: "block"
+    tags: ["bot-detection", "headless-browser", "crawlers"]
+    reference: "https://intoli.com/blog/making-chrome-headless-undetectable/"
+
+  - id: "BOT-CRAWL-003"
+    name: "PhantomJS Headless Browser Detected"
+    category: "bot-detection"
+    severity: "high"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)PhantomJS|phantom(?:js)?[/ ][0-9]"
+    action: "block"
+    tags: ["bot-detection", "headless-browser", "phantomjs", "crawlers"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-CRAWL-004"
+    name: "Selenium WebDriver Detected via User-Agent"
+    category: "bot-detection"
+    severity: "high"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)selenium|webdriver"
+    action: "block"
+    tags: ["bot-detection", "selenium", "webdriver", "crawlers"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-CRAWL-005"
+    name: "Puppeteer / Playwright Automation Detected"
+    category: "bot-detection"
+    severity: "high"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)Puppeteer|Playwright|puppeteer-cluster|chrome-aws-lambda"
+    action: "block"
+    tags: ["bot-detection", "puppeteer", "playwright", "crawlers"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-CRAWL-006"
+    name: "WebDriver Header Present"
+    category: "bot-detection"
+    severity: "critical"
+    paranoia: 1
+    field: "headers"
+    operator: "regex"
+    value: "(?i)(?:^|\\r\\n)(?:webdriver|__webdriver_evaluate|__selenium_evaluate|__webdriver_script_fn|__fxdriver_evaluate|__driver_evaluate|__selenium_unwrapped|__webdriverFunc)\\s*:"
+    action: "block"
+    tags: ["bot-detection", "webdriver", "selenium", "crawlers"]
+    reference: "https://intoli.com/blog/not-possible-to-block-chrome-headless/"
+
+  - id: "BOT-CRAWL-007"
+    name: "Known Vulnerability Scanner - Nikto"
+    category: "bot-detection"
+    severity: "critical"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)(?:Nikto|nikto/[0-9]|libwhisker)"
+    action: "block"
+    tags: ["bot-detection", "scanner", "nikto", "crawlers"]
+    reference: "https://cirt.net/Nikto2"
+
+  - id: "BOT-CRAWL-008"
+    name: "Known Vulnerability Scanner - sqlmap, Acunetix, Nessus"
+    category: "bot-detection"
+    severity: "critical"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)(?:sqlmap|acunetix|nessus(?:sd)?|openvas|nmap|masscan|dirbuster|gobuster|wfuzz|ffuf|hydra|medusa|burpsuite|zaproxy|w3af|skipfish|arachni|webscarab|Jorgee|DataCha0s)"
+    action: "block"
+    tags: ["bot-detection", "scanner", "crawlers"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-CRAWL-009"
+    name: "Generic Bad Bot - Known Malicious UA Strings"
+    category: "bot-detection"
+    severity: "high"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)(?:MJ12bot|AhrefsBot|SemrushBot|DotBot|MajesticSEO|BLEXBot|SeznamBot|Sogou|YandexBot|ZoominfoBot|Scrapy|scrapy/[0-9]|harvester|harvest|WGet|wget/[0-9]|libwww-perl|LWP::|LWPUA|masscan|NetSpark|Brutus|sitecheck\\.internetseer)"
+    action: "block"
+    tags: ["bot-detection", "bad-bot", "crawlers"]
+    reference: "https://github.com/nicowillis/bad-bot-list"
+
+  - id: "BOT-CRAWL-010"
+    name: "Suspicious Accept-Language - Missing or Wildcard Only"
+    category: "bot-detection"
+    severity: "low"
+    paranoia: 3
+    field: "headers"
+    operator: "regex"
+    value: "(?i)(?:^|\\r\\n)Accept-Language:\\s*(?:\\*|\\s*)(?:\\r\\n|$)"
+    action: "log"
+    tags: ["bot-detection", "suspicious-headers", "crawlers"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-CRAWL-011"
+    name: "Suspicious Accept Header - Missing Content Negotiation"
+    category: "bot-detection"
+    severity: "low"
+    paranoia: 3
+    field: "headers"
+    operator: "regex"
+    value: "(?i)(?:^|\\r\\n)Accept:\\s*\\*\\/\\*\\s*(?:\\r\\n|$)"
+    action: "log"
+    tags: ["bot-detection", "suspicious-headers", "crawlers"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-CRAWL-012"
+    name: "Python Requests Library Default User-Agent"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 2
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)^python-(?:requests|urllib[23]?|httpx|aiohttp|httplib2)/[0-9]"
+    action: "log"
+    tags: ["bot-detection", "automated-tool", "python", "crawlers"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-CRAWL-013"
+    name: "Java HTTP Client Default User-Agent"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 2
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)^Java/[0-9]|Apache-HttpClient/|okhttp/[0-9]|unirest-java/|feign/[0-9]"
+    action: "log"
+    tags: ["bot-detection", "automated-tool", "java", "crawlers"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-CRAWL-014"
+    name: "Go HTTP Client Default User-Agent"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 2
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)^(?:Go-http-client/[0-9]|Go/[0-9].*package\\s+http)"
+    action: "log"
+    tags: ["bot-detection", "automated-tool", "golang", "crawlers"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-CRAWL-015"
+    name: "Aggressive Link Harvester / Email Harvester UA"
+    category: "bot-detection"
+    severity: "high"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)(?:EmailCollector|EmailSiphon|WebBandit|WebEMailExtrac|TheNomad|CherryPicker|ExtractorPro|CopyRightCheck|Crescent|SiteSnagger|ProWebWalker|CheeseBot|Teleport|TeleportPro|MIIxpc|WebZip|WebSauger|Website\\s*eXtractor|WebCopier|NetAttache)"
+    action: "block"
+    tags: ["bot-detection", "harvester", "crawlers"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"

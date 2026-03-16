@@ -1,0 +1,185 @@
+version: "1.0"
+description: "Bot Detection - Content Scrapers, AI Training Crawlers, and Automated Tools"
+source: "prx-waf community rules"
+license: "Apache-2.0"
+
+rules:
+  - id: "BOT-SCRAPE-001"
+    name: "OpenAI GPTBot Crawler"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)GPTBot|gpt-bot|gpt_bot"
+    action: "log"
+    tags: ["bot-detection", "ai-crawler", "openai", "scraping"]
+    reference: "https://platform.openai.com/docs/gptbot"
+
+  - id: "BOT-SCRAPE-002"
+    name: "CommonCrawl CCBot Crawler"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)CCBot/[0-9]|CommonCrawl"
+    action: "log"
+    tags: ["bot-detection", "ai-crawler", "commoncrawl", "scraping"]
+    reference: "https://commoncrawl.org/faq"
+
+  - id: "BOT-SCRAPE-003"
+    name: "Anthropic AI Crawler"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)anthropic-ai|Claude-Web|ClaudeBot"
+    action: "log"
+    tags: ["bot-detection", "ai-crawler", "anthropic", "scraping"]
+    reference: "https://support.anthropic.com/en/articles/8896518-does-anthropic-crawl-the-web-and-how-can-site-owners-block-the-crawler"
+
+  - id: "BOT-SCRAPE-004"
+    name: "Google Extended / Bard AI Crawler"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)Google-Extended|GoogleOther|Google-InspectionTool|Googlebot-Video|Googlebot-Image"
+    action: "log"
+    tags: ["bot-detection", "ai-crawler", "google", "scraping"]
+    reference: "https://developers.google.com/search/docs/crawling-indexing/overview-google-crawlers"
+
+  - id: "BOT-SCRAPE-005"
+    name: "ByteDance Bytespider / TikTok Crawler"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)Bytespider|TikTok|bytedance"
+    action: "log"
+    tags: ["bot-detection", "ai-crawler", "bytedance", "scraping"]
+    reference: "https://darkvisitors.com/"
+
+  - id: "BOT-SCRAPE-006"
+    name: "Meta / Facebook AI Crawler"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)FacebookBot|meta-externalagent|meta-externalfetcher"
+    action: "log"
+    tags: ["bot-detection", "ai-crawler", "meta", "facebook", "scraping"]
+    reference: "https://darkvisitors.com/"
+
+  - id: "BOT-SCRAPE-007"
+    name: "AI Training Data Scrapers - Comprehensive List"
+    category: "bot-detection"
+    severity: "high"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)(?:Applebot-Extended|cohere-ai|Diffbot|FriendlyCrawler|ImagesiftBot|img2dataset|Kangaroo\\s+Bot|omgili|omgilibot|PerplexityBot|PiplBot|YouBot|AI2Bot|Timpibot|VelenPublicWebCrawler|Webzio-Extended)"
+    action: "log"
+    tags: ["bot-detection", "ai-crawler", "training-data", "scraping"]
+    reference: "https://github.com/ai-robots-txt/ai.robots.txt"
+
+  - id: "BOT-SCRAPE-008"
+    name: "curl Default User-Agent"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 2
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)^curl/[0-9]"
+    action: "log"
+    tags: ["bot-detection", "automated-tool", "curl", "scraping"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-SCRAPE-009"
+    name: "wget Default User-Agent"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 2
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)^Wget/[0-9]"
+    action: "log"
+    tags: ["bot-detection", "automated-tool", "wget", "scraping"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-SCRAPE-010"
+    name: "HTTPie Default User-Agent"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 2
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)^(?:HTTPie|http-prompt)/[0-9]"
+    action: "log"
+    tags: ["bot-detection", "automated-tool", "httpie", "scraping"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-SCRAPE-011"
+    name: "Scrapy Web Scraping Framework"
+    category: "bot-detection"
+    severity: "high"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)^Scrapy/[0-9]|Scrapy\\s+[0-9]"
+    action: "block"
+    tags: ["bot-detection", "scrapy", "scraping"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-SCRAPE-012"
+    name: "Automated Form Submission - No Browser Signals"
+    category: "bot-detection"
+    severity: "medium"
+    paranoia: 3
+    field: "headers"
+    operator: "regex"
+    value: "(?i)Content-Type:\\s*application/x-www-form-urlencoded"
+    action: "log"
+    tags: ["bot-detection", "automated-form", "scraping"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-SCRAPE-013"
+    name: "Data Mining Tools - BeautifulSoup / Mechanize / Requests-HTML"
+    category: "bot-detection"
+    severity: "high"
+    paranoia: 1
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)(?:mechanize|beautiful\\s*soup|requests-html|MechanicalSoup|lxml|html\\s*parser|html5lib|bs4)"
+    action: "block"
+    tags: ["bot-detection", "data-mining", "scraping"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-SCRAPE-014"
+    name: "RSS/Feed Aggregator Scraper Bots"
+    category: "bot-detection"
+    severity: "low"
+    paranoia: 3
+    field: "user_agent"
+    operator: "regex"
+    value: "(?i)(?:FeedFetcher|Feed\\s*Reader|RSS\\s*(?:Reader|Parser|Bot|Crawler)|Feedburner|Feedly|NewsBlur|NetNewsWire|Reeder)"
+    action: "log"
+    tags: ["bot-detection", "rss-bot", "scraping"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"
+
+  - id: "BOT-SCRAPE-015"
+    name: "Missing Referer on Deep Page (Possible Direct Access Scraping)"
+    category: "bot-detection"
+    severity: "low"
+    paranoia: 4
+    field: "path"
+    operator: "regex"
+    value: "(?i)/(?:[a-zA-Z0-9_-]+/){3,}[a-zA-Z0-9_-]+(?:\\.html?|\\.php|\\.jsp|/)?(?:\\?|$)"
+    action: "log"
+    tags: ["bot-detection", "missing-referer", "direct-access", "scraping"]
+    reference: "https://owasp.org/www-project-automated-threats-to-web-applications/"

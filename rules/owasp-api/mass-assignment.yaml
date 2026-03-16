@@ -1,0 +1,125 @@
+version: "1.0"
+description: "OWASP API Security - Mass Assignment / Broken Object Property Level Authorization (API3:2023)"
+source: "prx-waf community rules"
+license: "Apache-2.0"
+
+rules:
+  - id: "API-MASS-001"
+    name: "Mass Assignment - isAdmin Flag in Request Body"
+    category: "mass-assignment"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"is[_-]?(?:admin|superuser|root|privileged|staff|operator)\"\\s*:\\s*(?:true|1|\"true\"|\"1\"|\"yes\")"
+    action: "block"
+    tags: ["owasp-api", "mass-assignment", "privilege-escalation", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-MASS-002"
+    name: "Mass Assignment - Role Field Manipulation"
+    category: "mass-assignment"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"role(?:s|_id|_name|_type)?\"\\s*:\\s*(?:\"(?:admin|superadmin|root|operator|moderator|staff|owner|system)\"|0|\\[\"admin)"
+    action: "block"
+    tags: ["owasp-api", "mass-assignment", "role-manipulation", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-MASS-003"
+    name: "Mass Assignment - Privileges/Permissions Object in Body"
+    category: "mass-assignment"
+    severity: "high"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"(?:privilege[sd]?|permission[sd]?|access[_-]?level|user[_-]?type|account[_-]?type|plan|subscription[_-]?tier)\"\\s*:"
+    action: "log"
+    tags: ["owasp-api", "mass-assignment", "privilege-escalation", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-MASS-004"
+    name: "Mass Assignment - Internal User ID Override"
+    category: "mass-assignment"
+    severity: "high"
+    paranoia: 2
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"(?:_id|user_id|account_id|owner_id|creator_id|created_by)\"\\s*:\\s*(?:\"[0-9a-f]{24,}\"|-?[0-9]{1,12})"
+    action: "log"
+    tags: ["owasp-api", "mass-assignment", "id-override", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-MASS-005"
+    name: "Mass Assignment - Verified/Approved Status Override"
+    category: "mass-assignment"
+    severity: "high"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"(?:is_?verified|is_?approved|is_?active|is_?enabled|is_?confirmed|email_verified|phone_verified|kyc_verified|identity_verified)\"\\s*:\\s*(?:true|1|\"true\")"
+    action: "block"
+    tags: ["owasp-api", "mass-assignment", "status-override", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-MASS-006"
+    name: "Mass Assignment - Balance/Credit Field Manipulation"
+    category: "mass-assignment"
+    severity: "critical"
+    paranoia: 2
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"(?:balance|credit[sd]?|coins?|points?|wallet|account_balance|cash|funds?|tokens?)\"\\s*:\\s*-?[0-9]{4,}"
+    action: "log"
+    tags: ["owasp-api", "mass-assignment", "financial-manipulation", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-MASS-007"
+    name: "Mass Assignment - Internal System Fields Override"
+    category: "mass-assignment"
+    severity: "high"
+    paranoia: 2
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"(?:created_at|updated_at|deleted_at|last_login|password_hash|hashed_password|salt|secret_key|internal_id|legacy_id)\"\\s*:"
+    action: "log"
+    tags: ["owasp-api", "mass-assignment", "internal-fields", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-MASS-008"
+    name: "Mass Assignment - API Rate Limit Override Attempt"
+    category: "mass-assignment"
+    severity: "high"
+    paranoia: 2
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"(?:rate_limit|api_limit|max_requests?|quota|throttle_limit|tier_limit)\"\\s*:\\s*(?:0|-1|99999|null|false)"
+    action: "block"
+    tags: ["owasp-api", "mass-assignment", "rate-limit-bypass", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-MASS-009"
+    name: "Mass Assignment - Payment/Subscription Plan Override"
+    category: "mass-assignment"
+    severity: "critical"
+    paranoia: 2
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"(?:plan|subscription|pricing_tier|product_tier|license_type|license_key)\"\\s*:\\s*\"(?:enterprise|premium|pro|platinum|gold|unlimited|free|trial)\""
+    action: "log"
+    tags: ["owasp-api", "mass-assignment", "subscription-abuse", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-MASS-010"
+    name: "Mass Assignment - Multiple Sensitive Fields Batch"
+    category: "mass-assignment"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:\"is[_-]?admin\"[^}]{0,200}\"role\"[^}]{0,200}|\"role\"[^}]{0,200}\"is[_-]?admin\"[^}]{0,200}|\"permission[sd]?\"[^}]{0,200}\"is[_-]?admin\")"
+    action: "block"
+    tags: ["owasp-api", "mass-assignment", "privilege-escalation", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"

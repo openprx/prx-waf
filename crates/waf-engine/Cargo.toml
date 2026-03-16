@@ -26,3 +26,4 @@ serde_yaml = { workspace = true }
 wasmtime = { workspace = true }
 reqwest = { workspace = true }
 notify = { workspace = true }
+ip2region = { git = "https://github.com/lionsoul2014/ip2region.git", branch = "master" }

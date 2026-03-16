@@ -1,0 +1,161 @@
+version: "1.0"
+description: "Advanced Webshell Upload Detection - PHP, JSP, ASP, Polyglots"
+source: "prx-waf community rules"
+license: "Apache-2.0"
+
+rules:
+  - id: "ADV-SHELL-001"
+    name: "Webshell Upload - PHP Executable Extension in Upload Path"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "path"
+    operator: "regex"
+    value: "(?i)/(?:upload[s]?|files?|media|static|assets?|img|images?|docs?|documents?|public|tmp|temp|cache)/[^/]*\\.(?:php[0-9]?|phtml|phar|phps|php-s|pht|pgif|shtml|shtm|phtml|php[0-9]{1,2})"
+    action: "block"
+    tags: ["advanced", "webshell", "php", "upload"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-002"
+    name: "Webshell Upload - JSP/JSPX in Upload Path"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "path"
+    operator: "regex"
+    value: "(?i)/(?:upload[s]?|files?|media|static|assets?|img|images?|docs?|documents?|public|tmp|temp|cache)/[^/]*\\.(?:jsp[x]?|jspf|jsw|jsv|jtml)"
+    action: "block"
+    tags: ["advanced", "webshell", "jsp", "upload"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-003"
+    name: "Webshell Upload - ASP/ASPX in Upload Path"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "path"
+    operator: "regex"
+    value: "(?i)/(?:upload[s]?|files?|media|static|assets?|img|images?|docs?|documents?|public|tmp|temp|cache)/[^/]*\\.(?:asp[x]?|asa|cer|cdx|ashx|asmx|axd|cshtml|vbhtml)"
+    action: "block"
+    tags: ["advanced", "webshell", "aspx", "upload"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-004"
+    name: "Webshell - Double Extension Bypass (.php.jpg, .asp;.jpg)"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "path"
+    operator: "regex"
+    value: "(?i)\\.(?:php[0-9]?|phtml|phar|asp[x]?|jsp[x]?)(?:[.;: %00]|%2e|%252e)[a-zA-Z0-9]{2,5}(?:\\?|$|#)"
+    action: "block"
+    tags: ["advanced", "webshell", "double-extension", "bypass"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-005"
+    name: "Webshell - Null Byte Extension Bypass"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)\\.(?:php[0-9]?|phtml|phar|asp[x]?|jsp[x]?)(?:%00|\\x00|\\0)[a-zA-Z0-9.]*"
+    action: "block"
+    tags: ["advanced", "webshell", "null-byte", "bypass"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-006"
+    name: "PHP Webshell Content - system/exec/passthru Functions"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:eval|assert|preg_replace|create_function|call_user_func|array_map|usort|uasort|uksort|array_filter|array_walk|array_reduce)\\s*\\([^)]*(?:\\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES|ENV|GLOBALS)|base64_decode|gzinflate|str_rot13|gzuncompress|rawurldecode|hex2bin|chr|eval)"
+    action: "block"
+    tags: ["advanced", "webshell", "php", "code-injection"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-007"
+    name: "PHP Webshell Content - One-Liner Shell Patterns"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:<?php\\s*(?:system|exec|passthru|shell_exec|popen|proc_open|pcntl_exec|posix_spawn)\\s*\\(\\s*\\$_|<?php\\s*eval\\s*\\(\\s*base64_decode|<?php\\s*@eval|<?php\\s*\\$_=|<?php\\s*preg_replace\\s*\\(['\"]/.+/e['\"])"
+    action: "block"
+    tags: ["advanced", "webshell", "php", "one-liner"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-008"
+    name: "JSP Webshell Content - Runtime.exec Pattern"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:Runtime\\.getRuntime\\(\\)\\.exec\\s*\\(|ProcessBuilder\\s*\\(|new\\s+ProcessBuilder|Runtime\\.exec\\s*\\(|request\\.getParameter\\s*\\([^)]+\\).*exec)"
+    action: "block"
+    tags: ["advanced", "webshell", "jsp", "rce"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-009"
+    name: "ASP/ASPX Webshell Content - WScript.Shell Pattern"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:WScript\\.Shell|Server\\.CreateObject\\s*\\([\"']WScript\\.Shell[\"']\\)|CreateObject\\s*\\([\"']WScript\\.Shell[\"']\\)|cmd\\.exe|powershell\\.exe|Shell\\.Application|Scripting\\.FileSystemObject)"
+    action: "block"
+    tags: ["advanced", "webshell", "asp", "aspx", "rce"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-010"
+    name: "Polyglot Webshell - PHP in Image Header"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:\\xff\\xd8\\xff|GIF8[79]a|\\x89PNG|BM[\\x00-\\xff]{2}[\\x00-\\xff]{2}|RIFF)[^<]*<\\?php"
+    action: "block"
+    tags: ["advanced", "webshell", "polyglot", "image-header"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-011"
+    name: "Webshell Upload - CGI/Shell Script Extensions"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "path"
+    operator: "regex"
+    value: "(?i)/(?:upload[s]?|files?|media|static|assets?|public|tmp|temp|cgi-bin)/[^/]*\\.(?:cgi|pl|py|rb|sh|bash|zsh|fish|ksh|csh|tcsh|cmd|bat|ps1|psm1|psd1|exe|dll)"
+    action: "block"
+    tags: ["advanced", "webshell", "script-extensions", "upload"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-012"
+    name: "Webshell - SVG with Embedded Script"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)<svg[^>]*>(?:[^<]*<[^>]*>)*[^<]*<script[^>]*>(?:[^<]|<(?!/script>))*(?:eval|exec|system|passthru|cmd|shell_exec|fetch|import)"
+    action: "block"
+    tags: ["advanced", "webshell", "svg", "script-injection"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"
+
+  - id: "ADV-SHELL-013"
+    name: "Webshell - .htaccess Upload to Execute PHP"
+    category: "webshell-upload"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:AddType\\s+application/x-httpd-php|SetHandler\\s+application/x-httpd-php|Options\\s+(?:\\+)?ExecCGI|php_value\\s+auto_(?:prepend|append)_file)"
+    action: "block"
+    tags: ["advanced", "webshell", "htaccess", "bypass"]
+    reference: "https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload"

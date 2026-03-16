@@ -1,0 +1,149 @@
+version: "1.0"
+description: "OWASP API Security - Unrestricted Resource Consumption / Rate Abuse (API4:2023)"
+source: "prx-waf community rules"
+license: "Apache-2.0"
+
+rules:
+  - id: "API-RATE-001"
+    name: "GraphQL Batching Attack - Array of Multiple Queries"
+    category: "rate-abuse"
+    severity: "high"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)^\\s*\\[\\s*\\{[^}]*\"query\"\\s*:[^}]*\\}\\s*,\\s*\\{[^}]*\"query\""
+    action: "block"
+    tags: ["owasp-api", "graphql", "batching-attack", "api4-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+
+  - id: "API-RATE-002"
+    name: "GraphQL Batching Attack - Large Batch Count"
+    category: "rate-abuse"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:\"query\"\\s*:[^,}]+,\\s*){10,}"
+    action: "block"
+    tags: ["owasp-api", "graphql", "batching-attack", "dos", "api4-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+
+  - id: "API-RATE-003"
+    name: "Pagination Abuse - Extremely Large Page Size"
+    category: "rate-abuse"
+    severity: "high"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:^|&)(?:limit|per_page|page_size|count|size|take|n|rows)=(?:[0-9]{5,}|[1-9][0-9]{3,})"
+    action: "block"
+    tags: ["owasp-api", "rate-abuse", "pagination-abuse", "api4-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+
+  - id: "API-RATE-004"
+    name: "Bulk/Batch Endpoint Abuse - Large Array in Body"
+    category: "rate-abuse"
+    severity: "high"
+    paranoia: 2
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:\\{[^{}]*\\}\\s*,\\s*){50,}"
+    action: "block"
+    tags: ["owasp-api", "rate-abuse", "bulk-abuse", "api4-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+
+  - id: "API-RATE-005"
+    name: "Bulk Operation Endpoint Access"
+    category: "rate-abuse"
+    severity: "medium"
+    paranoia: 2
+    field: "path"
+    operator: "regex"
+    value: "(?i)/(?:api/v[0-9]+/)?(?:bulk|batch|mass|multi|parallel|concurrent)/(?:create|update|delete|send|process|import|export)"
+    action: "log"
+    tags: ["owasp-api", "rate-abuse", "bulk-endpoint", "api4-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+
+  - id: "API-RATE-006"
+    name: "GraphQL Nested Object Depth Abuse"
+    category: "rate-abuse"
+    severity: "high"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)\\{[^{}]*\\{[^{}]*\\{[^{}]*\\{[^{}]*\\{[^{}]*\\{[^{}]*\\{"
+    action: "block"
+    tags: ["owasp-api", "graphql", "depth-limit", "dos", "api4-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+
+  - id: "API-RATE-007"
+    name: "API Resource Export Abuse - Large Offset"
+    category: "rate-abuse"
+    severity: "medium"
+    paranoia: 2
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:^|&)offset=[0-9]{7,}"
+    action: "log"
+    tags: ["owasp-api", "rate-abuse", "pagination-abuse", "api4-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+
+  - id: "API-RATE-008"
+    name: "Bulk Email/SMS Send Endpoint"
+    category: "rate-abuse"
+    severity: "high"
+    paranoia: 1
+    field: "path"
+    operator: "regex"
+    value: "(?i)/(?:api/v[0-9]+/)?(?:email|sms|notification|message|push)/(?:bulk|batch|mass|broadcast|blast|campaign)(?:/|$|\\?)"
+    action: "log"
+    tags: ["owasp-api", "rate-abuse", "notification-abuse", "api4-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+
+  - id: "API-RATE-009"
+    name: "File Upload Size Abuse - Chunked Upload Manipulation"
+    category: "rate-abuse"
+    severity: "medium"
+    paranoia: 2
+    field: "headers"
+    operator: "regex"
+    value: "(?i)Content-Range:\\s*bytes\\s+[0-9]+-[0-9]+/(?:[0-9]{10,}|\\*)"
+    action: "log"
+    tags: ["owasp-api", "rate-abuse", "upload-abuse", "api4-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+
+  - id: "API-RATE-010"
+    name: "GraphQL Fragment Abuse - Circular Fragment"
+    category: "rate-abuse"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)fragment\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s+on\\s+[a-zA-Z_][a-zA-Z0-9_]*\\s*\\{[^}]*\\.\\.\\.\\1"
+    action: "block"
+    tags: ["owasp-api", "graphql", "circular-fragment", "dos", "api4-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+
+  - id: "API-RATE-011"
+    name: "API Zip Bomb via Multipart Upload"
+    category: "rate-abuse"
+    severity: "high"
+    paranoia: 2
+    field: "headers"
+    operator: "regex"
+    value: "(?i)Content-Type:\\s*(?:application/zip|application/x-zip|application/x-gzip|application/x-tar|application/x-bzip2)"
+    action: "log"
+    tags: ["owasp-api", "rate-abuse", "zip-bomb", "api4-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/"
+
+  - id: "API-RATE-012"
+    name: "Regex Injection for ReDoS via API"
+    category: "rate-abuse"
+    severity: "high"
+    paranoia: 2
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:\\(a+\\)\\+|\\(a\\*\\)\\*|\\(a\\|a\\)\\*|\\(?[a-zA-Z]\\+\\)\\+\\$|\\([^)]+\\+\\)\\+[a-zA-Z])"
+    action: "block"
+    tags: ["owasp-api", "rate-abuse", "redos", "regex-dos", "api4-2023"]
+    reference: "https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS"

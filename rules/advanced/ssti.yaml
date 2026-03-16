@@ -1,0 +1,161 @@
+version: "1.0"
+description: "Advanced Server-Side Template Injection (SSTI) Detection"
+source: "prx-waf community rules"
+license: "Apache-2.0"
+
+rules:
+  - id: "ADV-SSTI-001"
+    name: "SSTI - Generic Expression Evaluation Test (${7*7})"
+    category: "ssti"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:\\$\\{\\s*[0-9]+\\s*\\*\\s*[0-9]+\\s*\\}|\\{\\{\\s*[0-9]+\\s*\\*\\s*[0-9]+\\s*\\}\\}|<%=\\s*[0-9]+\\s*\\*\\s*[0-9]+\\s*%>|#\\{[0-9]+\\s*\\*\\s*[0-9]+\\})"
+    action: "block"
+    tags: ["advanced", "ssti", "template-injection", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-002"
+    name: "SSTI - Jinja2 Config Object Access"
+    category: "ssti"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)\\{\\{\\s*(?:config|settings|self|request|g\\.|current_app|url_for|get_flashed_messages|lipsum|dict|cycler|namespace)\\s*(?:\\.|\\[|\\}\\})"
+    action: "block"
+    tags: ["advanced", "ssti", "jinja2", "flask", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-003"
+    name: "SSTI - Jinja2 Class Traversal for RCE"
+    category: "ssti"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)\\{\\{[^}]*(?:__class__|__mro__|__subclasses__|__init__|__globals__|__builtins__|__import__|__base__|__bases__|__dict__|class_suite|func_globals)[^}]*\\}\\}"
+    action: "block"
+    tags: ["advanced", "ssti", "jinja2", "class-traversal", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-004"
+    name: "SSTI - Twig Template Engine Exploitation"
+    category: "ssti"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)\\{\\{\\s*(?:_self|_context|_charset|_environment|dump|include|source|template_from_string)[^}]*\\}\\}|\\{%[^%]*(?:set|block|extends|import|include|embed|use|macro|sandbox|apply)[^%]*%\\}"
+    action: "block"
+    tags: ["advanced", "ssti", "twig", "php", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-005"
+    name: "SSTI - Freemarker Template Injection"
+    category: "ssti"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:<#(?:assign|attempt|autoesc|compress|escape|flush|ftl|function|global|if|import|include|list|local|macro|noescape|noparse|nowhitespace|nt|outputformat|recover|recurse|return|setting|stop|switch|t|template|transform|visit|whitespace|nt)\\s+|\\$\\{(?:[^}]*\\.getClass\\(\\)|[^}]*Runtime|[^}]*exec\\(|freemarker\\.template\\.utility\\.Execute|freemarker\\.template\\.utility\\.ObjectConstructor))"
+    action: "block"
+    tags: ["advanced", "ssti", "freemarker", "java", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-006"
+    name: "SSTI - Velocity Template Injection"
+    category: "ssti"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:#set\\s*\\(|#macro\\s*\\(|#parse\\s*\\(|#evaluate\\s*\\(|#define\\s*\\(|\\$(?:context|request|response|session|application|templateEngine)\\.|\\$\\{[^}]*(?:Runtime|exec|ProcessBuilder|getRuntime)[^}]*\\})"
+    action: "block"
+    tags: ["advanced", "ssti", "velocity", "java", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-007"
+    name: "SSTI - Smarty PHP Template Injection"
+    category: "ssti"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)\\{(?:php|literal|section|foreach|if|capture|assign|include|php|block|call|nocache|config_load|fetch|eval)(?:\\s+[a-zA-Z0-9_\"'=.]+)*\\}"
+    action: "block"
+    tags: ["advanced", "ssti", "smarty", "php", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-008"
+    name: "SSTI - Pebble Template Injection (Java)"
+    category: "ssti"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)\\{%\\s*(?:import|include|extends|block|macro|set|for|if|filter|with)\\s+[^%]*%\\}|\\{\\{[^}]*(?:runtime|exec|processBuilder|getClass\\(\\))[^}]*\\}\\}"
+    action: "block"
+    tags: ["advanced", "ssti", "pebble", "java", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-009"
+    name: "SSTI - Mako Template Injection (Python)"
+    category: "ssti"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:\\$\\{[^}]*(?:import|os\\.system|subprocess|eval|exec|open|__import__)[^}]*\\}|<%[^%]*(?:import|os\\.system|subprocess|eval|exec|open|__import__)[^%]*%>)"
+    action: "block"
+    tags: ["advanced", "ssti", "mako", "python", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-010"
+    name: "SSTI - ERB Template Injection (Ruby)"
+    category: "ssti"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)<%=?[^%]*(?:system|exec|popen|backtick|Kernel\\.system|`[^`]*`|IO\\.popen|Process\\.spawn|Open3)[^%]*%>"
+    action: "block"
+    tags: ["advanced", "ssti", "erb", "ruby", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-011"
+    name: "SSTI - Handlebars/Mustache Template Injection"
+    category: "ssti"
+    severity: "high"
+    paranoia: 2
+    field: "all"
+    operator: "regex"
+    value: "(?i)\\{\\{\\{?[^}]*(?:lookup\\s+this|constructor|__proto__|__defineGetter__|__defineSetter__|process\\.mainModule)[^}]*\\}\\}\\}?"
+    action: "block"
+    tags: ["advanced", "ssti", "handlebars", "mustache", "nodejs", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-012"
+    name: "SSTI - Spring EL (SpEL) Injection"
+    category: "ssti"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:#\\{T\\s*\\(java\\.lang\\.Runtime\\)|\\$\\{T\\s*\\(|#\\{[^}]*\\.exec\\s*\\(|\\$\\{[^}]*Runtime\\.getRuntime\\(\\)\\.exec)"
+    action: "block"
+    tags: ["advanced", "ssti", "spel", "spring", "java", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"
+
+  - id: "ADV-SSTI-013"
+    name: "SSTI - Generic Polyglot Detection Probe"
+    category: "ssti"
+    severity: "high"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:a\\}\\}\\{\\{a|\\}\\}\\{\\{|<%=\\s*[0-9]+\\s*\\*\\s*[0-9]+|\\$\\{[0-9]+\\*[0-9]+\\}|\\{\\{[0-9]+\\*[0-9]+\\}\\}|#\\{[0-9]+\\*[0-9]+\\})"
+    action: "block"
+    tags: ["advanced", "ssti", "polyglot-probe", "rce"]
+    reference: "https://portswigger.net/research/server-side-template-injection"

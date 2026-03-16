@@ -1,0 +1,149 @@
+version: "1.0"
+description: "OWASP API Security - Sensitive Data Exposure (API3:2023 / API5:2023)"
+source: "prx-waf community rules"
+license: "Apache-2.0"
+
+rules:
+  - id: "API-EXPO-001"
+    name: "Sensitive Data in URL - Password Parameter"
+    category: "data-exposure"
+    severity: "high"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:^|&)(?:password|passwd|pass|pwd|secret|passphrase)=[^&]{1,}"
+    action: "log"
+    tags: ["owasp-api", "data-exposure", "sensitive-in-url", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-EXPO-002"
+    name: "Sensitive Data in URL - Token/Secret Parameter"
+    category: "data-exposure"
+    severity: "high"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:^|&)(?:token|secret|api_key|apikey|auth_token|session_token|access_key|private_key|signing_key)=[^&]{8,}"
+    action: "log"
+    tags: ["owasp-api", "data-exposure", "sensitive-in-url", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-EXPO-003"
+    name: "Sensitive Data in URL - Credit Card Number Pattern"
+    category: "data-exposure"
+    severity: "critical"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:^|&)(?:credit_card|card_number|cc_number|cvv|cvc|card_cvv)=[0-9 -]{12,19}"
+    action: "block"
+    tags: ["owasp-api", "data-exposure", "pci-dss", "credit-card", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-EXPO-004"
+    name: "PAN in URL or Body - Luhn Pattern"
+    category: "data-exposure"
+    severity: "critical"
+    paranoia: 2
+    field: "all"
+    operator: "regex"
+    value: "\\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|3(?:0[0-5]|[68][0-9])[0-9]{11}|(?:2131|1800|35[0-9]{3})[0-9]{11})\\b"
+    action: "block"
+    tags: ["owasp-api", "data-exposure", "pci-dss", "pan", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-EXPO-005"
+    name: "Debug Mode Parameter in API Request"
+    category: "data-exposure"
+    severity: "medium"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:^|&)(?:debug|verbose|trace|diagnostic|dev_mode|development)=(?:true|1|yes|on)"
+    action: "log"
+    tags: ["owasp-api", "data-exposure", "debug-mode", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-EXPO-006"
+    name: "Stack Trace Pattern in Response Body"
+    category: "data-exposure"
+    severity: "high"
+    paranoia: 1
+    field: "response_body"
+    operator: "regex"
+    value: "(?i)(?:at\\s+[a-zA-Z_$][a-zA-Z0-9_$]*(?:\\.[a-zA-Z_$][a-zA-Z0-9_$]*)+\\s*\\([^)]*\\.(?:java|py|rb|php|cs|go|js|ts):[0-9]+\\)|Traceback\\s+\\(most\\s+recent\\s+call\\s+last\\)|Fatal\\s+error:\\s+Uncaught|Exception\\s+in\\s+thread\\s+\"main\"|Caused\\s+by:|at\\s+org\\.(?:springframework|hibernate|apache))"
+    action: "log"
+    tags: ["owasp-api", "data-exposure", "stack-trace", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-EXPO-007"
+    name: "Internal IP Address Leaked in Response"
+    category: "data-exposure"
+    severity: "medium"
+    paranoia: 2
+    field: "response_body"
+    operator: "regex"
+    value: "(?i)(?:\"(?:internal_?ip|server_?ip|backend_?ip|private_?ip|host_?ip|node_?ip)\"\\s*:\\s*\"(?:10|172\\.(?:1[6-9]|2[0-9]|3[01])|192\\.168)\\.[0-9]{1,3}\\.[0-9]{1,3}\")"
+    action: "log"
+    tags: ["owasp-api", "data-exposure", "internal-ip", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-EXPO-008"
+    name: "Database Connection String in Response"
+    category: "data-exposure"
+    severity: "critical"
+    paranoia: 1
+    field: "response_body"
+    operator: "regex"
+    value: "(?i)(?:mysql|postgresql|mongodb|redis|mssql|oracle|sqlite)://[a-zA-Z0-9_.-]+(?::[^@/]+)?@[a-zA-Z0-9_.-]+(?::[0-9]+)?/"
+    action: "block"
+    tags: ["owasp-api", "data-exposure", "db-connection-string", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-EXPO-009"
+    name: "Private Key or Certificate Material in Response"
+    category: "data-exposure"
+    severity: "critical"
+    paranoia: 1
+    field: "response_body"
+    operator: "regex"
+    value: "-----BEGIN\\s+(?:RSA\\s+)?(?:PRIVATE\\s+KEY|EC\\s+PRIVATE\\s+KEY|DSA\\s+PRIVATE\\s+KEY|OPENSSH\\s+PRIVATE\\s+KEY|CERTIFICATE)-----"
+    action: "block"
+    tags: ["owasp-api", "data-exposure", "private-key", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-EXPO-010"
+    name: "AWS Access Key Exposed in Response"
+    category: "data-exposure"
+    severity: "critical"
+    paranoia: 1
+    field: "response_body"
+    operator: "regex"
+    value: "(?:AKIA|AIPA|AISA|AROA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"
+    action: "log"
+    tags: ["owasp-api", "data-exposure", "aws-key", "cloud-credentials", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-EXPO-011"
+    name: "Social Security Number Pattern in Request/Response"
+    category: "data-exposure"
+    severity: "critical"
+    paranoia: 2
+    field: "all"
+    operator: "regex"
+    value: "\\b(?!000|666|9[0-9]{2})[0-9]{3}-(?!00)[0-9]{2}-(?!0000)[0-9]{4}\\b"
+    action: "log"
+    tags: ["owasp-api", "data-exposure", "pii", "ssn", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"
+
+  - id: "API-EXPO-012"
+    name: "Password Hash Pattern in Response"
+    category: "data-exposure"
+    severity: "critical"
+    paranoia: 1
+    field: "response_body"
+    operator: "regex"
+    value: "(?i)\"(?:password_hash|hashed_password|passwd_hash|pwd_hash|password_digest)\"\\s*:\\s*\"(?:\\$2[aby]\\$|\\$argon2|\\$1\\$|\\$5\\$|\\$6\\$|\\$sha1\\$)[^\"]{10,}\""
+    action: "log"
+    tags: ["owasp-api", "data-exposure", "password-hash", "api3-2023"]
+    reference: "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/"

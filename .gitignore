@@ -4,3 +4,5 @@
 .DS_Store
 node_modules/
 web/admin-ui/dist/
+# ip2region xdb binary data files — download with `prx-waf geoip download`
+data/*.xdb

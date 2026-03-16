@@ -1,0 +1,125 @@
+version: "1.0"
+description: "Advanced Prototype Pollution Detection - JavaScript Object Prototype Manipulation"
+source: "prx-waf community rules"
+license: "Apache-2.0"
+
+rules:
+  - id: "ADV-PROTO-001"
+    name: "Prototype Pollution - __proto__ in JSON Body"
+    category: "prototype-pollution"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"__proto__\"\\s*:"
+    action: "block"
+    tags: ["advanced", "prototype-pollution", "nodejs", "rce"]
+    reference: "https://portswigger.net/web-security/prototype-pollution"
+
+  - id: "ADV-PROTO-002"
+    name: "Prototype Pollution - __proto__ in Query String"
+    category: "prototype-pollution"
+    severity: "critical"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:^|&)(?:[a-zA-Z0-9_.\\[\\]]+)?(?:%5F%5F|__)proto(?:%5F%5F|__)(?:\\[|%5B)"
+    action: "block"
+    tags: ["advanced", "prototype-pollution", "nodejs", "query-string"]
+    reference: "https://portswigger.net/web-security/prototype-pollution"
+
+  - id: "ADV-PROTO-003"
+    name: "Prototype Pollution - constructor.prototype in Body"
+    category: "prototype-pollution"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"constructor\"\\s*:\\s*\\{[^}]*\"prototype\"\\s*:"
+    action: "block"
+    tags: ["advanced", "prototype-pollution", "constructor-prototype", "rce"]
+    reference: "https://portswigger.net/web-security/prototype-pollution"
+
+  - id: "ADV-PROTO-004"
+    name: "Prototype Pollution - constructor.prototype in Query"
+    category: "prototype-pollution"
+    severity: "critical"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)(?:^|&)constructor(?:\\[|%5B)prototype(?:\\]|%5D)(?:\\[|%5B)"
+    action: "block"
+    tags: ["advanced", "prototype-pollution", "constructor-prototype", "query-string"]
+    reference: "https://portswigger.net/web-security/prototype-pollution"
+
+  - id: "ADV-PROTO-005"
+    name: "Prototype Pollution - Object.prototype via JSON"
+    category: "prototype-pollution"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"Object\"\\s*:\\s*\\{[^}]*\"prototype\"\\s*:|\"prototype\"\\s*:\\s*\\{[^}]*\"(?:toString|valueOf|hasOwnProperty|isPrototypeOf|constructor)\"\\s*:"
+    action: "block"
+    tags: ["advanced", "prototype-pollution", "object-prototype", "rce"]
+    reference: "https://portswigger.net/web-security/prototype-pollution"
+
+  - id: "ADV-PROTO-006"
+    name: "Prototype Pollution - Bracket Notation Access"
+    category: "prototype-pollution"
+    severity: "critical"
+    paranoia: 1
+    field: "query"
+    operator: "regex"
+    value: "(?i)\\[(?:%5F%5F|__)proto(?:%5F%5F|__)\\]|\\[constructor\\]\\[prototype\\]"
+    action: "block"
+    tags: ["advanced", "prototype-pollution", "bracket-notation"]
+    reference: "https://portswigger.net/web-security/prototype-pollution"
+
+  - id: "ADV-PROTO-007"
+    name: "Prototype Pollution - Dangerous Property Overrides"
+    category: "prototype-pollution"
+    severity: "critical"
+    paranoia: 1
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"__proto__\"\\s*:\\s*\\{[^}]*(?:\"isAdmin\"|\"admin\"|\"role\"|\"exec\"|\"spawn\"|\"require\"|\"shell\"|\"env\"|\"argv\")\\s*:"
+    action: "block"
+    tags: ["advanced", "prototype-pollution", "privilege-escalation", "rce"]
+    reference: "https://portswigger.net/web-security/prototype-pollution"
+
+  - id: "ADV-PROTO-008"
+    name: "Prototype Pollution - URL Encoded __proto__"
+    category: "prototype-pollution"
+    severity: "critical"
+    paranoia: 1
+    field: "all"
+    operator: "regex"
+    value: "(?i)(?:%5F%5Fproto%5F%5F|%5F%5Fproto__|__proto%5F%5F|\\\\u005f\\\\u005fproto\\\\u005f\\\\u005f)"
+    action: "block"
+    tags: ["advanced", "prototype-pollution", "url-encoded", "bypass"]
+    reference: "https://portswigger.net/web-security/prototype-pollution"
+
+  - id: "ADV-PROTO-009"
+    name: "Prototype Pollution - JSON.parse Override via Reviver"
+    category: "prototype-pollution"
+    severity: "high"
+    paranoia: 2
+    field: "body"
+    operator: "regex"
+    value: "(?i)\"(?:polluted|exploited|__defineGetter__|__defineSetter__|__lookupGetter__|__lookupSetter__)\"\\s*:"
+    action: "block"
+    tags: ["advanced", "prototype-pollution", "defineGetter"]
+    reference: "https://portswigger.net/web-security/prototype-pollution"
+
+  - id: "ADV-PROTO-010"
+    name: "Prototype Pollution - Deep Merge via Nested Objects"
+    category: "prototype-pollution"
+    severity: "high"
+    paranoia: 2
+    field: "body"
+    operator: "regex"
+    value: "(?i)(?:\\{[^{}]*\\{[^{}]*\\{[^{}]*\"__proto__\"\\s*:|\\{[^{}]*\"constructor\"[^{}]*\\{[^{}]*\"prototype\")"
+    action: "block"
+    tags: ["advanced", "prototype-pollution", "deep-merge"]
+    reference: "https://portswigger.net/web-security/prototype-pollution"

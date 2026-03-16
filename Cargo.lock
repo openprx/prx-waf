@@ -813,7 +813,7 @@ dependencies = [
  "cranelift-codegen",
  "cranelift-entity",
  "cranelift-frontend",
- "itertools",
+ "itertools 0.12.1",
  "log",
  "smallvec",
  "wasmparser 0.212.0",
@@ -2002,6 +2002,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip2region"
+version = "0.2.1"
+source = "git+https://github.com/lionsoul2014/ip2region.git?branch=master#04e51e218220284bd296068081fd2e0fbc4967cc"
+dependencies = [
+ "maker",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2031,6 +2041,15 @@ name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -2274,6 +2293,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "maker"
+version = "0.2.0"
+source = "git+https://github.com/lionsoul2014/ip2region.git?branch=master#04e51e218220284bd296068081fd2e0fbc4967cc"
+dependencies = [
+ "bytes",
+ "chrono",
+ "clap",
+ "itertools 0.14.0",
+ "num-derive",
+ "num-traits",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2545,6 +2580,17 @@ name = "num-conv"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
+
+[[package]]
+name = "num-derive"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "num-integer"
@@ -5047,6 +5093,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap",
+ "ip2region",
  "ipnet",
  "notify",
  "regex",

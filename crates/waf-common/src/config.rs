@@ -20,6 +20,9 @@ pub struct AppConfig {
     /// Phase 7: Rule management
     #[serde(default)]
     pub rules: RulesConfig,
+    /// GeoIP lookup configuration
+    #[serde(default)]
+    pub geoip: GeoIpConfig,
 }
 
 impl Default for AppConfig {
@@ -34,6 +37,7 @@ impl Default for AppConfig {
             security: SecurityConfig::default(),
             crowdsec: CrowdSecConfig::default(),
             rules: RulesConfig::default(),
+            geoip: GeoIpConfig::default(),
         }
     }
 }
@@ -292,6 +296,37 @@ impl Default for SecurityConfig {
             max_request_body_bytes: 10 * 1024 * 1024, // 10 MB
             api_rate_limit_rps: 0,
             cors_origins: Vec::new(),
+        }
+    }
+}
+
+/// GeoIP lookup configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoIpConfig {
+    /// Enable GeoIP lookups on every request.
+    pub enabled: bool,
+    /// Path to the ip2region IPv4 xdb file (default: "data/ip2region_v4.xdb").
+    #[serde(default = "default_ipv4_xdb")]
+    pub ipv4_xdb_path: String,
+    /// Path to the ip2region IPv6 xdb file (default: "data/ip2region_v6.xdb").
+    #[serde(default = "default_ipv6_xdb")]
+    pub ipv6_xdb_path: String,
+    /// Cache policy: "full_memory" (fastest, ~20MB), "vector_index" (~2MB), "no_cache" (1-2MB).
+    #[serde(default = "default_geoip_cache_policy")]
+    pub cache_policy: String,
+}
+
+fn default_ipv4_xdb() -> String { "data/ip2region_v4.xdb".to_string() }
+fn default_ipv6_xdb() -> String { "data/ip2region_v6.xdb".to_string() }
+fn default_geoip_cache_policy() -> String { "full_memory".to_string() }
+
+impl Default for GeoIpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ipv4_xdb_path: default_ipv4_xdb(),
+            ipv6_xdb_path: default_ipv6_xdb(),
+            cache_policy: default_geoip_cache_policy(),
         }
     }
 }

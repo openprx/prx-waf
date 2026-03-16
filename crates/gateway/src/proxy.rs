@@ -89,6 +89,7 @@ impl WafProxy {
             content_length: 0,
             is_tls: false,
             host_config,
+            geo: None, // populated by WafEngine::inspect when GeoIP is enabled
         }
     }
 }
@@ -152,7 +153,7 @@ impl ProxyHttp for WafProxy {
         session: &mut Session,
         ctx: &mut GatewayCtx,
     ) -> pingora_core::Result<bool> {
-        let request_ctx = match &ctx.request_ctx {
+        let mut request_ctx = match &ctx.request_ctx {
             Some(c) => c.clone(),
             None => return Ok(false),
         };
@@ -163,8 +164,8 @@ impl ProxyHttp for WafProxy {
             return Ok(true);
         }
 
-        // Run WAF inspection
-        let decision = self.engine.inspect(&request_ctx).await;
+        // Run WAF inspection (ctx is &mut so the engine can enrich it with GeoIP)
+        let decision = self.engine.inspect(&mut request_ctx).await;
 
         if !decision.is_allowed() {
             match &decision.action {

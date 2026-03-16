@@ -4,6 +4,16 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+/// GeoIP information resolved from the client IP address.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GeoIpInfo {
+    pub country: String,
+    pub province: String,
+    pub city: String,
+    pub isp: String,
+    pub iso_code: String,
+}
+
 /// Request context passed through the WAF pipeline
 #[derive(Debug, Clone)]
 pub struct RequestCtx {
@@ -20,6 +30,9 @@ pub struct RequestCtx {
     pub content_length: u64,
     pub is_tls: bool,
     pub host_config: Arc<HostConfig>,
+    /// GeoIP info populated by the WAF engine before checks run.
+    /// `None` if GeoIP is disabled or the xdb file is missing.
+    pub geo: Option<GeoIpInfo>,
 }
 
 /// WAF action decision
@@ -88,6 +101,8 @@ pub enum Phase {
     AntiHotlink = 15,
     /// CrowdSec bouncer / AppSec decision
     CrowdSec = 16,
+    /// GeoIP-based access control
+    GeoIp = 17,
 }
 
 impl std::fmt::Display for Phase {
@@ -109,6 +124,7 @@ impl std::fmt::Display for Phase {
             Phase::Sensitive => write!(f, "Sensitive Data"),
             Phase::AntiHotlink => write!(f, "Anti-Hotlink"),
             Phase::CrowdSec => write!(f, "CrowdSec"),
+            Phase::GeoIp => write!(f, "GeoIP"),
         }
     }
 }
