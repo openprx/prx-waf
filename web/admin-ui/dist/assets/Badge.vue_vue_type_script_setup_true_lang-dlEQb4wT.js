@@ -1,1 +1,0 @@
-import{d as t,o as a,c as n,t as o,n as s}from"./index-D7Tn84Bd.js";const m=t({__name:"Badge",props:{active:{type:Boolean},yes:{},no:{}},setup(e){return(c,r)=>(a(),n("span",{class:s([e.active?"bg-green-100 text-green-700":"bg-gray-100 text-gray-500","text-xs px-2 py-0.5 rounded font-medium"])},o(e.active?e.yes:e.no),3))}});export{m as _};
