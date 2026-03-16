@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -92,6 +92,51 @@ impl PhiAccrualDetector {
         } else {
             false
         }
+    }
+}
+
+// ─── Per-cluster heartbeat tracker ───────────────────────────────────────────
+
+/// Tracks heartbeat arrivals for every peer and drives the phi-accrual
+/// failure detector for each one.
+pub struct HeartbeatTracker {
+    peers: HashMap<String, PhiAccrualDetector>,
+    phi_suspect: f64,
+    phi_dead: f64,
+}
+
+impl HeartbeatTracker {
+    pub fn new(phi_suspect: f64, phi_dead: f64) -> Self {
+        Self {
+            peers: HashMap::new(),
+            phi_suspect,
+            phi_dead,
+        }
+    }
+
+    /// Record a heartbeat arrival for `node_id` at `now_ms`.
+    pub fn record(&mut self, node_id: &str, now_ms: u64) {
+        let phi_suspect = self.phi_suspect;
+        let phi_dead = self.phi_dead;
+        let detector = self
+            .peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| PhiAccrualDetector::new(node_id.to_string(), phi_suspect, phi_dead));
+        detector.record_heartbeat(now_ms);
+    }
+
+    /// Return the node IDs whose phi value exceeds the dead threshold.
+    pub fn dead_nodes(&self, now_ms: u64) -> Vec<String> {
+        self.peers
+            .iter()
+            .filter(|(_, d)| d.is_dead(now_ms))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Remove a peer from tracking (on graceful leave).
+    pub fn remove(&mut self, node_id: &str) {
+        self.peers.remove(node_id);
     }
 }
 
