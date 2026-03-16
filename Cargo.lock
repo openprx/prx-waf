@@ -5100,6 +5100,7 @@ dependencies = [
  "tokio",
  "tracing",
  "waf-common",
+ "waf-engine",
 ]
 
 [[package]]

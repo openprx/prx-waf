@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 waf-common = { path = "../waf-common" }
+waf-engine = { path = "../waf-engine" }
 
 # Transport (QUIC/TLS) — already in workspace
 quinn          = { workspace = true }

@@ -1,3 +1,4 @@
+pub mod cluster_forward;
 pub mod crypto;
 pub mod discovery;
 pub mod election;
@@ -7,6 +8,7 @@ pub mod protocol;
 pub mod sync;
 pub mod transport;
 
+pub use cluster_forward::PendingForwards;
 pub use node::{NodeState, PeerInfo, StorageMode};
 pub use protocol::ClusterMessage;
 pub use waf_common::config::{ClusterConfig, NodeRole};
