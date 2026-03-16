@@ -11,15 +11,20 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use crate::auth::{login, logout, refresh_token};
+use crate::cache_api::{cache_flush, cache_flush_host, cache_flush_key, cache_stats};
 use crate::handlers::*;
+use crate::health::health_check;
 use crate::middleware::require_auth;
 use crate::notifications::{
     create_notification, delete_notification, list_notifications, notification_log,
     test_notification,
 };
+use crate::plugins::{delete_plugin, disable_plugin, enable_plugin, list_plugins, upload_plugin};
+use crate::security::{list_audit_log, security_headers_middleware};
 use crate::state::AppState;
 use crate::stats::{stats_overview, stats_timeseries};
 use crate::static_files::static_handler;
+use crate::tunnels::{create_tunnel, delete_tunnel, list_tunnels, ws_tunnel};
 use crate::websocket::{ws_events, ws_logs};
 
 /// Build the Axum router with all API routes
@@ -29,11 +34,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Public auth routes (no JWT required)
-    let auth_routes = Router::new()
+    // Public routes (no JWT)
+    let public_routes = Router::new()
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
-        .route("/api/auth/refresh", post(refresh_token));
+        .route("/api/auth/refresh", post(refresh_token))
+        .route("/health", get(health_check));
 
     // Protected API routes (JWT required)
     let protected_routes = Router::new()
@@ -82,12 +88,28 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/notifications/:id", delete(delete_notification))
         .route("/api/notifications/log", get(notification_log))
         .route("/api/notifications/:id/test", post(test_notification))
+        // Phase 5: WASM Plugins
+        .route("/api/plugins", get(list_plugins).post(upload_plugin))
+        .route("/api/plugins/:id", delete(delete_plugin))
+        .route("/api/plugins/:id/enable", post(enable_plugin))
+        .route("/api/plugins/:id/disable", post(disable_plugin))
+        // Phase 5: Tunnels
+        .route("/api/tunnels", get(list_tunnels).post(create_tunnel))
+        .route("/api/tunnels/:id", delete(delete_tunnel))
+        // Phase 5: Cache
+        .route("/api/cache/stats", get(cache_stats))
+        .route("/api/cache", delete(cache_flush))
+        .route("/api/cache/host/:host", delete(cache_flush_host))
+        .route("/api/cache/key", delete(cache_flush_key))
+        // Phase 5: Audit log
+        .route("/api/audit-log", get(list_audit_log))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     // WebSocket routes (auth via query param, no layer middleware)
     let ws_routes = Router::new()
         .route("/ws/events", get(ws_events))
-        .route("/ws/logs", get(ws_logs));
+        .route("/ws/logs", get(ws_logs))
+        .route("/ws/tunnel", get(ws_tunnel));
 
     // Serve the embedded Vue 3 admin UI at /ui/*
     let ui_routes = Router::new()
@@ -96,10 +118,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/ui/*path", get(static_handler));
 
     Router::new()
-        .merge(auth_routes)
+        .merge(public_routes)
         .merge(protected_routes)
         .merge(ws_routes)
         .merge(ui_routes)
+        .layer(middleware::from_fn(security_headers_middleware))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

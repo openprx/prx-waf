@@ -1024,4 +1024,210 @@ impl Database {
 
         Ok((rows, total))
     }
+
+    // ─── Phase 5: WASM Plugins ────────────────────────────────────────────────
+
+    pub async fn list_wasm_plugins(&self) -> Result<Vec<WasmPluginRow>, StorageError> {
+        Ok(sqlx::query_as::<_, WasmPluginRow>(
+            "SELECT * FROM wasm_plugins ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn get_wasm_plugin(&self, id: Uuid) -> Result<Option<WasmPluginRow>, StorageError> {
+        Ok(sqlx::query_as::<_, WasmPluginRow>(
+            "SELECT * FROM wasm_plugins WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn create_wasm_plugin(
+        &self,
+        req: CreateWasmPlugin,
+    ) -> Result<WasmPluginRow, StorageError> {
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        Ok(sqlx::query_as::<_, WasmPluginRow>(
+            r#"INSERT INTO wasm_plugins
+               (id, name, version, description, author, wasm_binary, enabled, config_json, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *"#,
+        )
+        .bind(id)
+        .bind(&req.name)
+        .bind(req.version.as_deref().unwrap_or("1.0.0"))
+        .bind(&req.description)
+        .bind(&req.author)
+        .bind(&req.wasm_binary)
+        .bind(req.enabled.unwrap_or(true))
+        .bind(req.config_json.unwrap_or(serde_json::Value::Object(Default::default())))
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    pub async fn set_wasm_plugin_enabled(
+        &self,
+        id: Uuid,
+        enabled: bool,
+    ) -> Result<bool, StorageError> {
+        let r = sqlx::query(
+            "UPDATE wasm_plugins SET enabled=$2, updated_at=NOW() WHERE id=$1",
+        )
+        .bind(id)
+        .bind(enabled)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    pub async fn delete_wasm_plugin(&self, id: Uuid) -> Result<bool, StorageError> {
+        let r = sqlx::query("DELETE FROM wasm_plugins WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    // ─── Phase 5: Tunnels ─────────────────────────────────────────────────────
+
+    pub async fn list_tunnels(&self) -> Result<Vec<TunnelRow>, StorageError> {
+        Ok(sqlx::query_as::<_, TunnelRow>(
+            "SELECT * FROM tunnels ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn get_tunnel(&self, id: Uuid) -> Result<Option<TunnelRow>, StorageError> {
+        Ok(sqlx::query_as::<_, TunnelRow>("SELECT * FROM tunnels WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    pub async fn get_tunnel_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<TunnelRow>, StorageError> {
+        Ok(sqlx::query_as::<_, TunnelRow>(
+            "SELECT * FROM tunnels WHERE token_hash = $1 AND enabled = true",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn create_tunnel(
+        &self,
+        req: &CreateTunnel,
+        token_hash: &str,
+    ) -> Result<TunnelRow, StorageError> {
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        Ok(sqlx::query_as::<_, TunnelRow>(
+            r#"INSERT INTO tunnels
+               (id, name, token_hash, target_host, target_port, enabled, status, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,'disconnected',$7,$7) RETURNING *"#,
+        )
+        .bind(id)
+        .bind(&req.name)
+        .bind(token_hash)
+        .bind(&req.target_host)
+        .bind(req.target_port)
+        .bind(req.enabled.unwrap_or(true))
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    pub async fn delete_tunnel(&self, id: Uuid) -> Result<bool, StorageError> {
+        let r = sqlx::query("DELETE FROM tunnels WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    pub async fn update_tunnel_status(
+        &self,
+        id: Uuid,
+        status: &str,
+    ) -> Result<(), StorageError> {
+        let last_seen: Option<chrono::DateTime<chrono::Utc>> =
+            if status == "connected" { Some(chrono::Utc::now()) } else { None };
+        sqlx::query(
+            "UPDATE tunnels SET status=$2, last_seen=COALESCE($3, last_seen), updated_at=NOW() WHERE id=$1",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(last_seen)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ─── Phase 5: Audit Log ───────────────────────────────────────────────────
+
+    pub async fn create_audit_log(
+        &self,
+        admin_username: Option<&str>,
+        action: &str,
+        resource_type: Option<&str>,
+        resource_id: Option<&str>,
+        detail: Option<serde_json::Value>,
+        ip_addr: Option<&str>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"INSERT INTO audit_log
+               (admin_username, action, resource_type, resource_id, detail, ip_addr)
+               VALUES ($1,$2,$3,$4,$5,$6)"#,
+        )
+        .bind(admin_username)
+        .bind(action)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(detail)
+        .bind(ip_addr)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_audit_log(
+        &self,
+        query: &AuditLogQuery,
+    ) -> Result<(Vec<AuditLogEntry>, i64), StorageError> {
+        let page = query.page.unwrap_or(1).max(1);
+        let page_size = query.page_size.unwrap_or(50).min(200).max(1);
+        let offset = (page - 1) * page_size;
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE ($1::text IS NULL OR admin_username = $1)
+               AND ($2::text IS NULL OR action = $2)",
+        )
+        .bind(&query.admin_username)
+        .bind(&query.action)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let rows = sqlx::query_as::<_, AuditLogEntry>(
+            "SELECT * FROM audit_log
+             WHERE ($1::text IS NULL OR admin_username = $1)
+               AND ($2::text IS NULL OR action = $2)
+             ORDER BY created_at DESC
+             LIMIT $3 OFFSET $4",
+        )
+        .bind(&query.admin_username)
+        .bind(&query.action)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((rows, total))
+    }
 }

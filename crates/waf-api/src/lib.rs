@@ -1,12 +1,17 @@
 pub mod auth;
+pub mod cache_api;
 pub mod error;
 pub mod handlers;
+pub mod health;
 pub mod middleware;
 pub mod notifications;
+pub mod plugins;
+pub mod security;
 pub mod server;
 pub mod state;
 pub mod static_files;
 pub mod stats;
+pub mod tunnels;
 pub mod websocket;
 
 pub use server::start_api_server;

@@ -467,3 +467,84 @@ pub struct CreateNotificationConfig {
     pub enabled: Option<bool>,
     pub rate_limit_secs: Option<i32>,
 }
+
+// ─── Phase 5: WASM Plugins ────────────────────────────────────────────────────
+
+/// WASM plugin metadata (binary is stored separately)
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct WasmPluginRow {
+    pub id: Uuid,
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub author: Option<String>,
+    pub wasm_binary: Vec<u8>,
+    pub enabled: bool,
+    pub config_json: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Create WASM plugin request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateWasmPlugin {
+    pub name: String,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub author: Option<String>,
+    pub wasm_binary: Vec<u8>,
+    pub enabled: Option<bool>,
+    pub config_json: Option<serde_json::Value>,
+}
+
+// ─── Phase 5: Tunnels ─────────────────────────────────────────────────────────
+
+/// Tunnel configuration row
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TunnelRow {
+    pub id: Uuid,
+    pub name: String,
+    pub token_hash: String,
+    pub target_host: String,
+    pub target_port: i32,
+    pub enabled: bool,
+    pub status: String,
+    pub last_seen: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Create tunnel request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTunnel {
+    pub name: String,
+    /// Plain-text pre-shared key; will be hashed before storage
+    pub token: String,
+    pub target_host: String,
+    pub target_port: i32,
+    pub enabled: Option<bool>,
+}
+
+// ─── Phase 5: Audit Log ───────────────────────────────────────────────────────
+
+/// Admin audit log entry
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct AuditLogEntry {
+    pub id: i64,
+    pub admin_username: Option<String>,
+    pub action: String,
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    pub detail: Option<serde_json::Value>,
+    pub ip_addr: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Query parameters for audit log listing
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuditLogQuery {
+    pub admin_username: Option<String>,
+    pub action: Option<String>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+}

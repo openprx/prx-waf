@@ -4,11 +4,11 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use gateway::{HostRouter, TunnelConfig, WafProxy};
 use waf_api::{start_api_server, AppState};
 use waf_common::config::{load_config, AppConfig};
 use waf_engine::{WafEngine, WafEngineConfig};
 use waf_storage::Database;
-use gateway::{HostRouter, WafProxy};
 
 /// PRX-WAF — High-performance Pingora-based Web Application Firewall
 #[derive(Parser, Debug)]
@@ -28,6 +28,8 @@ enum Commands {
     Run,
     /// Run database migrations only
     Migrate,
+    /// Seed the default admin user (admin / admin) if none exist
+    SeedAdmin,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -54,11 +56,16 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Migrate => {
-            // One-shot async task for migration
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
                 .block_on(run_migrate(&config))?;
+        }
+        Commands::SeedAdmin => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(run_seed_admin(&config))?;
         }
         Commands::Run => {
             run_server(config)?;
@@ -78,18 +85,35 @@ async fn run_migrate(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Seed the default admin user
+async fn run_seed_admin(config: &AppConfig) -> anyhow::Result<()> {
+    info!("Connecting to database...");
+    let db = Arc::new(
+        Database::connect(&config.storage.database_url, config.storage.max_connections).await?,
+    );
+    db.migrate().await?;
+
+    let engine = Arc::new(WafEngine::new(Arc::clone(&db), WafEngineConfig::default()));
+    let router = Arc::new(HostRouter::new());
+    let state = Arc::new(AppState::new(Arc::clone(&db), engine, router));
+
+    waf_api::auth::ensure_default_admin(&state).await?;
+    info!("Default admin user seeded (username=admin, password=admin). Change it immediately!");
+    Ok(())
+}
+
 /// Start the full server: async init → API server thread → Pingora proxy
 fn run_server(config: AppConfig) -> anyhow::Result<()> {
     use pingora_core::server::Server;
 
-    // Phase 1: async initialization (db, engine, rules)
+    // Async initialization (db, engine, rules, Phase 5 components)
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
     let (engine, router, api_state) = rt.block_on(init_async(&config))?;
 
-    // Phase 2: start the management API in a background thread
+    // Start the management API in a background thread
     let api_listen = config.api.listen_addr.clone();
     let api_state_bg = Arc::clone(&api_state);
     std::thread::spawn(move || {
@@ -104,7 +128,48 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
         });
     });
 
-    // Phase 3: build and run Pingora proxy (blocks forever)
+    // Optionally start HTTP/3 listener
+    if config.http3.enabled {
+        let h3_config = config.http3.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build HTTP/3 runtime");
+            rt.block_on(async move {
+                let cert_pem = match h3_config.cert_pem.as_deref() {
+                    Some(p) => match std::fs::read_to_string(p) {
+                        Ok(s) => s,
+                        Err(e) => { tracing::error!("HTTP/3 cert read error: {e}"); return; }
+                    },
+                    None => { tracing::error!("HTTP/3 cert_pem not configured"); return; }
+                };
+                let key_pem = match h3_config.key_pem.as_deref() {
+                    Some(p) => match std::fs::read_to_string(p) {
+                        Ok(s) => s,
+                        Err(e) => { tracing::error!("HTTP/3 key read error: {e}"); return; }
+                    },
+                    None => { tracing::error!("HTTP/3 key_pem not configured"); return; }
+                };
+                let addr: std::net::SocketAddr = match h3_config.listen_addr.parse() {
+                    Ok(a) => a,
+                    Err(e) => { tracing::error!("HTTP/3 listen_addr parse error: {e}"); return; }
+                };
+                if let Err(e) = gateway::http3::start_http3_server(
+                    addr,
+                    cert_pem,
+                    key_pem,
+                    "http://127.0.0.1:8080".to_string(),
+                )
+                .await
+                {
+                    tracing::error!("HTTP/3 server error: {e}");
+                }
+            });
+        });
+    }
+
+    // Build and run Pingora proxy (blocks forever)
     let mut server = Server::new(None)?;
     server.bootstrap();
 
@@ -115,12 +180,15 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
 
     info!("Proxy listening on {}", config.proxy.listen_addr);
     info!("Management API listening on {}", config.api.listen_addr);
+    if config.http3.enabled {
+        info!("HTTP/3 (QUIC) listener on {}", config.http3.listen_addr);
+    }
     info!("Press Ctrl+C to stop");
 
     server.run_forever();
 }
 
-/// Async initialization: database, engine, rule loading, host registration
+/// Async initialization: database, engine, rule loading, Phase 5 components
 async fn init_async(
     config: &AppConfig,
 ) -> anyhow::Result<(Arc<WafEngine>, Arc<HostRouter>, Arc<AppState>)> {
@@ -185,6 +253,7 @@ async fn init_async(
 
     info!("Registered {} host routes", router.len());
 
+    // Build app state
     let api_state = Arc::new(AppState::new(
         Arc::clone(&db),
         Arc::clone(&engine),
@@ -194,6 +263,41 @@ async fn init_async(
     // Phase 4: create default admin user if none exist
     if let Err(e) = waf_api::auth::ensure_default_admin(&api_state).await {
         tracing::warn!("Could not ensure default admin: {e}");
+    }
+
+    // Phase 5: load WASM plugins from DB
+    let plugins = db.list_wasm_plugins().await.unwrap_or_default();
+    info!("Loading {} WASM plugins", plugins.len());
+    for p in &plugins {
+        if let Err(e) = api_state
+            .plugin_manager
+            .load(
+                p.id,
+                p.name.clone(),
+                p.version.clone(),
+                p.description.clone().unwrap_or_default(),
+                p.author.clone().unwrap_or_default(),
+                p.enabled,
+                &p.wasm_binary,
+            )
+            .await
+        {
+            tracing::warn!(plugin = %p.name, "Failed to load plugin: {e}");
+        }
+    }
+
+    // Phase 5: load tunnel configs from DB
+    let tunnels = db.list_tunnels().await.unwrap_or_default();
+    info!("Loaded {} tunnel configs", tunnels.len());
+    for t in &tunnels {
+        api_state.tunnel_registry.register(TunnelConfig {
+            id: t.id,
+            name: t.name.clone(),
+            token_hash: t.token_hash.clone(),
+            target_host: t.target_host.clone(),
+            target_port: t.target_port as u16,
+            enabled: t.enabled,
+        }).await;
     }
 
     Ok((engine, router, api_state))

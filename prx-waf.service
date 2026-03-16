@@ -1,0 +1,40 @@
+[Unit]
+Description=PRX-WAF — High-Performance Web Application Firewall
+Documentation=https://github.com/openprx/prx-waf
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=prx-waf
+Group=prx-waf
+WorkingDirectory=/opt/prx-waf
+ExecStart=/usr/local/bin/prx-waf --config /etc/prx-waf/config.toml run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/prx-waf/certs /var/log/prx-waf
+
+# Environment
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/prx-waf/env
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Capabilities required by Pingora for low port binding
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

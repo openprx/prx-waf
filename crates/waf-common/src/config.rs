@@ -8,6 +8,12 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub hosts: Vec<HostEntry>,
+    #[serde(default)]
+    pub cache: CacheConfig,
+    #[serde(default)]
+    pub http3: Http3Config,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 impl Default for AppConfig {
@@ -17,6 +23,9 @@ impl Default for AppConfig {
             api: ApiConfig::default(),
             storage: StorageConfig::default(),
             hosts: Vec::new(),
+            cache: CacheConfig::default(),
+            http3: Http3Config::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -80,6 +89,80 @@ pub struct HostEntry {
     pub guard_status: Option<bool>,
     pub cert_file: Option<String>,
     pub key_file: Option<String>,
+}
+
+/// Response caching configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// Enable response caching
+    pub enabled: bool,
+    /// Maximum cache size in megabytes
+    pub max_size_mb: u64,
+    /// Default TTL in seconds (used when Cache-Control is absent)
+    pub default_ttl_secs: u64,
+    /// Maximum TTL in seconds (caps upstream Cache-Control max-age)
+    pub max_ttl_secs: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_size_mb: 256,
+            default_ttl_secs: 60,
+            max_ttl_secs: 3600,
+        }
+    }
+}
+
+/// HTTP/3 (QUIC) listener configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Http3Config {
+    /// Enable HTTP/3 listener
+    pub enabled: bool,
+    /// UDP listen address for QUIC
+    pub listen_addr: String,
+    /// Path to TLS certificate PEM (required when enabled)
+    pub cert_pem: Option<String>,
+    /// Path to TLS key PEM (required when enabled)
+    pub key_pem: Option<String>,
+}
+
+impl Default for Http3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: "0.0.0.0:443".to_string(),
+            cert_pem: None,
+            key_pem: None,
+        }
+    }
+}
+
+/// Security hardening configuration for the management API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// IP allowlist for admin API (empty = allow all)
+    #[serde(default)]
+    pub admin_ip_allowlist: Vec<String>,
+    /// Maximum request body size in bytes (default 10 MB)
+    pub max_request_body_bytes: u64,
+    /// API rate limit (requests per second per IP, 0 = disabled)
+    pub api_rate_limit_rps: u32,
+    /// Allowed CORS origins for admin API (empty = all)
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            admin_ip_allowlist: Vec::new(),
+            max_request_body_bytes: 10 * 1024 * 1024, // 10 MB
+            api_rate_limit_rps: 0,
+            cors_origins: Vec::new(),
+        }
+    }
 }
 
 /// Load configuration from a TOML file

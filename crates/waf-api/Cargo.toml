@@ -34,3 +34,7 @@ data-encoding = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
+axum-extra = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+ipnet = { workspace = true }

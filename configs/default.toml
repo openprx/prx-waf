@@ -9,7 +9,32 @@ listen_addr = "127.0.0.1:9527"
 database_url = "postgresql://prx_waf:prx_waf@127.0.0.1:5432/prx_waf"
 max_connections = 20
 
-# Example host configuration (can also be managed via API)
+# ── Phase 5: Response Caching ─────────────────────────────────────────────────
+[cache]
+enabled = true
+max_size_mb = 256
+default_ttl_secs = 60
+max_ttl_secs = 3600
+
+# ── Phase 5: HTTP/3 (QUIC) ────────────────────────────────────────────────────
+[http3]
+enabled = false
+listen_addr = "0.0.0.0:443"
+# cert_pem = "/etc/prx-waf/tls/cert.pem"
+# key_pem  = "/etc/prx-waf/tls/key.pem"
+
+# ── Phase 5: Security Hardening ───────────────────────────────────────────────
+[security]
+# List of IPs/CIDRs allowed to access the admin API.  Empty = allow all.
+admin_ip_allowlist = []
+# Maximum request body size (bytes).  Default 10 MB.
+max_request_body_bytes = 10485760
+# Per-IP rate limit for the admin API (req/s).  0 = disabled.
+api_rate_limit_rps = 0
+# CORS origins for admin API.  Empty = allow all.
+cors_origins = []
+
+# ── Example host configuration ────────────────────────────────────────────────
 # [[hosts]]
 # host = "example.com"
 # port = 80

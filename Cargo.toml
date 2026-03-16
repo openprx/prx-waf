@@ -28,7 +28,7 @@ pingora-http = { version = "0.8" }
 pingora-timeout = { version = "0.8" }
 
 # API framework
-axum = { version = "0.7", features = ["macros", "ws"] }
+axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
 tower = { version = "0.4" }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
@@ -76,6 +76,19 @@ hex = "0.4"
 rand = "0.8"
 totp-lite = "2"
 data-encoding = "2"
+
+# Phase 5 additions
+wasmtime = { version = "23", default-features = false, features = ["cranelift", "runtime", "component-model"] }
+moka = { version = "0.12", features = ["future"] }
+quinn = { version = "0.11", features = ["rustls"] }
+rustls = { version = "0.23", features = ["ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+rustls-pemfile = "2"
+tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+futures-util = "0.3"
+multipart = { version = "0.18", default-features = false, features = ["server"] }
+axum-extra = { version = "0.9", features = ["multipart"] }
 
 [profile.release]
 opt-level = 3

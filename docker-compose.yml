@@ -1,0 +1,59 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL database ──────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: prx-waf-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: prx_waf
+      POSTGRES_PASSWORD: prx_waf
+      POSTGRES_DB: prx_waf
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prx_waf -d prx_waf"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  # ── PRX-WAF ──────────────────────────────────────────────────────────────────
+  prx-waf:
+    build: .
+    container_name: prx-waf
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production-with-a-long-random-secret}
+      DATABASE_URL: postgresql://prx_waf:prx_waf@postgres:5432/prx_waf
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./rules:/app/rules:ro
+      - waf_certs:/app/certs
+    ports:
+      - "80:80"       # HTTP proxy
+      - "443:443"     # HTTPS proxy
+      - "9527:9527"   # Management API + Admin UI
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9527/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    cap_add:
+      - NET_ADMIN      # required for Pingora raw socket support
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+volumes:
+  postgres_data:
+    driver: local
+  waf_certs:
+    driver: local

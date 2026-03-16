@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use waf_engine::WafEngine;
+use gateway::{HostRouter, ResponseCache, TunnelRegistry};
+use waf_engine::{PluginManager, WafEngine};
 use waf_storage::Database;
-use gateway::HostRouter;
 
 use crate::notifications::NotifRateLimiter;
 
@@ -23,6 +23,13 @@ pub struct AppState {
     pub jwt_secret: String,
     /// In-process rate limiter for notifications
     pub notif_rate_limiter: NotifRateLimiter,
+    // ── Phase 5 ──────────────────────────────────────────────────────────────
+    /// Response cache (moka-backed LRU)
+    pub cache: Arc<ResponseCache>,
+    /// WASM plugin manager
+    pub plugin_manager: Arc<PluginManager>,
+    /// Reverse tunnel registry
+    pub tunnel_registry: Arc<TunnelRegistry>,
 }
 
 impl AppState {
@@ -39,6 +46,9 @@ impl AppState {
             ws_connections: Arc::new(AtomicU32::new(0)),
             jwt_secret,
             notif_rate_limiter: crate::notifications::new_rate_limiter(),
+            cache: ResponseCache::new(256, 60, 3600),
+            plugin_manager: Arc::new(PluginManager::new()),
+            tunnel_registry: TunnelRegistry::new(),
         }
     }
 
@@ -57,5 +67,4 @@ impl AppState {
     pub fn total_blocked(&self) -> u64 {
         self.blocked_counter.load(Ordering::Relaxed)
     }
-
 }
