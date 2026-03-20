@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::{Path, Query, State},
     Json,
+    extract::{Path, Query, State},
 };
 use chrono::Utc;
 use dashmap::DashMap;
@@ -129,11 +129,11 @@ impl NotificationChannel for TelegramChannel {
     }
 
     async fn send(&self, payload: &NotificationPayload) -> anyhow::Result<()> {
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.bot_token
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
+        let text = format!(
+            "*{}*\n{}\n\n_{}_",
+            payload.title, payload.message, payload.event_type
         );
-        let text = format!("*{}*\n{}\n\n_{}_", payload.title, payload.message, payload.event_type);
         let body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
@@ -166,8 +166,8 @@ impl NotificationChannel for EmailChannel {
 
     async fn send(&self, payload: &NotificationPayload) -> anyhow::Result<()> {
         use lettre::{
-            message::header::ContentType, transport::smtp::authentication::Credentials,
             AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+            message::header::ContentType, transport::smtp::authentication::Credentials,
         };
 
         let from_addr: lettre::message::Mailbox = self.from.parse()?;
@@ -279,10 +279,10 @@ pub async fn dispatch_notification(
 
     for cfg in configs {
         // Check host_code filter: if config has a host_code, only dispatch for that host
-        if let Some(h) = &cfg.host_code {
-            if host_code.as_deref() != Some(h.as_str()) {
-                continue;
-            }
+        if let Some(h) = &cfg.host_code
+            && host_code.as_deref() != Some(h.as_str())
+        {
+            continue;
         }
 
         if is_rate_limited(&state.notif_rate_limiter, cfg.id) {
@@ -369,7 +369,7 @@ pub async fn create_notification(
         other => {
             return Err(ApiError::BadRequest(format!(
                 "unknown channel_type: {other}"
-            )))
+            )));
         }
     }
     let row = state.db.create_notification_config(req).await?;
@@ -383,7 +383,9 @@ pub async fn delete_notification(
 ) -> ApiResult<Json<serde_json::Value>> {
     let deleted = state.db.delete_notification_config(id).await?;
     if !deleted {
-        return Err(ApiError::NotFound(format!("Notification config {id} not found")));
+        return Err(ApiError::NotFound(format!(
+            "Notification config {id} not found"
+        )));
     }
     Ok(Json(serde_json::json!({ "success": true, "data": null })))
 }
@@ -418,9 +420,9 @@ pub async fn test_notification(
         timestamp: Utc::now(),
     };
 
-    chan.send(&payload)
-        .await
-        .map_err(|e| ApiError::Internal(e))?;
+    chan.send(&payload).await.map_err(ApiError::Internal)?;
 
-    Ok(Json(serde_json::json!({ "success": true, "data": "test sent" })))
+    Ok(Json(
+        serde_json::json!({ "success": true, "data": "test sent" }),
+    ))
 }

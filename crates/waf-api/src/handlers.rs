@@ -1,16 +1,15 @@
 use axum::{
-    extract::{Path, Query, State},
     Json,
+    extract::{Path, Query, State},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use waf_storage::models::{
-    AttackLogQuery, CreateCertificate, CreateCustomRule, CreateHost, CreateIpRule,
-    CreateLbBackend, CreateSensitivePattern, CreateUrlRule, SecurityEventQuery, UpdateHost,
-    UpsertHotlinkConfig,
+    AttackLogQuery, CreateCertificate, CreateCustomRule, CreateHost, CreateIpRule, CreateLbBackend,
+    CreateSensitivePattern, CreateUrlRule, SecurityEventQuery, UpdateHost, UpsertHotlinkConfig,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -26,7 +25,10 @@ pub struct ApiResponse<T: Serialize> {
 
 impl<T: Serialize> ApiResponse<T> {
     pub fn ok(data: T) -> Json<Self> {
-        Json(Self { success: true, data })
+        Json(Self {
+            success: true,
+            data,
+        })
     }
 }
 
@@ -121,7 +123,11 @@ pub async fn create_allow_ip(
 ) -> ApiResult<Json<Value>> {
     let row = state.db.create_allow_ip(req.clone()).await?;
     // Hot-update engine rules
-    state.engine.store.allow_ips.insert(&req.host_code, &req.ip_cidr);
+    state
+        .engine
+        .store
+        .allow_ips
+        .insert(&req.host_code, &req.ip_cidr);
     Ok(Json(json!({ "success": true, "data": row })))
 }
 
@@ -152,7 +158,11 @@ pub async fn create_block_ip(
 ) -> ApiResult<Json<Value>> {
     let row = state.db.create_block_ip(req.clone()).await?;
     // Hot-update engine rules
-    state.engine.store.block_ips.insert(&req.host_code, &req.ip_cidr);
+    state
+        .engine
+        .store
+        .block_ips
+        .insert(&req.host_code, &req.ip_cidr);
     Ok(Json(json!({ "success": true, "data": row })))
 }
 
@@ -173,7 +183,10 @@ pub async fn list_allow_urls(
     State(state): State<Arc<AppState>>,
     Query(filter): Query<HostCodeFilter>,
 ) -> ApiResult<Json<Value>> {
-    let rows = state.db.list_allow_urls(filter.host_code.as_deref()).await?;
+    let rows = state
+        .db
+        .list_allow_urls(filter.host_code.as_deref())
+        .await?;
     Ok(Json(json!({ "success": true, "data": rows })))
 }
 
@@ -202,7 +215,10 @@ pub async fn list_block_urls(
     State(state): State<Arc<AppState>>,
     Query(filter): Query<HostCodeFilter>,
 ) -> ApiResult<Json<Value>> {
-    let rows = state.db.list_block_urls(filter.host_code.as_deref()).await?;
+    let rows = state
+        .db
+        .list_block_urls(filter.host_code.as_deref())
+        .await?;
     Ok(Json(json!({ "success": true, "data": rows })))
 }
 
@@ -290,7 +306,7 @@ pub async fn reload_rules(State(state): State<Arc<AppState>>) -> ApiResult<Json<
         .engine
         .reload_rules()
         .await
-        .map_err(|e| ApiError::Internal(e))?;
+        .map_err(ApiError::Internal)?;
     Ok(Json(json!({ "success": true, "data": "Rules reloaded" })))
 }
 
@@ -300,7 +316,10 @@ pub async fn list_custom_rules(
     State(state): State<Arc<AppState>>,
     Query(filter): Query<HostCodeFilter>,
 ) -> ApiResult<Json<Value>> {
-    let rows = state.db.list_custom_rules(filter.host_code.as_deref()).await?;
+    let rows = state
+        .db
+        .list_custom_rules(filter.host_code.as_deref())
+        .await?;
     Ok(Json(json!({ "success": true, "data": rows })))
 }
 
@@ -310,7 +329,7 @@ pub async fn create_custom_rule(
 ) -> ApiResult<Json<Value>> {
     let row = state.db.create_custom_rule(req.clone()).await?;
     // Hot-add to engine
-    use waf_engine::rules::engine::{from_db_rule};
+    use waf_engine::rules::engine::from_db_rule;
     if let Ok(rule) = from_db_rule(&row) {
         state.engine.custom_rules.add_rule(rule);
     }
@@ -321,12 +340,19 @@ pub async fn delete_custom_rule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let rule = state.db.get_custom_rule(id).await?.ok_or_else(|| ApiError::NotFound(format!("Rule {} not found", id)))?;
+    let rule = state
+        .db
+        .get_custom_rule(id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Rule {} not found", id)))?;
     let deleted = state.db.delete_custom_rule(id).await?;
     if !deleted {
         return Err(ApiError::NotFound(format!("Rule {} not found", id)));
     }
-    state.engine.custom_rules.remove_rule(&rule.host_code, &rule.id.to_string());
+    state
+        .engine
+        .custom_rules
+        .remove_rule(&rule.host_code, &rule.id.to_string());
     Ok(Json(json!({ "success": true, "data": null })))
 }
 
@@ -336,7 +362,10 @@ pub async fn list_sensitive_patterns(
     State(state): State<Arc<AppState>>,
     Query(filter): Query<HostCodeFilter>,
 ) -> ApiResult<Json<Value>> {
-    let rows = state.db.list_sensitive_patterns(filter.host_code.as_deref()).await?;
+    let rows = state
+        .db
+        .list_sensitive_patterns(filter.host_code.as_deref())
+        .await?;
     Ok(Json(json!({ "success": true, "data": rows })))
 }
 
@@ -372,7 +401,9 @@ pub async fn get_hotlink_config(
     State(state): State<Arc<AppState>>,
     Query(filter): Query<HostCodeFilter>,
 ) -> ApiResult<Json<Value>> {
-    let host_code = filter.host_code.ok_or_else(|| ApiError::BadRequest("host_code required".into()))?;
+    let host_code = filter
+        .host_code
+        .ok_or_else(|| ApiError::BadRequest("host_code required".into()))?;
     let config = state.db.get_hotlink_config(&host_code).await?;
     Ok(Json(json!({ "success": true, "data": config })))
 }
@@ -400,7 +431,10 @@ pub async fn list_lb_backends(
     State(state): State<Arc<AppState>>,
     Query(filter): Query<HostCodeFilter>,
 ) -> ApiResult<Json<Value>> {
-    let rows = state.db.list_lb_backends(filter.host_code.as_deref()).await?;
+    let rows = state
+        .db
+        .list_lb_backends(filter.host_code.as_deref())
+        .await?;
     Ok(Json(json!({ "success": true, "data": rows })))
 }
 
@@ -429,22 +463,30 @@ pub async fn list_certificates(
     State(state): State<Arc<AppState>>,
     Query(filter): Query<HostCodeFilter>,
 ) -> ApiResult<Json<Value>> {
-    let rows = state.db.list_certificates(filter.host_code.as_deref()).await?;
+    let rows = state
+        .db
+        .list_certificates(filter.host_code.as_deref())
+        .await?;
     // Don't expose private keys in list response
-    let safe: Vec<Value> = rows.iter().map(|c| json!({
-        "id": c.id,
-        "host_code": c.host_code,
-        "domain": c.domain,
-        "issuer": c.issuer,
-        "subject": c.subject,
-        "not_before": c.not_before,
-        "not_after": c.not_after,
-        "auto_renew": c.auto_renew,
-        "status": c.status,
-        "error_msg": c.error_msg,
-        "created_at": c.created_at,
-        "updated_at": c.updated_at,
-    })).collect();
+    let safe: Vec<Value> = rows
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "host_code": c.host_code,
+                "domain": c.domain,
+                "issuer": c.issuer,
+                "subject": c.subject,
+                "not_before": c.not_before,
+                "not_after": c.not_after,
+                "auto_renew": c.auto_renew,
+                "status": c.status,
+                "error_msg": c.error_msg,
+                "created_at": c.created_at,
+                "updated_at": c.updated_at,
+            })
+        })
+        .collect();
     Ok(Json(json!({ "success": true, "data": safe })))
 }
 
@@ -453,7 +495,10 @@ pub async fn upload_certificate(
     Json(req): Json<CreateCertificate>,
 ) -> ApiResult<Json<Value>> {
     let row = state.db.create_certificate(req.clone()).await?;
-    state.db.update_certificate_status(row.id, "active", None).await?;
+    state
+        .db
+        .update_certificate_status(row.id, "active", None)
+        .await?;
     Ok(Json(json!({
         "success": true,
         "data": {

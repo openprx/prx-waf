@@ -96,8 +96,12 @@ pub enum ConditionOp {
 }
 
 impl ConditionOp {
-    pub fn from_str(s: &str) -> Self {
-        if s.eq_ignore_ascii_case("or") { Self::Or } else { Self::And }
+    pub fn parse_str(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("or") {
+            Self::Or
+        } else {
+            Self::And
+        }
     }
 }
 
@@ -113,10 +117,10 @@ pub enum RuleAction {
 }
 
 impl RuleAction {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "allow" => Self::Allow,
-            "log"   => Self::Log,
+            "log" => Self::Log,
             "challenge" => Self::Challenge,
             _ => Self::Block,
         }
@@ -205,17 +209,17 @@ impl CustomRulesEngine {
         let host_code = &ctx.host_config.code;
 
         // Host-specific rules first
-        if let Some(rules) = self.rules.get(host_code) {
-            if let Some(r) = self.eval_list(ctx, &rules) {
-                return Some(r);
-            }
+        if let Some(rules) = self.rules.get(host_code)
+            && let Some(r) = self.eval_list(ctx, &rules)
+        {
+            return Some(r);
         }
 
         // Global rules
-        if let Some(rules) = self.rules.get("*") {
-            if let Some(r) = self.eval_list(ctx, &rules) {
-                return Some(r);
-            }
+        if let Some(rules) = self.rules.get("*")
+            && let Some(r) = self.eval_list(ctx, &rules)
+        {
+            return Some(r);
         }
 
         None
@@ -254,12 +258,18 @@ impl CustomRulesEngine {
         scope.push("method", ctx.method.clone());
         scope.push("query", ctx.query.clone());
         scope.push("host", ctx.host.clone());
-        scope.push("user_agent",
-            ctx.headers.get("user-agent").cloned().unwrap_or_default());
-        scope.push("referer",
-            ctx.headers.get("referer").cloned().unwrap_or_default());
-        scope.push("content_type",
-            ctx.headers.get("content-type").cloned().unwrap_or_default());
+        scope.push(
+            "user_agent",
+            ctx.headers.get("user-agent").cloned().unwrap_or_default(),
+        );
+        scope.push(
+            "referer",
+            ctx.headers.get("referer").cloned().unwrap_or_default(),
+        );
+        scope.push(
+            "content_type",
+            ctx.headers.get("content-type").cloned().unwrap_or_default(),
+        );
         scope.push("content_length", ctx.content_length as i64);
 
         self.rhai
@@ -270,13 +280,18 @@ impl CustomRulesEngine {
             })
     }
 
-    fn eval_conditions(&self, ctx: &RequestCtx, conditions: &[Condition], op: &ConditionOp) -> bool {
+    fn eval_conditions(
+        &self,
+        ctx: &RequestCtx,
+        conditions: &[Condition],
+        op: &ConditionOp,
+    ) -> bool {
         if conditions.is_empty() {
             return false;
         }
         match op {
             ConditionOp::And => conditions.iter().all(|c| self.eval_one(ctx, c)),
-            ConditionOp::Or  => conditions.iter().any(|c| self.eval_one(ctx, c)),
+            ConditionOp::Or => conditions.iter().any(|c| self.eval_one(ctx, c)),
         }
     }
 
@@ -285,22 +300,23 @@ impl CustomRulesEngine {
         let fstr = fval.as_deref().unwrap_or("");
 
         match (&cond.operator, &cond.value) {
-            (Operator::Eq,        ConditionValue::Str(v))  => fstr.eq_ignore_ascii_case(v),
-            (Operator::Ne,        ConditionValue::Str(v))  => !fstr.eq_ignore_ascii_case(v),
-            (Operator::Contains,  ConditionValue::Str(v))  => fstr.contains(v.as_str()),
+            (Operator::Eq, ConditionValue::Str(v)) => fstr.eq_ignore_ascii_case(v),
+            (Operator::Ne, ConditionValue::Str(v)) => !fstr.eq_ignore_ascii_case(v),
+            (Operator::Contains, ConditionValue::Str(v)) => fstr.contains(v.as_str()),
             (Operator::NotContains, ConditionValue::Str(v)) => !fstr.contains(v.as_str()),
             (Operator::StartsWith, ConditionValue::Str(v)) => fstr.starts_with(v.as_str()),
-            (Operator::EndsWith,  ConditionValue::Str(v))  => fstr.ends_with(v.as_str()),
-            (Operator::Regex,     ConditionValue::Str(v))  => {
-                Regex::new(v).ok().map(|r| r.is_match(fstr)).unwrap_or(false)
-            }
-            (Operator::InList,    ConditionValue::List(l)) => l.iter().any(|v| v == fstr),
+            (Operator::EndsWith, ConditionValue::Str(v)) => fstr.ends_with(v.as_str()),
+            (Operator::Regex, ConditionValue::Str(v)) => Regex::new(v)
+                .ok()
+                .map(|r| r.is_match(fstr))
+                .unwrap_or(false),
+            (Operator::InList, ConditionValue::List(l)) => l.iter().any(|v| v == fstr),
             (Operator::NotInList, ConditionValue::List(l)) => !l.iter().any(|v| v == fstr),
-            (Operator::CidrMatch, ConditionValue::Str(cidr)) => {
-                cidr.parse::<ipnet::IpNet>().ok()
-                    .map(|net| net.contains(&ctx.client_ip))
-                    .unwrap_or(false)
-            }
+            (Operator::CidrMatch, ConditionValue::Str(cidr)) => cidr
+                .parse::<ipnet::IpNet>()
+                .ok()
+                .map(|net| net.contains(&ctx.client_ip))
+                .unwrap_or(false),
             (Operator::Gt, ConditionValue::Number(n)) => {
                 fstr.parse::<i64>().ok().map(|v| v > *n).unwrap_or(false)
             }
@@ -319,25 +335,23 @@ impl CustomRulesEngine {
 
     fn field_value(&self, ctx: &RequestCtx, field: &ConditionField) -> Option<String> {
         match field {
-            ConditionField::Ip            => Some(ctx.client_ip.to_string()),
-            ConditionField::Path          => Some(ctx.path.clone()),
-            ConditionField::Query         => Some(ctx.query.clone()),
-            ConditionField::Method        => Some(ctx.method.clone()),
-            ConditionField::Host          => Some(ctx.host.clone()),
+            ConditionField::Ip => Some(ctx.client_ip.to_string()),
+            ConditionField::Path => Some(ctx.path.clone()),
+            ConditionField::Query => Some(ctx.query.clone()),
+            ConditionField::Method => Some(ctx.method.clone()),
+            ConditionField::Host => Some(ctx.host.clone()),
             ConditionField::ContentLength => Some(ctx.content_length.to_string()),
-            ConditionField::Body          => {
-                Some(String::from_utf8_lossy(&ctx.body_preview).into_owned())
-            }
-            ConditionField::Cookie        => ctx.headers.get("cookie").cloned(),
-            ConditionField::UserAgent     => ctx.headers.get("user-agent").cloned(),
-            ConditionField::ContentType   => ctx.headers.get("content-type").cloned(),
-            ConditionField::Header(name)  => ctx.headers.get(&name.to_lowercase()).cloned(),
+            ConditionField::Body => Some(String::from_utf8_lossy(&ctx.body_preview).into_owned()),
+            ConditionField::Cookie => ctx.headers.get("cookie").cloned(),
+            ConditionField::UserAgent => ctx.headers.get("user-agent").cloned(),
+            ConditionField::ContentType => ctx.headers.get("content-type").cloned(),
+            ConditionField::Header(name) => ctx.headers.get(&name.to_lowercase()).cloned(),
             // ── GeoIP fields ────────────────────────────────────────────────
-            ConditionField::GeoCountry  => ctx.geo.as_ref().map(|g| g.country.clone()),
-            ConditionField::GeoIso      => ctx.geo.as_ref().map(|g| g.iso_code.clone()),
+            ConditionField::GeoCountry => ctx.geo.as_ref().map(|g| g.country.clone()),
+            ConditionField::GeoIso => ctx.geo.as_ref().map(|g| g.iso_code.clone()),
             ConditionField::GeoProvince => ctx.geo.as_ref().map(|g| g.province.clone()),
-            ConditionField::GeoCity     => ctx.geo.as_ref().map(|g| g.city.clone()),
-            ConditionField::GeoIsp      => ctx.geo.as_ref().map(|g| g.isp.clone()),
+            ConditionField::GeoCity => ctx.geo.as_ref().map(|g| g.city.clone()),
+            ConditionField::GeoIsp => ctx.geo.as_ref().map(|g| g.isp.clone()),
         }
     }
 }
@@ -353,8 +367,8 @@ impl Default for CustomRulesEngine {
 use waf_storage::models::CustomRule as DbCustomRule;
 
 pub fn from_db_rule(row: &DbCustomRule) -> anyhow::Result<CustomRule> {
-    let conditions: Vec<Condition> = serde_json::from_value(row.conditions.clone())
-        .unwrap_or_default();
+    let conditions: Vec<Condition> =
+        serde_json::from_value(row.conditions.clone()).unwrap_or_default();
 
     Ok(CustomRule {
         id: row.id.to_string(),
@@ -362,9 +376,9 @@ pub fn from_db_rule(row: &DbCustomRule) -> anyhow::Result<CustomRule> {
         name: row.name.clone(),
         priority: row.priority,
         enabled: row.enabled,
-        condition_op: ConditionOp::from_str(&row.condition_op),
+        condition_op: ConditionOp::parse_str(&row.condition_op),
         conditions,
-        action: RuleAction::from_str(&row.action),
+        action: RuleAction::parse_str(&row.action),
         action_status: row.action_status as u16,
         action_msg: row.action_msg.clone(),
         script: row.script.clone(),
@@ -374,9 +388,9 @@ pub fn from_db_rule(row: &DbCustomRule) -> anyhow::Result<CustomRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use bytes::Bytes;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use waf_common::HostConfig;
 
     fn make_ctx(path: &str, method: &str, ip: &str) -> RequestCtx {

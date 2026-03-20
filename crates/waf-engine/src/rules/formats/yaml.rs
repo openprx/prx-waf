@@ -32,10 +32,18 @@ struct YamlRule {
     metadata: HashMap<String, String>,
 }
 
-fn default_category() -> String { "custom".to_string() }
-fn default_source() -> String { "file".to_string() }
-fn default_enabled() -> bool { true }
-fn default_action() -> String { "block".to_string() }
+fn default_category() -> String {
+    "custom".to_string()
+}
+fn default_source() -> String {
+    "file".to_string()
+}
+fn default_enabled() -> bool {
+    true
+}
+fn default_action() -> String {
+    "block".to_string()
+}
 
 /// Parse YAML content into a list of `Rule`s.
 pub fn parse(content: &str) -> Result<Vec<Rule>> {

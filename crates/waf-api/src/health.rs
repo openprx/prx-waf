@@ -5,13 +5,8 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
-use serde_json::{json, Value};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -51,6 +46,10 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoRespon
         "version": env!("CARGO_PKG_VERSION"),
     });
 
-    let code = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let code = if db_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     (code, Json(status)).into_response()
 }

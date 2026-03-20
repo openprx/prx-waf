@@ -7,7 +7,7 @@ pub mod models;
 pub mod pusher;
 pub mod sync;
 
-pub use appsec::{appsec_to_detection, AppSecClient, AppSecResult};
+pub use appsec::{AppSecClient, AppSecResult, appsec_to_detection};
 pub use cache::DecisionCache;
 pub use checker::CrowdSecChecker;
 pub use client::CrowdSecClient;
@@ -69,15 +69,16 @@ pub async fn init_crowdsec(
 
     // AppSec client (only when mode includes appsec)
     let appsec_client = if matches!(config.mode, CrowdSecMode::Appsec | CrowdSecMode::Both) {
-        config.appsec.as_ref().and_then(|appsec_cfg| {
-            match AppSecClient::new(appsec_cfg.clone()) {
+        config
+            .appsec
+            .as_ref()
+            .and_then(|appsec_cfg| match AppSecClient::new(appsec_cfg.clone()) {
                 Ok(c) => Some(Arc::new(c)),
                 Err(e) => {
                     warn!("Failed to create AppSec client: {}", e);
                     None
                 }
-            }
-        })
+            })
     } else {
         None
     };

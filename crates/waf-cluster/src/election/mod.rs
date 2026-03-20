@@ -94,7 +94,10 @@ impl ElectionManager {
         // Keep only the new term's vote bucket (remove older)
         let mut votes = self.votes_for_me.lock();
         votes.retain(|&t, _| t >= new_term);
-        votes.entry(new_term).or_default().insert(self.node_id.clone());
+        votes
+            .entry(new_term)
+            .or_default()
+            .insert(self.node_id.clone());
         new_term
     }
 
@@ -106,7 +109,11 @@ impl ElectionManager {
         if term < *self.term.read() {
             return false;
         }
-        self.votes_for_me.lock().entry(term).or_default().insert(voter_id)
+        self.votes_for_me
+            .lock()
+            .entry(term)
+            .or_default()
+            .insert(voter_id)
     }
 
     /// Number of votes received for `term`.

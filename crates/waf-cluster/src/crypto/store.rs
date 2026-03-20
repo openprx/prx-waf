@@ -12,8 +12,8 @@ use std::fs;
 use std::path::Path;
 
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Key, Nonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng},
 };
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -41,8 +41,8 @@ impl KeyStore {
     ///
     /// Returns the raw PEM string of the CA private key.
     pub fn load_ca_key(&self, passphrase: &str) -> Result<String> {
-        let data =
-            fs::read(&self.path).with_context(|| format!("failed to read key store: {}", self.path))?;
+        let data = fs::read(&self.path)
+            .with_context(|| format!("failed to read key store: {}", self.path))?;
         if data.len() < 12 {
             return Err(anyhow::anyhow!("key store file is too short (corrupt?)"));
         }
@@ -141,7 +141,8 @@ mod tests {
         let path = dir.join("test_cluster_ca_key.bin");
         let store = KeyStore::new(path.to_str().unwrap());
 
-        let fake_key_pem = "-----BEGIN PRIVATE KEY-----\nfake-key-for-testing\n-----END PRIVATE KEY-----\n";
+        let fake_key_pem =
+            "-----BEGIN PRIVATE KEY-----\nfake-key-for-testing\n-----END PRIVATE KEY-----\n";
         let passphrase = "test-passphrase-123";
 
         store.save_ca_key(fake_key_pem, passphrase).unwrap();

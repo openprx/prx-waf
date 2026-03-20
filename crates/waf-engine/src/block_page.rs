@@ -38,10 +38,29 @@ const DEFAULT_TEMPLATE: &str = r#"<!DOCTYPE html>
 </body>
 </html>"#;
 
+/// Escape a string for safe inclusion in HTML content.
+///
+/// Replaces `&`, `<`, `>`, `"`, and `'` with their HTML entity equivalents.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Render the block page for the given request context and rule name.
 ///
 /// Uses the per-host custom template if configured, otherwise falls back
-/// to the built-in default template.
+/// to the built-in default template. All dynamic values are HTML-escaped
+/// to prevent reflected XSS.
 pub fn render_block_page(ctx: &RequestCtx, rule_name: &str) -> String {
     let template = ctx
         .host_config
@@ -50,18 +69,18 @@ pub fn render_block_page(ctx: &RequestCtx, rule_name: &str) -> String {
         .unwrap_or(DEFAULT_TEMPLATE);
 
     template
-        .replace("{{req_id}}", &ctx.req_id)
-        .replace("{{rule_name}}", rule_name)
-        .replace("{{client_ip}}", &ctx.client_ip.to_string())
+        .replace("{{req_id}}", &html_escape(&ctx.req_id))
+        .replace("{{rule_name}}", &html_escape(rule_name))
+        .replace("{{client_ip}}", &html_escape(&ctx.client_ip.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::sync::Arc;
-    use bytes::Bytes;
     use waf_common::HostConfig;
 
     fn make_ctx(req_id: &str, ip: &str) -> RequestCtx {
@@ -95,7 +114,9 @@ mod tests {
     #[test]
     fn renders_custom_template() {
         let ctx_arc = Arc::new(HostConfig {
-            block_page_template: Some("blocked: {{rule_name}} | {{req_id}} | {{client_ip}}".to_string()),
+            block_page_template: Some(
+                "blocked: {{rule_name}} | {{req_id}} | {{client_ip}}".to_string(),
+            ),
             ..HostConfig::default()
         });
         let mut ctx = make_ctx("req-xyz", "5.6.7.8");

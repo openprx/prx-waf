@@ -2,8 +2,8 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
     Json,
+    extract::{Query, State},
 };
 use serde::Deserialize;
 
@@ -18,7 +18,9 @@ pub struct TimeseriesQuery {
 }
 
 /// GET /api/stats/overview
-pub async fn stats_overview(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+pub async fn stats_overview(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<serde_json::Value>> {
     let overview = state.db.get_stats_overview().await?;
     let total_requests_live = state.total_requests();
     Ok(Json(serde_json::json!({

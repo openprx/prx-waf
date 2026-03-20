@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
+use axum::extract::Multipart;
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
-use axum::extract::Multipart;
 use serde_json::json;
 use tracing::info;
 use uuid::Uuid;
@@ -80,18 +80,16 @@ pub async fn upload_plugin(
             Some("author") => {
                 author = Some(field.text().await.unwrap_or_default());
             }
-            Some("file") => {
-                match field.bytes().await {
-                    Ok(b) => wasm_bytes = Some(b.to_vec()),
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(json!({ "error": format!("failed to read file: {e}") })),
-                        )
-                            .into_response();
-                    }
+            Some("file") => match field.bytes().await {
+                Ok(b) => wasm_bytes = Some(b.to_vec()),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("failed to read file: {e}") })),
+                    )
+                        .into_response();
                 }
-            }
+            },
             _ => {}
         }
     }
@@ -149,15 +147,15 @@ pub async fn upload_plugin(
     // Load into the plugin manager
     if let Err(e) = state
         .plugin_manager
-        .load(
-            row.id,
-            row.name.clone(),
-            row.version.clone(),
-            row.description.clone().unwrap_or_default(),
-            row.author.clone().unwrap_or_default(),
-            row.enabled,
-            &bytes,
-        )
+        .load(waf_engine::plugins::manager::LoadPluginParams {
+            id: row.id,
+            name: row.name.clone(),
+            version: row.version.clone(),
+            description: row.description.clone().unwrap_or_default(),
+            author: row.author.clone().unwrap_or_default(),
+            enabled: row.enabled,
+            wasm_bytes: &bytes,
+        })
         .await
     {
         // Plugin stored but failed to compile — surface the error
@@ -214,11 +212,7 @@ pub async fn disable_plugin(
     set_plugin_enabled(state, id, false).await
 }
 
-async fn set_plugin_enabled(
-    state: Arc<AppState>,
-    id: Uuid,
-    enabled: bool,
-) -> impl IntoResponse {
+async fn set_plugin_enabled(state: Arc<AppState>, id: Uuid, enabled: bool) -> impl IntoResponse {
     state.plugin_manager.set_enabled(id, enabled).await;
     match state.db.set_wasm_plugin_enabled(id, enabled).await {
         Ok(true) => (StatusCode::OK, Json(json!({ "enabled": enabled }))).into_response(),

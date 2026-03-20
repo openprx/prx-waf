@@ -10,13 +10,13 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::{
+    Json,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -64,7 +64,7 @@ async fn auth_and_upgrade(
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "token required" })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -108,11 +108,10 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, stream: &'static
                             "logs"   => true,
                             _        => true, // all events by default
                         };
-                        if send_it {
-                            if socket.send(Message::Text(text.into())).await.is_err() {
+                        if send_it
+                            && socket.send(Message::Text(text)).await.is_err() {
                                 break;
                             }
-                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // Skip lagged messages
@@ -124,7 +123,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, stream: &'static
 
             // Heartbeat ping
             _ = ping_interval.tick() => {
-                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                if socket.send(Message::Ping(vec![])).await.is_err() {
                     break;
                 }
             }

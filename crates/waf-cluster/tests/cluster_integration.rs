@@ -20,7 +20,7 @@ use waf_cluster::{
     crypto::{ca::CertificateAuthority, node_cert::NodeCertificate},
     node::PeerInfo,
     protocol::{ChangeOp, RuleSyncRequest, SyncType},
-    sync::rules::{apply_sync_response, handle_sync_request, RuleChangelog},
+    sync::rules::{RuleChangelog, apply_sync_response, handle_sync_request},
     transport::{client::ClusterClient, server::ClusterServer},
 };
 use waf_common::config::{ClusterConfig, NodeRole};
@@ -63,20 +63,18 @@ fn random_loopback_addr() -> SocketAddr {
 
 /// Build a minimal `ClusterConfig` pointing to the given listen address.
 fn minimal_config(listen_addr: SocketAddr) -> ClusterConfig {
-    let mut cfg = ClusterConfig::default();
-    cfg.enabled = true;
-    cfg.listen_addr = listen_addr.to_string();
-    cfg
+    ClusterConfig {
+        enabled: true,
+        listen_addr: listen_addr.to_string(),
+        ..ClusterConfig::default()
+    }
 }
 
 /// Helper: build a `NodeState` with the given id and addr.
 fn make_node_state(node_id: &str, config: ClusterConfig) -> Arc<NodeState> {
     let mut cfg = config;
     cfg.node_id = node_id.to_string();
-    Arc::new(
-        NodeState::new(cfg, StorageMode::Full)
-            .expect("NodeState::new failed"),
-    )
+    Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new failed"))
 }
 
 // ─── QUIC transport tests ──────────────────────────────────────────────────────
@@ -94,12 +92,10 @@ async fn two_nodes_connect_and_exchange_heartbeat() {
     let ca_cert_der = ca.cert_der().expect("CA DER");
 
     // ── Server node cert ───────────────────────────────────────────────────
-    let server_cert =
-        NodeCertificate::generate("integration-server", &ca, 1).expect("server cert");
+    let server_cert = NodeCertificate::generate("integration-server", &ca, 1).expect("server cert");
 
     // ── Client node cert ───────────────────────────────────────────────────
-    let client_cert =
-        NodeCertificate::generate("integration-client", &ca, 1).expect("client cert");
+    let client_cert = NodeCertificate::generate("integration-client", &ca, 1).expect("client cert");
 
     // ── Server state — pre-register client as known peer ──────────────────
     let server_state = make_node_state("integration-server", minimal_config(server_addr));
@@ -233,9 +229,8 @@ async fn rule_created_on_main_synced_to_worker() {
     let request_v0 = RuleSyncRequest { current_version: 0 };
 
     // ── Main: respond to the request ──────────────────────────────────────
-    let resp_full =
-        handle_sync_request(&changelog, &request_v0, &[rule_a.clone()])
-            .expect("handle_sync_request (full) failed");
+    let resp_full = handle_sync_request(&changelog, &request_v0, std::slice::from_ref(&rule_a))
+        .expect("handle_sync_request (full) failed");
 
     // A worker at version 0 is behind the first changelog entry (version 1),
     // so the main must send a full snapshot.
@@ -261,8 +256,7 @@ async fn rule_created_on_main_synced_to_worker() {
         "worker registry must contain the synced rule after full snapshot"
     );
     assert_eq!(
-        worker_registry.version,
-        full_version,
+        worker_registry.version, full_version,
         "worker version must match main's authoritative version after full sync"
     );
 
@@ -271,12 +265,13 @@ async fn rule_created_on_main_synced_to_worker() {
     changelog.record_change(ChangeOp::Upsert, rule_b.id.clone(), Some(&rule_b));
 
     // ── Worker: request from its current version ───────────────────────────
-    let request_v1 = RuleSyncRequest { current_version: worker_registry.version };
+    let request_v1 = RuleSyncRequest {
+        current_version: worker_registry.version,
+    };
 
     let all_rules = [rule_a.clone(), rule_b.clone()];
-    let resp_incr =
-        handle_sync_request(&changelog, &request_v1, &all_rules)
-            .expect("handle_sync_request (incremental) failed");
+    let resp_incr = handle_sync_request(&changelog, &request_v1, &all_rules)
+        .expect("handle_sync_request (incremental) failed");
 
     assert!(
         matches!(resp_incr.sync_type, SyncType::Incremental),
@@ -304,19 +299,19 @@ async fn rule_created_on_main_synced_to_worker() {
         "worker registry must retain previously synced rules"
     );
     assert_eq!(
-        worker_registry.version,
-        incr_version,
+        worker_registry.version, incr_version,
         "worker version must match main's authoritative version after incremental sync"
     );
 
     // ── Verify rule deletion is propagated ────────────────────────────────
     changelog.record_change(ChangeOp::Delete, "sqli-001".to_string(), None);
 
-    let request_v2 = RuleSyncRequest { current_version: worker_registry.version };
+    let request_v2 = RuleSyncRequest {
+        current_version: worker_registry.version,
+    };
     let remaining_rules = [rule_b.clone()];
-    let resp_delete =
-        handle_sync_request(&changelog, &request_v2, &remaining_rules)
-            .expect("handle_sync_request (delete) failed");
+    let resp_delete = handle_sync_request(&changelog, &request_v2, &remaining_rules)
+        .expect("handle_sync_request (delete) failed");
 
     assert!(
         matches!(resp_delete.sync_type, SyncType::Incremental),
@@ -353,9 +348,11 @@ async fn rule_sync_falls_back_to_full_when_worker_too_far_behind() {
     // the ring buffer has been populated past its capacity.  With max_retained=3
     // and 3 insertions, the oldest entry is version 1, so version 0 < 1 → Full.
     let request = RuleSyncRequest { current_version: 0 };
-    let rules: Vec<Rule> = (0..3u32).map(|i| make_test_rule(&format!("rule-{i:03}"))).collect();
-    let resp = handle_sync_request(&changelog, &request, &rules)
-        .expect("handle_sync_request failed");
+    let rules: Vec<Rule> = (0..3u32)
+        .map(|i| make_test_rule(&format!("rule-{i:03}")))
+        .collect();
+    let resp =
+        handle_sync_request(&changelog, &request, &rules).expect("handle_sync_request failed");
 
     assert!(
         matches!(resp.sync_type, SyncType::Full),
@@ -368,6 +365,10 @@ async fn rule_sync_falls_back_to_full_when_worker_too_far_behind() {
         .await
         .expect("apply full snapshot after fallback failed");
 
-    assert_eq!(registry.rules.len(), 3, "all 3 rules should be in worker registry");
+    assert_eq!(
+        registry.rules.len(),
+        3,
+        "all 3 rules should be in worker registry"
+    );
     assert_eq!(registry.version, changelog.current_version());
 }

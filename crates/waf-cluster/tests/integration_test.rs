@@ -5,8 +5,8 @@
 //! heartbeat-sender task are received by the peer.
 
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc,
+    atomic::{AtomicU32, Ordering},
 };
 
 use rustls::pki_types::CertificateDer;
@@ -23,12 +23,12 @@ fn install_crypto() {
 }
 
 use waf_cluster::{
+    ClusterConfig, NodeState,
     crypto::{ca::CertificateAuthority, node_cert::NodeCertificate},
     health::run_heartbeat_sender,
     node::StorageMode,
     protocol::ClusterMessage,
     transport::{client::ClusterClient, frame},
-    ClusterConfig, NodeState,
 };
 
 /// Build a rustls ServerConfig that requires mTLS against the cluster CA.
@@ -44,10 +44,9 @@ fn make_server_tls(
         .build()
         .unwrap();
 
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_pem.as_bytes())
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
         .unwrap()
@@ -123,8 +122,7 @@ async fn two_node_heartbeat_exchange() {
 
     // ── Node A: QUIC server ───────────────────────────────────────────────────
 
-    let server_tls =
-        make_server_tls(ca_der.clone(), &node_a_cert.cert_pem, &node_a_cert.key_pem);
+    let server_tls = make_server_tls(ca_der.clone(), &node_a_cert.cert_pem, &node_a_cert.key_pem);
     let (server_ep, server_addr) = bind_server(server_tls);
     let received = spawn_counting_server(server_ep);
 
@@ -142,9 +140,8 @@ async fn two_node_heartbeat_exchange() {
     );
 
     // NodeState needed by the heartbeat sender to populate the Heartbeat fields
-    let node_state = Arc::new(
-        NodeState::new(ClusterConfig::default(), StorageMode::ForwardOnly).unwrap(),
-    );
+    let node_state =
+        Arc::new(NodeState::new(ClusterConfig::default(), StorageMode::ForwardOnly).unwrap());
 
     // Spawn client connection task (auto-reconnects; will stop when msg_rx closes)
     let state_clone = Arc::clone(&node_state);
@@ -198,8 +195,11 @@ async fn mtls_rejects_unknown_cert() {
     let rogue_ca_der = rogue_ca.cert_der().unwrap();
 
     // Server trusts only cluster_ca
-    let server_tls =
-        make_server_tls(cluster_ca_der.clone(), &server_cert.cert_pem, &server_cert.key_pem);
+    let server_tls = make_server_tls(
+        cluster_ca_der.clone(),
+        &server_cert.cert_pem,
+        &server_cert.key_pem,
+    );
     let (_server_ep, server_addr) = bind_server(server_tls);
 
     // Rogue client uses its own CA as trust anchor (so the server cert fails too)

@@ -112,7 +112,7 @@ pub enum ExportFormat {
 }
 
 impl ExportFormat {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "json" => Self::Json,
             _ => Self::Yaml,

@@ -39,7 +39,11 @@ impl RuleChangelog {
         self.current_version += 1;
         let version = self.current_version;
         let rule_json = rule.and_then(|r| serde_json::to_value(r).ok());
-        let change = RuleChange { op, rule_id, rule_json };
+        let change = RuleChange {
+            op,
+            rule_id,
+            rule_json,
+        };
         self.push(version, change);
     }
 

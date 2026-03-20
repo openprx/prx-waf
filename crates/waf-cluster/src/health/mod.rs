@@ -25,8 +25,7 @@ pub async fn run_heartbeat_sender(
     interval_ms: u64,
     peer_senders: Vec<mpsc::Sender<ClusterMessage>>,
 ) {
-    let mut ticker =
-        tokio::time::interval(tokio::time::Duration::from_millis(interval_ms.max(1)));
+    let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(interval_ms.max(1)));
     let mut sequence: u64 = 0;
     let start_ms = now_unix_ms();
 

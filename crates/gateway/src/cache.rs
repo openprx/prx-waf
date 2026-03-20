@@ -124,9 +124,7 @@ impl ResponseCache {
                 debug!(key = %key, "skipping cache: Cache-Control directive");
                 return false;
             }
-            CacheDecision::MaxAge(secs) => {
-                Duration::from_secs(secs.min(self.max_ttl.as_secs()))
-            }
+            CacheDecision::MaxAge(secs) => Duration::from_secs(secs.min(self.max_ttl.as_secs())),
             CacheDecision::Default => self.default_ttl,
         };
 
@@ -209,10 +207,10 @@ fn parse_cache_control(header: Option<&str>) -> CacheDecision {
     }
     for part in lower.split(',') {
         let part = part.trim();
-        if let Some(rest) = part.strip_prefix("max-age=") {
-            if let Ok(secs) = rest.trim().parse::<u64>() {
-                return CacheDecision::MaxAge(secs);
-            }
+        if let Some(rest) = part.strip_prefix("max-age=")
+            && let Ok(secs) = rest.trim().parse::<u64>()
+        {
+            return CacheDecision::MaxAge(secs);
         }
     }
     CacheDecision::Default

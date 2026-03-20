@@ -338,6 +338,19 @@ pub struct CreateLbBackend {
     pub health_check_interval_secs: Option<i32>,
 }
 
+/// Update certificate PEM data (issued by ACME or manual upload)
+#[derive(Debug, Clone)]
+pub struct UpdateCertificatePem<'a> {
+    pub id: Uuid,
+    pub cert_pem: &'a str,
+    pub key_pem: &'a str,
+    pub chain_pem: Option<&'a str>,
+    pub not_before: DateTime<Utc>,
+    pub not_after: DateTime<Utc>,
+    pub issuer: &'a str,
+    pub subject: &'a str,
+}
+
 /// Create certificate request (manual upload)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateCertificate {

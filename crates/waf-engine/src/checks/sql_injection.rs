@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::RegexSet;
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
-use super::{request_targets, Check};
+use super::{Check, request_targets};
 
 /// Pattern descriptions aligned by index with SQLI_SET patterns.
 static SQLI_DESCS: &[&str] = &[
@@ -76,7 +76,10 @@ impl Check for SqlInjectionCheck {
             let matches = SQLI_SET.matches(&value);
             if matches.matched_any() {
                 let idx = matches.iter().next().unwrap_or(0);
-                let desc = SQLI_DESCS.get(idx).copied().unwrap_or("SQL Injection pattern");
+                let desc = SQLI_DESCS
+                    .get(idx)
+                    .copied()
+                    .unwrap_or("SQL Injection pattern");
                 return Some(DetectionResult {
                     rule_id: Some(format!("SQLI-{:03}", idx + 1)),
                     rule_name: "SQL Injection".to_string(),
@@ -92,10 +95,10 @@ impl Check for SqlInjectionCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::sync::Arc;
-    use bytes::Bytes;
     use waf_common::{DefenseConfig, HostConfig};
 
     fn make_ctx(query: &str, body: &str) -> RequestCtx {
@@ -113,7 +116,10 @@ mod tests {
             content_length: body.len() as u64,
             is_tls: false,
             host_config: Arc::new(HostConfig {
-                defense_config: DefenseConfig { sqli: true, ..DefenseConfig::default() },
+                defense_config: DefenseConfig {
+                    sqli: true,
+                    ..DefenseConfig::default()
+                },
                 ..HostConfig::default()
             }),
             geo: None,

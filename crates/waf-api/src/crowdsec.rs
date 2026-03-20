@@ -13,9 +13,9 @@
 use std::sync::Arc;
 
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,9 +59,7 @@ pub struct CrowdSecConfigResponse {
 // ── Handlers ───────────────────────────────────────────────────────────────────
 
 /// GET /api/crowdsec/status
-pub async fn crowdsec_status(
-    State(state): State<Arc<AppState>>,
-) -> Json<CrowdSecStatus> {
+pub async fn crowdsec_status(State(state): State<Arc<AppState>>) -> Json<CrowdSecStatus> {
     if let Some(ref cache) = state.crowdsec_cache {
         let stats = cache.stats();
         Json(CrowdSecStatus {
@@ -138,17 +136,13 @@ pub async fn test_crowdsec_connection(
         .map(str::to_string);
 
     match (lapi_url, api_key) {
-        (Some(url), Some(key)) => {
-            match waf_engine::CrowdSecClient::new(url, key) {
-                Ok(client) => match client.test_connection().await {
-                    Ok(msg) => Json(serde_json::json!({ "success": true, "message": msg })),
-                    Err(e) => {
-                        Json(serde_json::json!({ "success": false, "message": e.to_string() }))
-                    }
-                },
+        (Some(url), Some(key)) => match waf_engine::CrowdSecClient::new(url, key) {
+            Ok(client) => match client.test_connection().await {
+                Ok(msg) => Json(serde_json::json!({ "success": true, "message": msg })),
                 Err(e) => Json(serde_json::json!({ "success": false, "message": e.to_string() })),
-            }
-        }
+            },
+            Err(e) => Json(serde_json::json!({ "success": false, "message": e.to_string() })),
+        },
         _ => {
             // Use the running client if available
             if let Some(ref client) = state.crowdsec_client {
@@ -215,7 +209,12 @@ pub async fn update_crowdsec_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateCrowdSecConfig>,
 ) -> Result<Json<CrowdSecConfigResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let key = master_key();
+    let key = master_key().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
 
     let api_key_enc = if let Some(ref k) = body.api_key {
         if k.is_empty() {
@@ -283,9 +282,7 @@ pub async fn update_crowdsec_config(
 }
 
 /// GET /api/crowdsec/stats
-pub async fn crowdsec_stats(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+pub async fn crowdsec_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     if let Some(ref cache) = state.crowdsec_cache {
         let stats = cache.stats();
         let decisions = cache.list_decisions();
@@ -298,8 +295,7 @@ pub async fn crowdsec_stats(
         }
 
         // Decision type breakdown
-        let mut by_type: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::new();
+        let mut by_type: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         for d in &decisions {
             *by_type.entry(d.type_.clone()).or_default() += 1;
         }
@@ -319,9 +315,7 @@ pub async fn crowdsec_stats(
 }
 
 /// GET /api/crowdsec/events
-pub async fn list_crowdsec_events(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+pub async fn list_crowdsec_events(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let query = CrowdSecEventQuery::default();
     match state.db.list_crowdsec_events(&query).await {
         Ok((events, total)) => Json(serde_json::json!({

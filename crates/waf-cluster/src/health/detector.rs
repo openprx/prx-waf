@@ -126,9 +126,7 @@ impl HeartbeatTracker {
         let phi_dead = self.phi_dead;
         self.peers
             .entry(node_id.to_string())
-            .or_insert_with(|| {
-                PhiAccrualDetector::new(node_id.to_string(), phi_suspect, phi_dead)
-            })
+            .or_insert_with(|| PhiAccrualDetector::new(node_id.to_string(), phi_suspect, phi_dead))
             .record_heartbeat(now_ms);
     }
 

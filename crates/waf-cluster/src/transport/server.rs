@@ -81,9 +81,8 @@ impl ClusterServer {
     /// Runs forever; returns only on fatal error.
     pub async fn serve(self, node_state: Arc<NodeState>) -> Result<()> {
         let tls_config = self.build_tls_config()?;
-        let quic_config =
-            quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
-                .map_err(|e| anyhow::anyhow!("QUIC server TLS config error: {e:?}"))?;
+        let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+            .map_err(|e| anyhow::anyhow!("QUIC server TLS config error: {e:?}"))?;
         let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
 
         let endpoint = quinn::Endpoint::server(server_config, self.listen_addr)
@@ -172,7 +171,10 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState) -> Option
                     peer.last_seen_ms = now_ms;
                 }
             }
-            node_state.heartbeat_tracker.lock().record(&hb.node_id, now_ms);
+            node_state
+                .heartbeat_tracker
+                .lock()
+                .record(&hb.node_id, now_ms);
             debug!(
                 from = %hb.node_id,
                 seq = hb.sequence,
@@ -191,13 +193,9 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState) -> Option
             let encrypted_ca_key_b64 = if !ca_passphrase.is_empty() {
                 let ca_key_opt = node_state.ca_key_pem.lock().clone();
                 ca_key_opt.and_then(|ca_key_pem| {
-                    match crate::crypto::store::encrypt_blob(
-                        ca_key_pem.as_bytes(),
-                        &ca_passphrase,
-                    ) {
-                        Ok(enc) => {
-                            Some(base64::engine::general_purpose::STANDARD.encode(&enc))
-                        }
+                    match crate::crypto::store::encrypt_blob(ca_key_pem.as_bytes(), &ca_passphrase)
+                    {
+                        Ok(enc) => Some(base64::engine::general_purpose::STANDARD.encode(&enc)),
                         Err(e) => {
                             warn!("Failed to encrypt CA key for JoinResponse: {e}");
                             None

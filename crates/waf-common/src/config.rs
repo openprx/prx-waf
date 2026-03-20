@@ -23,11 +23,13 @@ pub struct AppConfig {
     /// GeoIP lookup configuration
     #[serde(default)]
     pub geoip: GeoIpConfig,
+    /// Community threat intelligence sharing
+    #[serde(default)]
+    pub community: CommunityConfig,
     /// Cluster configuration — None means standalone mode (default)
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
 }
-
 
 /// Rule source entry from configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,8 +47,12 @@ pub struct RuleSourceEntry {
     pub update_interval: u64,
 }
 
-fn default_rule_format() -> String { "yaml".to_string() }
-fn default_update_interval() -> u64 { 86400 }
+fn default_rule_format() -> String {
+    "yaml".to_string()
+}
+fn default_update_interval() -> u64 {
+    86400
+}
 
 /// Phase 7: Rule management configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,10 +80,18 @@ pub struct RulesConfig {
     pub sources: Vec<RuleSourceEntry>,
 }
 
-fn default_rules_dir() -> String { "rules/".to_string() }
-fn default_hot_reload() -> bool { true }
-fn default_debounce_ms() -> u64 { 500 }
-fn default_true() -> bool { true }
+fn default_rules_dir() -> String {
+    "rules/".to_string()
+}
+fn default_hot_reload() -> bool {
+    true
+}
+fn default_debounce_ms() -> u64 {
+    500
+}
+fn default_true() -> bool {
+    true
+}
 
 impl Default for RulesConfig {
     fn default() -> Self {
@@ -158,6 +172,12 @@ pub struct ProxyConfig {
     pub listen_addr: String,
     pub listen_addr_tls: String,
     pub worker_threads: Option<usize>,
+    /// Trust X-Forwarded-For / X-Real-IP headers from upstream proxies.
+    /// When `false` (default), the client IP is always taken from the TCP
+    /// connection peer address. Only enable this when running behind a
+    /// trusted reverse proxy.
+    #[serde(default)]
+    pub trust_proxy_headers: bool,
 }
 
 impl Default for ProxyConfig {
@@ -166,6 +186,7 @@ impl Default for ProxyConfig {
             listen_addr: "0.0.0.0:80".to_string(),
             listen_addr_tls: "0.0.0.0:443".to_string(),
             worker_threads: None,
+            trust_proxy_headers: false,
         }
     }
 }
@@ -248,6 +269,11 @@ pub struct Http3Config {
     pub cert_pem: Option<String>,
     /// Path to TLS key PEM (required when enabled)
     pub key_pem: Option<String>,
+    /// Verify upstream TLS certificates.
+    /// When `true` (default), invalid/self-signed upstream certs are rejected.
+    /// Set to `false` only for development/testing with self-signed upstreams.
+    #[serde(default = "default_true")]
+    pub upstream_tls_verify: bool,
 }
 
 impl Default for Http3Config {
@@ -257,6 +283,7 @@ impl Default for Http3Config {
             listen_addr: "0.0.0.0:443".to_string(),
             cert_pem: None,
             key_pem: None,
+            upstream_tls_verify: true,
         }
     }
 }
@@ -303,7 +330,9 @@ pub struct GeoIpAutoUpdateConfig {
     pub source_url: String,
 }
 
-fn default_geoip_update_interval() -> String { "7d".to_string() }
+fn default_geoip_update_interval() -> String {
+    "7d".to_string()
+}
 fn default_geoip_source_url() -> String {
     "https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data".to_string()
 }
@@ -337,9 +366,15 @@ pub struct GeoIpConfig {
     pub auto_update: GeoIpAutoUpdateConfig,
 }
 
-fn default_ipv4_xdb() -> String { "data/ip2region_v4.xdb".to_string() }
-fn default_ipv6_xdb() -> String { "data/ip2region_v6.xdb".to_string() }
-fn default_geoip_cache_policy() -> String { "full_memory".to_string() }
+fn default_ipv4_xdb() -> String {
+    "data/ip2region_v4.xdb".to_string()
+}
+fn default_ipv6_xdb() -> String {
+    "data/ip2region_v6.xdb".to_string()
+}
+fn default_geoip_cache_policy() -> String {
+    "full_memory".to_string()
+}
 
 impl Default for GeoIpConfig {
     fn default() -> Self {
@@ -349,6 +384,62 @@ impl Default for GeoIpConfig {
             ipv6_xdb_path: default_ipv6_xdb(),
             cache_policy: default_geoip_cache_policy(),
             auto_update: GeoIpAutoUpdateConfig::default(),
+        }
+    }
+}
+
+/// Community threat intelligence sharing configuration.
+///
+/// Mirrors `waf_engine::community::config::CommunityConfig` so the TOML
+/// config can be loaded without pulling in the full engine crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunityConfig {
+    /// Enable community threat intelligence sharing.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Community server base URL.
+    #[serde(default = "default_community_server_url")]
+    pub server_url: String,
+    /// API key obtained during machine enrollment.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Machine identifier obtained during enrollment.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    /// Maximum number of signals to batch before flushing.
+    #[serde(default = "default_community_batch_size")]
+    pub batch_size: usize,
+    /// Flush interval in seconds.
+    #[serde(default = "default_community_flush_interval")]
+    pub flush_interval_secs: u64,
+    /// Blocklist sync interval in seconds.
+    #[serde(default = "default_community_sync_interval")]
+    pub sync_interval_secs: u64,
+}
+
+fn default_community_server_url() -> String {
+    "https://community.openprx.dev".to_string()
+}
+fn default_community_batch_size() -> usize {
+    50
+}
+fn default_community_flush_interval() -> u64 {
+    30
+}
+fn default_community_sync_interval() -> u64 {
+    300
+}
+
+impl Default for CommunityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: default_community_server_url(),
+            api_key: None,
+            machine_id: None,
+            batch_size: default_community_batch_size(),
+            flush_interval_secs: default_community_flush_interval(),
+            sync_interval_secs: default_community_sync_interval(),
         }
     }
 }
@@ -406,12 +497,24 @@ pub struct ClusterCryptoConfig {
     pub ca_passphrase: String,
 }
 
-fn default_ca_cert_path() -> String { "/app/certs/cluster-ca.pem".to_string() }
-fn default_node_cert_path() -> String { "/app/certs/node.pem".to_string() }
-fn default_node_key_path() -> String { "/app/certs/node.key".to_string() }
-fn default_ca_validity_days() -> u32 { 3650 }
-fn default_node_validity_days() -> u32 { 365 }
-fn default_renewal_before_days() -> u32 { 7 }
+fn default_ca_cert_path() -> String {
+    "/app/certs/cluster-ca.pem".to_string()
+}
+fn default_node_cert_path() -> String {
+    "/app/certs/node.pem".to_string()
+}
+fn default_node_key_path() -> String {
+    "/app/certs/node.key".to_string()
+}
+fn default_ca_validity_days() -> u32 {
+    3650
+}
+fn default_node_validity_days() -> u32 {
+    365
+}
+fn default_renewal_before_days() -> u32 {
+    7
+}
 
 impl Default for ClusterCryptoConfig {
     fn default() -> Self {
@@ -452,12 +555,24 @@ pub struct ClusterSyncConfig {
     pub events_queue_size: usize,
 }
 
-fn default_rules_interval() -> u64 { 10 }
-fn default_config_interval() -> u64 { 30 }
-fn default_events_batch_size() -> usize { 100 }
-fn default_events_flush_interval() -> u64 { 5 }
-fn default_stats_interval() -> u64 { 10 }
-fn default_events_queue_size() -> usize { 10_000 }
+fn default_rules_interval() -> u64 {
+    10
+}
+fn default_config_interval() -> u64 {
+    30
+}
+fn default_events_batch_size() -> usize {
+    100
+}
+fn default_events_flush_interval() -> u64 {
+    5
+}
+fn default_stats_interval() -> u64 {
+    10
+}
+fn default_events_queue_size() -> usize {
+    10_000
+}
 
 impl Default for ClusterSyncConfig {
     fn default() -> Self {
@@ -492,11 +607,21 @@ pub struct ClusterElectionConfig {
     pub phi_dead: f64,
 }
 
-fn default_timeout_min_ms() -> u64 { 150 }
-fn default_timeout_max_ms() -> u64 { 300 }
-fn default_heartbeat_interval_ms() -> u64 { 50 }
-fn default_phi_suspect() -> f64 { 8.0 }
-fn default_phi_dead() -> f64 { 12.0 }
+fn default_timeout_min_ms() -> u64 {
+    150
+}
+fn default_timeout_max_ms() -> u64 {
+    300
+}
+fn default_heartbeat_interval_ms() -> u64 {
+    50
+}
+fn default_phi_suspect() -> f64 {
+    8.0
+}
+fn default_phi_dead() -> f64 {
+    12.0
+}
 
 impl Default for ClusterElectionConfig {
     fn default() -> Self {
@@ -521,8 +646,12 @@ pub struct ClusterHealthConfig {
     pub max_missed_heartbeats: u32,
 }
 
-fn default_health_check_interval() -> u64 { 5 }
-fn default_max_missed_heartbeats() -> u32 { 3 }
+fn default_health_check_interval() -> u64 {
+    5
+}
+fn default_max_missed_heartbeats() -> u32 {
+    3
+}
 
 impl Default for ClusterHealthConfig {
     fn default() -> Self {
@@ -565,8 +694,12 @@ pub struct ClusterConfig {
     pub health: ClusterHealthConfig,
 }
 
-fn default_cluster_role() -> String { "auto".to_string() }
-fn default_cluster_addr() -> String { "0.0.0.0:16851".to_string() }
+fn default_cluster_role() -> String {
+    "auto".to_string()
+}
+fn default_cluster_addr() -> String {
+    "0.0.0.0:16851".to_string()
+}
 
 impl Default for ClusterConfig {
     fn default() -> Self {

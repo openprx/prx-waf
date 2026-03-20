@@ -7,12 +7,12 @@
 use std::sync::Arc;
 
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use chrono::Utc;
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -80,7 +80,9 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
 }
 
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    let Ok(parsed) = PasswordHash::new(hash) else { return false };
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
@@ -129,7 +131,7 @@ pub async fn login(
 
     let access_token =
         generate_access_token(user.id, &user.username, &user.role, &state.jwt_secret)
-            .map_err(|e| ApiError::Internal(e))?;
+            .map_err(ApiError::Internal)?;
 
     // Generate a random refresh token
     let raw_refresh: String = {
@@ -167,7 +169,9 @@ pub async fn logout(
 ) -> ApiResult<Json<serde_json::Value>> {
     let token_hash = hash_token(&req.refresh_token);
     state.db.revoke_refresh_token(&token_hash).await?;
-    Ok(Json(serde_json::json!({ "success": true, "data": "logged out" })))
+    Ok(Json(
+        serde_json::json!({ "success": true, "data": "logged out" }),
+    ))
 }
 
 pub async fn refresh_token(
@@ -193,7 +197,7 @@ pub async fn refresh_token(
 
     let access_token =
         generate_access_token(user.id, &user.username, &user.role, &state.jwt_secret)
-            .map_err(|e| ApiError::Internal(e))?;
+            .map_err(ApiError::Internal)?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -206,10 +210,25 @@ pub async fn refresh_token(
 }
 
 /// Bootstrap: create the default admin user if no users exist.
+///
+/// If `ADMIN_PASSWORD` is set, uses that value. Otherwise generates a random
+/// 24-character password and prints it **once** to stdout so the operator can
+/// capture it from the initial startup log.
 pub async fn ensure_default_admin(state: &AppState) -> anyhow::Result<()> {
     let count = state.db.admin_users_count().await?;
     if count == 0 {
-        let password = std::env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "admin123".into());
+        let (password, generated) = match std::env::var("ADMIN_PASSWORD") {
+            Ok(p) if !p.is_empty() => (p, false),
+            _ => {
+                use rand::Rng;
+                let pw: String = rand::thread_rng()
+                    .sample_iter(&rand::distributions::Alphanumeric)
+                    .take(24)
+                    .map(char::from)
+                    .collect();
+                (pw, true)
+            }
+        };
         let hash = hash_password(&password)?;
         state
             .db
@@ -223,6 +242,16 @@ pub async fn ensure_default_admin(state: &AppState) -> anyhow::Result<()> {
                 &hash,
             )
             .await?;
+        if generated {
+            // Print to stdout (not tracing) so operators can capture the initial password.
+            // This is intentionally printed only once on first startup.
+            println!("============================================================");
+            println!("  ADMIN USER CREATED");
+            println!("  Username: admin");
+            println!("  Password: {password}");
+            println!("  CHANGE THIS PASSWORD IMMEDIATELY!");
+            println!("============================================================");
+        }
         tracing::info!("Created default admin user (username=admin)");
     }
     Ok(())

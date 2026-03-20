@@ -7,10 +7,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use waf_cluster::{
+    ClusterConfig, NodeRole, NodeState, StorageMode,
     election::ElectionManager,
     node::PeerInfo,
     protocol::{ElectionResult, ElectionVote},
-    ClusterConfig, NodeRole, NodeState, StorageMode,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -21,9 +21,11 @@ fn random_loopback_addr() -> SocketAddr {
 }
 
 fn make_node(node_id: &str) -> Arc<NodeState> {
-    let mut cfg = ClusterConfig::default();
-    cfg.node_id = node_id.to_string();
-    cfg.listen_addr = random_loopback_addr().to_string();
+    let cfg = ClusterConfig {
+        node_id: node_id.to_string(),
+        listen_addr: random_loopback_addr().to_string(),
+        ..ClusterConfig::default()
+    };
     Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"))
 }
 
@@ -54,7 +56,8 @@ async fn candidate_with_majority_wins_election() {
     assert_eq!(node.election.vote_count_for_term(term), 1);
 
     // Simulate voter-1 granting the vote (normally arrives via QUIC recv).
-    node.election.record_vote_for_me(term, "voter-1".to_string());
+    node.election
+        .record_vote_for_me(term, "voter-1".to_string());
 
     let vote_count = node.election.vote_count_for_term(term);
     let total = node.total_nodes().await; // 1 peer + self = 2
@@ -101,17 +104,36 @@ async fn stale_election_result_rejected() {
         voter_ids: vec!["stale-leader".to_string(), "zombie-1".to_string()],
     };
     let role = em.process_result(&stale).await.expect("process_result");
-    assert_eq!(role, NodeRole::Worker, "stale-term result must not grant Main role");
-    assert_eq!(em.current_term_sync(), 5, "term must not be rolled back by stale result");
+    assert_eq!(
+        role,
+        NodeRole::Worker,
+        "stale-term result must not grant Main role"
+    );
+    assert_eq!(
+        em.current_term_sync(),
+        5,
+        "term must not be rolled back by stale result"
+    );
 
     // A valid result at term 5 electing someone else → we step down to Worker.
     let valid_other = ElectionResult {
         term: 5,
         elected_id: "node-b".to_string(),
-        voter_ids: vec!["node-a".to_string(), "node-b".to_string(), "node-c".to_string()],
+        voter_ids: vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ],
     };
-    let role = em.process_result(&valid_other).await.expect("process_result");
-    assert_eq!(role, NodeRole::Worker, "node-a should step down when node-b wins");
+    let role = em
+        .process_result(&valid_other)
+        .await
+        .expect("process_result");
+    assert_eq!(
+        role,
+        NodeRole::Worker,
+        "node-a should step down when node-b wins"
+    );
 
     // A valid result at term 6 electing us → we become Main.
     let valid_us = ElectionResult {
@@ -120,8 +142,16 @@ async fn stale_election_result_rejected() {
         voter_ids: vec!["node-a".to_string(), "node-b".to_string()],
     };
     let role = em.process_result(&valid_us).await.expect("process_result");
-    assert_eq!(role, NodeRole::Main, "node-a must become Main when it is elected");
-    assert_eq!(em.current_term_sync(), 6, "term should advance to 6 after valid result");
+    assert_eq!(
+        role,
+        NodeRole::Main,
+        "node-a must become Main when it is elected"
+    );
+    assert_eq!(
+        em.current_term_sync(),
+        6,
+        "term should advance to 6 after valid result"
+    );
 }
 
 // ─── Test 3: Concurrent election — only the majority winner survives ──────────
@@ -179,12 +209,26 @@ async fn concurrent_election_only_majority_wins() {
     };
 
     // A receives the result and steps down.
-    let a_role = em_a.process_result(&result).await.expect("A process_result");
-    assert_eq!(a_role, NodeRole::Worker, "losing candidate A must step down");
+    let a_role = em_a
+        .process_result(&result)
+        .await
+        .expect("A process_result");
+    assert_eq!(
+        a_role,
+        NodeRole::Worker,
+        "losing candidate A must step down"
+    );
 
     // B processes its own result and becomes Main.
-    let b_role = em_b.process_result(&result).await.expect("B process_result");
-    assert_eq!(b_role, NodeRole::Main, "winning candidate B must become Main");
+    let b_role = em_b
+        .process_result(&result)
+        .await
+        .expect("B process_result");
+    assert_eq!(
+        b_role,
+        NodeRole::Main,
+        "winning candidate B must become Main"
+    );
 
     // Both converge on term 1.
     assert_eq!(em_a.current_term_sync(), 1);

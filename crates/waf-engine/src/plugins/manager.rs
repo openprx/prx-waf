@@ -97,7 +97,16 @@ impl WasmPlugin {
         let engine = Engine::new(&cfg)?;
         let module = Module::new(&engine, wasm_bytes)?;
 
-        Ok(Self { id, name, version, description, author, enabled, engine, module })
+        Ok(Self {
+            id,
+            name,
+            version,
+            description,
+            author,
+            enabled,
+            engine,
+            module,
+        })
     }
 
     /// Execute `on_request` with method / path / client IP context.
@@ -118,7 +127,12 @@ impl WasmPlugin {
         }
     }
 
-    fn run_request(&self, method: &str, path: &str, client_ip: &str) -> anyhow::Result<PluginAction> {
+    fn run_request(
+        &self,
+        method: &str,
+        path: &str,
+        client_ip: &str,
+    ) -> anyhow::Result<PluginAction> {
         let mut store = Store::new(&self.engine, ());
         store.set_fuel(FUEL_PER_CALL)?;
 
@@ -135,27 +149,20 @@ impl WasmPlugin {
         }
 
         // Call on_request() -> i32
-        let action_code = if let Ok(func) =
-            instance.get_typed_func::<(), i32>(&mut store, "on_request")
-        {
-            func.call(&mut store, ())?
-        } else if let Ok(func) =
-            instance.get_typed_func::<(), i32>(&mut store, "get_action")
-        {
-            func.call(&mut store, ())?
-        } else {
-            0 // default Allow
-        };
+        let action_code =
+            if let Ok(func) = instance.get_typed_func::<(), i32>(&mut store, "on_request") {
+                func.call(&mut store, ())?
+            } else if let Ok(func) = instance.get_typed_func::<(), i32>(&mut store, "get_action") {
+                func.call(&mut store, ())?
+            } else {
+                0 // default Allow
+            };
 
         Ok(PluginAction::try_from(action_code).unwrap_or(PluginAction::Allow))
     }
 
     /// Read a plugin name/version string from WASM memory exports.
-    pub fn read_string_export(
-        &self,
-        ptr_export: &str,
-        len_export: &str,
-    ) -> Option<String> {
+    pub fn read_string_export(&self, ptr_export: &str, len_export: &str) -> Option<String> {
         let mut store = Store::new(&self.engine, ());
         store.set_fuel(1_000_000).ok()?;
         let linker = Linker::new(&self.engine);
@@ -197,6 +204,17 @@ impl WasmPlugin {
 
 // ─── Plugin manager ───────────────────────────────────────────────────────────
 
+/// Parameters for loading a WASM plugin.
+pub struct LoadPluginParams<'a> {
+    pub id: Uuid,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub author: String,
+    pub enabled: bool,
+    pub wasm_bytes: &'a [u8],
+}
+
 /// Thread-safe registry of loaded WASM plugins.
 pub struct PluginManager {
     plugins: RwLock<HashMap<Uuid, Arc<WasmPlugin>>>,
@@ -204,24 +222,25 @@ pub struct PluginManager {
 
 impl PluginManager {
     pub fn new() -> Self {
-        Self { plugins: RwLock::new(HashMap::new()) }
+        Self {
+            plugins: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Load (or reload) a plugin from its binary bytes.
-    pub async fn load(
-        &self,
-        id: Uuid,
-        name: String,
-        version: String,
-        description: String,
-        author: String,
-        enabled: bool,
-        wasm_bytes: &[u8],
-    ) -> anyhow::Result<()> {
-        let plugin = WasmPlugin::new(id, name.clone(), version, description, author, enabled, wasm_bytes)?;
+    pub async fn load(&self, params: LoadPluginParams<'_>) -> anyhow::Result<()> {
+        let plugin = WasmPlugin::new(
+            params.id,
+            params.name.clone(),
+            params.version,
+            params.description,
+            params.author,
+            params.enabled,
+            params.wasm_bytes,
+        )?;
         let mut map = self.plugins.write().await;
-        map.insert(id, Arc::new(plugin));
-        info!(plugin = %name, "WASM plugin loaded");
+        map.insert(params.id, Arc::new(plugin));
+        info!(plugin = %params.name, "WASM plugin loaded");
         Ok(())
     }
 
@@ -280,7 +299,12 @@ impl PluginManager {
     }
 
     pub async fn list(&self) -> Vec<PluginInfo> {
-        self.plugins.read().await.values().map(|p| p.info()).collect()
+        self.plugins
+            .read()
+            .await
+            .values()
+            .map(|p| p.info())
+            .collect()
     }
 
     pub async fn get(&self, id: Uuid) -> Option<Arc<WasmPlugin>> {

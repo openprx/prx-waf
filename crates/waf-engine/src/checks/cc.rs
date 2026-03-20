@@ -103,8 +103,7 @@ impl Check for CcCheck {
 
             if state.violation_count >= ban_threshold {
                 // Auto-ban the IP.
-                state.banned_until =
-                    Some(now + std::time::Duration::from_secs(ban_duration_secs));
+                state.banned_until = Some(now + std::time::Duration::from_secs(ban_duration_secs));
                 return Some(DetectionResult {
                     rule_id: Some("CC-BAN".to_string()),
                     rule_name: "Rate Limit (auto-ban triggered)".to_string(),
@@ -132,10 +131,10 @@ impl Check for CcCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::sync::Arc;
-    use bytes::Bytes;
     use waf_common::{DefenseConfig, HostConfig};
 
     fn make_ctx_with_rps(rps: f64, burst: u32) -> RequestCtx {

@@ -1,13 +1,14 @@
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
+
+use parking_lot::RwLock;
 
 use dashmap::DashMap;
 use ipnet::IpNet;
 
 use super::config::CrowdSecConfig;
-use super::models::{CachedDecision, CacheStats, Decision, DecisionStream};
+use super::models::{CacheStats, CachedDecision, Decision, DecisionStream};
 
 /// In-memory decision cache with exact-IP and CIDR-range matching.
 ///
@@ -46,15 +47,16 @@ impl DecisionCache {
     /// Check if `ip` has an active decision. Returns the first match found.
     pub fn check_ip(&self, ip: &IpAddr) -> Option<CachedDecision> {
         // 1. Exact IP match
-        if let Some(entry) = self.ip_decisions.get(ip) {
-            if !entry.is_expired() {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Some(entry.clone());
-            }
+        if let Some(entry) = self.ip_decisions.get(ip)
+            && !entry.is_expired()
+        {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(entry.clone());
         }
 
         // 2. CIDR range match
-        if let Ok(ranges) = self.range_decisions.read() {
+        {
+            let ranges = self.range_decisions.read();
             for (net, cached) in ranges.iter() {
                 if net.contains(ip) && !cached.is_expired() {
                     self.hits.fetch_add(1, Ordering::Relaxed);
@@ -96,7 +98,8 @@ impl DecisionCache {
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
         self.ip_decisions.retain(|_, v| v.expires_at > now);
-        if let Ok(mut ranges) = self.range_decisions.write() {
+        {
+            let mut ranges = self.range_decisions.write();
             ranges.retain(|(_, v)| v.expires_at > now);
         }
         self.other_decisions.retain(|_, v| v.expires_at > now);
@@ -113,7 +116,8 @@ impl DecisionCache {
             }
         }
 
-        if let Ok(ranges) = self.range_decisions.read() {
+        {
+            let ranges = self.range_decisions.read();
             for (_, cached) in ranges.iter() {
                 if !cached.is_expired() {
                     result.push(cached.decision.clone());
@@ -172,10 +176,10 @@ impl DecisionCache {
         if self.cache_ttl_secs > 0 {
             return Instant::now() + Duration::from_secs(self.cache_ttl_secs);
         }
-        if let Some(ref dur_str) = decision.duration {
-            if let Some(secs) = parse_cs_duration(dur_str) {
-                return Instant::now() + Duration::from_secs(secs);
-            }
+        if let Some(ref dur_str) = decision.duration
+            && let Some(secs) = parse_cs_duration(dur_str)
+        {
+            return Instant::now() + Duration::from_secs(secs);
         }
         // Default fallback: 4 hours
         Instant::now() + Duration::from_secs(4 * 3600)
@@ -191,15 +195,13 @@ impl DecisionCache {
             }
             "range" => {
                 if let Ok(net) = decision.value.parse::<IpNet>() {
-                    if let Ok(mut ranges) = self.range_decisions.write() {
-                        ranges.retain(|(n, _)| *n != net);
-                        ranges.push((net, cached));
-                    }
+                    let mut ranges = self.range_decisions.write();
+                    ranges.retain(|(n, _)| *n != net);
+                    ranges.push((net, cached));
                 }
             }
             _ => {
-                self.other_decisions
-                    .insert(decision.value.clone(), cached);
+                self.other_decisions.insert(decision.value.clone(), cached);
             }
         }
     }
@@ -214,9 +216,8 @@ impl DecisionCache {
             }
             "range" => {
                 if let Ok(net) = decision.value.parse::<IpNet>() {
-                    if let Ok(mut ranges) = self.range_decisions.write() {
-                        ranges.retain(|(n, _)| *n != net);
-                    }
+                    let mut ranges = self.range_decisions.write();
+                    ranges.retain(|(n, _)| *n != net);
                 }
             }
             _ => {
@@ -227,11 +228,7 @@ impl DecisionCache {
 
     fn update_total(&self) {
         let n = self.ip_decisions.len()
-            + self
-                .range_decisions
-                .read()
-                .map(|r| r.len())
-                .unwrap_or(0)
+            + self.range_decisions.read().len()
             + self.other_decisions.len();
         self.total_cached.store(n as u64, Ordering::Relaxed);
     }

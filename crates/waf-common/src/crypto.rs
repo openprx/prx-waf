@@ -4,8 +4,8 @@
 /// If the env var is not set, a zero key is used (no-op in production—operators must
 /// set MASTER_KEY to get real encryption).
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Key, Nonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng},
 };
 use sha2::{Digest, Sha256};
 
@@ -20,11 +20,17 @@ pub fn derive_key(master_password: &str) -> [u8; 32] {
     key
 }
 
-/// Load master key from `MASTER_KEY` env var, falling back to a static dev key.
-pub fn master_key() -> [u8; 32] {
+/// Load master key from `MASTER_KEY` env var.
+///
+/// Returns an error if the variable is not set or is empty.
+/// Operators **must** set `MASTER_KEY` to a strong random value in production.
+pub fn master_key() -> anyhow::Result<[u8; 32]> {
     match std::env::var("MASTER_KEY") {
-        Ok(s) if !s.is_empty() => derive_key(&s),
-        _ => derive_key("dev-insecure-master-key-change-me"),
+        Ok(s) if !s.is_empty() => Ok(derive_key(&s)),
+        _ => Err(anyhow::anyhow!(
+            "MASTER_KEY environment variable is not set. \
+             Set a strong random value (>= 32 chars) for encryption at rest."
+        )),
     }
 }
 

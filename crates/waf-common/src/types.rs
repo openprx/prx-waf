@@ -40,14 +40,9 @@ pub struct RequestCtx {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WafAction {
     Allow,
-    Block {
-        status: u16,
-        body: Option<String>,
-    },
+    Block { status: u16, body: Option<String> },
     LogOnly,
-    Redirect {
-        url: String,
-    },
+    Redirect { url: String },
 }
 
 /// WAF decision with context
@@ -103,6 +98,8 @@ pub enum Phase {
     CrowdSec = 16,
     /// GeoIP-based access control
     GeoIp = 17,
+    /// Community threat intelligence blocklist
+    Community = 18,
 }
 
 impl std::fmt::Display for Phase {
@@ -125,6 +122,7 @@ impl std::fmt::Display for Phase {
             Phase::AntiHotlink => write!(f, "Anti-Hotlink"),
             Phase::CrowdSec => write!(f, "CrowdSec"),
             Phase::GeoIp => write!(f, "GeoIP"),
+            Phase::Community => write!(f, "Community"),
         }
     }
 }
@@ -229,12 +227,24 @@ pub struct DefenseConfig {
     pub owasp_paranoia: u8,
 }
 
-fn bool_true() -> bool { true }
-fn default_cc_rps() -> f64 { 100.0 }
-fn default_cc_burst() -> u32 { 200 }
-fn default_cc_ban_threshold() -> u32 { 10 }
-fn default_cc_ban_duration_secs() -> u64 { 300 }
-fn default_owasp_paranoia() -> u8 { 1 }
+fn bool_true() -> bool {
+    true
+}
+fn default_cc_rps() -> f64 {
+    100.0
+}
+fn default_cc_burst() -> u32 {
+    200
+}
+fn default_cc_ban_threshold() -> u32 {
+    10
+}
+fn default_cc_ban_duration_secs() -> u64 {
+    300
+}
+fn default_owasp_paranoia() -> u8 {
+    1
+}
 
 impl Default for DefenseConfig {
     fn default() -> Self {

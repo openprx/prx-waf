@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::RegexSet;
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
-use super::{request_targets, Check};
+use super::{Check, request_targets};
 
 static XSS_DESCS: &[&str] = &[
     "<script> tag",
@@ -103,10 +103,10 @@ impl Check for XssCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::sync::Arc;
-    use bytes::Bytes;
     use waf_common::{DefenseConfig, HostConfig};
 
     fn make_ctx(query: &str, body: &str) -> RequestCtx {
@@ -124,7 +124,10 @@ mod tests {
             content_length: body.len() as u64,
             is_tls: false,
             host_config: Arc::new(HostConfig {
-                defense_config: DefenseConfig { xss: true, ..DefenseConfig::default() },
+                defense_config: DefenseConfig {
+                    xss: true,
+                    ..DefenseConfig::default()
+                },
                 ..HostConfig::default()
             }),
             geo: None,

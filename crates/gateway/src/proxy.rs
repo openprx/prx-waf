@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -19,24 +19,32 @@ use crate::router::HostRouter;
 pub struct WafProxy {
     pub router: Arc<HostRouter>,
     pub engine: Arc<WafEngine>,
+    /// Whether to trust X-Forwarded-For headers for client IP extraction.
+    /// Should only be `true` when running behind a trusted reverse proxy.
+    pub trust_proxy_headers: bool,
 }
 
 impl WafProxy {
     pub fn new(router: Arc<HostRouter>, engine: Arc<WafEngine>) -> Self {
-        Self { router, engine }
+        Self {
+            router,
+            engine,
+            trust_proxy_headers: false,
+        }
     }
 
-    /// Extract client IP from session, respecting X-Forwarded-For
-    fn extract_client_ip(session: &Session) -> std::net::IpAddr {
-        // Check X-Forwarded-For header
-        if let Some(xff) = session.get_header("x-forwarded-for") {
-            if let Ok(s) = std::str::from_utf8(xff.as_bytes()) {
-                if let Some(first) = s.split(',').next() {
-                    if let Ok(ip) = first.trim().parse() {
-                        return ip;
-                    }
-                }
-            }
+    /// Extract client IP from session.
+    ///
+    /// Only reads X-Forwarded-For when `trust_proxy_headers` is enabled;
+    /// otherwise always uses the TCP peer address.
+    fn extract_client_ip(&self, session: &Session) -> std::net::IpAddr {
+        if self.trust_proxy_headers
+            && let Some(xff) = session.get_header("x-forwarded-for")
+            && let Ok(s) = std::str::from_utf8(xff.as_bytes())
+            && let Some(first) = s.split(',').next()
+            && let Ok(ip) = first.trim().parse()
+        {
+            return ip;
         }
 
         // Fall back to remote addr
@@ -48,11 +56,8 @@ impl WafProxy {
     }
 
     /// Build a RequestCtx from the Pingora session
-    fn build_request_ctx(
-        session: &Session,
-        host_config: Arc<HostConfig>,
-    ) -> RequestCtx {
-        let client_ip = Self::extract_client_ip(session);
+    fn build_request_ctx(&self, session: &Session, host_config: Arc<HostConfig>) -> RequestCtx {
+        let client_ip = self.extract_client_ip(session);
         let client_port = session
             .client_addr()
             .and_then(|a| a.as_inet())
@@ -115,15 +120,12 @@ impl ProxyHttp for WafProxy {
 
         debug!("Routing request for host: {}", host_header);
 
-        let host_config = self
-            .router
-            .resolve(&host_header)
-            .ok_or_else(|| {
-                pingora_core::Error::explain(
-                    pingora_core::ErrorType::ConnectProxyFailure,
-                    format!("No route found for host: {}", host_header),
-                )
-            })?;
+        let host_config = self.router.resolve(&host_header).ok_or_else(|| {
+            pingora_core::Error::explain(
+                pingora_core::ErrorType::ConnectProxyFailure,
+                format!("No route found for host: {}", host_header),
+            )
+        })?;
 
         // Check if the site is started
         if !host_config.start_status {
@@ -139,7 +141,7 @@ impl ProxyHttp for WafProxy {
         ctx.upstream_addr = Some(upstream_addr.clone());
         ctx.host_config = Some(Arc::clone(&host_config));
 
-        let request_ctx = Self::build_request_ctx(session, Arc::clone(&host_config));
+        let request_ctx = self.build_request_ctx(session, Arc::clone(&host_config));
         ctx.request_ctx = Some(request_ctx);
 
         info!("Proxying {} → {}", host_header, upstream_addr);
@@ -172,16 +174,16 @@ impl ProxyHttp for WafProxy {
                 WafAction::Block { status, body } => {
                     warn!(
                         "WAF blocked request: ip={} path={} host={}",
-                        request_ctx.client_ip,
-                        request_ctx.path,
-                        request_ctx.host,
+                        request_ctx.client_ip, request_ctx.path, request_ctx.host,
                     );
                     let status_code = *status;
                     let body_str = body.clone().unwrap_or_else(|| "Access Denied".to_string());
 
                     // Build a simple HTTP 403 response
                     let response = pingora_http::ResponseHeader::build(status_code, None)?;
-                    session.write_response_header(Box::new(response), false).await?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
                     let body_bytes = Bytes::from(body_str);
                     session.write_response_body(Some(body_bytes), true).await?;
                     return Ok(true);
@@ -189,7 +191,9 @@ impl ProxyHttp for WafProxy {
                 WafAction::Redirect { url } => {
                     let mut response = pingora_http::ResponseHeader::build(302, None)?;
                     response.insert_header("location", url.as_str())?;
-                    session.write_response_header(Box::new(response), true).await?;
+                    session
+                        .write_response_header(Box::new(response), true)
+                        .await?;
                     return Ok(true);
                 }
                 _ => {}

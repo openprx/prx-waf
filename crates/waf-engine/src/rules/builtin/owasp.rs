@@ -1,7 +1,7 @@
 //! Built-in OWASP CRS rules (subset compiled into the binary).
 
-use std::collections::HashMap;
 use super::super::registry::Rule;
+use std::collections::HashMap;
 
 fn rule(id: &str, name: &str, category: &str, pattern: &str, severity: &str) -> Rule {
     Rule {

@@ -129,7 +129,10 @@ impl GeoIpService {
 /// opened, so callers can continue with degraded but functional behaviour.
 fn load_searcher(path: &str, policy: CachePolicy, label: &str) -> Option<Arc<Searcher>> {
     if !std::path::Path::new(path).exists() {
-        info!("GeoIP: {} xdb file not found at '{}' — skipping", label, path);
+        info!(
+            "GeoIP: {} xdb file not found at '{}' — skipping",
+            label, path
+        );
         return None;
     }
 
@@ -139,7 +142,10 @@ fn load_searcher(path: &str, policy: CachePolicy, label: &str) -> Option<Arc<Sea
             Some(Arc::new(s))
         }
         Err(e) => {
-            warn!("GeoIP: failed to load {} searcher from '{}': {}", label, path, e);
+            warn!(
+                "GeoIP: failed to load {} searcher from '{}': {}",
+                label, path, e
+            );
             None
         }
     }
@@ -157,27 +163,37 @@ fn parse_region(raw: &str) -> GeoIpInfo {
     }
 
     let mut parts = raw.splitn(5, '|');
-    let country  = normalize(parts.next().unwrap_or(""));
+    let country = normalize(parts.next().unwrap_or(""));
     let province = normalize(parts.next().unwrap_or(""));
-    let city     = normalize(parts.next().unwrap_or(""));
-    let isp      = normalize(parts.next().unwrap_or(""));
+    let city = normalize(parts.next().unwrap_or(""));
+    let isp = normalize(parts.next().unwrap_or(""));
     let iso_code = normalize(parts.next().unwrap_or(""));
 
-    GeoIpInfo { country, province, city, isp, iso_code }
+    GeoIpInfo {
+        country,
+        province,
+        city,
+        isp,
+        iso_code,
+    }
 }
 
 /// Return an empty string for the ip2region sentinel value `"0"`.
 #[inline]
 fn normalize(s: &str) -> String {
-    if s == "0" { String::new() } else { s.to_string() }
+    if s == "0" {
+        String::new()
+    } else {
+        s.to_string()
+    }
 }
 
 /// Convert a `cache_policy` string (from config) to ip2region's `CachePolicy`.
 pub fn cache_policy_from_str(s: &str) -> CachePolicy {
     match s.to_lowercase().as_str() {
         "vector_index" => CachePolicy::VectorIndex,
-        "no_cache"     => CachePolicy::NoCache,
-        _              => CachePolicy::FullMemory, // "full_memory" is the default
+        "no_cache" => CachePolicy::NoCache,
+        _ => CachePolicy::FullMemory, // "full_memory" is the default
     }
 }
 
@@ -212,9 +228,21 @@ mod tests {
 
     #[test]
     fn cache_policy_mapping() {
-        assert!(matches!(cache_policy_from_str("full_memory"), CachePolicy::FullMemory));
-        assert!(matches!(cache_policy_from_str("vector_index"), CachePolicy::VectorIndex));
-        assert!(matches!(cache_policy_from_str("no_cache"), CachePolicy::NoCache));
-        assert!(matches!(cache_policy_from_str("unknown"), CachePolicy::FullMemory));
+        assert!(matches!(
+            cache_policy_from_str("full_memory"),
+            CachePolicy::FullMemory
+        ));
+        assert!(matches!(
+            cache_policy_from_str("vector_index"),
+            CachePolicy::VectorIndex
+        ));
+        assert!(matches!(
+            cache_policy_from_str("no_cache"),
+            CachePolicy::NoCache
+        ));
+        assert!(matches!(
+            cache_policy_from_str("unknown"),
+            CachePolicy::FullMemory
+        ));
     }
 }

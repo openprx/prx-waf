@@ -78,7 +78,9 @@ struct RuleSet {
     rules: Vec<YamlRule>,
 }
 
-fn default_paranoia_level() -> u8 { 1 }
+fn default_paranoia_level() -> u8 {
+    1
+}
 
 #[derive(Debug, Deserialize)]
 struct YamlRule {
@@ -143,33 +145,28 @@ impl CompiledRule {
                     _ => field_val.as_ref().map(|v| re.is_match(v)).unwrap_or(false),
                 }
             }
-            CompiledMatcher::Contains(s) => {
-                field_val.as_ref().map(|v| v.contains(s.as_str())).unwrap_or(false)
-            }
-            CompiledMatcher::NotIn(list) => {
-                field_val
-                    .as_ref()
-                    .map(|v| !list.iter().any(|allowed| allowed.eq_ignore_ascii_case(v)))
-                    .unwrap_or(false)
-            }
-            CompiledMatcher::Gt(n) => {
-                field_val
-                    .as_ref()
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .map(|v| v > *n)
-                    .unwrap_or(false)
-            }
-            CompiledMatcher::Lt(n) => {
-                field_val
-                    .as_ref()
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .map(|v| v < *n)
-                    .unwrap_or(false)
-            }
+            CompiledMatcher::Contains(s) => field_val
+                .as_ref()
+                .map(|v| v.contains(s.as_str()))
+                .unwrap_or(false),
+            CompiledMatcher::NotIn(list) => field_val
+                .as_ref()
+                .map(|v| !list.iter().any(|allowed| allowed.eq_ignore_ascii_case(v)))
+                .unwrap_or(false),
+            CompiledMatcher::Gt(n) => field_val
+                .as_ref()
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(|v| v > *n)
+                .unwrap_or(false),
+            CompiledMatcher::Lt(n) => field_val
+                .as_ref()
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(|v| v < *n)
+                .unwrap_or(false),
         }
     }
 
-    fn get_field<'a>(&self, ctx: &'a RequestCtx) -> Option<String> {
+    fn get_field(&self, ctx: &RequestCtx) -> Option<String> {
         match self.field.as_str() {
             "method" => Some(ctx.method.clone()),
             "path" => Some(ctx.path.clone()),
@@ -270,11 +267,7 @@ impl OWASPCheck {
             }
         };
 
-        let rules = ruleset
-            .rules
-            .into_iter()
-            .filter_map(|r| compile_rule(r))
-            .collect();
+        let rules = ruleset.rules.into_iter().filter_map(compile_rule).collect();
 
         Self { rules }
     }
@@ -342,7 +335,10 @@ fn compile_rule(r: YamlRule) -> Option<CompiledRule> {
             CompiledMatcher::Lt(n)
         }
         op => {
-            debug!("Skipping OWASP rule {} with unsupported operator '{}'", r.id, op);
+            debug!(
+                "Skipping OWASP rule {} with unsupported operator '{}'",
+                r.id, op
+            );
             return None;
         }
     };
@@ -393,14 +389,16 @@ impl Check for OWASPCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use bytes::Bytes;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use waf_common::{DefenseConfig, HostConfig};
 
     fn make_ctx(method: &str, path: &str, content_length: u64) -> RequestCtx {
-        let mut dc = DefenseConfig::default();
-        dc.owasp_set = true;
+        let dc = DefenseConfig {
+            owasp_set: true,
+            ..DefenseConfig::default()
+        };
         let host_config = Arc::new(HostConfig {
             code: "test".into(),
             host: "example.com".into(),
@@ -429,7 +427,10 @@ mod tests {
     fn test_invalid_method_blocked() {
         let checker = OWASPCheck::new();
         let ctx = make_ctx("FOOBAR", "/", 0);
-        assert!(checker.check(&ctx).is_some(), "FOOBAR method should be blocked");
+        assert!(
+            checker.check(&ctx).is_some(),
+            "FOOBAR method should be blocked"
+        );
     }
 
     #[test]

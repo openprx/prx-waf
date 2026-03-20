@@ -7,53 +7,49 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
+use parking_lot::Mutex;
+
 use axum::{
+    Json,
     body::Body,
     http::{Request, StatusCode},
     middleware::Next,
     response::IntoResponse,
-    Json,
 };
 use serde_json::json;
 
 // ─── Security headers middleware ──────────────────────────────────────────────
 
 /// Adds security headers to every management API response.
-pub async fn security_headers_middleware(
-    req: Request<Body>,
-    next: Next,
-) -> impl IntoResponse {
+pub async fn security_headers_middleware(req: Request<Body>, next: Next) -> impl IntoResponse {
+    use axum::http::HeaderValue;
+
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
 
-    headers.insert(
-        "X-Frame-Options",
-        "DENY".parse().unwrap(),
-    );
+    headers.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
     headers.insert(
         "X-Content-Type-Options",
-        "nosniff".parse().unwrap(),
+        HeaderValue::from_static("nosniff"),
     );
     headers.insert(
         "X-XSS-Protection",
-        "1; mode=block".parse().unwrap(),
+        HeaderValue::from_static("1; mode=block"),
     );
     headers.insert(
         "Strict-Transport-Security",
-        "max-age=31536000; includeSubDomains".parse().unwrap(),
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
     );
     headers.insert(
         "Content-Security-Policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'"
-            .parse()
-            .unwrap(),
+        HeaderValue::from_static("default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'"),
     );
     headers.insert(
         "Referrer-Policy",
-        "strict-origin-when-cross-origin".parse().unwrap(),
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
 
     response
@@ -89,7 +85,7 @@ impl ApiRateLimiter {
             return true;
         }
         let now = Instant::now();
-        let mut map = self.buckets.lock().unwrap();
+        let mut map = self.buckets.lock();
         let bucket = map.entry(ip).or_insert(Bucket {
             tokens: self.burst,
             last_refill: now,
@@ -122,10 +118,10 @@ pub fn is_admin_ip_allowed(ip: &IpAddr, allowlist: &[String]) -> bool {
             return true;
         }
         // CIDR check via ipnet
-        if let Ok(net) = entry.parse::<ipnet::IpNet>() {
-            if net.contains(ip) {
-                return true;
-            }
+        if let Ok(net) = entry.parse::<ipnet::IpNet>()
+            && net.contains(ip)
+        {
+            return true;
         }
     }
     false
@@ -134,7 +130,7 @@ pub fn is_admin_ip_allowed(ip: &IpAddr, allowlist: &[String]) -> bool {
 // ─── GET /api/audit-log ───────────────────────────────────────────────────────
 
 use crate::state::AppState;
-use axum::{extract::State, extract::Query};
+use axum::{extract::Query, extract::State};
 use waf_storage::models::AuditLogQuery;
 
 pub async fn list_audit_log(

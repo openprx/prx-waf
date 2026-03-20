@@ -3,14 +3,15 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tracing::info;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use gateway::{HostRouter, TunnelConfig, WafProxy};
-use waf_api::{start_api_server, AppState};
-use waf_common::config::{load_config, AppConfig};
+use waf_api::{AppState, start_api_server};
+use waf_common::config::{AppConfig, load_config};
 use waf_engine::{
-    cache_policy_from_str, init_crowdsec, spawn_auto_updater, CrowdSecClient, CrowdSecConfig,
-    ExportFormat, GeoIpService, RuleManager, WafEngine, WafEngineConfig, XdbUpdater,
+    CrowdSecClient, CrowdSecConfig, ExportFormat, GeoIpService, RuleManager, WafEngine,
+    WafEngineConfig, XdbUpdater, cache_policy_from_str, init_community, init_crowdsec,
+    spawn_auto_updater,
 };
 use waf_storage::Database;
 
@@ -49,9 +50,25 @@ enum Commands {
     /// GeoIP database management (download, update, status)
     #[command(subcommand)]
     Geoip(GeoIpCommands),
+    /// Community threat intelligence sharing management
+    #[command(subcommand)]
+    Community(CommunityCommands),
     /// Cluster management (status, nodes, token, promote/demote/remove)
     #[command(subcommand)]
     Cluster(ClusterCommands),
+}
+
+// ── Community sub-commands ────────────────────────────────────────────────────
+
+/// Community threat intelligence sub-commands
+#[derive(Subcommand, Debug)]
+enum CommunityCommands {
+    /// Show community integration status
+    Status,
+    /// Enroll this machine with the community server
+    Enroll,
+    /// Test connectivity to the community server
+    Test,
 }
 
 // ── Cluster sub-commands ──────────────────────────────────────────────────────
@@ -261,10 +278,9 @@ enum GeoIpCommands {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(
-            EnvFilter::from_default_env()
-                .add_directive("info".parse().unwrap()),
-        )
+        .with(EnvFilter::from_default_env().add_directive(
+            tracing_subscriber::filter::Directive::from(tracing::Level::INFO),
+        ))
         .init();
 
     let cli = Cli::parse();
@@ -318,6 +334,12 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()?
                 .block_on(run_geoip_cmd(sub, &config))?;
+        }
+        Commands::Community(sub) => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(run_community_cmd(sub, &config))?;
         }
         Commands::Cluster(sub) => {
             run_cluster_cmd(sub, &config)?;
@@ -413,7 +435,10 @@ async fn run_geoip_cmd(cmd: GeoIpCommands, config: &AppConfig) -> anyhow::Result
             println!("    Cache policy:   {}", config.geoip.cache_policy);
             println!("    Auto-update:    {}", config.geoip.auto_update.enabled);
             println!("    Interval:       {}", config.geoip.auto_update.interval);
-            println!("    Source URL:     {}", config.geoip.auto_update.source_url);
+            println!(
+                "    Source URL:     {}",
+                config.geoip.auto_update.source_url
+            );
         }
     }
 
@@ -428,7 +453,7 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
             let mut manager = RuleManager::new(&config.rules);
             manager.load_all()?;
 
-            let reg = manager.registry.read().unwrap();
+            let reg = manager.registry.read();
             let rules: Vec<_> = match (&category, &source) {
                 (Some(cat), _) => reg.filter_by_category(cat),
                 (_, Some(src)) => reg.filter_by_source(src),
@@ -458,14 +483,17 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
             let mut manager = RuleManager::new(&config.rules);
             manager.load_all()?;
 
-            let reg = manager.registry.read().unwrap();
+            let reg = manager.registry.read();
             match reg.get(&rule_id) {
                 Some(rule) => {
                     println!("ID:          {}", rule.id);
                     println!("Name:        {}", rule.name);
                     println!("Category:    {}", rule.category);
                     println!("Source:      {}", rule.source);
-                    println!("Status:      {}", if rule.enabled { "enabled" } else { "disabled" });
+                    println!(
+                        "Status:      {}",
+                        if rule.enabled { "enabled" } else { "disabled" }
+                    );
                     println!("Action:      {}", rule.action);
                     if let Some(sev) = &rule.severity {
                         println!("Severity:    {sev}");
@@ -533,7 +561,7 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
         RulesCommands::Export { format } => {
             let mut manager = RuleManager::new(&config.rules);
             manager.load_all()?;
-            let fmt = ExportFormat::from_str(&format);
+            let fmt = ExportFormat::parse_str(&format);
             let output = manager.export(fmt)?;
             print!("{output}");
         }
@@ -608,7 +636,11 @@ fn run_sources_cmd(cmd: SourcesCommands, config: &AppConfig) -> anyhow::Result<(
             println!("{:<20} {:<12} URL/Path", "Name", "Type");
             println!("{}", "-".repeat(80));
             for src in &config.rules.sources {
-                let type_str = if src.url.is_some() { "remote_url" } else { "local" };
+                let type_str = if src.url.is_some() {
+                    "remote_url"
+                } else {
+                    "local"
+                };
                 let location = src.url.as_deref().or(src.path.as_deref()).unwrap_or("-");
                 println!("{:<20} {:<12} {}", src.name, type_str, location);
             }
@@ -657,13 +689,10 @@ fn run_bot_cmd(cmd: BotCommands, config: &AppConfig) -> anyhow::Result<()> {
         BotCommands::List => {
             let mut manager = RuleManager::new(&config.rules);
             manager.load_all()?;
-            let reg = manager.registry.read().unwrap();
+            let reg = manager.registry.read();
             let bot_rules = reg.filter_by_category("bot");
 
-            println!(
-                "{:<20} {:<40} {:<8} Tags",
-                "ID", "Name", "Action"
-            );
+            println!("{:<20} {:<40} {:<8} Tags", "ID", "Name", "Action");
             println!("{}", "-".repeat(100));
             for rule in bot_rules {
                 println!(
@@ -696,7 +725,7 @@ fn run_bot_cmd(cmd: BotCommands, config: &AppConfig) -> anyhow::Result<()> {
         BotCommands::Test { user_agent } => {
             let mut manager = RuleManager::new(&config.rules);
             manager.load_all()?;
-            let reg = manager.registry.read().unwrap();
+            let reg = manager.registry.read();
             let bot_rules = reg.filter_by_category("bot");
 
             let mut matched = false;
@@ -741,7 +770,9 @@ fn run_cluster_cmd(cmd: ClusterCommands, config: &AppConfig) -> anyhow::Result<(
                 println!("  Node ID:    {}", cluster.node_id);
                 println!("  Seeds:      {}", cluster.seeds.join(", "));
             } else {
-                println!("  [INFO] Cluster is not configured. Add a [cluster] section to your config.");
+                println!(
+                    "  [INFO] Cluster is not configured. Add a [cluster] section to your config."
+                );
             }
         }
 
@@ -750,7 +781,10 @@ fn run_cluster_cmd(cmd: ClusterCommands, config: &AppConfig) -> anyhow::Result<(
             println!("=============");
             println!();
             if let Some(cluster) = &config.cluster {
-                println!("  This node:  {} ({})", cluster.node_id, cluster.listen_addr);
+                println!(
+                    "  This node:  {} ({})",
+                    cluster.node_id, cluster.listen_addr
+                );
                 if cluster.seeds.is_empty() {
                     println!("  Peers:      (none configured)");
                 } else {
@@ -760,7 +794,9 @@ fn run_cluster_cmd(cmd: ClusterCommands, config: &AppConfig) -> anyhow::Result<(
                     }
                 }
                 println!();
-                println!("  Note: live node list is only available through the running cluster API.");
+                println!(
+                    "  Note: live node list is only available through the running cluster API."
+                );
             } else {
                 println!("  [INFO] Cluster is not configured.");
             }
@@ -820,9 +856,8 @@ fn run_cert_init(
     use waf_cluster::crypto::node_cert::NodeCertificate;
 
     let output = Path::new(output_dir);
-    fs::create_dir_all(output).map_err(|e| {
-        anyhow::anyhow!("failed to create output directory '{output_dir}': {e}")
-    })?;
+    fs::create_dir_all(output)
+        .map_err(|e| anyhow::anyhow!("failed to create output directory '{output_dir}': {e}"))?;
 
     // Generate cluster CA.
     let ca = CertificateAuthority::generate(ca_validity_days)
@@ -830,10 +865,15 @@ fn run_cert_init(
 
     let ca_cert_path = output.join("cluster-ca.pem");
     let ca_key_path = output.join("cluster-ca.key");
-    fs::write(&ca_cert_path, ca.cert_pem())
-        .map_err(|e| anyhow::anyhow!("failed to write CA cert to '{}': {e}", ca_cert_path.display()))?;
-    fs::write(&ca_key_path, ca.key_pem())
-        .map_err(|e| anyhow::anyhow!("failed to write CA key to '{}': {e}", ca_key_path.display()))?;
+    fs::write(&ca_cert_path, ca.cert_pem()).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to write CA cert to '{}': {e}",
+            ca_cert_path.display()
+        )
+    })?;
+    fs::write(&ca_key_path, ca.key_pem()).map_err(|e| {
+        anyhow::anyhow!("failed to write CA key to '{}': {e}", ca_key_path.display())
+    })?;
 
     println!("Generated cluster CA:");
     println!("  Cert: {}", ca_cert_path.display());
@@ -841,14 +881,20 @@ fn run_cert_init(
     println!();
 
     // Generate per-node certificates.
-    let node_names: Vec<&str> = nodes.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let node_names: Vec<&str> = nodes
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if node_names.is_empty() {
         anyhow::bail!("--nodes must contain at least one node name");
     }
 
     for node_name in &node_names {
-        let node_cert = NodeCertificate::generate(node_name, &ca, node_validity_days)
-            .map_err(|e| anyhow::anyhow!("failed to generate certificate for node '{node_name}': {e}"))?;
+        let node_cert =
+            NodeCertificate::generate(node_name, &ca, node_validity_days).map_err(|e| {
+                anyhow::anyhow!("failed to generate certificate for node '{node_name}': {e}")
+            })?;
 
         let cert_path = output.join(format!("{node_name}.pem"));
         let key_path = output.join(format!("{node_name}.key"));
@@ -884,6 +930,90 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+// ── Community commands ────────────────────────────────────────────────────────
+
+async fn run_community_cmd(cmd: CommunityCommands, config: &AppConfig) -> anyhow::Result<()> {
+    match cmd {
+        CommunityCommands::Status => {
+            println!("Community Threat Intelligence Status");
+            println!("====================================");
+            println!("  Enabled:    {}", config.community.enabled);
+            println!("  Server URL: {}", config.community.server_url);
+            println!(
+                "  Machine ID: {}",
+                config
+                    .community
+                    .machine_id
+                    .as_deref()
+                    .unwrap_or("(not enrolled)")
+            );
+            println!(
+                "  API Key:    {}",
+                if config.community.api_key.is_some() {
+                    "(configured)"
+                } else {
+                    "(not set)"
+                }
+            );
+            println!("  Batch size: {}", config.community.batch_size);
+            println!(
+                "  Flush interval: {}s",
+                config.community.flush_interval_secs
+            );
+            println!("  Sync interval:  {}s", config.community.sync_interval_secs);
+            if !config.community.enabled {
+                println!();
+                println!(
+                    "  [INFO] Community sharing is disabled. Enable it in configs/default.toml."
+                );
+            }
+        }
+
+        CommunityCommands::Enroll => {
+            println!(
+                "Enrolling machine with community server: {}",
+                config.community.server_url
+            );
+            let client = waf_engine::CommunityClient::new(&config.community.server_url)?;
+            match waf_engine::community::enroll::enroll_machine(&client).await {
+                Ok(resp) => {
+                    println!();
+                    println!("Enrollment successful!");
+                    println!("  Machine ID: {}", resp.machine_id);
+                    println!("  API Key:    {}", resp.api_key);
+                    if let Some(cred) = resp.enrollment_credential {
+                        println!("  Credential: {cred}");
+                    }
+                    println!();
+                    println!("Add to your configs/default.toml:");
+                    println!();
+                    println!("[community]");
+                    println!("enabled = true");
+                    println!("server_url = \"{}\"", config.community.server_url);
+                    println!("machine_id = \"{}\"", resp.machine_id);
+                    println!("api_key = \"{}\"", resp.api_key);
+                }
+                Err(e) => {
+                    eprintln!("Enrollment failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        CommunityCommands::Test => {
+            println!("Testing connection to: {}", config.community.server_url);
+            let client = waf_engine::CommunityClient::new(&config.community.server_url)?;
+            let api_key_ref = config.community.api_key.as_deref();
+            match client.test_connection(api_key_ref).await {
+                Ok(msg) => println!("OK: {msg}"),
+                Err(e) => println!("FAILED: {e}"),
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── Existing implementations (unchanged) ─────────────────────────────────────
 
 async fn run_migrate(config: &AppConfig) -> anyhow::Result<()> {
@@ -904,7 +1034,7 @@ async fn run_seed_admin(config: &AppConfig) -> anyhow::Result<()> {
 
     let engine = Arc::new(WafEngine::new(Arc::clone(&db), WafEngineConfig::default()));
     let router = Arc::new(HostRouter::new());
-    let state = Arc::new(AppState::new(Arc::clone(&db), engine, router));
+    let state = Arc::new(AppState::new(Arc::clone(&db), engine, router)?);
 
     waf_api::auth::ensure_default_admin(&state).await?;
     info!("Default admin user seeded (username=admin, password=admin). Change it immediately!");
@@ -990,7 +1120,9 @@ async fn run_crowdsec_cmd(cmd: CrowdSecCommands, config: &AppConfig) -> anyhow::
             #[cfg(target_os = "windows")]
             {
                 println!("Detected platform: Windows");
-                println!("CrowdSec for Windows: https://docs.crowdsec.net/docs/getting_started/install_windows/");
+                println!(
+                    "CrowdSec for Windows: https://docs.crowdsec.net/docs/getting_started/install_windows/"
+                );
                 println!();
             }
             #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -1081,10 +1213,16 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
     let api_listen = config.api.listen_addr.clone();
     let api_state_bg = Arc::clone(&api_state);
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
+        let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .expect("failed to build API runtime");
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!("Failed to build API runtime: {e}");
+                return;
+            }
+        };
         rt.block_on(async move {
             if let Err(e) = start_api_server(&api_listen, api_state_bg).await {
                 tracing::error!("API server error: {}", e);
@@ -1096,10 +1234,16 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
     if config.http3.enabled {
         let h3_config = config.http3.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .expect("failed to build HTTP/3 runtime");
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to build HTTP/3 runtime: {e}");
+                    return;
+                }
+            };
             rt.block_on(async move {
                 let cert_pem = match h3_config.cert_pem.as_deref() {
                     Some(p) => match std::fs::read_to_string(p) {
@@ -1139,6 +1283,7 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
                     cert_pem,
                     key_pem,
                     "http://127.0.0.1:8080".to_string(),
+                    h3_config.upstream_tls_verify,
                 )
                 .await
                 {
@@ -1153,10 +1298,16 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
         && cluster_cfg.enabled
     {
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .expect("failed to build cluster runtime");
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to build cluster runtime: {e}");
+                    return;
+                }
+            };
             rt.block_on(async move {
                 match waf_cluster::ClusterNode::new(cluster_cfg) {
                     Ok(node) => {
@@ -1174,7 +1325,8 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
     let mut server = Server::new(None)?;
     server.bootstrap();
 
-    let proxy = WafProxy::new(router, engine);
+    let mut proxy = WafProxy::new(router, engine);
+    proxy.trust_proxy_headers = config.proxy.trust_proxy_headers;
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
     proxy_service.add_tcp(&config.proxy.listen_addr);
     server.add_service(proxy_service);
@@ -1295,7 +1447,7 @@ async fn init_async(
     info!("Registered {} host routes", router.len());
 
     // Build app state
-    let mut api_state = AppState::new(Arc::clone(&db), Arc::clone(&engine), Arc::clone(&router));
+    let mut api_state = AppState::new(Arc::clone(&db), Arc::clone(&engine), Arc::clone(&router))?;
 
     // Phase 4: create default admin user if none exist
     {
@@ -1311,15 +1463,15 @@ async fn init_async(
     for p in &plugins {
         if let Err(e) = api_state
             .plugin_manager
-            .load(
-                p.id,
-                p.name.clone(),
-                p.version.clone(),
-                p.description.clone().unwrap_or_default(),
-                p.author.clone().unwrap_or_default(),
-                p.enabled,
-                &p.wasm_binary,
-            )
+            .load(waf_engine::plugins::manager::LoadPluginParams {
+                id: p.id,
+                name: p.name.clone(),
+                version: p.version.clone(),
+                description: p.description.clone().unwrap_or_default(),
+                author: p.author.clone().unwrap_or_default(),
+                enabled: p.enabled,
+                wasm_bytes: &p.wasm_binary,
+            })
             .await
         {
             tracing::warn!(plugin = %p.name, "Failed to load plugin: {e}");
@@ -1374,6 +1526,44 @@ async fn init_async(
             }
             None => {
                 tracing::warn!("CrowdSec enabled in config but failed to initialise");
+            }
+        }
+    }
+
+    // Phase 8: Community threat intelligence sharing
+    if config.community.enabled {
+        let community_config = waf_engine::community::config::CommunityConfig {
+            enabled: config.community.enabled,
+            server_url: config.community.server_url.clone(),
+            api_key: config.community.api_key.clone(),
+            machine_id: config.community.machine_id.clone(),
+            batch_size: config.community.batch_size,
+            flush_interval_secs: config.community.flush_interval_secs,
+            sync_interval_secs: config.community.sync_interval_secs,
+        };
+
+        // Create a shutdown channel for community tasks
+        let (_community_shutdown_tx, community_shutdown_rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(_community_shutdown_tx);
+
+        match init_community(community_config, community_shutdown_rx).await {
+            Some(components) => {
+                info!(
+                    server_url = %config.community.server_url,
+                    "Community threat intelligence active"
+                );
+
+                // Plug community checker into the WAF engine
+                engine.set_community(Arc::clone(&components.checker));
+
+                // Share reporter with the API state for potential future use
+                api_state.community_reporter = Some(Arc::clone(&components.reporter));
+
+                // Keep background tasks alive
+                std::mem::forget(components);
+            }
+            None => {
+                tracing::warn!("Community sharing enabled in config but failed to initialise");
             }
         }
     }

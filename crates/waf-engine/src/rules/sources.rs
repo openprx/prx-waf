@@ -33,9 +33,7 @@ pub enum RuleSource {
         update_interval_secs: u64,
     },
     /// A built-in source compiled into the binary
-    Builtin {
-        name: String,
-    },
+    Builtin { name: String },
 }
 
 impl RuleSource {
@@ -59,9 +57,10 @@ impl RuleSource {
 
     pub fn update_interval(&self) -> Option<Duration> {
         match self {
-            Self::RemoteUrl { update_interval_secs, .. } => {
-                Some(Duration::from_secs(*update_interval_secs))
-            }
+            Self::RemoteUrl {
+                update_interval_secs,
+                ..
+            } => Some(Duration::from_secs(*update_interval_secs)),
             _ => None,
         }
     }

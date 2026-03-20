@@ -9,7 +9,7 @@ use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use time::OffsetDateTime;
 use tracing::info;
 
-use super::ca::{CertificateAuthority, CLUSTER_SERVER_NAME};
+use super::ca::{CLUSTER_SERVER_NAME, CertificateAuthority};
 
 /// Generated node certificate material ready for use in Quinn mTLS.
 pub struct NodeCertificate {
@@ -24,11 +24,7 @@ impl NodeCertificate {
     ///
     /// SANs include both `CLUSTER_SERVER_NAME` (for SNI matching on the server
     /// side) and `node_id` (for node-level identification).
-    pub fn generate(
-        node_id: &str,
-        ca: &CertificateAuthority,
-        validity_days: u32,
-    ) -> Result<Self> {
+    pub fn generate(node_id: &str, ca: &CertificateAuthority, validity_days: u32) -> Result<Self> {
         let (ca_cert, ca_key) = ca.as_rcgen_issuer().context("failed to reconstruct CA")?;
 
         let node_key = KeyPair::generate_for(&PKCS_ED25519)
@@ -62,9 +58,7 @@ impl NodeCertificate {
     }
 
     /// Parse the node cert PEM into DER bytes for use in rustls cert chains.
-    pub fn cert_chain_der(
-        &self,
-    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    pub fn cert_chain_der(&self) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
         rustls_pemfile::certs(&mut self.cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .context("failed to parse node certificate chain PEM")

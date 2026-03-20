@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use axum::{
+    Json,
     extract::{Path, Query, State, WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -16,7 +16,7 @@ use uuid::Uuid;
 use waf_storage::models::CreateTunnel;
 
 use crate::state::AppState;
-use gateway::{TunnelConfig, TunnelConnection, hash_token, generate_token};
+use gateway::{TunnelConfig, TunnelConnection, generate_token, hash_token};
 
 // ─── REST handlers ─────────────────────────────────────────────────────────────
 
@@ -114,14 +114,17 @@ pub async fn create_tunnel(
     };
 
     // Register in the in-memory registry
-    state.tunnel_registry.register(TunnelConfig {
-        id: row.id,
-        name: row.name.clone(),
-        token_hash,
-        target_host: row.target_host.clone(),
-        target_port: row.target_port as u16,
-        enabled: row.enabled,
-    }).await;
+    state
+        .tunnel_registry
+        .register(TunnelConfig {
+            id: row.id,
+            name: row.name.clone(),
+            token_hash,
+            target_host: row.target_host.clone(),
+            target_port: row.target_port as u16,
+            enabled: row.enabled,
+        })
+        .await;
 
     info!(tunnel = %name, "Tunnel created");
     (

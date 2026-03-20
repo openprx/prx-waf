@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use gateway::{HostRouter, ResponseCache, TunnelRegistry};
-use waf_engine::{CrowdSecClient, DecisionCache, PluginManager, WafEngine};
+use waf_engine::{CommunityReporter, CrowdSecClient, DecisionCache, PluginManager, WafEngine};
 use waf_storage::Database;
 
 use crate::notifications::NotifRateLimiter;
@@ -37,17 +37,35 @@ pub struct AppState {
     pub crowdsec_client: Option<Arc<CrowdSecClient>>,
     /// LAPI base URL (for display in status endpoint)
     pub crowdsec_lapi_url: Option<String>,
+    // ── Community threat intelligence ──────────────────────────────────────
+    /// Community signal reporter (None if community sharing not enabled)
+    pub community_reporter: Option<Arc<CommunityReporter>>,
     // ── Phase 7: Cluster ─────────────────────────────────────────────────────
     /// Shared cluster node state (None when running in standalone mode)
     pub cluster_state: Option<Arc<waf_cluster::NodeState>>,
 }
 
 impl AppState {
-    pub fn new(db: Arc<Database>, engine: Arc<WafEngine>, router: Arc<HostRouter>) -> Self {
+    /// Create new application state.
+    ///
+    /// Returns an error if the `JWT_SECRET` environment variable is not set or empty.
+    /// In production this ensures the operator explicitly configures a strong secret.
+    pub fn new(
+        db: Arc<Database>,
+        engine: Arc<WafEngine>,
+        router: Arc<HostRouter>,
+    ) -> anyhow::Result<Self> {
         let jwt_secret = std::env::var("JWT_SECRET")
-            .unwrap_or_else(|_| "prx-waf-dev-jwt-secret-change-in-production".into());
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "JWT_SECRET environment variable is not set. \
+                 Set a strong random secret (>= 32 chars) before starting the server."
+                )
+            })?;
 
-        Self {
+        Ok(Self {
             db,
             engine,
             router,
@@ -62,8 +80,9 @@ impl AppState {
             crowdsec_cache: None,
             crowdsec_client: None,
             crowdsec_lapi_url: None,
+            community_reporter: None,
             cluster_state: None,
-        }
+        })
     }
 
     pub fn increment_requests(&self) {

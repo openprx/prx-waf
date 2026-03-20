@@ -27,10 +27,9 @@ pub fn alt_svc_header(port: u16) -> String {
 pub fn build_tls_config(cert_pem: &str, key_pem: &str) -> anyhow::Result<rustls::ServerConfig> {
     use rustls::pki_types::CertificateDer;
 
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_pem.as_bytes())
-            .collect::<Result<Vec<_>, _>>()
-            .context("failed to parse certificate PEM")?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to parse certificate PEM")?;
 
     let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
         .context("failed to read private key PEM")?
@@ -55,6 +54,7 @@ pub async fn start_http3_server(
     cert_pem: String,
     key_pem: String,
     upstream_url: String,
+    upstream_tls_verify: bool,
 ) -> anyhow::Result<()> {
     let tls_config = build_tls_config(&cert_pem, &key_pem)?;
     let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
@@ -68,10 +68,11 @@ pub async fn start_http3_server(
 
     while let Some(incoming) = endpoint.accept().await {
         let upstream = upstream_url.clone();
+        let verify_tls = upstream_tls_verify;
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
-                    if let Err(e) = handle_quic_connection(conn, upstream).await {
+                    if let Err(e) = handle_quic_connection(conn, upstream, verify_tls).await {
                         warn!("HTTP/3 connection error: {e}");
                     }
                 }
@@ -87,19 +88,19 @@ pub async fn start_http3_server(
 async fn handle_quic_connection(
     conn: quinn::Connection,
     upstream_url: String,
+    upstream_tls_verify: bool,
 ) -> anyhow::Result<()> {
     let peer = conn.remote_address();
     debug!(%peer, "HTTP/3 connection accepted");
 
     let h3_conn = h3_quinn::Connection::new(conn);
-    let mut server_conn: h3::server::Connection<_, bytes::Bytes> =
-        h3::server::builder()
-            .build(h3_conn)
-            .await
-            .context("h3 handshake failed")?;
+    let mut server_conn: h3::server::Connection<_, bytes::Bytes> = h3::server::builder()
+        .build(h3_conn)
+        .await
+        .context("h3 handshake failed")?;
 
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(!upstream_tls_verify)
         .build()?;
 
     loop {
@@ -111,8 +112,7 @@ async fn handle_quic_connection(
                     // h3 0.0.8: use resolver.resolve_request() to get (req, stream)
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
-                            if let Err(e) =
-                                handle_h3_request(req, stream, &client, &upstream).await
+                            if let Err(e) = handle_h3_request(req, stream, &client, &upstream).await
                             {
                                 warn!("HTTP/3 request error: {e}");
                             }
@@ -143,7 +143,11 @@ where
     C: h3::quic::BidiStream<bytes::Bytes>,
 {
     let (parts, _) = req.into_parts();
-    let path = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
     let target = format!("{}{}", upstream_url.trim_end_matches('/'), path);
 
     debug!(method = %parts.method, %target, "HTTP/3 → upstream");
@@ -165,7 +169,7 @@ where
         .header("content-length", body_bytes.len().to_string())
         .header("server", "prx-waf/h3")
         .body(())
-        .unwrap();
+        .map_err(|e| anyhow::anyhow!("failed to build H3 response: {e}"))?;
 
     stream.send_response(response).await?;
     stream.send_data(body_bytes).await?;

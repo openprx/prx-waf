@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Path, State},
     Json,
+    extract::{Path, State},
 };
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -266,18 +266,15 @@ pub async fn generate_join_token(
 
     // Clone CA key out of parking_lot mutex without crossing an await point.
     let ca_key = ns.ca_key_pem.lock().clone().ok_or_else(|| {
-        ApiError::NotFound(
-            "CA key not available — token generation requires the Main node".into(),
-        )
+        ApiError::NotFound("CA key not available — token generation requires the Main node".into())
     })?;
 
     let ttl_ms = req.ttl_ms.unwrap_or(3_600_000); // default 1 h
 
-    let token = waf_cluster::crypto::token::generate_token(&ca_key, ttl_ms)
-        .map_err(|e| {
-            warn!(err = %e, "Failed to generate cluster join token");
-            ApiError::Internal(anyhow::anyhow!("token generation failed: {e}"))
-        })?;
+    let token = waf_cluster::crypto::token::generate_token(&ca_key, ttl_ms).map_err(|e| {
+        warn!(err = %e, "Failed to generate cluster join token");
+        ApiError::Internal(anyhow::anyhow!("token generation failed: {e}"))
+    })?;
 
     Ok(Json(TokenResponse { token, ttl_ms }))
 }

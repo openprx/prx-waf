@@ -52,11 +52,11 @@ impl HostRouter {
         }
 
         // Try stripping default port if present
-        if let Some(bare_host) = host_header.split(':').next() {
-            if let Some(entry) = self.routes.get(bare_host) {
-                let cfg: Arc<HostConfig> = Arc::clone(&*entry);
-                return Some(cfg);
-            }
+        if let Some(bare_host) = host_header.split(':').next()
+            && let Some(entry) = self.routes.get(bare_host)
+        {
+            let cfg: Arc<HostConfig> = Arc::clone(&*entry);
+            return Some(cfg);
         }
 
         None

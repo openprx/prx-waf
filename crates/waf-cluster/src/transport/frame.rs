@@ -47,7 +47,6 @@ where
         .read_exact(&mut data)
         .await
         .context("failed to read cluster frame body")?;
-    let msg: T =
-        serde_json::from_slice(&data).context("failed to deserialize cluster message")?;
+    let msg: T = serde_json::from_slice(&data).context("failed to deserialize cluster message")?;
     Ok(msg)
 }

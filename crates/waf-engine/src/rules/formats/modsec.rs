@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use regex::Regex;
 
 use super::super::registry::Rule;
@@ -74,7 +74,10 @@ fn parse_secrule(line: &str, line_no: usize) -> Result<Rule> {
 
     let parts = split_secrule_parts(rest)?;
     if parts.len() < 3 {
-        bail!("line {line_no}: expected VARIABLES OPERATOR ACTIONS, got {}", line);
+        bail!(
+            "line {line_no}: expected VARIABLES OPERATOR ACTIONS, got {}",
+            line
+        );
     }
 
     let variables = &parts[0];
@@ -138,9 +141,9 @@ fn split_secrule_parts(s: &str) -> Result<Vec<String>> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
-    let mut chars = s.chars().peekable();
+    let chars = s.chars().peekable();
 
-    while let Some(c) = chars.next() {
+    for c in chars {
         match c {
             '"' => {
                 in_quotes = !in_quotes;
@@ -192,7 +195,10 @@ fn parse_actions(actions: &str) -> HashMap<String, String> {
     for part in actions.split(',') {
         let part = part.trim().trim_matches('"').trim_matches('\'');
         if let Some((k, v)) = part.split_once(':') {
-            map.insert(k.trim().to_lowercase(), v.trim().trim_matches('\'').to_string());
+            map.insert(
+                k.trim().to_lowercase(),
+                v.trim().trim_matches('\'').to_string(),
+            );
         } else if !part.is_empty() {
             map.insert(part.to_lowercase(), String::new());
         }
@@ -223,6 +229,10 @@ fn infer_category(variables: &str, value: &str) -> String {
     "custom".to_string()
 }
 
+// Satisfy the unused import from Regex
+#[allow(unused_imports)]
+use Regex as _Regex;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,7 +249,8 @@ mod tests {
 
     #[test]
     fn parse_continuation_line() {
-        let content = "SecRule ARGS \"@contains <script>\" \\\n    \"id:1002,phase:2,deny,msg:'XSS'\"\n";
+        let content =
+            "SecRule ARGS \"@contains <script>\" \\\n    \"id:1002,phase:2,deny,msg:'XSS'\"\n";
         let rules = parse(content).unwrap();
         assert_eq!(rules.len(), 1);
     }
@@ -251,7 +262,3 @@ mod tests {
         assert_eq!(rules.len(), 1);
     }
 }
-
-// Satisfy the unused import from Regex
-#[allow(unused_imports)]
-use Regex as _Regex;

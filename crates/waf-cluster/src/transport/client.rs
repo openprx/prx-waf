@@ -96,7 +96,9 @@ impl ClusterClient {
         let client_config = quinn::ClientConfig::new(Arc::new(quic_config));
 
         let mut endpoint = quinn::Endpoint::client(
-            "0.0.0.0:0".parse().context("failed to parse ephemeral bind addr")?,
+            "0.0.0.0:0"
+                .parse()
+                .context("failed to parse ephemeral bind addr")?,
         )
         .context("failed to bind QUIC client endpoint")?;
         endpoint.set_default_client_config(client_config);
@@ -200,7 +202,10 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
                     peer.last_seen_ms = now_ms;
                 }
             }
-            node_state.heartbeat_tracker.lock().record(&hb.node_id, now_ms);
+            node_state
+                .heartbeat_tracker
+                .lock()
+                .record(&hb.node_id, now_ms);
             debug!(
                 from = %hb.node_id,
                 seq = hb.sequence,
@@ -233,8 +238,9 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
             if let Some(voter_id) = vote.voter_id {
                 // This is a vote-grant echo addressed to us as the candidate.
                 if vote.candidate_id == node_state.node_id {
-                    let recorded =
-                        node_state.election.record_vote_for_me(vote.term, voter_id.clone());
+                    let recorded = node_state
+                        .election
+                        .record_vote_for_me(vote.term, voter_id.clone());
                     if recorded {
                         debug!(voter = %voter_id, term = vote.term, "Vote grant received");
                     }

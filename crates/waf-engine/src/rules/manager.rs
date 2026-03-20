@@ -1,15 +1,19 @@
 //! RuleManager — loads, reloads, validates, enables/disables rules.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use parking_lot::RwLock;
+
+use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
 use waf_common::config::RulesConfig;
 
 use super::builtin::all_builtin_rules;
-use super::formats::{export_rules, parse_rules, validate_rules, ExportFormat, RuleFormat, ValidationError};
+use super::formats::{
+    ExportFormat, RuleFormat, ValidationError, export_rules, parse_rules, validate_rules,
+};
 use super::registry::{Rule, RuleRegistry, RuleStats};
 use super::sources::{RuleLoadReport, RuleReloadReport, RuleSource};
 
@@ -70,13 +74,19 @@ impl RuleManager {
 
         // Add builtin sources
         if config.enable_builtin_owasp {
-            sources.push(RuleSource::Builtin { name: "builtin-owasp".to_string() });
+            sources.push(RuleSource::Builtin {
+                name: "builtin-owasp".to_string(),
+            });
         }
         if config.enable_builtin_bot {
-            sources.push(RuleSource::Builtin { name: "builtin-bot".to_string() });
+            sources.push(RuleSource::Builtin {
+                name: "builtin-bot".to_string(),
+            });
         }
         if config.enable_builtin_scanner {
-            sources.push(RuleSource::Builtin { name: "builtin-scanner".to_string() });
+            sources.push(RuleSource::Builtin {
+                name: "builtin-scanner".to_string(),
+            });
         }
 
         Self {
@@ -102,7 +112,7 @@ impl RuleManager {
         let builtin_count = builtin.len();
 
         {
-            let mut reg = self.registry.write().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut reg = self.registry.write();
             reg.clear();
             for rule in builtin {
                 reg.insert(rule);
@@ -123,30 +133,26 @@ impl RuleManager {
         let sources = self.sources.clone();
         for source in &sources {
             match source {
-                RuleSource::LocalFile { path, format, name } => {
-                    match load_file(path, *format) {
-                        Ok(rules) => {
-                            let count = rules.len();
-                            let mut reg = self.registry.write().map_err(|e| anyhow::anyhow!("{e}"))?;
-                            for rule in rules {
-                                reg.insert(rule);
-                            }
-                            info!(source = %name, rules = count, "Loaded rules from file");
-                            report.rules_loaded += count;
-                            report.sources_loaded += 1;
+                RuleSource::LocalFile { path, format, name } => match load_file(path, *format) {
+                    Ok(rules) => {
+                        let count = rules.len();
+                        let mut reg = self.registry.write();
+                        for rule in rules {
+                            reg.insert(rule);
                         }
-                        Err(e) => report.errors.push(format!("{name}: {e}")),
+                        info!(source = %name, rules = count, "Loaded rules from file");
+                        report.rules_loaded += count;
+                        report.sources_loaded += 1;
                     }
-                }
-                RuleSource::LocalDir { path, name, .. } => {
-                    match self.load_from_dir(path) {
-                        Ok(sub) => {
-                            info!(source = %name, rules = sub.rules_loaded, "Loaded rules from dir");
-                            report.merge(sub);
-                        }
-                        Err(e) => report.errors.push(format!("{name}: {e}")),
+                    Err(e) => report.errors.push(format!("{name}: {e}")),
+                },
+                RuleSource::LocalDir { path, name, .. } => match self.load_from_dir(path) {
+                    Ok(sub) => {
+                        info!(source = %name, rules = sub.rules_loaded, "Loaded rules from dir");
+                        report.merge(sub);
                     }
-                }
+                    Err(e) => report.errors.push(format!("{name}: {e}")),
+                },
                 RuleSource::Builtin { .. } => {
                     // Already handled above
                 }
@@ -158,7 +164,7 @@ impl RuleManager {
         }
 
         {
-            let mut reg = self.registry.write().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut reg = self.registry.write();
             reg.mark_loaded();
         }
 
@@ -174,15 +180,21 @@ impl RuleManager {
     /// Reload all rules (clear + load_all). Returns a diff report.
     pub fn reload(&mut self) -> Result<RuleReloadReport> {
         let before = {
-            let reg = self.registry.read().map_err(|e| anyhow::anyhow!("{e}"))?;
-            reg.rules.keys().cloned().collect::<std::collections::HashSet<_>>()
+            let reg = self.registry.read();
+            reg.rules
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
         };
 
         let load_report = self.load_all()?;
 
         let after = {
-            let reg = self.registry.read().map_err(|e| anyhow::anyhow!("{e}"))?;
-            reg.rules.keys().cloned().collect::<std::collections::HashSet<_>>()
+            let reg = self.registry.read();
+            reg.rules
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
         };
 
         let added = after.difference(&before).count();
@@ -212,7 +224,7 @@ impl RuleManager {
             .ok_or_else(|| anyhow::anyhow!("Unknown rule format for: {}", path.display()))?;
         let rules = load_file(path, format)?;
         let count = rules.len();
-        let mut reg = self.registry.write().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut reg = self.registry.write();
         for rule in rules {
             reg.insert(rule);
         }
@@ -232,7 +244,7 @@ impl RuleManager {
             .with_context(|| format!("Failed to parse rules from {url}"))?;
 
         let count = rules.len();
-        let mut reg = self.registry.write().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut reg = self.registry.write();
         for rule in rules {
             reg.insert(rule);
         }
@@ -242,38 +254,44 @@ impl RuleManager {
 
     /// Export all enabled rules in the given format.
     pub fn export(&self, format: ExportFormat) -> Result<String> {
-        let reg = self.registry.read().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let reg = self.registry.read();
         let rules: Vec<Rule> = reg.list().into_iter().cloned().collect();
         export_rules(&rules, format)
     }
 
     /// Search rules by name, id, or description.
     pub fn search(&self, query: &str) -> Vec<Rule> {
-        let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
+        let reg = self.registry.read();
         reg.search(query).into_iter().cloned().collect()
     }
 
     /// Enable a rule by id.
     pub fn enable_rule(&mut self, id: &str) -> Result<()> {
-        let mut reg = self.registry.write().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut reg = self.registry.write();
         match reg.get_mut(id) {
-            Some(rule) => { rule.enabled = true; Ok(()) }
+            Some(rule) => {
+                rule.enabled = true;
+                Ok(())
+            }
             None => bail!("Rule not found: {id}"),
         }
     }
 
     /// Disable a rule by id.
     pub fn disable_rule(&mut self, id: &str) -> Result<()> {
-        let mut reg = self.registry.write().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut reg = self.registry.write();
         match reg.get_mut(id) {
-            Some(rule) => { rule.enabled = false; Ok(()) }
+            Some(rule) => {
+                rule.enabled = false;
+                Ok(())
+            }
             None => bail!("Rule not found: {id}"),
         }
     }
 
     /// Return registry statistics.
     pub fn stats(&self) -> RuleStats {
-        let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
+        let reg = self.registry.read();
         reg.stats()
     }
 
@@ -304,7 +322,7 @@ impl RuleManager {
             match load_file(&path, format) {
                 Ok(rules) => {
                     let count = rules.len();
-                    let mut reg = self.registry.write().map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let mut reg = self.registry.write();
                     for rule in rules {
                         reg.insert(rule);
                     }
@@ -324,8 +342,7 @@ impl RuleManager {
 
 /// Read and parse a single rule file.
 fn load_file(path: &Path, format: RuleFormat) -> Result<Vec<Rule>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Cannot read {}", path.display()))?;
-    parse_rules(&content, format)
-        .with_context(|| format!("Failed to parse {}", path.display()))
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("Cannot read {}", path.display()))?;
+    parse_rules(&content, format).with_context(|| format!("Failed to parse {}", path.display()))
 }

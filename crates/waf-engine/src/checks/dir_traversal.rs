@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::RegexSet;
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
-use super::{url_decode, Check};
+use super::{Check, url_decode};
 
 static TRAVERSAL_DESCS: &[&str] = &[
     "directory traversal (../)",
@@ -74,7 +74,10 @@ impl Check for DirTraversalCheck {
             let matches = TRAVERSAL_SET.matches(value);
             if matches.matched_any() {
                 let idx = matches.iter().next().unwrap_or(0);
-                let desc = TRAVERSAL_DESCS.get(idx).copied().unwrap_or("path traversal");
+                let desc = TRAVERSAL_DESCS
+                    .get(idx)
+                    .copied()
+                    .unwrap_or("path traversal");
                 return Some(DetectionResult {
                     rule_id: Some(format!("TRAV-{:03}", idx + 1)),
                     rule_name: "Directory Traversal".to_string(),
@@ -90,10 +93,10 @@ impl Check for DirTraversalCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::sync::Arc;
-    use bytes::Bytes;
     use waf_common::{DefenseConfig, HostConfig};
 
     fn make_ctx(path: &str, query: &str) -> RequestCtx {
@@ -111,7 +114,10 @@ mod tests {
             content_length: 0,
             is_tls: false,
             host_config: Arc::new(HostConfig {
-                defense_config: DefenseConfig { dir_traversal: true, ..DefenseConfig::default() },
+                defense_config: DefenseConfig {
+                    dir_traversal: true,
+                    ..DefenseConfig::default()
+                },
                 ..HostConfig::default()
             }),
             geo: None,

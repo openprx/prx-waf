@@ -5,8 +5,7 @@
 
 use anyhow::{Context, Result};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
-    PKCS_ED25519,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ED25519,
 };
 use time::OffsetDateTime;
 use tracing::info;
@@ -35,8 +34,7 @@ impl CertificateAuthority {
 
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.not_before = OffsetDateTime::now_utc();
-        params.not_after =
-            OffsetDateTime::now_utc() + time::Duration::days(validity_days as i64);
+        params.not_after = OffsetDateTime::now_utc() + time::Duration::days(validity_days as i64);
 
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, "prx-waf Cluster CA");

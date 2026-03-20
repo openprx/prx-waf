@@ -10,14 +10,14 @@ static GOOD_BOT_SET: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)\bgooglebot\b",
         r"(?i)\bbingbot\b",
-        r"(?i)\bslurp\b",             // Yahoo
+        r"(?i)\bslurp\b", // Yahoo
         r"(?i)\bduckduckbot\b",
         r"(?i)\bbaiduspider\b",
         r"(?i)\byandexbot\b",
         r"(?i)\bsogou\b",
         r"(?i)\bexabot\b",
-        r"(?i)\bfacebot\b",           // Facebook
-        r"(?i)\bia_archiver\b",       // Wayback Machine
+        r"(?i)\bfacebot\b",     // Facebook
+        r"(?i)\bia_archiver\b", // Wayback Machine
         r"(?i)\btwitterbot\b",
         r"(?i)\bLinkedInBot\b",
         r"(?i)\bAppleBot\b",
@@ -93,7 +93,11 @@ impl Check for BotCheck {
             return None;
         }
 
-        let ua = ctx.headers.get("user-agent").map(|s| s.as_str()).unwrap_or("");
+        let ua = ctx
+            .headers
+            .get("user-agent")
+            .map(|s| s.as_str())
+            .unwrap_or("");
 
         // Allow known legitimate search engines first.
         if !ua.is_empty() && GOOD_BOT_SET.matches(ua).matched_any() {
@@ -120,10 +124,10 @@ impl Check for BotCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::sync::Arc;
-    use bytes::Bytes;
     use waf_common::{DefenseConfig, HostConfig};
 
     fn make_ctx(ua: &str) -> RequestCtx {
@@ -143,7 +147,10 @@ mod tests {
             content_length: 0,
             is_tls: false,
             host_config: Arc::new(HostConfig {
-                defense_config: DefenseConfig { bot: true, ..DefenseConfig::default() },
+                defense_config: DefenseConfig {
+                    bot: true,
+                    ..DefenseConfig::default()
+                },
                 ..HostConfig::default()
             }),
             geo: None,
@@ -153,7 +160,8 @@ mod tests {
     #[test]
     fn allows_googlebot() {
         let checker = BotCheck::new();
-        let ctx = make_ctx("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)");
+        let ctx =
+            make_ctx("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)");
         assert!(checker.check(&ctx).is_none(), "Should allow Googlebot");
     }
 
@@ -177,13 +185,19 @@ mod tests {
         let ctx = make_ctx(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         );
-        assert!(checker.check(&ctx).is_none(), "Should allow regular browser");
+        assert!(
+            checker.check(&ctx).is_none(),
+            "Should allow regular browser"
+        );
     }
 
     #[test]
     fn blocks_go_http_client() {
         let checker = BotCheck::new();
         let ctx = make_ctx("Go-http-client/1.1");
-        assert!(checker.check(&ctx).is_some(), "Should block bare Go HTTP client");
+        assert!(
+            checker.check(&ctx).is_some(),
+            "Should block bare Go HTTP client"
+        );
     }
 }

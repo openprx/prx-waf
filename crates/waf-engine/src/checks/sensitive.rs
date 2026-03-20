@@ -60,7 +60,10 @@ impl HostPatterns {
 
     fn find_in(&self, text: &str) -> Option<&str> {
         if let Some(m) = self.request_ac.find(text) {
-            return self.patterns.get(m.pattern().as_usize()).map(|s| s.as_str());
+            return self
+                .patterns
+                .get(m.pattern().as_usize())
+                .map(|s| s.as_str());
         }
         None
     }
@@ -117,10 +120,10 @@ impl SensitiveCheck {
         }
 
         // Check per-host patterns
-        if let Some(hp) = self.per_host.get(host_code) {
-            if let Some(pat) = hp.find_in(text) {
-                return Some(pat.to_string());
-            }
+        if let Some(hp) = self.per_host.get(host_code)
+            && let Some(pat) = hp.find_in(text)
+        {
+            return Some(pat.to_string());
         }
 
         None
@@ -140,10 +143,7 @@ impl Check for SensitiveCheck {
         }
 
         let host_code = &ctx.host_config.code;
-        let targets = [
-            ("path", ctx.path.as_str()),
-            ("query", ctx.query.as_str()),
-        ];
+        let targets = [("path", ctx.path.as_str()), ("query", ctx.query.as_str())];
 
         for (location, text) in &targets {
             if let Some(pattern) = self.scan(text, host_code) {
@@ -176,14 +176,16 @@ impl Check for SensitiveCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use bytes::Bytes;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use waf_common::{DefenseConfig, HostConfig};
 
     fn make_ctx(path: &str, body: &[u8]) -> RequestCtx {
-        let mut dc = DefenseConfig::default();
-        dc.sensitive = true;
+        let dc = DefenseConfig {
+            sensitive: true,
+            ..DefenseConfig::default()
+        };
         let host_config = Arc::new(HostConfig {
             code: "test".into(),
             host: "example.com".into(),

@@ -1,7 +1,7 @@
 /// Serve the embedded Vue 3 admin UI from /ui/* (SPA with fallback to index.html).
 use axum::{
     body::Body,
-    http::{header, StatusCode, Uri},
+    http::{StatusCode, Uri, header},
     response::Response,
 };
 use rust_embed::RustEmbed;
@@ -12,9 +12,7 @@ struct Assets;
 
 pub async fn static_handler(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    let asset_path = path
-        .strip_prefix("ui/")
-        .unwrap_or(path);
+    let asset_path = path.strip_prefix("ui/").unwrap_or(path);
     let asset_path = if asset_path.is_empty() || asset_path == "ui" {
         "index.html"
     } else {
@@ -50,20 +48,32 @@ fn serve_asset(path: &str) -> Response {
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime)
                 .body(Body::from(content.data.into_owned()))
-                .unwrap()
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from("Failed to build response"))
+                        .unwrap_or_default()
+                })
         }
         None => {
-            // SPA fallback — serve index.html for client-side routes
+            // SPA fallback -- serve index.html for client-side routes
             match Assets::get("index.html") {
                 Some(content) => Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
                     .body(Body::from(content.data.into_owned()))
-                    .unwrap(),
+                    .unwrap_or_else(|_| {
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Body::from("Failed to build response"))
+                            .unwrap_or_default()
+                    }),
                 None => Response::builder()
                     .status(StatusCode::NOT_FOUND)
-                    .body(Body::from("Admin UI not found. Run: cd web/admin-ui && npm install && npm run build"))
-                    .unwrap(),
+                    .body(Body::from(
+                        "Admin UI not found. Run: cd web/admin-ui && npm install && npm run build",
+                    ))
+                    .unwrap_or_default(),
             }
         }
     }

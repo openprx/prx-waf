@@ -9,9 +9,11 @@
 //! Health checks run as a background Tokio task (TCP connect).
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+use parking_lot::RwLock;
 
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
@@ -89,7 +91,7 @@ impl LoadBalancer {
 
     /// Add or update a backend.
     pub fn add_backend(&self, backend: Backend) {
-        let mut backends = self.backends.write().unwrap();
+        let mut backends = self.backends.write();
         if let Some(existing) = backends.iter_mut().find(|b| b.id == backend.id) {
             *existing = backend;
         } else {
@@ -99,19 +101,18 @@ impl LoadBalancer {
 
     /// Remove a backend by ID.
     pub fn remove_backend(&self, id: &str) {
-        self.backends.write().unwrap().retain(|b| b.id != id);
+        self.backends.write().retain(|b| b.id != id);
     }
 
     /// Replace all backends.
     pub fn set_backends(&self, backends: Vec<Backend>) {
-        *self.backends.write().unwrap() = backends;
+        *self.backends.write() = backends;
     }
 
     /// Get healthy backends only.
     pub fn healthy_backends(&self) -> Vec<Backend> {
         self.backends
             .read()
-            .unwrap()
             .iter()
             .filter(|b| b.is_healthy())
             .cloned()
@@ -119,7 +120,7 @@ impl LoadBalancer {
     }
 
     pub fn all_backends(&self) -> Vec<Backend> {
-        self.backends.read().unwrap().clone()
+        self.backends.read().clone()
     }
 
     /// Pick the next backend according to the strategy.
@@ -129,7 +130,7 @@ impl LoadBalancer {
         let healthy = self.healthy_backends();
         if healthy.is_empty() {
             // Fall back to all backends if none are healthy
-            let all = self.backends.read().unwrap();
+            let all = self.backends.read();
             if all.is_empty() {
                 return None;
             }
@@ -275,7 +276,10 @@ pub async fn tcp_health_check(host: &str, port: u16, timeout: Duration) -> bool 
 /// Spawn a background health-check task for a LoadBalancer.
 ///
 /// Periodically checks each backend and updates the `is_healthy` flag.
-pub fn spawn_health_checker(lb: Arc<LoadBalancer>, interval: Duration) -> tokio::task::JoinHandle<()> {
+pub fn spawn_health_checker(
+    lb: Arc<LoadBalancer>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let timeout = Duration::from_secs(5);
         loop {
@@ -313,9 +317,8 @@ mod tests {
     fn test_round_robin() {
         let lb = make_lb(LoadBalanceStrategy::RoundRobin);
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-        let backends: std::collections::HashSet<String> = (0..6)
-            .map(|_| lb.next_backend(ip).unwrap())
-            .collect();
+        let backends: std::collections::HashSet<String> =
+            (0..6).map(|_| lb.next_backend(ip).unwrap()).collect();
         // Should hit all 3 backends over 6 requests
         assert_eq!(backends.len(), 3);
     }
@@ -326,7 +329,11 @@ mod tests {
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let first = lb.next_backend(ip).unwrap();
         for _ in 0..10 {
-            assert_eq!(lb.next_backend(ip).unwrap(), first, "IP hash should be sticky");
+            assert_eq!(
+                lb.next_backend(ip).unwrap(),
+                first,
+                "IP hash should be sticky"
+            );
         }
     }
 
@@ -366,7 +373,10 @@ mod tests {
         // Expected distribution: b2 ≈ 50%, b1 ≈ 25%, b3 ≈ 25%
         let b2 = counts.get("10.0.0.2:8080").copied().unwrap_or(0);
         let b1 = counts.get("10.0.0.1:8080").copied().unwrap_or(0);
-        assert!(b2 > b1, "b2 (weight 2) should get more traffic than b1 (weight 1)");
+        assert!(
+            b2 > b1,
+            "b2 (weight 2) should get more traffic than b1 (weight 1)"
+        );
     }
 
     #[test]
@@ -380,7 +390,10 @@ mod tests {
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         for _ in 0..10 {
             let addr = lb.next_backend(ip).unwrap();
-            assert_eq!(addr, "10.0.0.2:8080", "Should only pick the healthy backend");
+            assert_eq!(
+                addr, "10.0.0.2:8080",
+                "Should only pick the healthy backend"
+            );
         }
     }
 }

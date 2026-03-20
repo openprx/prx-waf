@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
-use tokio::sync::watch;
 use tokio::sync::Mutex;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use waf_common::DetectionResult;
@@ -88,10 +88,7 @@ impl CrowdSecPusher {
     }
 
     /// Background task: flush the event buffer on a timer and on shutdown.
-    pub async fn run_flush_task(
-        self: Arc<Self>,
-        mut shutdown_rx: watch::Receiver<bool>,
-    ) {
+    pub async fn run_flush_task(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
         let interval = Duration::from_secs(FLUSH_INTERVAL_SECS);
         loop {
             tokio::select! {

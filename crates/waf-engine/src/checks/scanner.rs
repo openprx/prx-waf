@@ -108,7 +108,11 @@ impl Check for ScannerCheck {
             return None;
         }
 
-        let ua = ctx.headers.get("user-agent").map(|s| s.as_str()).unwrap_or("");
+        let ua = ctx
+            .headers
+            .get("user-agent")
+            .map(|s| s.as_str())
+            .unwrap_or("");
 
         let matches = SCANNER_UA_SET.matches(ua);
         if matches.matched_any() {
@@ -129,10 +133,10 @@ impl Check for ScannerCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::sync::Arc;
-    use bytes::Bytes;
     use waf_common::{DefenseConfig, HostConfig};
 
     fn make_ctx(ua: &str) -> RequestCtx {
@@ -154,7 +158,10 @@ mod tests {
             content_length: 0,
             is_tls: false,
             host_config: Arc::new(HostConfig {
-                defense_config: DefenseConfig { scan: true, ..DefenseConfig::default() },
+                defense_config: DefenseConfig {
+                    scan: true,
+                    ..DefenseConfig::default()
+                },
                 ..HostConfig::default()
             }),
             geo: None,

@@ -59,11 +59,7 @@ pub async fn run_decision_sync(
                 let n_new = stream.new.as_ref().map(|v| v.len()).unwrap_or(0);
                 let n_del = stream.deleted.as_ref().map(|v| v.len()).unwrap_or(0);
                 if n_new > 0 || n_del > 0 {
-                    info!(
-                        new = n_new,
-                        deleted = n_del,
-                        "CrowdSec incremental update"
-                    );
+                    info!(new = n_new, deleted = n_del, "CrowdSec incremental update");
                     cache.apply_stream(stream, &config);
                 }
             }

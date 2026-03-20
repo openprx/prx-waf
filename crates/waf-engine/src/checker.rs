@@ -2,7 +2,10 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use waf_common::{DetectionResult, Phase, RequestCtx, WafAction, WafDecision};
-use waf_storage::{Database, models::{AllowIp, AllowUrl, BlockIp, BlockUrl}};
+use waf_storage::{
+    Database,
+    models::{AllowIp, AllowUrl, BlockIp, BlockUrl},
+};
 
 use crate::rules::{IpRuleSet, UrlMatchType, UrlRule, UrlRuleSet};
 
@@ -62,7 +65,9 @@ impl RuleStore {
         use std::collections::HashMap;
         let mut map: HashMap<&str, Vec<String>> = HashMap::new();
         for row in rows {
-            map.entry(&row.host_code).or_default().push(row.ip_cidr.clone());
+            map.entry(&row.host_code)
+                .or_default()
+                .push(row.ip_cidr.clone());
         }
         for (code, cidrs) in map {
             self.allow_ips.load(code, &cidrs);
@@ -73,7 +78,9 @@ impl RuleStore {
         use std::collections::HashMap;
         let mut map: HashMap<&str, Vec<String>> = HashMap::new();
         for row in rows {
-            map.entry(&row.host_code).or_default().push(row.ip_cidr.clone());
+            map.entry(&row.host_code)
+                .or_default()
+                .push(row.ip_cidr.clone());
         }
         for (code, cidrs) in map {
             self.block_ips.load(code, &cidrs);
@@ -87,7 +94,7 @@ impl RuleStore {
             map.entry(&row.host_code).or_default().push(UrlRule {
                 id: row.id.to_string(),
                 pattern: row.url_pattern.clone(),
-                match_type: UrlMatchType::from_str(&row.match_type),
+                match_type: UrlMatchType::parse_str(&row.match_type),
             });
         }
         for (code, rules) in map {
@@ -102,7 +109,7 @@ impl RuleStore {
             map.entry(&row.host_code).or_default().push(UrlRule {
                 id: row.id.to_string(),
                 pattern: row.url_pattern.clone(),
-                match_type: UrlMatchType::from_str(&row.match_type),
+                match_type: UrlMatchType::parse_str(&row.match_type),
             });
         }
         for (code, rules) in map {
@@ -125,20 +132,26 @@ impl RuleStore {
         self.block_ips.load(host_code, &cidrs);
 
         let allow_urls = self.db.list_allow_urls(Some(host_code)).await?;
-        let rules: Vec<UrlRule> = allow_urls.iter().map(|r| UrlRule {
-            id: r.id.to_string(),
-            pattern: r.url_pattern.clone(),
-            match_type: UrlMatchType::from_str(&r.match_type),
-        }).collect();
+        let rules: Vec<UrlRule> = allow_urls
+            .iter()
+            .map(|r| UrlRule {
+                id: r.id.to_string(),
+                pattern: r.url_pattern.clone(),
+                match_type: UrlMatchType::parse_str(&r.match_type),
+            })
+            .collect();
         self.allow_urls.clear_host(host_code);
         self.allow_urls.load(host_code, rules);
 
         let block_urls = self.db.list_block_urls(Some(host_code)).await?;
-        let rules: Vec<UrlRule> = block_urls.iter().map(|r| UrlRule {
-            id: r.id.to_string(),
-            pattern: r.url_pattern.clone(),
-            match_type: UrlMatchType::from_str(&r.match_type),
-        }).collect();
+        let rules: Vec<UrlRule> = block_urls
+            .iter()
+            .map(|r| UrlRule {
+                id: r.id.to_string(),
+                pattern: r.url_pattern.clone(),
+                match_type: UrlMatchType::parse_str(&r.match_type),
+            })
+            .collect();
         self.block_urls.clear_host(host_code);
         self.block_urls.load(host_code, rules);
 

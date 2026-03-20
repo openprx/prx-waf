@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use parking_lot::Mutex as ParkingMutex;
-use tokio::sync::mpsc;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use waf_common::config::{ClusterConfig, NodeRole};
 

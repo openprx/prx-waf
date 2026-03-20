@@ -38,7 +38,9 @@ impl HotlinkConfig {
     /// Returns `true` if the given referer URL is allowed.
     pub fn is_allowed(&self, referer: &str) -> bool {
         let domain = extract_domain(referer);
-        self.allowed_domains.iter().any(|pat| domain_matches(pat, &domain))
+        self.allowed_domains
+            .iter()
+            .any(|pat| domain_matches(pat, &domain))
     }
 }
 
@@ -98,6 +100,10 @@ impl AntiHotlinkCheck {
     pub fn len(&self) -> usize {
         self.configs.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.configs.is_empty()
+    }
 }
 
 impl Default for AntiHotlinkCheck {
@@ -152,9 +158,9 @@ impl Check for AntiHotlinkCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use bytes::Bytes;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use waf_common::HostConfig;
 
     fn make_ctx(referer: Option<&str>) -> RequestCtx {
@@ -188,19 +194,34 @@ mod tests {
     #[test]
     fn test_allowed_domain() {
         let checker = AntiHotlinkCheck::new();
-        checker.set_config("test", HotlinkConfig {
-            enabled: true,
-            allow_empty_referer: true,
-            allowed_domains: vec!["example.com".into(), "*.mysite.com".into()],
-            redirect_url: None,
-        });
+        checker.set_config(
+            "test",
+            HotlinkConfig {
+                enabled: true,
+                allow_empty_referer: true,
+                allowed_domains: vec!["example.com".into(), "*.mysite.com".into()],
+                redirect_url: None,
+            },
+        );
 
         // Exact match
-        assert!(checker.check(&make_ctx(Some("https://example.com/page"))).is_none());
+        assert!(
+            checker
+                .check(&make_ctx(Some("https://example.com/page")))
+                .is_none()
+        );
         // Wildcard match
-        assert!(checker.check(&make_ctx(Some("https://sub.mysite.com/page"))).is_none());
+        assert!(
+            checker
+                .check(&make_ctx(Some("https://sub.mysite.com/page")))
+                .is_none()
+        );
         // Not allowed
-        assert!(checker.check(&make_ctx(Some("https://evil.com/page"))).is_some());
+        assert!(
+            checker
+                .check(&make_ctx(Some("https://evil.com/page")))
+                .is_some()
+        );
         // Empty allowed (allow_empty_referer = true)
         assert!(checker.check(&make_ctx(None)).is_none());
     }
@@ -208,35 +229,52 @@ mod tests {
     #[test]
     fn test_block_empty_referer() {
         let checker = AntiHotlinkCheck::new();
-        checker.set_config("test", HotlinkConfig {
-            enabled: true,
-            allow_empty_referer: false,
-            allowed_domains: vec!["example.com".into()],
-            redirect_url: None,
-        });
+        checker.set_config(
+            "test",
+            HotlinkConfig {
+                enabled: true,
+                allow_empty_referer: false,
+                allowed_domains: vec!["example.com".into()],
+                redirect_url: None,
+            },
+        );
 
         assert!(checker.check(&make_ctx(None)).is_some());
-        assert!(checker.check(&make_ctx(Some("https://example.com/"))).is_none());
+        assert!(
+            checker
+                .check(&make_ctx(Some("https://example.com/")))
+                .is_none()
+        );
     }
 
     #[test]
     fn test_disabled() {
         let checker = AntiHotlinkCheck::new();
-        checker.set_config("test", HotlinkConfig {
-            enabled: false,
-            allow_empty_referer: false,
-            allowed_domains: vec![],
-            redirect_url: None,
-        });
+        checker.set_config(
+            "test",
+            HotlinkConfig {
+                enabled: false,
+                allow_empty_referer: false,
+                allowed_domains: vec![],
+                redirect_url: None,
+            },
+        );
 
         // Disabled — always passes
-        assert!(checker.check(&make_ctx(Some("https://evil.com/"))).is_none());
+        assert!(
+            checker
+                .check(&make_ctx(Some("https://evil.com/")))
+                .is_none()
+        );
     }
 
     #[test]
     fn test_extract_domain() {
         assert_eq!(extract_domain("https://example.com/path"), "example.com");
-        assert_eq!(extract_domain("http://sub.example.com:8080/"), "sub.example.com");
+        assert_eq!(
+            extract_domain("http://sub.example.com:8080/"),
+            "sub.example.com"
+        );
         assert_eq!(extract_domain("example.com"), "example.com");
     }
 

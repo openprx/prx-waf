@@ -14,13 +14,15 @@
 //! `GET /.well-known/acme-challenge/{token}`
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
+
+use parking_lot::RwLock;
 
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use waf_storage::{models::CreateCertificate, Database};
+use waf_storage::{Database, models::CreateCertificate};
 
 // ── Challenge store ───────────────────────────────────────────────────────────
 
@@ -38,19 +40,19 @@ impl ChallengeStore {
         Self::default()
     }
 
-    /// Store a challenge token → key_authorization pair.
+    /// Store a challenge token -> key_authorization pair.
     pub fn set(&self, token: String, key_auth: String) {
-        self.inner.write().unwrap().insert(token, key_auth);
+        self.inner.write().insert(token, key_auth);
     }
 
     /// Look up the key authorization for a token.
     pub fn get(&self, token: &str) -> Option<String> {
-        self.inner.read().unwrap().get(token).cloned()
+        self.inner.read().get(token).cloned()
     }
 
     /// Remove a challenge after it has been processed.
     pub fn remove(&self, token: &str) {
-        self.inner.write().unwrap().remove(token);
+        self.inner.write().remove(token);
     }
 }
 
@@ -82,11 +84,7 @@ pub struct SslManager {
 }
 
 impl SslManager {
-    pub fn new(
-        db: Arc<Database>,
-        acme_email: impl Into<String>,
-        acme_staging: bool,
-    ) -> Self {
+    pub fn new(db: Arc<Database>, acme_email: impl Into<String>, acme_staging: bool) -> Self {
         Self {
             db,
             challenges: Arc::new(ChallengeStore::new()),
@@ -118,7 +116,10 @@ impl SslManager {
         self.db
             .update_certificate_status(cert.id, "active", None)
             .await?;
-        info!("Uploaded certificate for domain {} (id={})", domain, cert.id);
+        info!(
+            "Uploaded certificate for domain {} (id={})",
+            domain, cert.id
+        );
         Ok(cert.id)
     }
 
@@ -132,8 +133,7 @@ impl SslManager {
         domain: &str,
     ) -> anyhow::Result<Uuid> {
         use instant_acme::{
-            Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-            OrderStatus,
+            Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus,
         };
         use rcgen::{CertificateParams, KeyPair};
 
@@ -186,7 +186,8 @@ impl SslManager {
                 .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge available"))?;
 
             let key_auth = order.key_authorization(challenge);
-            self.challenges.set(challenge.token.clone(), key_auth.as_str().to_string());
+            self.challenges
+                .set(challenge.token.clone(), key_auth.as_str().to_string());
 
             order.set_challenge_ready(&challenge.url).await?;
         }
@@ -238,21 +239,25 @@ impl SslManager {
         let not_after = now + chrono::Duration::days(90); // typical LE validity
 
         self.db
-            .update_certificate_pem(
-                cert_id,
-                &cert_pem,
-                &key_pem,
-                None,
-                now,
+            .update_certificate_pem(&waf_storage::models::UpdateCertificatePem {
+                id: cert_id,
+                cert_pem: &cert_pem,
+                key_pem: &key_pem,
+                chain_pem: None,
+                not_before: now,
                 not_after,
-                "Let's Encrypt",
-                domain,
-            )
+                issuer: "Let's Encrypt",
+                subject: domain,
+            })
             .await?;
 
         // Clean up challenges
         for auth in &authorizations {
-            if let Some(c) = auth.challenges.iter().find(|c| c.r#type == ChallengeType::Http01) {
+            if let Some(c) = auth
+                .challenges
+                .iter()
+                .find(|c| c.r#type == ChallengeType::Http01)
+            {
                 self.challenges.remove(&c.token);
             }
         }

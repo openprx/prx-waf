@@ -1,5 +1,5 @@
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use tokio::sync::broadcast;
 use tracing::info;
 
@@ -54,12 +54,12 @@ impl Database {
 
 /// Strip password from URL for logging
 fn sanitize_url(url: &str) -> String {
-    if let Some(at_pos) = url.rfind('@') {
-        if let Some(scheme_end) = url.find("://") {
-            let scheme = &url[..scheme_end + 3];
-            let rest = &url[at_pos..];
-            return format!("{}***{}", scheme, rest);
-        }
+    if let Some(at_pos) = url.rfind('@')
+        && let Some(scheme_end) = url.find("://")
+    {
+        let scheme = &url[..scheme_end + 3];
+        let rest = &url[at_pos..];
+        return format!("{}***{}", scheme, rest);
     }
     url.to_string()
 }

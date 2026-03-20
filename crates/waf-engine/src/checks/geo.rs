@@ -55,12 +55,15 @@ pub struct GeoCheck {
 
 impl GeoCheck {
     pub fn new() -> Self {
-        Self { rules: Arc::new(DashMap::new()) }
+        Self {
+            rules: Arc::new(DashMap::new()),
+        }
     }
 
     /// Replace all geo rules for the given host (or `"*"` for global rules).
     pub fn load_rules(&self, host_code: &str, rules: Vec<GeoRule>) {
-        self.rules.insert(host_code.to_string(), HostGeoRules { rules });
+        self.rules
+            .insert(host_code.to_string(), HostGeoRules { rules });
     }
 
     /// Remove all rules for a host.
@@ -70,18 +73,18 @@ impl GeoCheck {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    fn eval_rules<'a>(&self, host_code: &str, geo: &waf_common::GeoIpInfo) -> Option<DetectionResult> {
+    fn eval_rules(&self, host_code: &str, geo: &waf_common::GeoIpInfo) -> Option<DetectionResult> {
         // Host-specific rules first
-        if let Some(entry) = self.rules.get(host_code) {
-            if let Some(r) = Self::match_rules(geo, &entry.rules) {
-                return Some(r);
-            }
+        if let Some(entry) = self.rules.get(host_code)
+            && let Some(r) = Self::match_rules(geo, &entry.rules)
+        {
+            return Some(r);
         }
         // Global rules
-        if let Some(entry) = self.rules.get("*") {
-            if let Some(r) = Self::match_rules(geo, &entry.rules) {
-                return Some(r);
-            }
+        if let Some(entry) = self.rules.get("*")
+            && let Some(r) = Self::match_rules(geo, &entry.rules)
+        {
+            return Some(r);
         }
         None
     }
@@ -129,7 +132,10 @@ impl GeoCheck {
         }
         // Match country name (case-insensitive)
         if !geo.country.is_empty()
-            && rule.countries.iter().any(|c| c.eq_ignore_ascii_case(&geo.country))
+            && rule
+                .countries
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&geo.country))
         {
             return true;
         }

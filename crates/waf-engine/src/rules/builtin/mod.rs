@@ -7,11 +7,7 @@ pub mod scanner;
 use super::registry::Rule;
 
 /// Load all built-in rules into a combined list.
-pub fn all_builtin_rules(
-    enable_owasp: bool,
-    enable_bot: bool,
-    enable_scanner: bool,
-) -> Vec<Rule> {
+pub fn all_builtin_rules(enable_owasp: bool, enable_bot: bool, enable_scanner: bool) -> Vec<Rule> {
     let mut rules = Vec::new();
     if enable_owasp {
         rules.extend(owasp::rules());

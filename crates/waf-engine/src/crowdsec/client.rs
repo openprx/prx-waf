@@ -30,10 +30,7 @@ impl CrowdSecClient {
     /// `startup = true`  → full pull of all active decisions.
     /// `startup = false` → incremental update (new/deleted since last pull).
     pub async fn get_decisions_stream(&self, startup: bool) -> Result<DecisionStream> {
-        let url = format!(
-            "{}/v1/decisions/stream?startup={}",
-            self.lapi_url, startup
-        );
+        let url = format!("{}/v1/decisions/stream?startup={}", self.lapi_url, startup);
         debug!("CrowdSec LAPI pull: {}", url);
 
         let resp = self
@@ -121,10 +118,7 @@ impl CrowdSecClient {
             anyhow::bail!("LAPI test returned {status}");
         }
 
-        Ok(format!(
-            "Connected to CrowdSec LAPI at {}",
-            self.lapi_url
-        ))
+        Ok(format!("Connected to CrowdSec LAPI at {}", self.lapi_url))
     }
 
     /// Push alerts to LAPI (used by the log pusher).

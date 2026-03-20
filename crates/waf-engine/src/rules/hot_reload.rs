@@ -4,8 +4,10 @@
 //! Debounces rapid successive changes by waiting `debounce_ms` after the last event.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use anyhow::Result;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -36,8 +38,10 @@ impl HotReloader {
         let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
 
         // Create the directory if it doesn't exist yet
-        if !rules_dir.exists() {
-            std::fs::create_dir_all(&rules_dir).ok();
+        if !rules_dir.exists()
+            && let Err(e) = std::fs::create_dir_all(&rules_dir)
+        {
+            warn!(path = %rules_dir.display(), "Failed to create rules directory: {e}");
         }
 
         watcher.watch(&rules_dir, RecursiveMode::Recursive)?;
@@ -54,10 +58,7 @@ impl HotReloader {
                     Ok(Ok(event)) => {
                         // Filter: only react to Create, Modify, Remove
                         use notify::EventKind::*;
-                        let relevant = matches!(
-                            event.kind,
-                            Create(_) | Modify(_) | Remove(_)
-                        );
+                        let relevant = matches!(event.kind, Create(_) | Modify(_) | Remove(_));
                         if relevant {
                             last_event = std::time::Instant::now();
                             pending = true;
@@ -84,12 +85,10 @@ impl HotReloader {
 }
 
 fn trigger_reload(manager: &Arc<Mutex<RuleManager>>) {
-    match manager.lock() {
-        Ok(mut mgr) => match mgr.reload() {
-            Ok(report) => info!("Hot-reload: {report}"),
-            Err(e) => warn!("Hot-reload failed: {e}"),
-        },
-        Err(e) => warn!("Hot-reload: failed to lock manager: {e}"),
+    let mut mgr = manager.lock();
+    match mgr.reload() {
+        Ok(report) => info!("Hot-reload: {report}"),
+        Err(e) => warn!("Hot-reload failed: {e}"),
     }
 }
 
@@ -99,7 +98,7 @@ fn trigger_reload(manager: &Arc<Mutex<RuleManager>>) {
 #[cfg(unix)]
 pub fn register_sighup_handler(manager: Arc<Mutex<RuleManager>>) {
     tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut stream = match signal(SignalKind::hangup()) {
             Ok(s) => s,
             Err(e) => {
@@ -111,11 +110,13 @@ pub fn register_sighup_handler(manager: Arc<Mutex<RuleManager>>) {
             stream.recv().await;
             info!("SIGHUP received — reloading rules");
             let mgr = Arc::clone(&manager);
-            tokio::task::spawn_blocking(move || {
+            if let Err(e) = tokio::task::spawn_blocking(move || {
                 trigger_reload(&mgr);
             })
             .await
-            .ok();
+            {
+                warn!("SIGHUP reload task panicked: {e}");
+            }
         }
     });
 }

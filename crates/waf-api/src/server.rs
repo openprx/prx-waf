@@ -2,9 +2,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    middleware,
+    Router, middleware,
     routing::{delete, get, post},
-    Router,
 };
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -13,8 +12,7 @@ use tracing::info;
 use crate::auth::{login, logout, refresh_token};
 use crate::cache_api::{cache_flush, cache_flush_host, cache_flush_key, cache_stats};
 use crate::cluster::{
-    cluster_status, generate_join_token, get_cluster_node, list_cluster_nodes,
-    remove_cluster_node,
+    cluster_status, generate_join_token, get_cluster_node, list_cluster_nodes, remove_cluster_node,
 };
 use crate::crowdsec::{
     crowdsec_stats, crowdsec_status, delete_crowdsec_decision, get_crowdsec_config,
@@ -31,8 +29,8 @@ use crate::notifications::{
 use crate::plugins::{delete_plugin, disable_plugin, enable_plugin, list_plugins, upload_plugin};
 use crate::security::{list_audit_log, security_headers_middleware};
 use crate::state::AppState;
-use crate::stats::{stats_geo, stats_overview, stats_timeseries};
 use crate::static_files::static_handler;
+use crate::stats::{stats_geo, stats_overview, stats_timeseries};
 use crate::tunnels::{create_tunnel, delete_tunnel, list_tunnels, ws_tunnel};
 use crate::websocket::{ws_events, ws_logs};
 
@@ -54,7 +52,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let protected_routes = Router::new()
         // Hosts
         .route("/api/hosts", get(list_hosts).post(create_host))
-        .route("/api/hosts/:id", get(get_host).put(update_host).delete(delete_host))
+        .route(
+            "/api/hosts/:id",
+            get(get_host).put(update_host).delete(delete_host),
+        )
         // Allow IPs
         .route("/api/allow-ips", get(list_allow_ips).post(create_allow_ip))
         .route("/api/allow-ips/:id", delete(delete_allow_ip))
@@ -62,10 +63,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/block-ips", get(list_block_ips).post(create_block_ip))
         .route("/api/block-ips/:id", delete(delete_block_ip))
         // Allow URLs
-        .route("/api/allow-urls", get(list_allow_urls).post(create_allow_url))
+        .route(
+            "/api/allow-urls",
+            get(list_allow_urls).post(create_allow_url),
+        )
         .route("/api/allow-urls/:id", delete(delete_allow_url))
         // Block URLs
-        .route("/api/block-urls", get(list_block_urls).post(create_block_url))
+        .route(
+            "/api/block-urls",
+            get(list_block_urls).post(create_block_url),
+        )
         .route("/api/block-urls/:id", delete(delete_block_url))
         // Attack logs
         .route("/api/attack-logs", get(list_attack_logs))
@@ -76,25 +83,46 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Rule reload
         .route("/api/reload", post(reload_rules))
         // Phase 3: Custom rules
-        .route("/api/custom-rules", get(list_custom_rules).post(create_custom_rule))
+        .route(
+            "/api/custom-rules",
+            get(list_custom_rules).post(create_custom_rule),
+        )
         .route("/api/custom-rules/:id", delete(delete_custom_rule))
         // Phase 3: Sensitive patterns
-        .route("/api/sensitive-patterns", get(list_sensitive_patterns).post(create_sensitive_pattern))
-        .route("/api/sensitive-patterns/:id", delete(delete_sensitive_pattern))
+        .route(
+            "/api/sensitive-patterns",
+            get(list_sensitive_patterns).post(create_sensitive_pattern),
+        )
+        .route(
+            "/api/sensitive-patterns/:id",
+            delete(delete_sensitive_pattern),
+        )
         // Phase 3: Hotlink config
-        .route("/api/hotlink-config", get(get_hotlink_config).post(upsert_hotlink_config))
+        .route(
+            "/api/hotlink-config",
+            get(get_hotlink_config).post(upsert_hotlink_config),
+        )
         // Phase 3: LB backends
-        .route("/api/lb-backends", get(list_lb_backends).post(create_lb_backend))
+        .route(
+            "/api/lb-backends",
+            get(list_lb_backends).post(create_lb_backend),
+        )
         .route("/api/lb-backends/:id", delete(delete_lb_backend))
         // Phase 3: Certificates
-        .route("/api/certificates", get(list_certificates).post(upload_certificate))
+        .route(
+            "/api/certificates",
+            get(list_certificates).post(upload_certificate),
+        )
         .route("/api/certificates/:id", delete(delete_certificate))
         // Phase 4: Statistics
         .route("/api/stats/overview", get(stats_overview))
         .route("/api/stats/timeseries", get(stats_timeseries))
         .route("/api/stats/geo", get(stats_geo))
         // Phase 4: Notifications
-        .route("/api/notifications", get(list_notifications).post(create_notification))
+        .route(
+            "/api/notifications",
+            get(list_notifications).post(create_notification),
+        )
         .route("/api/notifications/:id", delete(delete_notification))
         .route("/api/notifications/log", get(notification_log))
         .route("/api/notifications/:id/test", post(test_notification))
@@ -122,9 +150,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Phase 6: CrowdSec
         .route("/api/crowdsec/status", get(crowdsec_status))
         .route("/api/crowdsec/decisions", get(list_crowdsec_decisions))
-        .route("/api/crowdsec/decisions/:id", delete(delete_crowdsec_decision))
+        .route(
+            "/api/crowdsec/decisions/:id",
+            delete(delete_crowdsec_decision),
+        )
         .route("/api/crowdsec/test", post(test_crowdsec_connection))
-        .route("/api/crowdsec/config", get(get_crowdsec_config).put(update_crowdsec_config))
+        .route(
+            "/api/crowdsec/config",
+            get(get_crowdsec_config).put(update_crowdsec_config),
+        )
         .route("/api/crowdsec/stats", get(crowdsec_stats))
         .route("/api/crowdsec/events", get(list_crowdsec_events))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
@@ -153,10 +187,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 }
 
 /// Start the management API server
-pub async fn start_api_server(
-    listen_addr: &str,
-    state: Arc<AppState>,
-) -> anyhow::Result<()> {
+pub async fn start_api_server(listen_addr: &str, state: Arc<AppState>) -> anyhow::Result<()> {
     let addr: SocketAddr = listen_addr.parse()?;
     let app = build_router(state);
 

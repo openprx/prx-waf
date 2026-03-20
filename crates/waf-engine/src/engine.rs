@@ -4,21 +4,22 @@ use uuid::Uuid;
 
 use waf_common::{RequestCtx, WafAction, WafDecision};
 use waf_storage::{
-    models::{AttackLog, CreateSecurityEvent},
     Database,
+    models::{AttackLog, CreateSecurityEvent},
 };
 
 use crate::block_page::render_block_page;
 use crate::checker::{
-    check_ip_blacklist, check_ip_whitelist, check_url_blacklist, check_url_whitelist, RuleStore,
+    RuleStore, check_ip_blacklist, check_ip_whitelist, check_url_blacklist, check_url_whitelist,
 };
 use crate::checks::{
     AntiHotlinkCheck, BotCheck, CcCheck, Check, DirTraversalCheck, GeoCheck, OWASPCheck, RceCheck,
     ScannerCheck, SensitiveCheck, SqlInjectionCheck, XssCheck,
 };
-use crate::crowdsec::{appsec_to_detection, AppSecClient, AppSecResult, CrowdSecChecker};
+use crate::community::CommunityChecker;
+use crate::crowdsec::{AppSecClient, AppSecResult, CrowdSecChecker, appsec_to_detection};
 use crate::geoip::GeoIpService;
-use crate::rules::engine::{from_db_rule, CustomRulesEngine};
+use crate::rules::engine::{CustomRulesEngine, from_db_rule};
 
 /// WAF engine configuration
 #[derive(Debug, Clone, Default)]
@@ -55,6 +56,9 @@ pub struct WafEngine {
     crowdsec_checker: OnceLock<Arc<CrowdSecChecker>>,
     /// AppSec client (set once after engine construction via set_crowdsec)
     appsec_client: OnceLock<Arc<AppSecClient>>,
+    // ── Community ──────────────────────────────────────────────────────────
+    /// Community blocklist checker (set once after engine construction via set_community)
+    community_checker: OnceLock<Arc<CommunityChecker>>,
     // ── GeoIP ────────────────────────────────────────────────────────────────
     /// GeoIP lookup service (set once after engine construction via set_geoip)
     geoip: OnceLock<Arc<GeoIpService>>,
@@ -93,20 +97,22 @@ impl WafEngine {
             geo_check,
             crowdsec_checker: OnceLock::new(),
             appsec_client: OnceLock::new(),
+            community_checker: OnceLock::new(),
             geoip: OnceLock::new(),
         }
     }
 
     /// Plug CrowdSec components into the engine (called once after init).
-    pub fn set_crowdsec(
-        &self,
-        checker: Arc<CrowdSecChecker>,
-        appsec: Option<Arc<AppSecClient>>,
-    ) {
+    pub fn set_crowdsec(&self, checker: Arc<CrowdSecChecker>, appsec: Option<Arc<AppSecClient>>) {
         let _ = self.crowdsec_checker.set(checker);
         if let Some(ac) = appsec {
             let _ = self.appsec_client.set(ac);
         }
+    }
+
+    /// Plug the community checker into the engine (called once after init).
+    pub fn set_community(&self, checker: Arc<CommunityChecker>) {
+        let _ = self.community_checker.set(checker);
     }
 
     /// Plug the GeoIP lookup service into the engine (called once after init).
@@ -135,10 +141,7 @@ impl WafEngine {
             for row in &custom_rules {
                 match from_db_rule(row) {
                     Ok(rule) => {
-                        by_host
-                            .entry(row.host_code.clone())
-                            .or_default()
-                            .push(rule);
+                        by_host.entry(row.host_code.clone()).or_default().push(rule);
                     }
                     Err(e) => warn!("Failed to parse custom rule {}: {}", row.id, e),
                 }
@@ -208,13 +211,12 @@ impl WafEngine {
 
         // ── Phase 1: IP Whitelist — allow immediately if matched ──────────────
         let ip_wl = check_ip_whitelist(ctx, &self.store);
-        if let Some(ref result) = ip_wl.result {
-            if matches!(ip_wl.action, WafAction::Allow)
-                && result.phase == waf_common::Phase::IpWhitelist
-            {
-                debug!("Request allowed by IP whitelist: {}", ctx.client_ip);
-                return ip_wl;
-            }
+        if let Some(ref result) = ip_wl.result
+            && matches!(ip_wl.action, WafAction::Allow)
+            && result.phase == waf_common::Phase::IpWhitelist
+        {
+            debug!("Request allowed by IP whitelist: {}", ctx.client_ip);
+            return ip_wl;
         }
 
         // ── Phase 2: IP Blacklist — block if matched ───────────────────────────
@@ -238,21 +240,39 @@ impl WafEngine {
         }
 
         // ── Phase 16a: CrowdSec Bouncer — fast cache lookup ───────────────────
-        if let Some(cs) = self.crowdsec_checker.get() {
-            if let Some(result) = cs.check(ctx) {
-                let rule_name = result.rule_name.clone();
-                let decision = if ctx.host_config.log_only_mode {
-                    WafDecision {
-                        action: WafAction::LogOnly,
-                        result: Some(result),
-                    }
-                } else {
-                    let body = render_block_page(ctx, &rule_name);
-                    WafDecision::block(403, Some(body), result)
-                };
-                self.log_security_event(ctx, &decision).await;
-                return decision;
-            }
+        if let Some(cs) = self.crowdsec_checker.get()
+            && let Some(result) = cs.check(ctx)
+        {
+            let rule_name = result.rule_name.clone();
+            let decision = if ctx.host_config.log_only_mode {
+                WafDecision {
+                    action: WafAction::LogOnly,
+                    result: Some(result),
+                }
+            } else {
+                let body = render_block_page(ctx, &rule_name);
+                WafDecision::block(403, Some(body), result)
+            };
+            self.log_security_event(ctx, &decision).await;
+            return decision;
+        }
+
+        // ── Phase 18: Community blocklist ─────────────────────────────────────
+        if let Some(cc) = self.community_checker.get()
+            && let Some(result) = cc.check(ctx)
+        {
+            let rule_name = result.rule_name.clone();
+            let decision = if ctx.host_config.log_only_mode {
+                WafDecision {
+                    action: WafAction::LogOnly,
+                    result: Some(result),
+                }
+            } else {
+                let body = render_block_page(ctx, &rule_name);
+                WafDecision::block(403, Some(body), result)
+            };
+            self.log_security_event(ctx, &decision).await;
+            return decision;
         }
 
         // ── Phase 17: GeoIP access control ────────────────────────────────────
@@ -414,13 +434,15 @@ impl WafEngine {
             phase: result.phase.to_string(),
             detail: Some(result.detail.clone()),
             request_headers: None,
-            geo_info: ctx.geo.as_ref().map(|g| serde_json::json!({
-                "country": g.country,
-                "province": g.province,
-                "city": g.city,
-                "isp": g.isp,
-                "iso_code": g.iso_code,
-            })),
+            geo_info: ctx.geo.as_ref().map(|g| {
+                serde_json::json!({
+                    "country": g.country,
+                    "province": g.province,
+                    "city": g.city,
+                    "isp": g.isp,
+                    "iso_code": g.iso_code,
+                })
+            }),
             created_at: chrono::Utc::now(),
         };
 
@@ -455,13 +477,15 @@ impl WafEngine {
             rule_name: result.rule_name.clone(),
             action: action_str.to_string(),
             detail: Some(result.detail.clone()),
-            geo_info: ctx.geo.as_ref().map(|g| serde_json::json!({
-                "country": g.country,
-                "province": g.province,
-                "city": g.city,
-                "isp": g.isp,
-                "iso_code": g.iso_code,
-            })),
+            geo_info: ctx.geo.as_ref().map(|g| {
+                serde_json::json!({
+                    "country": g.country,
+                    "province": g.province,
+                    "city": g.city,
+                    "isp": g.isp,
+                    "iso_code": g.iso_code,
+                })
+            }),
         };
 
         let db = Arc::clone(&self.db);

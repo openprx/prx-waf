@@ -48,7 +48,10 @@ pub struct XdbUpdater {
 impl XdbUpdater {
     /// Create an updater that fetches from `github_base_url`.
     pub fn new(data_dir: PathBuf, github_base_url: String) -> Self {
-        Self { data_dir, github_base_url }
+        Self {
+            data_dir,
+            github_base_url,
+        }
     }
 
     /// Create an updater using the default upstream GitHub URL.
@@ -70,7 +73,10 @@ impl XdbUpdater {
 
             // Missing file → definitely need to download.
             if !local_path.exists() {
-                debug!("GeoIP updater: {} not found locally — update needed", filename);
+                debug!(
+                    "GeoIP updater: {} not found locally — update needed",
+                    filename
+                );
                 return Ok(true);
             }
 
@@ -85,21 +91,24 @@ impl XdbUpdater {
                         .get(reqwest::header::CONTENT_LENGTH)
                         .and_then(|v| v.to_str().ok())
                         .and_then(|s| s.parse::<u64>().ok())
+                        && remote_size != local_size
                     {
-                        if remote_size != local_size {
-                            debug!(
-                                "GeoIP updater: {} size mismatch local={} remote={}",
-                                filename, local_size, remote_size
-                            );
-                            return Ok(true);
-                        }
+                        debug!(
+                            "GeoIP updater: {} size mismatch local={} remote={}",
+                            filename, local_size, remote_size
+                        );
+                        return Ok(true);
                     }
                 }
                 Ok(resp) => {
                     warn!("GeoIP updater: HEAD {} returned {}", url, resp.status());
                 }
                 Err(e) => {
-                    return Err(anyhow::anyhow!("GeoIP HEAD check failed for {}: {}", url, e));
+                    return Err(anyhow::anyhow!(
+                        "GeoIP HEAD check failed for {}: {}",
+                        url,
+                        e
+                    ));
                 }
             }
         }
@@ -121,12 +130,15 @@ impl XdbUpdater {
 
         let client = build_client(120)?;
 
-        let (ipv4_updated, ipv4_size) =
-            self.download_one(&client, "ip2region_v4.xdb").await?;
-        let (ipv6_updated, ipv6_size) =
-            self.download_one(&client, "ip2region_v6.xdb").await?;
+        let (ipv4_updated, ipv4_size) = self.download_one(&client, "ip2region_v4.xdb").await?;
+        let (ipv6_updated, ipv6_size) = self.download_one(&client, "ip2region_v6.xdb").await?;
 
-        Ok(UpdateResult { ipv4_updated, ipv6_updated, ipv4_size, ipv6_size })
+        Ok(UpdateResult {
+            ipv4_updated,
+            ipv6_updated,
+            ipv4_size,
+            ipv6_size,
+        })
     }
 
     /// Full update cycle: `check_update` → `download` → hot-reload.
@@ -136,7 +148,10 @@ impl XdbUpdater {
     /// returns an error but the running engine keeps using the existing files.
     pub async fn update(&self, geoip: &GeoIpService) -> Result<UpdateResult> {
         let needs_update = self.check_update().await.unwrap_or_else(|e| {
-            warn!("GeoIP updater: check_update error (will attempt download anyway): {}", e);
+            warn!(
+                "GeoIP updater: check_update error (will attempt download anyway): {}",
+                e
+            );
             true
         });
 
@@ -146,10 +161,10 @@ impl XdbUpdater {
 
         let result = self.download().await?;
 
-        if result.ipv4_updated || result.ipv6_updated {
-            if let Err(e) = geoip.reload() {
-                warn!("GeoIP updater: hot-reload failed after download: {}", e);
-            }
+        if (result.ipv4_updated || result.ipv6_updated)
+            && let Err(e) = geoip.reload()
+        {
+            warn!("GeoIP updater: hot-reload failed after download: {}", e);
         }
 
         Ok(result)
@@ -158,11 +173,7 @@ impl XdbUpdater {
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /// Download a single xdb file atomically.  Returns `(updated, size_bytes)`.
-    async fn download_one(
-        &self,
-        client: &reqwest::Client,
-        filename: &str,
-    ) -> Result<(bool, u64)> {
+    async fn download_one(&self, client: &reqwest::Client, filename: &str) -> Result<(bool, u64)> {
         let url = format!("{}/{}", self.github_base_url, filename);
         let final_path = self.data_dir.join(filename);
         let tmp_path = self.data_dir.join(format!("{}.tmp", filename));
@@ -217,10 +228,7 @@ impl XdbUpdater {
             )
         })?;
 
-        info!(
-            "GeoIP updater: {} updated ({} bytes)",
-            filename, size
-        );
+        info!("GeoIP updater: {} updated ({} bytes)", filename, size);
 
         Ok((true, size))
     }
@@ -289,7 +297,10 @@ pub fn parse_duration(s: &str) -> Duration {
         "m" => n * 60,
         "s" => n,
         _ => {
-            warn!("GeoIP updater: unrecognised duration '{}', defaulting to 7d", s);
+            warn!(
+                "GeoIP updater: unrecognised duration '{}', defaulting to 7d",
+                s
+            );
             7 * 86_400
         }
     };
@@ -327,10 +338,10 @@ pub fn xdb_file_info(path: &Path) -> String {
                 .unwrap_or_default()
                 .as_secs();
             // Format as YYYY-MM-DD HH:MM:SS UTC (no chrono dep needed here)
-            let dt = chrono::DateTime::from_timestamp(secs as i64, 0)
+
+            chrono::DateTime::from_timestamp(secs as i64, 0)
                 .map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            dt
+                .unwrap_or_else(|| "unknown".to_string())
         })
         .unwrap_or_else(|_| "unknown".to_string());
 

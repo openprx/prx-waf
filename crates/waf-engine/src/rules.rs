@@ -6,9 +6,9 @@ pub mod manager;
 pub mod registry;
 pub mod sources;
 
-use std::net::IpAddr;
 use dashmap::DashMap;
 use ipnet::IpNet;
+use std::net::IpAddr;
 use tracing::debug;
 
 /// In-memory IP rule store with CIDR support
@@ -31,9 +31,7 @@ impl IpRuleSet {
             .filter_map(|s| {
                 // Try parsing as CIDR first, then as plain IP
                 s.parse::<IpNet>()
-                    .or_else(|_| {
-                        s.parse::<IpAddr>().map(|ip| IpNet::from(ip))
-                    })
+                    .or_else(|_| s.parse::<IpAddr>().map(IpNet::from))
                     .ok()
                     .inspect(|_| debug!("Loaded IP rule: {}", s))
                     .or_else(|| {
@@ -48,23 +46,24 @@ impl IpRuleSet {
     /// Check if an IP matches any rule for a given host_code
     pub fn matches(&self, host_code: &str, ip: IpAddr) -> bool {
         // Check host-specific rules
-        if let Some(nets) = self.entries.get(host_code) {
-            if nets.iter().any(|net| net.contains(&ip)) {
-                return true;
-            }
+        if let Some(nets) = self.entries.get(host_code)
+            && nets.iter().any(|net| net.contains(&ip))
+        {
+            return true;
         }
         // Check global rules (host_code = "*")
-        if let Some(nets) = self.entries.get("*") {
-            if nets.iter().any(|net| net.contains(&ip)) {
-                return true;
-            }
+        if let Some(nets) = self.entries.get("*")
+            && nets.iter().any(|net| net.contains(&ip))
+        {
+            return true;
         }
         false
     }
 
     /// Insert a single rule
     pub fn insert(&self, host_code: &str, cidr: &str) {
-        let net = cidr.parse::<IpNet>()
+        let net = cidr
+            .parse::<IpNet>()
             .or_else(|_| cidr.parse::<IpAddr>().map(IpNet::from));
 
         if let Ok(net) = net {
@@ -102,7 +101,7 @@ pub enum UrlMatchType {
 }
 
 impl UrlMatchType {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "prefix" => Self::Prefix,
             "contains" => Self::Contains,
@@ -149,16 +148,16 @@ impl UrlRuleSet {
 
     pub fn matches(&self, host_code: &str, path: &str) -> Option<String> {
         // Check host-specific rules
-        if let Some(rules) = self.entries.get(host_code) {
-            if let Some(rule) = rules.iter().find(|r| r.matches(path)) {
-                return Some(rule.id.clone());
-            }
+        if let Some(rules) = self.entries.get(host_code)
+            && let Some(rule) = rules.iter().find(|r| r.matches(path))
+        {
+            return Some(rule.id.clone());
         }
         // Check global rules
-        if let Some(rules) = self.entries.get("*") {
-            if let Some(rule) = rules.iter().find(|r| r.matches(path)) {
-                return Some(rule.id.clone());
-            }
+        if let Some(rules) = self.entries.get("*")
+            && let Some(rule) = rules.iter().find(|r| r.matches(path))
+        {
+            return Some(rule.id.clone());
         }
         None
     }

@@ -39,3 +39,4 @@ axum-extra = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
 ipnet = { workspace = true }
+parking_lot = { workspace = true }

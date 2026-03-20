@@ -1,6 +1,7 @@
 pub mod block_page;
 pub mod checker;
 pub mod checks;
+pub mod community;
 pub mod crowdsec;
 pub mod engine;
 pub mod geoip;
@@ -10,13 +11,17 @@ pub mod rules;
 
 pub use checker::RuleStore;
 pub use checks::{AntiHotlinkCheck, GeoCheck, GeoRule, GeoRuleMode, OWASPCheck, SensitiveCheck};
+pub use community::{
+    CommunityChecker, CommunityClient, CommunityComponents, CommunityConfig, CommunityReporter,
+    RequestInfo, init_community,
+};
 pub use crowdsec::{
-    init_crowdsec, CacheStats, CrowdSecChecker, CrowdSecClient, CrowdSecComponents,
-    CrowdSecConfig, Decision, DecisionCache,
+    CacheStats, CrowdSecChecker, CrowdSecClient, CrowdSecComponents, CrowdSecConfig, Decision,
+    DecisionCache, init_crowdsec,
 };
 pub use engine::{WafEngine, WafEngineConfig};
-pub use geoip::{cache_policy_from_str, GeoIpService};
-pub use geoip_updater::{spawn_auto_updater, UpdateResult, XdbUpdater};
+pub use geoip::{GeoIpService, cache_policy_from_str};
+pub use geoip_updater::{UpdateResult, XdbUpdater, spawn_auto_updater};
 pub use plugins::{PluginAction, PluginInfo, PluginManager, WasmPlugin};
 pub use rules::engine::{CustomRule, CustomRulesEngine};
 pub use rules::formats::{ExportFormat, RuleFormat, ValidationError};
