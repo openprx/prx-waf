@@ -15,6 +15,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
+description = "Pingora-based web application firewall with YAML rules engine"
 repository = "https://github.com/openprx/prx-waf"
 
 [workspace.dependencies]
