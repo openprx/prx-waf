@@ -409,6 +409,12 @@ cd web/admin-ui && npm install && npm run build
 
 ---
 
+## Links
+
+- [Documentation](https://docs.openprx.dev/en/prx-waf/) — Full PRX-WAF documentation (10 languages)
+- [Community](https://community.openprx.dev) — OpenPRX community forum
+- [OpenPRX](https://openprx.dev) — Project homepage
+
 ## License
 
 Licensed under either of
