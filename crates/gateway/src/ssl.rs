@@ -1,7 +1,7 @@
 //! SSL/TLS Certificate Automation
 //!
 //! Manages TLS certificates for WAF-protected sites:
-//!   - Storage in PostgreSQL (PEM format)
+//!   - Storage in `PostgreSQL` (PEM format)
 //!   - Let's Encrypt via ACME HTTP-01 challenge (instant-acme crate)
 //!   - CSR generation via rcgen
 //!   - Auto-renewal 30 days before expiry
@@ -40,7 +40,7 @@ impl ChallengeStore {
         Self::default()
     }
 
-    /// Store a challenge token -> key_authorization pair.
+    /// Store a challenge token -> `key_authorization` pair.
     pub fn set(&self, token: String, key_auth: String) {
         self.inner.write().insert(token, key_auth);
     }
@@ -113,28 +113,17 @@ impl SslManager {
             auto_renew: Some(false),
         };
         let cert = self.db.create_certificate(req).await?;
-        self.db
-            .update_certificate_status(cert.id, "active", None)
-            .await?;
-        info!(
-            "Uploaded certificate for domain {} (id={})",
-            domain, cert.id
-        );
+        self.db.update_certificate_status(cert.id, "active", None).await?;
+        info!("Uploaded certificate for domain {} (id={})", domain, cert.id);
         Ok(cert.id)
     }
 
     /// Request a new certificate via ACME HTTP-01 for `domain`.
     ///
     /// Stores challenge tokens so the gateway can serve them, then waits for
-    /// ACME validation and stores the issued certificate in PostgreSQL.
-    pub async fn request_certificate(
-        self: Arc<Self>,
-        host_code: &str,
-        domain: &str,
-    ) -> anyhow::Result<Uuid> {
-        use instant_acme::{
-            Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus,
-        };
+    /// ACME validation and stores the issued certificate in `PostgreSQL`.
+    pub async fn request_certificate(self: Arc<Self>, host_code: &str, domain: &str) -> anyhow::Result<Uuid> {
+        use instant_acme::{Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus};
         use rcgen::{CertificateParams, KeyPair};
 
         info!("Requesting ACME certificate for domain: {}", domain);
@@ -204,7 +193,7 @@ impl SslManager {
                         .db
                         .update_certificate_status(cert_id, "error", Some("ACME validation failed"))
                         .await;
-                    anyhow::bail!("ACME order invalid for domain {}", domain);
+                    anyhow::bail!("ACME order invalid for domain {domain}");
                 }
                 _ => {}
             }
@@ -213,7 +202,7 @@ impl SslManager {
                     .db
                     .update_certificate_status(cert_id, "error", Some("ACME validation timeout"))
                     .await;
-                anyhow::bail!("ACME validation timed out for domain {}", domain);
+                anyhow::bail!("ACME validation timed out for domain {domain}");
             }
         }
 
@@ -253,11 +242,7 @@ impl SslManager {
 
         // Clean up challenges
         for auth in &authorizations {
-            if let Some(c) = auth
-                .challenges
-                .iter()
-                .find(|c| c.r#type == ChallengeType::Http01)
-            {
+            if let Some(c) = auth.challenges.iter().find(|c| c.r#type == ChallengeType::Http01) {
                 self.challenges.remove(&c.token);
             }
         }

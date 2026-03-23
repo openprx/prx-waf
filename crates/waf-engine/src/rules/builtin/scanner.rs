@@ -27,30 +27,15 @@ pub fn rules() -> Vec<Rule> {
         // Security scanners
         rule("SCAN-001", "Nikto web scanner", r"(?i)\bnikto\b", "high"),
         rule("SCAN-002", "Nmap web scanner", r"(?i)\bnmap\b", "high"),
-        rule(
-            "SCAN-003",
-            "sqlmap SQL injection tool",
-            r"(?i)\bsqlmap\b",
-            "critical",
-        ),
+        rule("SCAN-003", "sqlmap SQL injection tool", r"(?i)\bsqlmap\b", "critical"),
         rule(
             "SCAN-004",
             "Acunetix Web Vulnerability Scanner",
             r"(?i)(acunetix|acubw)",
             "high",
         ),
-        rule(
-            "SCAN-005",
-            "Nessus vulnerability scanner",
-            r"(?i)\bnessus\b",
-            "high",
-        ),
-        rule(
-            "SCAN-006",
-            "OpenVAS vulnerability scanner",
-            r"(?i)\bopenvas\b",
-            "high",
-        ),
+        rule("SCAN-005", "Nessus vulnerability scanner", r"(?i)\bnessus\b", "high"),
+        rule("SCAN-006", "OpenVAS vulnerability scanner", r"(?i)\bopenvas\b", "high"),
         rule(
             "SCAN-007",
             "Burp Suite proxy/scanner",
@@ -63,18 +48,8 @@ pub fn rules() -> Vec<Rule> {
             r"(?i)\bzap\b.*\bhttp\b|\bowasp.*scanner\b",
             "high",
         ),
-        rule(
-            "SCAN-009",
-            "w3af web application scanner",
-            r"(?i)\bw3af\b",
-            "high",
-        ),
-        rule(
-            "SCAN-010",
-            "Skipfish web scanner",
-            r"(?i)\bskipfish\b",
-            "high",
-        ),
+        rule("SCAN-009", "w3af web application scanner", r"(?i)\bw3af\b", "high"),
+        rule("SCAN-010", "Skipfish web scanner", r"(?i)\bskipfish\b", "high"),
         rule("SCAN-011", "Wfuzz fuzzing tool", r"(?i)\bwfuzz\b", "high"),
         rule(
             "SCAN-012",
@@ -82,33 +57,13 @@ pub fn rules() -> Vec<Rule> {
             r"(?i)\bdirbuster\b",
             "high",
         ),
-        rule(
-            "SCAN-013",
-            "Gobuster directory bruteforce",
-            r"(?i)\bgobuster\b",
-            "high",
-        ),
-        rule(
-            "SCAN-014",
-            "Hydra password bruteforce",
-            r"(?i)\bhydra\b",
-            "critical",
-        ),
-        rule(
-            "SCAN-015",
-            "Metasploit Framework",
-            r"(?i)(metasploit|msf)",
-            "critical",
-        ),
+        rule("SCAN-013", "Gobuster directory bruteforce", r"(?i)\bgobuster\b", "high"),
+        rule("SCAN-014", "Hydra password bruteforce", r"(?i)\bhydra\b", "critical"),
+        rule("SCAN-015", "Metasploit Framework", r"(?i)(metasploit|msf)", "critical"),
         // Network recon tools
         rule("SCAN-016", "Shodan scanner", r"(?i)\bshodan\b", "medium"),
         rule("SCAN-017", "Censys scanner", r"(?i)\bcensys\b", "medium"),
-        rule(
-            "SCAN-018",
-            "zgrab2 banner grabber",
-            r"(?i)\bzgrab\b",
-            "high",
-        ),
+        rule("SCAN-018", "zgrab2 banner grabber", r"(?i)\bzgrab\b", "high"),
         rule("SCAN-019", "Masscan", r"(?i)\bmasscan\b", "high"),
         // Fuzzing path patterns (not UA-based; applied to path)
         rule(

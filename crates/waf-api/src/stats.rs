@@ -18,9 +18,7 @@ pub struct TimeseriesQuery {
 }
 
 /// GET /api/stats/overview
-pub async fn stats_overview(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<serde_json::Value>> {
+pub async fn stats_overview(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
     let overview = state.db.get_stats_overview().await?;
     let total_requests_live = state.total_requests();
     Ok(Json(serde_json::json!({
@@ -45,14 +43,11 @@ pub async fn stats_timeseries(
     Query(q): Query<TimeseriesQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let hours = q.hours.unwrap_or(24).clamp(1, 720);
-    let series = state
-        .db
-        .get_stats_timeseries(q.host_code.as_deref(), hours)
-        .await?;
+    let series = state.db.get_stats_timeseries(q.host_code.as_deref(), hours).await?;
     Ok(Json(serde_json::json!({ "success": true, "data": series })))
 }
 
-/// GET /api/stats/geo — GeoIP distribution of blocked requests
+/// GET /api/stats/geo — `GeoIP` distribution of blocked requests
 pub async fn stats_geo(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
     let geo = state.db.get_geo_stats().await?;
     Ok(Json(serde_json::json!({

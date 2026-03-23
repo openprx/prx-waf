@@ -12,12 +12,12 @@ pub mod rules;
 pub use checker::RuleStore;
 pub use checks::{AntiHotlinkCheck, GeoCheck, GeoRule, GeoRuleMode, OWASPCheck, SensitiveCheck};
 pub use community::{
-    CommunityChecker, CommunityClient, CommunityComponents, CommunityConfig, CommunityReporter,
-    RequestInfo, init_community,
+    CommunityChecker, CommunityClient, CommunityComponents, CommunityConfig, CommunityReporter, RequestInfo,
+    init_community,
 };
 pub use crowdsec::{
-    CacheStats, CrowdSecChecker, CrowdSecClient, CrowdSecComponents, CrowdSecConfig, Decision,
-    DecisionCache, init_crowdsec,
+    CacheStats, CrowdSecChecker, CrowdSecClient, CrowdSecComponents, CrowdSecConfig, Decision, DecisionCache,
+    init_crowdsec,
 };
 pub use engine::{WafEngine, WafEngineConfig};
 pub use geoip::{GeoIpService, cache_policy_from_str};

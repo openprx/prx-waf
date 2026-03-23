@@ -1,8 +1,8 @@
 /// AES-256-GCM encryption utilities for sensitive config fields.
 ///
 /// The master key is derived from the `MASTER_KEY` environment variable via SHA-256.
-/// If the env var is not set, a zero key is used (no-op in production—operators must
-/// set MASTER_KEY to get real encryption).
+/// If the env var is not set, a zero key is used (no-op in production--operators must
+/// set `MASTER_KEY` to get real encryption).
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -16,7 +16,7 @@ pub fn derive_key(master_password: &str) -> [u8; 32] {
     hasher.update(master_password.as_bytes());
     let result = hasher.finalize();
     let mut key = [0u8; 32];
-    key.copy_from_slice(&result[..32]);
+    key.copy_from_slice(result.as_slice());
     key
 }
 
@@ -35,8 +35,11 @@ pub fn master_key() -> anyhow::Result<[u8; 32]> {
 }
 
 /// Encrypt `plaintext` with AES-256-GCM using `key`.
+///
 /// Returns base64(nonce || ciphertext).
 pub fn encrypt_field(key: &[u8; 32], plaintext: &str) -> anyhow::Result<String> {
+    use base64::Engine as _;
+
     let k = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(k);
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -45,13 +48,13 @@ pub fn encrypt_field(key: &[u8; 32], plaintext: &str) -> anyhow::Result<String> 
         .map_err(|e| anyhow::anyhow!("encryption error: {e}"))?;
     let mut combined = nonce.to_vec();
     combined.extend_from_slice(&ciphertext);
-    use base64::Engine as _;
     Ok(base64::engine::general_purpose::STANDARD.encode(combined))
 }
 
 /// Decrypt a base64(nonce || ciphertext) value produced by [`encrypt_field`].
 pub fn decrypt_field(key: &[u8; 32], encoded: &str) -> anyhow::Result<String> {
     use base64::Engine;
+
     let combined = base64::engine::general_purpose::STANDARD.decode(encoded)?;
     if combined.len() < 12 {
         return Err(anyhow::anyhow!("ciphertext too short"));

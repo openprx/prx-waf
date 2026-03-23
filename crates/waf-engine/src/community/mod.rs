@@ -24,9 +24,9 @@ pub struct CommunityComponents {
     /// IP blocklist checker for the WAF pipeline
     pub checker: Arc<CommunityChecker>,
     /// Background sync task handle
-    pub _sync_handle: tokio::task::JoinHandle<()>,
+    pub sync_handle: tokio::task::JoinHandle<()>,
     /// Background flush task handle
-    pub _flush_handle: tokio::task::JoinHandle<()>,
+    pub flush_handle: tokio::task::JoinHandle<()>,
 }
 
 /// Initialise the community threat intelligence integration.
@@ -94,7 +94,7 @@ pub async fn init_community(
     // Create reporter
     let reporter = Arc::new(CommunityReporter::new(
         Arc::clone(&client),
-        api_key.clone(),
+        api_key,
         config.batch_size,
         config.flush_interval_secs,
     ));
@@ -116,7 +116,7 @@ pub async fn init_community(
         client,
         reporter,
         checker,
-        _sync_handle: sync_handle,
-        _flush_handle: flush_handle,
+        sync_handle,
+        flush_handle,
     })
 }

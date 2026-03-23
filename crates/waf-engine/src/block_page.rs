@@ -114,9 +114,7 @@ mod tests {
     #[test]
     fn renders_custom_template() {
         let ctx_arc = Arc::new(HostConfig {
-            block_page_template: Some(
-                "blocked: {{rule_name}} | {{req_id}} | {{client_ip}}".to_string(),
-            ),
+            block_page_template: Some("blocked: {{rule_name}} | {{req_id}} | {{client_ip}}".to_string()),
             ..HostConfig::default()
         });
         let mut ctx = make_ctx("req-xyz", "5.6.7.8");

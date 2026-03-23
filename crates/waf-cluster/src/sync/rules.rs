@@ -10,7 +10,7 @@ use crate::protocol::{ChangeOp, RuleChange, RuleSyncRequest, RuleSyncResponse, S
 /// Workers send `RuleSyncRequest { current_version }` and receive either an
 /// incremental delta (if the worker is caught up enough) or a full snapshot.
 pub struct RuleChangelog {
-    /// (version_after_change, change) pairs in chronological order
+    /// (`version_after_change`, change) pairs in chronological order
     changes: VecDeque<(u64, RuleChange)>,
     max_retained: usize,
     /// Monotonic version counter — incremented by every `record_change` call.
@@ -19,7 +19,7 @@ pub struct RuleChangelog {
 
 impl RuleChangelog {
     /// Create a new changelog with the given ring-buffer capacity.
-    pub fn new(max_retained: usize) -> Self {
+    pub const fn new(max_retained: usize) -> Self {
         Self {
             changes: VecDeque::new(),
             max_retained,
@@ -28,7 +28,7 @@ impl RuleChangelog {
     }
 
     /// The version after the last recorded change.
-    pub fn current_version(&self) -> u64 {
+    pub const fn current_version(&self) -> u64 {
         self.current_version
     }
 
@@ -39,11 +39,7 @@ impl RuleChangelog {
         self.current_version += 1;
         let version = self.current_version;
         let rule_json = rule.and_then(|r| serde_json::to_value(r).ok());
-        let change = RuleChange {
-            op,
-            rule_id,
-            rule_json,
-        };
+        let change = RuleChange { op, rule_id, rule_json };
         self.push(version, change);
     }
 
@@ -62,7 +58,7 @@ impl RuleChangelog {
             // No changes ever recorded; worker is already up to date.
             return Some(Vec::new());
         }
-        let first = self.changes.front().map(|(v, _)| *v).unwrap_or(0);
+        let first = self.changes.front().map_or(0, |(v, _)| *v);
         if from_version < first {
             // Worker is too far behind; needs a full snapshot.
             return None;
@@ -82,20 +78,20 @@ impl RuleChangelog {
     /// the `snapshot_lz4` field is left empty — callers must call
     /// [`handle_sync_request`] or fill it manually.
     pub fn build_response(&self, from_version: u64) -> RuleSyncResponse {
-        match self.delta_since(from_version) {
-            Some(changes) => RuleSyncResponse {
-                version: self.current_version,
-                sync_type: SyncType::Incremental,
-                changes,
-                snapshot_lz4: Vec::new(),
-            },
-            None => RuleSyncResponse {
+        self.delta_since(from_version).map_or_else(
+            || RuleSyncResponse {
                 version: self.current_version,
                 sync_type: SyncType::Full,
                 changes: Vec::new(),
                 snapshot_lz4: Vec::new(),
             },
-        }
+            |changes| RuleSyncResponse {
+                version: self.current_version,
+                sync_type: SyncType::Incremental,
+                changes,
+                snapshot_lz4: Vec::new(),
+            },
+        )
     }
 }
 
@@ -109,8 +105,7 @@ pub fn snapshot_rules(rules: &[Rule]) -> Result<Vec<u8>> {
 
 /// Decompress and deserialize a full snapshot produced by [`snapshot_rules`].
 pub fn restore_snapshot(data: &[u8]) -> Result<Vec<Rule>> {
-    let json = lz4_flex::decompress_size_prepended(data)
-        .map_err(|e| anyhow::anyhow!("lz4 decompress failed: {e}"))?;
+    let json = lz4_flex::decompress_size_prepended(data).map_err(|e| anyhow::anyhow!("lz4 decompress failed: {e}"))?;
     serde_json::from_slice(&json).context("failed to deserialize rules from snapshot")
 }
 
@@ -148,8 +143,8 @@ pub fn apply_rule_changes(registry: &mut RuleRegistry, changes: Vec<RuleChange>)
             }
             ChangeOp::Upsert => {
                 if let Some(val) = change.rule_json {
-                    let rule: Rule = serde_json::from_value(val)
-                        .context("failed to deserialize rule from incremental change")?;
+                    let rule: Rule =
+                        serde_json::from_value(val).context("failed to deserialize rule from incremental change")?;
                     registry.insert(rule);
                 }
             }
@@ -208,6 +203,5 @@ pub fn compress_snapshot(data: &[u8]) -> Vec<u8> {
 
 /// Decompress an lz4-compressed blob produced by [`compress_snapshot`].
 pub fn decompress_snapshot(data: &[u8]) -> Result<Vec<u8>> {
-    lz4_flex::decompress_size_prepended(data)
-        .map_err(|e| anyhow::anyhow!("lz4 decompress failed: {e}"))
+    lz4_flex::decompress_size_prepended(data).map_err(|e| anyhow::anyhow!("lz4 decompress failed: {e}"))
 }

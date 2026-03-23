@@ -3,6 +3,7 @@
 //! Spins up a real in-process QUIC server and client, verifies the mTLS
 //! handshake succeeds, and asserts that heartbeat messages sent by the
 //! heartbeat-sender task are received by the peer.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::sync::{
     Arc,
@@ -14,7 +15,7 @@ use rustls::server::WebPkiClientVerifier;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
-/// Install the ring CryptoProvider once per process.
+/// Install the ring `CryptoProvider` once per process.
 ///
 /// rustls 0.23 requires an explicit call when multiple feature flags
 /// (ring + aws-lc-rs) are pulled in by transitive dependencies.
@@ -31,26 +32,18 @@ use waf_cluster::{
     transport::{client::ClusterClient, frame},
 };
 
-/// Build a rustls ServerConfig that requires mTLS against the cluster CA.
-fn make_server_tls(
-    ca_der: CertificateDer<'static>,
-    cert_pem: &str,
-    key_pem: &str,
-) -> rustls::ServerConfig {
+/// Build a rustls `ServerConfig` that requires mTLS against the cluster CA.
+fn make_server_tls(ca_der: CertificateDer<'static>, cert_pem: &str, key_pem: &str) -> rustls::ServerConfig {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(ca_der).unwrap();
 
-    let verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
-        .build()
-        .unwrap();
+    let verifier = WebPkiClientVerifier::builder(Arc::new(root_store)).build().unwrap();
 
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .unwrap()
-        .unwrap();
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes()).unwrap().unwrap();
 
     let mut config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
@@ -61,7 +54,7 @@ fn make_server_tls(
     config
 }
 
-/// Bind an ephemeral QUIC server endpoint and return (endpoint, bound_addr).
+/// Bind an ephemeral QUIC server endpoint and return (endpoint, `bound_addr`).
 fn bind_server(tls: rustls::ServerConfig) -> (quinn::Endpoint, std::net::SocketAddr) {
     let quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
     let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_cfg));
@@ -73,6 +66,7 @@ fn bind_server(tls: rustls::ServerConfig) -> (quinn::Endpoint, std::net::SocketA
 /// Spawn a server task that counts received `ClusterMessage::Heartbeat` frames.
 ///
 /// Returns the shared counter so the test can inspect it.
+#[allow(clippy::excessive_nesting)]
 fn spawn_counting_server(ep: quinn::Endpoint) -> Arc<AtomicU32> {
     let counter = Arc::new(AtomicU32::new(0));
     let counter_clone = Arc::clone(&counter);
@@ -81,9 +75,8 @@ fn spawn_counting_server(ep: quinn::Endpoint) -> Arc<AtomicU32> {
         while let Some(incoming) = ep.accept().await {
             let cnt = Arc::clone(&counter_clone);
             tokio::spawn(async move {
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    Err(_) => return,
+                let Ok(conn) = incoming.await else {
+                    return;
                 };
                 // Accept streams until the connection closes
                 while let Ok((_send, mut recv)) = conn.accept_bi().await {
@@ -109,6 +102,7 @@ fn spawn_counting_server(ep: quinn::Endpoint) -> Arc<AtomicU32> {
 /// Node B (client) connects and sends periodic heartbeats.
 /// We assert that A receives at least one heartbeat within 500 ms.
 #[tokio::test]
+#[allow(clippy::similar_names)]
 async fn two_node_heartbeat_exchange() {
     install_crypto();
 
@@ -140,8 +134,7 @@ async fn two_node_heartbeat_exchange() {
     );
 
     // NodeState needed by the heartbeat sender to populate the Heartbeat fields
-    let node_state =
-        Arc::new(NodeState::new(ClusterConfig::default(), StorageMode::ForwardOnly).unwrap());
+    let node_state = Arc::new(NodeState::new(ClusterConfig::default(), StorageMode::ForwardOnly).unwrap());
 
     // Spawn client connection task (auto-reconnects; will stop when msg_rx closes)
     let state_clone = Arc::clone(&node_state);
@@ -164,12 +157,11 @@ async fn two_node_heartbeat_exchange() {
         if received.load(Ordering::SeqCst) >= 1 {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "no heartbeat received within 500 ms (got {})",
-                received.load(Ordering::SeqCst)
-            );
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no heartbeat received within 500 ms (got {})",
+            received.load(Ordering::SeqCst)
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -195,11 +187,7 @@ async fn mtls_rejects_unknown_cert() {
     let rogue_ca_der = rogue_ca.cert_der().unwrap();
 
     // Server trusts only cluster_ca
-    let server_tls = make_server_tls(
-        cluster_ca_der.clone(),
-        &server_cert.cert_pem,
-        &server_cert.key_pem,
-    );
+    let server_tls = make_server_tls(cluster_ca_der.clone(), &server_cert.cert_pem, &server_cert.key_pem);
     let (_server_ep, server_addr) = bind_server(server_tls);
 
     // Rogue client uses its own CA as trust anchor (so the server cert fails too)
@@ -214,8 +202,7 @@ async fn mtls_rejects_unknown_cert() {
     // Attempt connection — must fail (server rejects the rogue client cert)
     let (tx, rx) = mpsc::channel::<ClusterMessage>(1);
     drop(tx); // close immediately so send_loop exits
-    let rogue_state =
-        Arc::new(NodeState::new(ClusterConfig::default(), StorageMode::ForwardOnly).unwrap());
+    let rogue_state = Arc::new(NodeState::new(ClusterConfig::default(), StorageMode::ForwardOnly).unwrap());
 
     // run_with_reconnect will attempt one connect, fail, then try to sleep &
     // reconnect.  We only care that the first attempt fails (not accepted).
@@ -229,8 +216,8 @@ async fn mtls_rejects_unknown_cert() {
     // Either timeout (client keeps retrying) or an error — both are acceptable;
     // the key invariant is that the server did NOT accept the rogue client.
     match result {
-        Ok(Err(_)) => {} // expected: connection error
-        Err(_) => {}     // timeout while retrying — also acceptable
+        // expected: connection error or timeout while retrying — both acceptable
+        Ok(Err(_)) | Err(_) => {}
         Ok(Ok(())) => panic!("rogue client should not connect cleanly"),
     }
 }

@@ -9,12 +9,10 @@ use waf_storage::{
 };
 
 use crate::block_page::render_block_page;
-use crate::checker::{
-    RuleStore, check_ip_blacklist, check_ip_whitelist, check_url_blacklist, check_url_whitelist,
-};
+use crate::checker::{RuleStore, check_ip_blacklist, check_ip_whitelist, check_url_blacklist, check_url_whitelist};
 use crate::checks::{
-    AntiHotlinkCheck, BotCheck, CcCheck, Check, DirTraversalCheck, GeoCheck, OWASPCheck, RceCheck,
-    ScannerCheck, SensitiveCheck, SqlInjectionCheck, XssCheck,
+    AntiHotlinkCheck, BotCheck, CcCheck, Check, DirTraversalCheck, GeoCheck, OWASPCheck, RceCheck, ScannerCheck,
+    SensitiveCheck, SqlInjectionCheck, XssCheck,
 };
 use crate::community::CommunityChecker;
 use crate::crowdsec::{AppSecClient, AppSecResult, CrowdSecChecker, appsec_to_detection};
@@ -31,9 +29,9 @@ pub struct WafEngineConfig {
 /// Main WAF engine — runs all detection phases.
 ///
 /// Phase 1-4  : IP / URL whitelist + blacklist (fast-path)
-/// Phase 16   : CrowdSec bouncer (cache lookup — runs early for efficiency)
-/// Phase 5-11 : Attack detection (CC, scanner, bot, SQLi, XSS, RCE, traversal)
-/// Phase 16b  : CrowdSec AppSec (async HTTP check — runs after local detectors)
+/// Phase 16   : `CrowdSec` bouncer (cache lookup — runs early for efficiency)
+/// Phase 5-11 : Attack detection (CC, scanner, bot, `SQLi`, XSS, RCE, traversal)
+/// Phase 16b  : `CrowdSec` `AppSec` (async HTTP check — runs after local detectors)
 /// Phase 12   : Custom rules engine (Rhai scripting)
 /// Phase 13   : OWASP CRS subset
 /// Phase 14   : Sensitive data detection
@@ -51,16 +49,16 @@ pub struct WafEngine {
     owasp: Arc<OWASPCheck>,
     /// GeoIP-based access control check (Phase 17).
     geo_check: Arc<GeoCheck>,
-    // ── Phase 6: CrowdSec ────────────────────────────────────────────────────
-    /// Bouncer checker (set once after engine construction via set_crowdsec)
+    // ── Phase 6: `CrowdSec` ───────────────────────────────────────────────────
+    /// Bouncer checker (set once after engine construction via `set_crowdsec`)
     crowdsec_checker: OnceLock<Arc<CrowdSecChecker>>,
-    /// AppSec client (set once after engine construction via set_crowdsec)
+    /// `AppSec` client (set once after engine construction via `set_crowdsec`)
     appsec_client: OnceLock<Arc<AppSecClient>>,
     // ── Community ──────────────────────────────────────────────────────────
-    /// Community blocklist checker (set once after engine construction via set_community)
+    /// Community blocklist checker (set once after engine construction via `set_community`)
     community_checker: OnceLock<Arc<CommunityChecker>>,
-    // ── GeoIP ────────────────────────────────────────────────────────────────
-    /// GeoIP lookup service (set once after engine construction via set_geoip)
+    // ── `GeoIP` ────────────────────────────────────────────────────────────────
+    /// `GeoIP` lookup service (set once after engine construction via `set_geoip`)
     geoip: OnceLock<Arc<GeoIpService>>,
 }
 
@@ -102,7 +100,7 @@ impl WafEngine {
         }
     }
 
-    /// Plug CrowdSec components into the engine (called once after init).
+    /// Plug `CrowdSec` components into the engine (called once after init).
     pub fn set_crowdsec(&self, checker: Arc<CrowdSecChecker>, appsec: Option<Arc<AppSecClient>>) {
         let _ = self.crowdsec_checker.set(checker);
         if let Some(ac) = appsec {
@@ -115,16 +113,16 @@ impl WafEngine {
         let _ = self.community_checker.set(checker);
     }
 
-    /// Plug the GeoIP lookup service into the engine (called once after init).
+    /// Plug the `GeoIP` lookup service into the engine (called once after init).
     ///
     /// After this call every request will have its `ctx.geo` populated before
-    /// the checker pipeline runs, enabling GeoIP-based rules.
+    /// the checker pipeline runs, enabling `GeoIP`-based rules.
     pub fn set_geoip(&self, service: Arc<GeoIpService>) {
         let _ = self.geoip.set(service);
     }
 
-    /// Return a reference to the GeoCheck so callers can load rules.
-    pub fn geo_check(&self) -> &Arc<GeoCheck> {
+    /// Return a reference to the `GeoCheck` so callers can load rules.
+    pub const fn geo_check(&self) -> &Arc<GeoCheck> {
         &self.geo_check
     }
 
@@ -136,8 +134,7 @@ impl WafEngine {
         // Reload custom rules
         let custom_rules = self.db.list_custom_rules(None).await?;
         {
-            let mut by_host: std::collections::HashMap<String, Vec<_>> =
-                std::collections::HashMap::new();
+            let mut by_host: std::collections::HashMap<String, Vec<_>> = std::collections::HashMap::new();
             for row in &custom_rules {
                 match from_db_rule(row) {
                     Ok(rule) => {
@@ -154,8 +151,7 @@ impl WafEngine {
         // Reload sensitive patterns
         let patterns = self.db.list_sensitive_patterns(None).await?;
         {
-            let mut by_host: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
+            let mut by_host: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
             for row in &patterns {
                 if row.check_request {
                     by_host
@@ -165,7 +161,7 @@ impl WafEngine {
                 }
             }
             for (host_code, pats) in by_host {
-                self.sensitive.load_host(&host_code, pats);
+                self.sensitive.load_host(&host_code, &pats);
             }
         }
 
@@ -175,11 +171,7 @@ impl WafEngine {
             let domains: Vec<String> = row
                 .allowed_domains
                 .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
             let config = crate::checks::anti_hotlink::HotlinkConfig {
                 enabled: row.enabled,
@@ -195,7 +187,7 @@ impl WafEngine {
 
     /// Run the full WAF inspection pipeline.
     ///
-    /// `ctx` is taken as `&mut` so the engine can enrich it with GeoIP data
+    /// `ctx` is taken as `&mut` so the engine can enrich it with `GeoIP` data
     /// before the checker pipeline runs.  Callers should check
     /// `decision.is_allowed()`.
     pub async fn inspect(&self, ctx: &mut RequestCtx) -> WafDecision {
@@ -210,20 +202,20 @@ impl WafEngine {
         }
 
         // ── Phase 1: IP Whitelist — allow immediately if matched ──────────────
-        let ip_wl = check_ip_whitelist(ctx, &self.store);
-        if let Some(ref result) = ip_wl.result
-            && matches!(ip_wl.action, WafAction::Allow)
+        let ip_whitelist = check_ip_whitelist(ctx, &self.store);
+        if let Some(ref result) = ip_whitelist.result
+            && matches!(ip_whitelist.action, WafAction::Allow)
             && result.phase == waf_common::Phase::IpWhitelist
         {
             debug!("Request allowed by IP whitelist: {}", ctx.client_ip);
-            return ip_wl;
+            return ip_whitelist;
         }
 
         // ── Phase 2: IP Blacklist — block if matched ───────────────────────────
-        let ip_bl = check_ip_blacklist(ctx, &self.store);
-        if !ip_bl.is_allowed() {
-            self.log_attack(ctx, &ip_bl).await;
-            return ip_bl;
+        let ip_blacklist = check_ip_blacklist(ctx, &self.store);
+        if !ip_blacklist.is_allowed() {
+            self.log_attack(ctx, &ip_blacklist);
+            return ip_blacklist;
         }
 
         // ── Phase 3: URL Whitelist — allow immediately if matched ──────────────
@@ -235,7 +227,7 @@ impl WafEngine {
         // ── Phase 4: URL Blacklist — block if matched ──────────────────────────
         let url_bl = check_url_blacklist(ctx, &self.store);
         if !url_bl.is_allowed() {
-            self.log_attack(ctx, &url_bl).await;
+            self.log_attack(ctx, &url_bl);
             return url_bl;
         }
 
@@ -253,7 +245,7 @@ impl WafEngine {
                 let body = render_block_page(ctx, &rule_name);
                 WafDecision::block(403, Some(body), result)
             };
-            self.log_security_event(ctx, &decision).await;
+            self.log_security_event(ctx, &decision);
             return decision;
         }
 
@@ -271,7 +263,7 @@ impl WafEngine {
                 let body = render_block_page(ctx, &rule_name);
                 WafDecision::block(403, Some(body), result)
             };
-            self.log_security_event(ctx, &decision).await;
+            self.log_security_event(ctx, &decision);
             return decision;
         }
 
@@ -287,7 +279,7 @@ impl WafEngine {
                 let body = render_block_page(ctx, &rule_name);
                 WafDecision::block(403, Some(body), result)
             };
-            self.log_security_event(ctx, &decision).await;
+            self.log_security_event(ctx, &decision);
             return decision;
         }
 
@@ -306,7 +298,7 @@ impl WafEngine {
                     WafDecision::block(403, Some(body), result)
                 };
 
-                self.log_security_event(ctx, &decision).await;
+                self.log_security_event(ctx, &decision);
                 return decision;
             }
         }
@@ -326,7 +318,7 @@ impl WafEngine {
                         let body = render_block_page(ctx, &rule_name);
                         WafDecision::block(403, Some(body), result)
                     };
-                    self.log_security_event(ctx, &decision).await;
+                    self.log_security_event(ctx, &decision);
                     return decision;
                 }
                 AppSecResult::Allow | AppSecResult::Unavailable => {}
@@ -345,7 +337,7 @@ impl WafEngine {
                 let body = render_block_page(ctx, &rule_name);
                 WafDecision::block(403, Some(body), result)
             };
-            self.log_security_event(ctx, &decision).await;
+            self.log_security_event(ctx, &decision);
             return decision;
         }
 
@@ -361,7 +353,7 @@ impl WafEngine {
                 let body = render_block_page(ctx, &rule_name);
                 WafDecision::block(403, Some(body), result)
             };
-            self.log_security_event(ctx, &decision).await;
+            self.log_security_event(ctx, &decision);
             return decision;
         }
 
@@ -377,7 +369,7 @@ impl WafEngine {
                 let body = render_block_page(ctx, &rule_name);
                 WafDecision::block(403, Some(body), result)
             };
-            self.log_security_event(ctx, &decision).await;
+            self.log_security_event(ctx, &decision);
             return decision;
         }
 
@@ -393,7 +385,7 @@ impl WafEngine {
                 let body = render_block_page(ctx, &rule_name);
                 WafDecision::block(403, Some(body), result)
             };
-            self.log_security_event(ctx, &decision).await;
+            self.log_security_event(ctx, &decision);
             return decision;
         }
 
@@ -403,10 +395,9 @@ impl WafEngine {
     // ── Logging helpers ───────────────────────────────────────────────────────
 
     /// Log a Phase 1/2 event to the `attack_logs` table (fire-and-forget).
-    async fn log_attack(&self, ctx: &RequestCtx, decision: &WafDecision) {
-        let result = match &decision.result {
-            Some(r) => r,
-            None => return,
+    fn log_attack(&self, ctx: &RequestCtx, decision: &WafDecision) {
+        let Some(result) = &decision.result else {
+            return;
         };
 
         let action_str = match &decision.action {
@@ -455,10 +446,9 @@ impl WafEngine {
     }
 
     /// Log a Phase 2+ security event to the `security_events` table (fire-and-forget).
-    async fn log_security_event(&self, ctx: &RequestCtx, decision: &WafDecision) {
-        let result = match &decision.result {
-            Some(r) => r,
-            None => return,
+    fn log_security_event(&self, ctx: &RequestCtx, decision: &WafDecision) {
+        let Some(result) = &decision.result else {
+            return;
         };
 
         let action_str = match &decision.action {

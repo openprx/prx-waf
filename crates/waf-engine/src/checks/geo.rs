@@ -62,8 +62,7 @@ impl GeoCheck {
 
     /// Replace all geo rules for the given host (or `"*"` for global rules).
     pub fn load_rules(&self, host_code: &str, rules: Vec<GeoRule>) {
-        self.rules
-            .insert(host_code.to_string(), HostGeoRules { rules });
+        self.rules.insert(host_code.to_string(), HostGeoRules { rules });
     }
 
     /// Remove all rules for a host.
@@ -131,12 +130,7 @@ impl GeoCheck {
             return true;
         }
         // Match country name (case-insensitive)
-        if !geo.country.is_empty()
-            && rule
-                .countries
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(&geo.country))
-        {
+        if !geo.country.is_empty() && rule.countries.iter().any(|c| c.eq_ignore_ascii_case(&geo.country)) {
             return true;
         }
         false

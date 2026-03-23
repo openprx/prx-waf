@@ -4,6 +4,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 /// Host / site configuration
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Host {
     pub id: Uuid,
@@ -199,6 +200,7 @@ pub struct LbBackend {
 // ─── Request / Input types ────────────────────────────────────────────────────
 
 /// Create host request
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateHost {
     pub host: String,
@@ -432,7 +434,7 @@ pub struct StatsOverview {
     pub top_isps: Vec<TopEntry>,
 }
 
-/// GeoIP distribution statistics
+/// `GeoIP` distribution statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoStats {
     pub top_countries: Vec<TopEntry>,
@@ -441,7 +443,7 @@ pub struct GeoStats {
     pub country_distribution: Vec<GeoDistEntry>,
 }
 
-/// GeoIP country distribution entry (for map visualization)
+/// `GeoIP` country distribution entry (for map visualization)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoDistEntry {
     pub iso_code: String,
@@ -588,7 +590,7 @@ pub struct AuditLogQuery {
 
 // ─── Phase 6: CrowdSec ────────────────────────────────────────────────────────
 
-/// CrowdSec integration configuration stored in database
+/// `CrowdSec` integration configuration stored in database
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct CrowdSecConfigRow {
     pub id: i32,
@@ -599,7 +601,7 @@ pub struct CrowdSecConfigRow {
     /// AES-256-GCM encrypted API key (base64 encoded)
     pub api_key_encrypted: Option<String>,
     pub appsec_endpoint: Option<String>,
-    /// AES-256-GCM encrypted AppSec API key (base64 encoded)
+    /// AES-256-GCM encrypted `AppSec` API key (base64 encoded)
     pub appsec_key_encrypted: Option<String>,
     pub update_frequency_secs: i32,
     pub fallback_action: String,
@@ -607,7 +609,7 @@ pub struct CrowdSecConfigRow {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Upsert CrowdSec config request
+/// Upsert `CrowdSec` config request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpsertCrowdSecConfig {
     pub host_id: Option<Uuid>,
@@ -617,13 +619,13 @@ pub struct UpsertCrowdSecConfig {
     /// Plaintext API key (will be encrypted before storage)
     pub api_key: Option<String>,
     pub appsec_endpoint: Option<String>,
-    /// Plaintext AppSec API key (will be encrypted before storage)
+    /// Plaintext `AppSec` API key (will be encrypted before storage)
     pub appsec_key: Option<String>,
     pub update_frequency_secs: Option<i32>,
     pub fallback_action: Option<String>,
 }
 
-/// A persisted CrowdSec event / detection log
+/// A persisted `CrowdSec` event / detection log
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct CrowdSecEventRow {
     pub id: i64,
@@ -636,7 +638,7 @@ pub struct CrowdSecEventRow {
     pub created_at: DateTime<Utc>,
 }
 
-/// Insert a new CrowdSec event
+/// Insert a new `CrowdSec` event
 #[derive(Debug, Clone)]
 pub struct CreateCrowdSecEvent {
     pub host_id: Option<Uuid>,
@@ -647,7 +649,7 @@ pub struct CreateCrowdSecEvent {
     pub request_path: Option<String>,
 }
 
-/// Query params for listing CrowdSec events
+/// Query params for listing `CrowdSec` events
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CrowdSecEventQuery {
     pub page: Option<i64>,

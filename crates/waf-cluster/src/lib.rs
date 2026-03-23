@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use crate::crypto::ca::CertificateAuthority;
 use crate::crypto::node_cert::NodeCertificate;
 use crate::election::run_election_loop;
-use crate::health::run_heartbeat_sender;
+use crate::health::{run_heartbeat_sender, run_peer_eviction};
 use crate::transport::client::ClusterClient;
 use crate::transport::server::ClusterServer;
 
@@ -38,7 +38,7 @@ pub struct ClusterNode {
 
 impl ClusterNode {
     /// Create a cluster node from configuration.
-    pub fn new(config: ClusterConfig) -> Result<Self> {
+    pub const fn new(config: ClusterConfig) -> Result<Self> {
         Ok(Self { config })
     }
 
@@ -47,18 +47,13 @@ impl ClusterNode {
     ///
     /// This function does not return under normal operation.
     pub async fn run(self) -> Result<()> {
-        let listen_addr: SocketAddr = self
-            .config
-            .listen_addr
-            .parse()
-            .context("invalid cluster listen_addr")?;
+        let listen_addr: SocketAddr = self.config.listen_addr.parse().context("invalid cluster listen_addr")?;
 
         // ── NodeState (resolves node_id before cert generation) ──────────────
 
         let storage_mode = StorageMode::Full;
         let node_state = Arc::new(
-            NodeState::new(self.config.clone(), storage_mode)
-                .context("failed to initialise cluster node state")?,
+            NodeState::new(self.config.clone(), storage_mode).context("failed to initialise cluster node state")?,
         );
 
         // ── Certificate setup ─────────────────────────────────────────────────
@@ -72,12 +67,8 @@ impl ClusterNode {
             // Store CA private key in node state for replication to workers at join time.
             *node_state.ca_key_pem.lock() = Some(ca.key_pem().to_string());
 
-            let node_cert = NodeCertificate::generate(
-                &node_state.node_id,
-                &ca,
-                self.config.crypto.node_validity_days,
-            )
-            .context("failed to generate node certificate")?;
+            let node_cert = NodeCertificate::generate(&node_state.node_id, &ca, self.config.crypto.node_validity_days)
+                .context("failed to generate node certificate")?;
 
             (ca_cert_der, node_cert)
         } else {
@@ -117,14 +108,12 @@ impl ClusterNode {
 
         // ── Dial seed peers ──────────────────────────────────────────────────
 
-        let mut peer_senders: Vec<mpsc::Sender<ClusterMessage>> =
-            Vec::with_capacity(self.config.seeds.len());
+        let mut peer_senders: Vec<mpsc::Sender<ClusterMessage>> = Vec::with_capacity(self.config.seeds.len());
 
         for seed_str in &self.config.seeds {
             // Resolve hostname+port to SocketAddr (supports DNS names used in docker etc.)
-            let seed_addr = match resolve_seed_addr(seed_str).await {
-                Some(addr) => addr,
-                None => continue,
+            let Some(seed_addr) = resolve_seed_addr(seed_str).await else {
+                continue;
             };
 
             if seed_addr == listen_addr {
@@ -136,7 +125,23 @@ impl ClusterNode {
 
             // Register channel with NodeState so broadcast() reaches this peer.
             node_state.add_peer_channel(tx.clone());
-            peer_senders.push(tx);
+            peer_senders.push(tx.clone());
+
+            // Send JoinRequest as the initial handshake message
+            let join_req = ClusterMessage::JoinRequest(crate::protocol::JoinRequest {
+                token: String::new(),
+                csr_pem: String::new(),
+                node_info: crate::protocol::NodeInfo {
+                    node_id: node_state.node_id.clone(),
+                    hostname: node_state.node_id.clone(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    listen_addr: self.config.listen_addr.clone(),
+                    capabilities: vec!["waf".to_string()],
+                },
+            });
+            if let Err(e) = tx.try_send(join_req) {
+                warn!(seed = %seed_str, "Failed to queue JoinRequest: {e}");
+            }
 
             let client = ClusterClient::new(
                 seed_addr,
@@ -164,6 +169,18 @@ impl ClusterNode {
             });
         }
 
+        // ── Peer eviction (dead-peer cleanup) ─────────────────────────────────
+
+        {
+            let eviction_state = Arc::clone(&node_state);
+            // Check 3x the heartbeat interval — gives peers enough time to respond
+            // before being declared dead by the phi-accrual detector.
+            let eviction_interval_ms = self.config.election.heartbeat_interval_ms.saturating_mul(3);
+            tokio::spawn(async move {
+                run_peer_eviction(eviction_state, eviction_interval_ms).await;
+            });
+        }
+
         // ── Election loop ────────────────────────────────────────────────────
 
         let state_election = Arc::clone(&node_state);
@@ -173,12 +190,7 @@ impl ClusterNode {
 
         // ── QUIC server (blocks) ─────────────────────────────────────────────
 
-        let server = ClusterServer::new(
-            listen_addr,
-            ca_cert_der,
-            node_cert.cert_pem,
-            node_cert.key_pem,
-        );
+        let server = ClusterServer::new(listen_addr, ca_cert_der, node_cert.cert_pem, node_cert.key_pem);
 
         server.serve(node_state).await
     }
@@ -189,13 +201,10 @@ impl ClusterNode {
 /// Returns `None` and logs a warning if resolution fails or yields no addresses.
 async fn resolve_seed_addr(seed_str: &str) -> Option<SocketAddr> {
     match tokio::net::lookup_host(seed_str).await {
-        Ok(mut addrs) => match addrs.next() {
-            Some(addr) => Some(addr),
-            None => {
-                warn!(addr = %seed_str, "Cluster seed resolved to no addresses; skipping");
-                None
-            }
-        },
+        Ok(mut addrs) => addrs.next().or_else(|| {
+            warn!(addr = %seed_str, "Cluster seed resolved to no addresses; skipping");
+            None
+        }),
         Err(e) => {
             warn!(addr = %seed_str, error = %e, "Cannot resolve cluster seed address; skipping");
             None

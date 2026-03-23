@@ -1,8 +1,8 @@
 //! Per-node TLS certificate management.
 //!
 //! Each cluster node gets an Ed25519 certificate signed by the cluster CA.
-//! All node certs include CLUSTER_SERVER_NAME as a SAN so the SNI check
-//! passes when connecting with ServerName "cluster.prx-waf".
+//! All node certs include `CLUSTER_SERVER_NAME` as a SAN so the SNI check
+//! passes when connecting with `ServerName` "cluster.prx-waf".
 
 use anyhow::{Context, Result};
 use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
@@ -24,21 +24,23 @@ impl NodeCertificate {
     ///
     /// SANs include both `CLUSTER_SERVER_NAME` (for SNI matching on the server
     /// side) and `node_id` (for node-level identification).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if CA reconstruction, keypair generation, or certificate
+    /// signing fails.
     pub fn generate(node_id: &str, ca: &CertificateAuthority, validity_days: u32) -> Result<Self> {
         let (ca_cert, ca_key) = ca.as_rcgen_issuer().context("failed to reconstruct CA")?;
 
-        let node_key = KeyPair::generate_for(&PKCS_ED25519)
-            .context("failed to generate node Ed25519 keypair")?;
+        let node_key = KeyPair::generate_for(&PKCS_ED25519).context("failed to generate node Ed25519 keypair")?;
 
         // Both the fixed cluster server name (for SNI matching) and the node_id
         // are included as DNS SANs.
-        let mut node_params =
-            CertificateParams::new(vec![CLUSTER_SERVER_NAME.to_owned(), node_id.to_owned()])
-                .context("invalid SAN for node certificate")?;
+        let mut node_params = CertificateParams::new(vec![CLUSTER_SERVER_NAME.to_owned(), node_id.to_owned()])
+            .context("invalid SAN for node certificate")?;
 
         node_params.not_before = OffsetDateTime::now_utc();
-        node_params.not_after =
-            OffsetDateTime::now_utc() + time::Duration::days(validity_days as i64);
+        node_params.not_after = OffsetDateTime::now_utc() + time::Duration::days(i64::from(validity_days));
 
         let node_cert = node_params
             .signed_by(&node_key, &ca_cert, &ca_key)
@@ -53,7 +55,7 @@ impl NodeCertificate {
     }
 
     /// Load node cert from PEM strings (e.g., read from disk on restart).
-    pub fn from_pem(cert_pem: String, key_pem: String) -> Self {
+    pub const fn from_pem(cert_pem: String, key_pem: String) -> Self {
         Self { cert_pem, key_pem }
     }
 
@@ -95,8 +97,7 @@ mod tests {
         let ca = CertificateAuthority::generate(3650).unwrap();
         let node_cert = NodeCertificate::generate("node-roundtrip", &ca, 365).unwrap();
 
-        let loaded =
-            NodeCertificate::from_pem(node_cert.cert_pem.clone(), node_cert.key_pem.clone());
+        let loaded = NodeCertificate::from_pem(node_cert.cert_pem.clone(), node_cert.key_pem.clone());
         assert_eq!(loaded.cert_pem, node_cert.cert_pem);
         assert_eq!(loaded.key_pem, node_cert.key_pem);
     }

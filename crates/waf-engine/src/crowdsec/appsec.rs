@@ -8,21 +8,21 @@ use waf_common::{DetectionResult, Phase, RequestCtx};
 use super::config::AppSecConfig;
 use super::models::AppSecResponse;
 
-/// Result of an AppSec check
+/// Result of an `AppSec` check
 #[derive(Debug, Clone)]
 pub enum AppSecResult {
     /// Request is clean — allow it
     Allow,
     /// Request is malicious — block it
     Block { message: String },
-    /// AppSec engine unavailable — caller applies fallback_action
+    /// `AppSec` engine unavailable — caller applies `fallback_action`
     Unavailable,
 }
 
-/// CrowdSec AppSec protocol client.
+/// `CrowdSec` `AppSec` protocol client.
 ///
-/// Implements the CrowdSec AppSec protocol: forward each request to the
-/// AppSec HTTP endpoint using special headers, then act on the response.
+/// Implements the `CrowdSec` `AppSec` protocol: forward each request to the
+/// `AppSec` HTTP endpoint using special headers, then act on the response.
 pub struct AppSecClient {
     client: Client,
     config: AppSecConfig,
@@ -37,7 +37,7 @@ impl AppSecClient {
         Ok(Self { client, config })
     }
 
-    /// Check a request against the CrowdSec AppSec engine.
+    /// Check a request against the `CrowdSec` `AppSec` engine.
     ///
     /// Returns `AppSecResult::Unavailable` on network/timeout errors so that
     /// the caller can apply the configured `failure_action`.
@@ -69,10 +69,10 @@ impl AppSecClient {
         }
 
         // Forward body for methods that carry one
-        let builder = if !ctx.body_preview.is_empty() {
-            builder.body(ctx.body_preview.clone())
-        } else {
+        let builder = if ctx.body_preview.is_empty() {
             builder
+        } else {
+            builder.body(ctx.body_preview.clone())
         };
 
         let resp = builder.send().await.context("AppSec HTTP request failed")?;
@@ -97,7 +97,7 @@ impl AppSecClient {
     }
 }
 
-/// Convert an AppSec block result into a WAF `DetectionResult`.
+/// Convert an `AppSec` block result into a WAF `DetectionResult`.
 pub fn appsec_to_detection(message: String) -> DetectionResult {
     DetectionResult {
         rule_id: Some("crowdsec:appsec".to_string()),

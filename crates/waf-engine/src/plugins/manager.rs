@@ -44,9 +44,9 @@ impl TryFrom<i32> for PluginAction {
     type Error = ();
     fn try_from(v: i32) -> Result<Self, Self::Error> {
         match v {
-            0 => Ok(PluginAction::Allow),
-            1 => Ok(PluginAction::Block),
-            2 => Ok(PluginAction::Log),
+            0 => Ok(Self::Allow),
+            1 => Ok(Self::Block),
+            2 => Ok(Self::Log),
             _ => Err(()),
         }
     }
@@ -127,12 +127,7 @@ impl WasmPlugin {
         }
     }
 
-    fn run_request(
-        &self,
-        method: &str,
-        path: &str,
-        client_ip: &str,
-    ) -> anyhow::Result<PluginAction> {
+    fn run_request(&self, method: &str, path: &str, client_ip: &str) -> anyhow::Result<PluginAction> {
         let mut store = Store::new(&self.engine, ());
         store.set_fuel(FUEL_PER_CALL)?;
 
@@ -141,22 +136,22 @@ impl WasmPlugin {
 
         // Try to write context into plugin memory (best-effort)
         if let Some(mem) = instance.get_memory(&mut store, "memory") {
-            let combined = format!("{}\0{}\0{}\0", method, path, client_ip);
+            let combined = format!("{method}\0{path}\0{client_ip}\0");
             let bytes = combined.as_bytes();
+            #[allow(clippy::cast_possible_truncation)]
             if bytes.len() < MAX_MEMORY_BYTES as usize {
                 let _ = mem.write(&mut store, 0, bytes);
             }
         }
 
         // Call on_request() -> i32
-        let action_code =
-            if let Ok(func) = instance.get_typed_func::<(), i32>(&mut store, "on_request") {
-                func.call(&mut store, ())?
-            } else if let Ok(func) = instance.get_typed_func::<(), i32>(&mut store, "get_action") {
-                func.call(&mut store, ())?
-            } else {
-                0 // default Allow
-            };
+        let action_code = if let Ok(func) = instance.get_typed_func::<(), i32>(&mut store, "on_request") {
+            func.call(&mut store, ())?
+        } else if let Ok(func) = instance.get_typed_func::<(), i32>(&mut store, "get_action") {
+            func.call(&mut store, ())?
+        } else {
+            0 // default Allow
+        };
 
         Ok(PluginAction::try_from(action_code).unwrap_or(PluginAction::Allow))
     }
@@ -169,22 +164,25 @@ impl WasmPlugin {
         let instance = linker.instantiate(&mut store, &self.module).ok()?;
         let mem = instance.get_memory(&mut store, "memory")?;
 
-        let ptr = instance
+        let ptr_i32 = instance
             .get_typed_func::<(), i32>(&mut store, ptr_export)
             .ok()?
             .call(&mut store, ())
-            .ok()? as usize;
-        let len = instance
+            .ok()?;
+        let len_i32 = instance
             .get_typed_func::<(), i32>(&mut store, len_export)
             .ok()?
             .call(&mut store, ())
-            .ok()? as usize;
+            .ok()?;
+
+        let ptr = usize::try_from(ptr_i32).ok()?;
+        let len = usize::try_from(len_i32).ok()?;
 
         let data = mem.data(&store);
         if ptr + len <= data.len() {
-            std::str::from_utf8(&data[ptr..ptr + len])
-                .ok()
-                .map(|s| s.to_owned())
+            data.get(ptr..ptr + len)
+                .and_then(|slice| std::str::from_utf8(slice).ok())
+                .map(ToOwned::to_owned)
         } else {
             None
         }
@@ -238,16 +236,20 @@ impl PluginManager {
             params.enabled,
             params.wasm_bytes,
         )?;
-        let mut map = self.plugins.write().await;
-        map.insert(params.id, Arc::new(plugin));
+        {
+            let mut map = self.plugins.write().await;
+            map.insert(params.id, Arc::new(plugin));
+        }
         info!(plugin = %params.name, "WASM plugin loaded");
         Ok(())
     }
 
     /// Remove a plugin by ID.
     pub async fn unload(&self, id: Uuid) -> bool {
-        let mut map = self.plugins.write().await;
-        let removed = map.remove(&id).is_some();
+        let removed = {
+            let mut map = self.plugins.write().await;
+            map.remove(&id).is_some()
+        };
         if removed {
             debug!(plugin_id = %id, "WASM plugin unloaded");
         }
@@ -256,36 +258,42 @@ impl PluginManager {
 
     /// Enable or disable a plugin without unloading it.
     pub async fn set_enabled(&self, id: Uuid, enabled: bool) -> bool {
-        let map = self.plugins.read().await;
-        if let Some(plugin) = map.get(&id) {
+        let exists = {
+            let map = self.plugins.read().await;
+            map.contains_key(&id)
+        };
+        if exists {
             // WasmPlugin.enabled is set on load; we rebuild the entry
-            let p = plugin.clone();
-            drop(map);
-            let mut wmap = self.plugins.write().await;
-            if let Some(existing) = wmap.remove(&id) {
-                let updated = WasmPlugin {
-                    enabled,
-                    id: existing.id,
-                    name: existing.name.clone(),
-                    version: existing.version.clone(),
-                    description: existing.description.clone(),
-                    author: existing.author.clone(),
-                    engine: existing.engine.clone(),
-                    module: existing.module.clone(),
-                };
-                wmap.insert(id, Arc::new(updated));
-                return true;
-            }
-            drop(p);
+            let found = {
+                let mut wmap = self.plugins.write().await;
+                wmap.remove(&id).is_some_and(|existing| {
+                    let updated = WasmPlugin {
+                        enabled,
+                        id: existing.id,
+                        name: existing.name.clone(),
+                        version: existing.version.clone(),
+                        description: existing.description.clone(),
+                        author: existing.author.clone(),
+                        engine: existing.engine.clone(),
+                        module: existing.module.clone(),
+                    };
+                    wmap.insert(id, Arc::new(updated));
+                    true
+                })
+            };
+            return found;
         }
         false
     }
 
     /// Run all enabled plugins' `on_request` and return the strictest decision.
     pub async fn run_request(&self, method: &str, path: &str, client_ip: &str) -> PluginAction {
-        let map = self.plugins.read().await;
+        let plugins: Vec<Arc<WasmPlugin>> = {
+            let map = self.plugins.read().await;
+            map.values().cloned().collect()
+        };
         let mut decision = PluginAction::Allow;
-        for plugin in map.values() {
+        for plugin in &plugins {
             let action = plugin.on_request(method, path, client_ip);
             if action == PluginAction::Block {
                 error!(plugin = %plugin.name, %path, "Plugin blocked request");
@@ -299,12 +307,7 @@ impl PluginManager {
     }
 
     pub async fn list(&self) -> Vec<PluginInfo> {
-        self.plugins
-            .read()
-            .await
-            .values()
-            .map(|p| p.info())
-            .collect()
+        self.plugins.read().await.values().map(|p| p.info()).collect()
     }
 
     pub async fn get(&self, id: Uuid) -> Option<Arc<WasmPlugin>> {

@@ -5,7 +5,7 @@ use waf_common::{DetectionResult, Phase, RequestCtx};
 
 use super::{Check, request_targets};
 
-/// Pattern descriptions aligned by index with SQLI_SET patterns.
+/// Pattern descriptions aligned by index with `SQLI_SET` patterns.
 static SQLI_DESCS: &[&str] = &[
     "UNION SELECT injection",
     "comment-based injection (-- / #)",
@@ -21,6 +21,7 @@ static SQLI_DESCS: &[&str] = &[
     "MySQL/MSSQL system table enumeration",
 ];
 
+#[allow(clippy::expect_used)]
 static SQLI_SET: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         // UNION … SELECT
@@ -55,7 +56,7 @@ static SQLI_SET: LazyLock<RegexSet> = LazyLock::new(|| {
 pub struct SqlInjectionCheck;
 
 impl SqlInjectionCheck {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -76,15 +77,12 @@ impl Check for SqlInjectionCheck {
             let matches = SQLI_SET.matches(&value);
             if matches.matched_any() {
                 let idx = matches.iter().next().unwrap_or(0);
-                let desc = SQLI_DESCS
-                    .get(idx)
-                    .copied()
-                    .unwrap_or("SQL Injection pattern");
+                let desc = SQLI_DESCS.get(idx).copied().unwrap_or("SQL Injection pattern");
                 return Some(DetectionResult {
                     rule_id: Some(format!("SQLI-{:03}", idx + 1)),
                     rule_name: "SQL Injection".to_string(),
                     phase: Phase::SqlInjection,
-                    detail: format!("{} detected in {}", desc, location),
+                    detail: format!("{desc} detected in {location}"),
                 });
             }
         }

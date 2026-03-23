@@ -37,7 +37,7 @@ impl Database {
     }
 
     /// Get a reference to the connection pool
-    pub fn pool(&self) -> &PgPool {
+    pub const fn pool(&self) -> &PgPool {
         &self.pool
     }
 
@@ -59,7 +59,7 @@ fn sanitize_url(url: &str) -> String {
     {
         let scheme = &url[..scheme_end + 3];
         let rest = &url[at_pos..];
-        return format!("{}***{}", scheme, rest);
+        return format!("{scheme}***{rest}");
     }
     url.to_string()
 }

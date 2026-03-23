@@ -39,7 +39,7 @@ pub struct ClusterClient {
 
 impl ClusterClient {
     /// Create a new cluster client.
-    pub fn new(
+    pub const fn new(
         peer_addr: SocketAddr,
         node_id: String,
         ca_cert_der: CertificateDer<'static>,
@@ -62,15 +62,13 @@ impl ClusterClient {
             .add(self.ca_cert_der.clone())
             .context("failed to add cluster CA to client root store")?;
 
-        let certs: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut self.node_cert_pem.as_bytes())
-                .collect::<Result<Vec<_>, _>>()
-                .context("failed to parse node cert PEM")?;
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut self.node_cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to parse node cert PEM")?;
 
-        let key: PrivateKeyDer<'static> =
-            rustls_pemfile::private_key(&mut self.node_key_pem.as_bytes())
-                .context("failed to read node key PEM")?
-                .context("no private key found in node key PEM")?;
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut self.node_key_pem.as_bytes())
+            .context("failed to read node key PEM")?
+            .context("no private key found in node key PEM")?;
 
         let mut tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
@@ -95,12 +93,8 @@ impl ClusterClient {
             .map_err(|e| anyhow::anyhow!("QUIC client TLS config error: {e:?}"))?;
         let client_config = quinn::ClientConfig::new(Arc::new(quic_config));
 
-        let mut endpoint = quinn::Endpoint::client(
-            "0.0.0.0:0"
-                .parse()
-                .context("failed to parse ephemeral bind addr")?,
-        )
-        .context("failed to bind QUIC client endpoint")?;
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().context("failed to parse ephemeral bind addr")?)
+            .context("failed to bind QUIC client endpoint")?;
         endpoint.set_default_client_config(client_config);
 
         let conn = endpoint
@@ -115,10 +109,7 @@ impl ClusterClient {
             "Connected to cluster peer"
         );
 
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .context("failed to open cluster control stream")?;
+        let (mut send, mut recv) = conn.open_bi().await.context("failed to open cluster control stream")?;
 
         let state = Arc::clone(node_state);
         tokio::select! {
@@ -156,7 +147,7 @@ impl ClusterClient {
     }
 
     /// Peer address this client dials.
-    pub fn peer_addr(&self) -> SocketAddr {
+    pub const fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
 }
@@ -164,19 +155,15 @@ impl ClusterClient {
 /// Write queued outbound messages to the control stream.
 ///
 /// Returns `Ok(())` when `msg_rx` is closed (no more senders).
-async fn send_loop(
-    send: &mut quinn::SendStream,
-    msg_rx: &mut mpsc::Receiver<ClusterMessage>,
-) -> Result<()> {
+async fn send_loop(send: &mut quinn::SendStream, msg_rx: &mut mpsc::Receiver<ClusterMessage>) -> Result<()> {
     loop {
-        match msg_rx.recv().await {
-            Some(msg) => frame::write_frame(send, &msg)
+        if let Some(msg) = msg_rx.recv().await {
+            frame::write_frame(send, &msg)
                 .await
-                .context("failed to write cluster frame to peer")?,
-            None => {
-                debug!("Cluster outbound channel closed; send loop exiting");
-                return Ok(());
-            }
+                .context("failed to write cluster frame to peer")?;
+        } else {
+            debug!("Cluster outbound channel closed; send loop exiting");
+            return Ok(());
         }
     }
 }
@@ -200,12 +187,18 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
                 let mut peers = node_state.peers.write().await;
                 if let Some(peer) = peers.iter_mut().find(|p| p.node_id == hb.node_id) {
                     peer.last_seen_ms = now_ms;
+                    peer.role = hb.role;
+                } else {
+                    // Auto-register unknown peer on first heartbeat
+                    peers.push(crate::node::PeerInfo {
+                        node_id: hb.node_id.clone(),
+                        addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                        role: hb.role,
+                        last_seen_ms: now_ms,
+                    });
                 }
             }
-            node_state
-                .heartbeat_tracker
-                .lock()
-                .record(&hb.node_id, now_ms);
+            node_state.heartbeat_tracker.lock().record(&hb.node_id, now_ms);
             debug!(
                 from = %hb.node_id,
                 seq = hb.sequence,
@@ -226,6 +219,40 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
                         Err(e) => warn!("Failed to decode encrypted_ca_key_b64: {e}"),
                     }
                 }
+
+                // Register main node in the cluster topology
+                let main_addr = node_state
+                    .config
+                    .seeds
+                    .first()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                node_state
+                    .add_or_update_peer(crate::node::PeerInfo {
+                        node_id: resp.cluster_state.main_node_id.clone(),
+                        addr: main_addr,
+                        role: waf_common::config::NodeRole::Main,
+                        last_seen_ms: unix_ms(),
+                    })
+                    .await;
+
+                // Also register any other known cluster members
+                for node_info in &resp.cluster_state.nodes {
+                    if node_info.node_id != node_state.node_id {
+                        let addr = node_info
+                            .listen_addr
+                            .parse()
+                            .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                        node_state
+                            .add_or_update_peer(crate::node::PeerInfo {
+                                node_id: node_info.node_id.clone(),
+                                addr,
+                                role: waf_common::config::NodeRole::Worker,
+                                last_seen_ms: unix_ms(),
+                            })
+                            .await;
+                    }
+                }
             } else {
                 warn!(
                     reason = resp.reason.as_deref().unwrap_or("unknown"),
@@ -238,9 +265,7 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
             if let Some(voter_id) = vote.voter_id {
                 // This is a vote-grant echo addressed to us as the candidate.
                 if vote.candidate_id == node_state.node_id {
-                    let recorded = node_state
-                        .election
-                        .record_vote_for_me(vote.term, voter_id.clone());
+                    let recorded = node_state.election.record_vote_for_me(vote.term, voter_id.clone());
                     if recorded {
                         debug!(voter = %voter_id, term = vote.term, "Vote grant received");
                     }
@@ -254,12 +279,10 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
             }
         }
 
-        ClusterMessage::ElectionResult(result) => {
-            match node_state.election.process_result(&result).await {
-                Ok(new_role) => node_state.transition_to(new_role).await,
-                Err(e) => warn!("process_result error: {e}"),
-            }
-        }
+        ClusterMessage::ElectionResult(result) => match node_state.election.process_result(&result) {
+            Ok(new_role) => node_state.transition_to(new_role).await,
+            Err(e) => warn!("process_result error: {e}"),
+        },
 
         other => {
             debug!(
@@ -270,6 +293,7 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

@@ -19,29 +19,26 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-/// All runtime components of the CrowdSec integration.
+/// All runtime components of the `CrowdSec` integration.
 pub struct CrowdSecComponents {
     /// Shared decision cache (also exposed via API)
     pub cache: Arc<DecisionCache>,
     /// Bouncer checker — plugged into the WAF pipeline
     pub checker: Arc<CrowdSecChecker>,
-    /// Optional AppSec client for async per-request checks
+    /// Optional `AppSec` client for async per-request checks
     pub appsec_client: Option<Arc<AppSecClient>>,
     /// Optional log pusher
     pub pusher: Option<Arc<CrowdSecPusher>>,
     /// LAPI client (shared with API handlers for delete/test)
     pub lapi_client: Arc<CrowdSecClient>,
     /// Background sync task handle
-    pub _sync_handle: tokio::task::JoinHandle<()>,
+    pub sync_handle: tokio::task::JoinHandle<()>,
 }
 
-/// Initialise the CrowdSec integration from config.
+/// Initialise the `CrowdSec` integration from config.
 ///
 /// Returns `None` when `config.enabled == false`.
-pub async fn init_crowdsec(
-    config: CrowdSecConfig,
-    shutdown_rx: watch::Receiver<bool>,
-) -> Option<CrowdSecComponents> {
+pub async fn init_crowdsec(config: CrowdSecConfig, shutdown_rx: watch::Receiver<bool>) -> Option<CrowdSecComponents> {
     if !config.enabled {
         return None;
     }
@@ -85,10 +82,7 @@ pub async fn init_crowdsec(
 
     // Log pusher
     let pusher = config.pusher.as_ref().map(|pusher_cfg| {
-        let p = Arc::new(CrowdSecPusher::new(
-            Arc::clone(&lapi_client),
-            pusher_cfg.clone(),
-        ));
+        let p = Arc::new(CrowdSecPusher::new(Arc::clone(&lapi_client), pusher_cfg.clone()));
         // Start flush background task
         let p2 = Arc::clone(&p);
         let rx2 = shutdown_rx.clone();
@@ -99,9 +93,8 @@ pub async fn init_crowdsec(
     // Start decision sync task
     let client_sync = Arc::clone(&lapi_client);
     let cache_sync = Arc::clone(&cache);
-    let config_sync = config.clone();
     let sync_handle = tokio::spawn(async move {
-        sync::run_decision_sync(client_sync, cache_sync, config_sync, shutdown_rx).await;
+        sync::run_decision_sync(client_sync, cache_sync, config, shutdown_rx).await;
     });
 
     Some(CrowdSecComponents {
@@ -110,6 +103,6 @@ pub async fn init_crowdsec(
         appsec_client,
         pusher,
         lapi_client,
-        _sync_handle: sync_handle,
+        sync_handle,
     })
 }

@@ -2,6 +2,7 @@
 //!
 //! Exercises the Raft-lite election state machine, phi-accrual failure detection,
 //! and split-brain prevention fencing without requiring a live QUIC cluster.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -56,8 +57,7 @@ async fn candidate_with_majority_wins_election() {
     assert_eq!(node.election.vote_count_for_term(term), 1);
 
     // Simulate voter-1 granting the vote (normally arrives via QUIC recv).
-    node.election
-        .record_vote_for_me(term, "voter-1".to_string());
+    node.election.record_vote_for_me(term, "voter-1".to_string());
 
     let vote_count = node.election.vote_count_for_term(term);
     let total = node.total_nodes().await; // 1 peer + self = 2
@@ -103,12 +103,8 @@ async fn stale_election_result_rejected() {
         elected_id: "stale-leader".to_string(),
         voter_ids: vec!["stale-leader".to_string(), "zombie-1".to_string()],
     };
-    let role = em.process_result(&stale).await.expect("process_result");
-    assert_eq!(
-        role,
-        NodeRole::Worker,
-        "stale-term result must not grant Main role"
-    );
+    let role = em.process_result(&stale).expect("process_result");
+    assert_eq!(role, NodeRole::Worker, "stale-term result must not grant Main role");
     assert_eq!(
         em.current_term_sync(),
         5,
@@ -119,21 +115,10 @@ async fn stale_election_result_rejected() {
     let valid_other = ElectionResult {
         term: 5,
         elected_id: "node-b".to_string(),
-        voter_ids: vec![
-            "node-a".to_string(),
-            "node-b".to_string(),
-            "node-c".to_string(),
-        ],
+        voter_ids: vec!["node-a".to_string(), "node-b".to_string(), "node-c".to_string()],
     };
-    let role = em
-        .process_result(&valid_other)
-        .await
-        .expect("process_result");
-    assert_eq!(
-        role,
-        NodeRole::Worker,
-        "node-a should step down when node-b wins"
-    );
+    let role = em.process_result(&valid_other).expect("process_result");
+    assert_eq!(role, NodeRole::Worker, "node-a should step down when node-b wins");
 
     // A valid result at term 6 electing us → we become Main.
     let valid_us = ElectionResult {
@@ -141,17 +126,9 @@ async fn stale_election_result_rejected() {
         elected_id: "node-a".to_string(),
         voter_ids: vec!["node-a".to_string(), "node-b".to_string()],
     };
-    let role = em.process_result(&valid_us).await.expect("process_result");
-    assert_eq!(
-        role,
-        NodeRole::Main,
-        "node-a must become Main when it is elected"
-    );
-    assert_eq!(
-        em.current_term_sync(),
-        6,
-        "term should advance to 6 after valid result"
-    );
+    let role = em.process_result(&valid_us).expect("process_result");
+    assert_eq!(role, NodeRole::Main, "node-a must become Main when it is elected");
+    assert_eq!(em.current_term_sync(), 6, "term should advance to 6 after valid result");
 }
 
 // ─── Test 3: Concurrent election — only the majority winner survives ──────────
@@ -209,26 +186,12 @@ async fn concurrent_election_only_majority_wins() {
     };
 
     // A receives the result and steps down.
-    let a_role = em_a
-        .process_result(&result)
-        .await
-        .expect("A process_result");
-    assert_eq!(
-        a_role,
-        NodeRole::Worker,
-        "losing candidate A must step down"
-    );
+    let a_role = em_a.process_result(&result).expect("A process_result");
+    assert_eq!(a_role, NodeRole::Worker, "losing candidate A must step down");
 
     // B processes its own result and becomes Main.
-    let b_role = em_b
-        .process_result(&result)
-        .await
-        .expect("B process_result");
-    assert_eq!(
-        b_role,
-        NodeRole::Main,
-        "winning candidate B must become Main"
-    );
+    let b_role = em_b.process_result(&result).expect("B process_result");
+    assert_eq!(b_role, NodeRole::Main, "winning candidate B must become Main");
 
     // Both converge on term 1.
     assert_eq!(em_a.current_term_sync(), 1);
@@ -257,11 +220,11 @@ async fn vote_grant_idempotent_deny_different_candidate() {
     };
 
     // First vote for cand-a: granted.
-    assert!(em.process_vote(&vote_a).await.expect("vote_a first"));
+    assert!(em.process_vote(&vote_a).expect("vote_a first"));
     // Same candidate again: still granted (idempotent).
-    assert!(em.process_vote(&vote_a).await.expect("vote_a repeat"));
+    assert!(em.process_vote(&vote_a).expect("vote_a repeat"));
     // Different candidate in same term: denied.
-    assert!(!em.process_vote(&vote_b).await.expect("vote_b denied"));
+    assert!(!em.process_vote(&vote_b).expect("vote_b denied"));
 
     // Stale term: denied regardless.
     let vote_old = ElectionVote {
@@ -270,5 +233,5 @@ async fn vote_grant_idempotent_deny_different_candidate() {
         last_log_index: 0,
         voter_id: None,
     };
-    assert!(!em.process_vote(&vote_old).await.expect("stale vote"));
+    assert!(!em.process_vote(&vote_old).expect("stale vote"));
 }

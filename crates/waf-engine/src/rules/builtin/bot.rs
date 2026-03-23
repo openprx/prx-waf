@@ -3,7 +3,7 @@
 //! Covers:
 //! - Known good bots (search engines) — tagged allow
 //! - Known bad bots (scrapers, spam, headless browsers) — tagged block
-//! - AI crawlers (GPTBot, Claude-Web, CCBot, etc.) — tagged block by default
+//! - AI crawlers (`GPTBot`, `Claude-Web`, `CCBot`, etc.) — tagged block by default
 //! - Behavior indicators (empty UA, scripted HTTP clients)
 
 use super::super::registry::Rule;
@@ -22,7 +22,7 @@ fn rule(id: &str, name: &str, pattern: &str, action: &str, severity: &str, tags:
         action: action.to_string(),
         severity: Some(severity.to_string()),
         pattern: Some(pattern.to_string()),
-        tags: tags.iter().map(|s| s.to_string()).collect(),
+        tags: tags.iter().copied().map(ToString::to_string).collect(),
         metadata: meta,
     }
 }

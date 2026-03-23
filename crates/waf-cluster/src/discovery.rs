@@ -20,7 +20,7 @@ impl StaticSeeds {
             .iter()
             .map(|s| {
                 s.parse::<SocketAddr>()
-                    .map_err(|e| anyhow::anyhow!("invalid seed address {:?}: {e}", s))
+                    .map_err(|e| anyhow::anyhow!("invalid seed address {s:?}: {e}"))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { seeds })

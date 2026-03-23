@@ -1,19 +1,18 @@
-//! ModSecurity SecRule parser — basic subset.
+//! `ModSecurity` `SecRule` parser — basic subset.
 //!
 //! Supported directives: `SecRule`
-//! Supported variables: ARGS, REQUEST_HEADERS, REQUEST_URI, REQUEST_BODY, REQUEST_METHOD
-//! Supported operators: @rx (regex), @contains, @beginsWith, @endsWith, @ipMatch
+//! Supported variables: `ARGS`, `REQUEST_HEADERS`, `REQUEST_URI`, `REQUEST_BODY`, `REQUEST_METHOD`
+//! Supported operators: `@rx` (regex), `@contains`, `@beginsWith`, `@endsWith`, `@ipMatch`
 //! Supported actions: deny, pass, log, block, redirect, allow
 //! Continuation lines via `\` are supported.
 
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use regex::Regex;
 
 use super::super::registry::Rule;
 
-/// Parse a ModSecurity rule file into the internal `Rule` format.
+/// Parse a `ModSecurity` rule file into the internal `Rule` format.
 pub fn parse(content: &str) -> Result<Vec<Rule>> {
     // Join continuation lines
     let joined = join_lines(content);
@@ -72,17 +71,21 @@ fn parse_secrule(line: &str, line_no: usize) -> Result<Rule> {
     // Operator: next token (could be @rx, @contains, etc.) wrapped in quotes or bare
     // Actions: last quoted string
 
-    let parts = split_secrule_parts(rest)?;
+    let parts = split_secrule_parts(rest);
     if parts.len() < 3 {
-        bail!(
-            "line {line_no}: expected VARIABLES OPERATOR ACTIONS, got {}",
-            line
-        );
+        bail!("line {line_no}: expected VARIABLES OPERATOR ACTIONS, got {line}");
     }
 
-    let variables = &parts[0];
-    let operator_str = &parts[1];
-    let actions_str = &parts[2];
+    // SAFETY: length checked >= 3 above
+    let Some(variables) = parts.first() else {
+        bail!("line {line_no}: missing VARIABLES");
+    };
+    let Some(operator_str) = parts.get(1) else {
+        bail!("line {line_no}: missing OPERATOR");
+    };
+    let Some(actions_str) = parts.get(2) else {
+        bail!("line {line_no}: missing ACTIONS");
+    };
 
     // Parse operator and value
     let (op_name, op_value) = parse_operator(operator_str);
@@ -92,13 +95,12 @@ fn parse_secrule(line: &str, line_no: usize) -> Result<Rule> {
 
     let id = actions
         .get("id")
-        .map(|s| format!("MODSEC-{}", s))
-        .unwrap_or_else(|| format!("MODSEC-LINE-{}", line_no));
+        .map_or_else(|| format!("MODSEC-LINE-{line_no}"), |s| format!("MODSEC-{s}"));
 
     let name = actions
         .get("msg")
         .cloned()
-        .unwrap_or_else(|| format!("ModSecurity rule {}", id));
+        .unwrap_or_else(|| format!("ModSecurity rule {id}"));
 
     let action = if actions.contains_key("deny") || actions.contains_key("block") {
         "block"
@@ -136,26 +138,23 @@ fn parse_secrule(line: &str, line_no: usize) -> Result<Rule> {
     })
 }
 
-/// Split "VARIABLES OPERATOR ACTIONS_STRING" respecting quotes.
-fn split_secrule_parts(s: &str) -> Result<Vec<String>> {
+/// Split `VARIABLES OPERATOR ACTIONS_STRING` respecting quotes.
+fn split_secrule_parts(s: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
-    let chars = s.chars().peekable();
 
-    for c in chars {
+    for c in s.chars() {
         match c {
             '"' => {
                 in_quotes = !in_quotes;
                 if !in_quotes && !current.is_empty() {
-                    parts.push(current.clone());
-                    current.clear();
+                    parts.push(std::mem::take(&mut current));
                 }
             }
             ' ' | '\t' if !in_quotes => {
                 if !current.is_empty() {
-                    parts.push(current.clone());
-                    current.clear();
+                    parts.push(std::mem::take(&mut current));
                 }
             }
             _ => current.push(c),
@@ -164,7 +163,7 @@ fn split_secrule_parts(s: &str) -> Result<Vec<String>> {
     if !current.is_empty() {
         parts.push(current);
     }
-    Ok(parts)
+    parts
 }
 
 /// Parse an operator string like `@rx pattern` or `"@contains foo"`.
@@ -195,10 +194,7 @@ fn parse_actions(actions: &str) -> HashMap<String, String> {
     for part in actions.split(',') {
         let part = part.trim().trim_matches('"').trim_matches('\'');
         if let Some((k, v)) = part.split_once(':') {
-            map.insert(
-                k.trim().to_lowercase(),
-                v.trim().trim_matches('\'').to_string(),
-            );
+            map.insert(k.trim().to_lowercase(), v.trim().trim_matches('\'').to_string());
         } else if !part.is_empty() {
             map.insert(part.to_lowercase(), String::new());
         }
@@ -229,11 +225,8 @@ fn infer_category(variables: &str, value: &str) -> String {
     "custom".to_string()
 }
 
-// Satisfy the unused import from Regex
-#[allow(unused_imports)]
-use Regex as _Regex;
-
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -249,8 +242,7 @@ mod tests {
 
     #[test]
     fn parse_continuation_line() {
-        let content =
-            "SecRule ARGS \"@contains <script>\" \\\n    \"id:1002,phase:2,deny,msg:'XSS'\"\n";
+        let content = "SecRule ARGS \"@contains <script>\" \\\n    \"id:1002,phase:2,deny,msg:'XSS'\"\n";
         let rules = parse(content).unwrap();
         assert_eq!(rules.len(), 1);
     }

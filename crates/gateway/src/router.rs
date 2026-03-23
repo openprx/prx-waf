@@ -11,9 +11,7 @@ pub struct HostRouter {
 
 impl Default for HostRouter {
     fn default() -> Self {
-        Self {
-            routes: DashMap::new(),
-        }
+        Self { routes: DashMap::new() }
     }
 }
 
@@ -23,20 +21,20 @@ impl HostRouter {
     }
 
     /// Register a host configuration
-    pub fn register(&self, config: Arc<HostConfig>) {
+    pub fn register(&self, config: &Arc<HostConfig>) {
         // Register by "host:port"
         let key = format!("{}:{}", config.host, config.port);
-        self.routes.insert(key, Arc::clone(&config));
+        self.routes.insert(key, Arc::clone(config));
 
         // Also register by bare hostname for default ports (80/443)
         if config.port == 80 || config.port == 443 {
-            self.routes.insert(config.host.clone(), Arc::clone(&config));
+            self.routes.insert(config.host.clone(), Arc::clone(config));
         }
     }
 
     /// Remove a host configuration
     pub fn unregister(&self, host: &str, port: u16) {
-        let key = format!("{}:{}", host, port);
+        let key = format!("{host}:{port}");
         self.routes.remove(&key);
         if port == 80 || port == 443 {
             self.routes.remove(host);
@@ -67,7 +65,7 @@ impl HostRouter {
         let mut seen: HashSet<String> = HashSet::new();
         let mut result: Vec<Arc<HostConfig>> = Vec::new();
 
-        for entry in self.routes.iter() {
+        for entry in &self.routes {
             let config: &Arc<HostConfig> = entry.value();
             let code = config.code.clone();
             if seen.insert(code) {

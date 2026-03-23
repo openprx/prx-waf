@@ -10,19 +10,19 @@ pub struct ConfigSyncer {
 }
 
 impl ConfigSyncer {
-    pub fn new(node_id: String) -> Self {
+    pub const fn new(node_id: String) -> Self {
         Self {
             node_id,
             current_version: 0,
         }
     }
 
-    pub fn current_version(&self) -> u64 {
+    pub const fn current_version(&self) -> u64 {
         self.current_version
     }
 
     /// Apply an incoming `ConfigSync` from main, updating the stored version.
-    pub fn apply_sync(&mut self, sync: ConfigSync) -> Result<()> {
+    pub fn apply_sync(&mut self, sync: &ConfigSync) -> Result<()> {
         debug!(
             node_id = %self.node_id,
             version = sync.version,
@@ -33,7 +33,7 @@ impl ConfigSyncer {
     }
 
     /// Build a `ConfigSync` message for the given TOML string (called by main).
-    pub fn build_sync(&self, config_toml: String) -> ConfigSync {
+    pub const fn build_sync(&self, config_toml: String) -> ConfigSync {
         ConfigSync {
             version: self.current_version + 1,
             config_toml,

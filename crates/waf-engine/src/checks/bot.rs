@@ -6,6 +6,7 @@ use waf_common::{DetectionResult, Phase, RequestCtx};
 use super::Check;
 
 /// Known search-engine / legitimate crawlers — these are allowed through.
+#[allow(clippy::expect_used)]
 static GOOD_BOT_SET: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)\bgooglebot\b",
@@ -48,6 +49,7 @@ static BAD_BOT_DESCS: &[&str] = &[
     "Go standard HTTP client",
 ];
 
+#[allow(clippy::expect_used)]
 static BAD_BOT_SET: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)\bscrapy\b",
@@ -76,7 +78,7 @@ static BAD_BOT_SET: LazyLock<RegexSet> = LazyLock::new(|| {
 pub struct BotCheck;
 
 impl BotCheck {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -93,11 +95,7 @@ impl Check for BotCheck {
             return None;
         }
 
-        let ua = ctx
-            .headers
-            .get("user-agent")
-            .map(|s| s.as_str())
-            .unwrap_or("");
+        let ua = ctx.headers.get("user-agent").map_or("", String::as_str);
 
         // Allow known legitimate search engines first.
         if !ua.is_empty() && GOOD_BOT_SET.matches(ua).matched_any() {
@@ -113,7 +111,7 @@ impl Check for BotCheck {
                 rule_id: Some(format!("BOT-{:03}", idx + 1)),
                 rule_name: "Bot".to_string(),
                 phase: Phase::Bot,
-                detail: format!("{} detected", desc),
+                detail: format!("{desc} detected"),
             });
         }
 
@@ -160,8 +158,7 @@ mod tests {
     #[test]
     fn allows_googlebot() {
         let checker = BotCheck::new();
-        let ctx =
-            make_ctx("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)");
+        let ctx = make_ctx("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)");
         assert!(checker.check(&ctx).is_none(), "Should allow Googlebot");
     }
 
@@ -185,19 +182,13 @@ mod tests {
         let ctx = make_ctx(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         );
-        assert!(
-            checker.check(&ctx).is_none(),
-            "Should allow regular browser"
-        );
+        assert!(checker.check(&ctx).is_none(), "Should allow regular browser");
     }
 
     #[test]
     fn blocks_go_http_client() {
         let checker = BotCheck::new();
         let ctx = make_ctx("Go-http-client/1.1");
-        assert!(
-            checker.check(&ctx).is_some(),
-            "Should block bare Go HTTP client"
-        );
+        assert!(checker.check(&ctx).is_some(), "Should block bare Go HTTP client");
     }
 }

@@ -24,6 +24,7 @@ use crate::state::AppState;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+#[allow(clippy::cast_possible_truncation)] // u128 millis won't overflow u64 for millennia
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -114,9 +115,7 @@ pub struct RemoveNodeRequest {
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 /// GET /api/cluster/status — cluster topology + health
-pub async fn cluster_status(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<ClusterStatusResponse>> {
+pub async fn cluster_status(State(state): State<Arc<AppState>>) -> ApiResult<Json<ClusterStatusResponse>> {
     let ns = require_cluster(&state)?;
 
     let role = *ns.role.read().await;
@@ -168,9 +167,7 @@ pub async fn cluster_status(
 }
 
 /// GET /api/cluster/nodes — list all nodes with health
-pub async fn list_cluster_nodes(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<NodeListResponse>> {
+pub async fn list_cluster_nodes(State(state): State<Arc<AppState>>) -> ApiResult<Json<NodeListResponse>> {
     let ns = require_cluster(&state)?;
 
     let role = *ns.role.read().await;
@@ -265,9 +262,10 @@ pub async fn generate_join_token(
     let ns = require_cluster(&state)?;
 
     // Clone CA key out of parking_lot mutex without crossing an await point.
-    let ca_key = ns.ca_key_pem.lock().clone().ok_or_else(|| {
-        ApiError::NotFound("CA key not available — token generation requires the Main node".into())
-    })?;
+    let ca_key =
+        ns.ca_key_pem.lock().clone().ok_or_else(|| {
+            ApiError::NotFound("CA key not available — token generation requires the Main node".into())
+        })?;
 
     let ttl_ms = req.ttl_ms.unwrap_or(3_600_000); // default 1 h
 
@@ -287,20 +285,18 @@ pub async fn remove_cluster_node(
     let ns = require_cluster(&state)?;
 
     if ns.node_id == req.node_id {
-        return Err(ApiError::BadRequest(
-            "cannot remove self from cluster".into(),
-        ));
+        return Err(ApiError::BadRequest("cannot remove self from cluster".into()));
     }
 
-    let mut peers = ns.peers.write().await;
-    let before = peers.len();
-    peers.retain(|p| p.node_id != req.node_id);
+    let removed = {
+        let mut peers = ns.peers.write().await;
+        let before = peers.len();
+        peers.retain(|p| p.node_id != req.node_id);
+        peers.len() != before
+    };
 
-    if peers.len() == before {
-        return Err(ApiError::NotFound(format!(
-            "node '{}' not found",
-            req.node_id
-        )));
+    if !removed {
+        return Err(ApiError::NotFound(format!("node '{}' not found", req.node_id)));
     }
 
     Ok(Json(serde_json::json!({ "removed": req.node_id })))

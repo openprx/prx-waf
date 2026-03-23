@@ -14,7 +14,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use tracing::{debug, info, warn};
 
-use crate::node::NodeState;
+use crate::node::{NodeState, PeerInfo};
 use crate::protocol::{ClusterMessage, ClusterState, ElectionVote, JoinResponse, NodeInfo};
 use crate::transport::frame;
 
@@ -31,7 +31,7 @@ pub struct ClusterServer {
 
 impl ClusterServer {
     /// Create a new cluster server.
-    pub fn new(
+    pub const fn new(
         listen_addr: SocketAddr,
         ca_cert_der: CertificateDer<'static>,
         node_cert_pem: String,
@@ -56,15 +56,13 @@ impl ClusterServer {
             .build()
             .context("failed to build client cert verifier")?;
 
-        let certs: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut self.node_cert_pem.as_bytes())
-                .collect::<Result<Vec<_>, _>>()
-                .context("failed to parse node cert PEM")?;
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut self.node_cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to parse node cert PEM")?;
 
-        let key: PrivateKeyDer<'static> =
-            rustls_pemfile::private_key(&mut self.node_key_pem.as_bytes())
-                .context("failed to read node key PEM")?
-                .context("no private key found in node key PEM")?;
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut self.node_key_pem.as_bytes())
+            .context("failed to read node key PEM")?
+            .context("no private key found in node key PEM")?;
 
         let mut tls_config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(client_verifier)
@@ -85,8 +83,8 @@ impl ClusterServer {
             .map_err(|e| anyhow::anyhow!("QUIC server TLS config error: {e:?}"))?;
         let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
 
-        let endpoint = quinn::Endpoint::server(server_config, self.listen_addr)
-            .context("failed to bind QUIC cluster endpoint")?;
+        let endpoint =
+            quinn::Endpoint::server(server_config, self.listen_addr).context("failed to bind QUIC cluster endpoint")?;
 
         info!(addr = %self.listen_addr, "Cluster QUIC mTLS server listening");
 
@@ -108,7 +106,7 @@ impl ClusterServer {
     }
 
     /// Returns the configured listen address.
-    pub fn listen_addr(&self) -> SocketAddr {
+    pub const fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
     }
 }
@@ -169,12 +167,18 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState) -> Option
                 let mut peers = node_state.peers.write().await;
                 if let Some(peer) = peers.iter_mut().find(|p| p.node_id == hb.node_id) {
                     peer.last_seen_ms = now_ms;
+                    peer.role = hb.role;
+                } else {
+                    // Auto-register unknown peer on first heartbeat
+                    peers.push(PeerInfo {
+                        node_id: hb.node_id.clone(),
+                        addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                        role: hb.role,
+                        last_seen_ms: now_ms,
+                    });
                 }
             }
-            node_state
-                .heartbeat_tracker
-                .lock()
-                .record(&hb.node_id, now_ms);
+            node_state.heartbeat_tracker.lock().record(&hb.node_id, now_ms);
             debug!(
                 from = %hb.node_id,
                 seq = hb.sequence,
@@ -190,11 +194,12 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState) -> Option
             // Encrypt CA key for worker failover if passphrase is configured.
             // Clone under a short-lived parking_lot lock — no await held while locked.
             let ca_passphrase = node_state.config.crypto.ca_passphrase.clone();
-            let encrypted_ca_key_b64 = if !ca_passphrase.is_empty() {
+            let encrypted_ca_key_b64 = if ca_passphrase.is_empty() {
+                None
+            } else {
                 let ca_key_opt = node_state.ca_key_pem.lock().clone();
                 ca_key_opt.and_then(|ca_key_pem| {
-                    match crate::crypto::store::encrypt_blob(ca_key_pem.as_bytes(), &ca_passphrase)
-                    {
+                    match crate::crypto::store::encrypt_blob(ca_key_pem.as_bytes(), &ca_passphrase) {
                         Ok(enc) => Some(base64::engine::general_purpose::STANDARD.encode(&enc)),
                         Err(e) => {
                             warn!("Failed to encrypt CA key for JoinResponse: {e}");
@@ -202,8 +207,6 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState) -> Option
                         }
                     }
                 })
-            } else {
-                None
             };
 
             let rules_version = *node_state.rules_version.read().await;
@@ -236,6 +239,21 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState) -> Option
                 "Accepting JoinRequest"
             );
 
+            // Register the joining peer in the cluster topology
+            let peer_addr = req
+                .node_info
+                .listen_addr
+                .parse()
+                .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+            node_state
+                .add_or_update_peer(PeerInfo {
+                    node_id: req.node_info.node_id.clone(),
+                    addr: peer_addr,
+                    role: waf_common::config::NodeRole::Worker,
+                    last_seen_ms: unix_ms(),
+                })
+                .await;
+
             Some(ClusterMessage::JoinResponse(JoinResponse {
                 accepted: true,
                 reason: None,
@@ -257,7 +275,7 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState) -> Option
                 return None;
             }
             // Process a vote request from a candidate.
-            match node_state.election.process_vote(&vote).await {
+            match node_state.election.process_vote(&vote) {
                 Ok(true) => {
                     // Grant — echo back with our node_id as voter.
                     Some(ClusterMessage::ElectionVote(ElectionVote {
@@ -281,7 +299,7 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState) -> Option
                 term = result.term,
                 "ElectionResult received"
             );
-            match node_state.election.process_result(&result).await {
+            match node_state.election.process_result(&result) {
                 Ok(new_role) => node_state.transition_to(new_role).await,
                 Err(e) => warn!("process_result error: {e}"),
             }
@@ -298,6 +316,7 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState) -> Option
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

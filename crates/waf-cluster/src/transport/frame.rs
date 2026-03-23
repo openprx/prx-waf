@@ -15,18 +15,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Serialize `msg` and write it as a length-prefixed JSON frame
 pub async fn write_frame<T, W>(writer: &mut W, msg: &T) -> Result<()>
 where
-    T: Serialize,
-    W: AsyncWrite + Unpin,
+    T: Serialize + Sync,
+    W: AsyncWrite + Unpin + Send,
 {
     let json = serde_json::to_vec(msg).context("failed to serialize cluster message")?;
+    #[allow(clippy::cast_possible_truncation)]
     let len = json.len() as u32;
     let mut buf = BytesMut::with_capacity(4 + json.len());
     buf.put_u32(len);
     buf.put_slice(&json);
-    writer
-        .write_all(&buf)
-        .await
-        .context("failed to write cluster frame")?;
+    writer.write_all(&buf).await.context("failed to write cluster frame")?;
     Ok(())
 }
 
@@ -34,7 +32,7 @@ where
 pub async fn read_frame<T, R>(reader: &mut R) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send,
 {
     let mut len_buf = [0u8; 4];
     reader

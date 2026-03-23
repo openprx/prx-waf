@@ -21,7 +21,7 @@ pub struct EventBatcher {
 }
 
 impl EventBatcher {
-    pub fn new(node_id: String, batch_size: usize, flush_interval_ms: u64) -> Self {
+    pub const fn new(node_id: String, batch_size: usize, flush_interval_ms: u64) -> Self {
         Self {
             node_id,
             queue: VecDeque::new(),
@@ -31,7 +31,7 @@ impl EventBatcher {
     }
 
     /// The configured flush interval in milliseconds.
-    pub fn flush_interval_ms(&self) -> u64 {
+    pub const fn flush_interval_ms(&self) -> u64 {
         self.flush_interval_ms
     }
 
@@ -89,22 +89,19 @@ pub async fn run_event_batcher(
             biased;
 
             event = event_rx.recv() => {
-                match event {
-                    Some(ev) => {
-                        if let Some(batch) = batcher.push(ev)
-                            && batch_tx.send(batch).await.is_err()
-                        {
-                            debug!("Event batch channel closed; stopping batcher");
-                            return;
-                        }
-                    }
-                    None => {
-                        // Flush any remaining events before exit.
-                        if let Some(batch) = batcher.flush() {
-                            let _ = batch_tx.send(batch).await;
-                        }
+                if let Some(ev) = event {
+                    if let Some(batch) = batcher.push(ev)
+                        && batch_tx.send(batch).await.is_err()
+                    {
+                        debug!("Event batch channel closed; stopping batcher");
                         return;
                     }
+                } else {
+                    // Flush any remaining events before exit.
+                    if let Some(batch) = batcher.flush() {
+                        let _ = batch_tx.send(batch).await;
+                    }
+                    return;
                 }
             }
 
@@ -154,13 +151,7 @@ impl StatsCollector {
     ///
     /// `rule_id` is `None` for requests that passed all checks without a match.
     /// `country` may be an empty string if geo data is unavailable.
-    pub fn record_request(
-        &mut self,
-        ip: &str,
-        rule_id: Option<&str>,
-        country: &str,
-        blocked: bool,
-    ) {
+    pub fn record_request(&mut self, ip: &str, rule_id: Option<&str>, country: &str, blocked: bool) {
         self.total_requests += 1;
         if blocked {
             self.blocked_requests += 1;
@@ -200,11 +191,12 @@ impl StatsCollector {
     }
 
     /// Current total request count (without flushing).
-    pub fn total_requests(&self) -> u64 {
+    pub const fn total_requests(&self) -> u64 {
         self.total_requests
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -221,11 +213,7 @@ fn unix_ms() -> u64 {
 /// an exact total, so a missed batch merely reduces precision.
 ///
 /// The loop exits cleanly when the QUIC connection is closed.
-pub async fn run_stats_sender(
-    mut collector: StatsCollector,
-    interval_ms: u64,
-    conn: quinn::Connection,
-) {
+pub async fn run_stats_sender(mut collector: StatsCollector, interval_ms: u64, conn: quinn::Connection) {
     let interval = interval_ms.max(1);
     let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

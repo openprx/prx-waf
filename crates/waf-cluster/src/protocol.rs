@@ -70,7 +70,7 @@ pub struct JoinRequest {
     pub node_info: NodeInfo,
 }
 
-/// Main's response to a JoinRequest
+/// Main's response to a `JoinRequest`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinResponse {
     pub accepted: bool,
@@ -92,7 +92,7 @@ pub struct NodeInfo {
     pub hostname: String,
     pub version: String,
     pub listen_addr: String,
-    /// Feature flags: ["waf", "proxy", "api"]
+    /// Feature flags: `["waf", "proxy", "api"]`
     pub capabilities: Vec<String>,
 }
 
@@ -108,9 +108,9 @@ pub struct RuleSyncRequest {
 pub struct RuleSyncResponse {
     pub version: u64,
     pub sync_type: SyncType,
-    /// Incremental changes (empty when sync_type == Full)
+    /// Incremental changes (empty when `sync_type` == Full)
     pub changes: Vec<RuleChange>,
-    /// lz4-compressed JSON of Vec<Rule> (empty when sync_type == Incremental)
+    /// lz4-compressed JSON of Vec<Rule> (empty when `sync_type` == Incremental)
     pub snapshot_lz4: Vec<u8>,
 }
 

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-/// A CrowdSec decision from the LAPI
+/// A `CrowdSec` decision from the LAPI
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
     /// Decision database ID
@@ -48,7 +48,7 @@ impl CachedDecision {
     }
 }
 
-/// Response from POST /v1/decisions/stream (AppSec)
+/// Response from POST /v1/decisions/stream (`AppSec`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSecResponse {
     pub action: String,

@@ -29,7 +29,7 @@ pub async fn list_tunnels(State(state): State<Arc<AppState>>) -> impl IntoRespon
                 .iter()
                 .map(|r| {
                     let status = live.iter().find(|s| s.id == r.id);
-                    let connected = status.map(|s| s.connected).unwrap_or(false);
+                    let connected = status.is_some_and(|s| s.connected);
                     json!({
                         "id": r.id,
                         "name": r.name,
@@ -60,35 +60,36 @@ pub async fn create_tunnel(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let name = match body.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "name is required" })),
-            )
-                .into_response();
-        }
+    let Some(name) = body
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+    else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "name is required" }))).into_response();
     };
-    let target_host = match body.get("target_host").and_then(|v| v.as_str()) {
-        Some(h) => h.to_string(),
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "target_host is required" })),
-            )
-                .into_response();
-        }
+    let Some(target_host) = body
+        .get("target_host")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "target_host is required" })),
+        )
+            .into_response();
     };
-    let target_port = match body.get("target_port").and_then(|v| v.as_i64()) {
-        Some(p) if p > 0 && p < 65536 => p as i32,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "target_port must be 1-65535" })),
-            )
-                .into_response();
-        }
+    #[allow(clippy::cast_possible_truncation)]
+    let Some(target_port) = body
+        .get("target_port")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|&p| p > 0 && p < 65536)
+        .map(|p| p as i32)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "target_port must be 1-65535" })),
+        )
+            .into_response();
     };
 
     let token = generate_token();
@@ -99,7 +100,7 @@ pub async fn create_tunnel(
         token: token.clone(),
         target_host: target_host.clone(),
         target_port,
-        enabled: body.get("enabled").and_then(|v| v.as_bool()),
+        enabled: body.get("enabled").and_then(serde_json::Value::as_bool),
     };
 
     let row = match state.db.create_tunnel(&req, &token_hash).await {
@@ -114,6 +115,8 @@ pub async fn create_tunnel(
     };
 
     // Register in the in-memory registry
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let reg_port = row.target_port as u16;
     state
         .tunnel_registry
         .register(TunnelConfig {
@@ -121,7 +124,7 @@ pub async fn create_tunnel(
             name: row.name.clone(),
             token_hash,
             target_host: row.target_host.clone(),
-            target_port: row.target_port as u16,
+            target_port: reg_port,
             enabled: row.enabled,
         })
         .await;
@@ -142,18 +145,11 @@ pub async fn create_tunnel(
 }
 
 /// DELETE /api/tunnels/:id
-pub async fn delete_tunnel(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-) -> impl IntoResponse {
+pub async fn delete_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> impl IntoResponse {
     state.tunnel_registry.unregister(id).await;
     match state.db.delete_tunnel(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "tunnel not found" })),
-        )
-            .into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "tunnel not found" }))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -196,25 +192,18 @@ pub async fn ws_tunnel(
         };
 
         // Register in live connections
-        use tokio::sync::mpsc;
-        let (tx, mut rx) = mpsc::channel::<String>(32);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
         let tunnel_id = cfg.id;
-        let conn = TunnelConnection::new(
-            tunnel_id,
-            cfg.name.clone(),
-            cfg.target_host.clone(),
-            cfg.target_port as u16,
-            tx,
-        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let target_port = cfg.target_port as u16;
+        let conn = TunnelConnection::new(tunnel_id, cfg.name.clone(), cfg.target_host.clone(), target_port, tx);
         registry.connect(conn.clone()).await;
         let _ = db.update_tunnel_status(tunnel_id, "connected").await;
 
         let (mut ws_sink, mut ws_stream) = socket.split();
 
         // Send OK greeting
-        let _ = ws_sink
-            .send(axum::extract::ws::Message::Text("OK".to_string()))
-            .await;
+        let _ = ws_sink.send(axum::extract::ws::Message::Text("OK".to_string())).await;
 
         info!(tunnel = %cfg.name, "Tunnel WebSocket session started");
 

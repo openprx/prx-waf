@@ -28,6 +28,7 @@ static RCE_DESCS: &[&str] = &[
     "nc/netcat reverse shell",
 ];
 
+#[allow(clippy::expect_used)]
 static RCE_SET: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         // Pipe/semicolon followed by known shell commands
@@ -70,7 +71,7 @@ static RCE_SET: LazyLock<RegexSet> = LazyLock::new(|| {
 pub struct RceCheck;
 
 impl RceCheck {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -96,7 +97,7 @@ impl Check for RceCheck {
                     rule_id: Some(format!("RCE-{:03}", idx + 1)),
                     rule_name: "RCE".to_string(),
                     phase: Phase::Rce,
-                    detail: format!("{} detected in {}", desc, location),
+                    detail: format!("{desc} detected in {location}"),
                 });
             }
         }

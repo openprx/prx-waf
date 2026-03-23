@@ -1,15 +1,17 @@
 /// JWT-based authentication handlers.
 ///
 /// Endpoints:
-///   POST /api/auth/login   — returns access_token + refresh_token
-///   POST /api/auth/logout  — revokes the refresh_token
-///   POST /api/auth/refresh — exchanges refresh_token for a new access_token
+///   POST /api/auth/login   — returns `access_token` + `refresh_token`
+///   POST /api/auth/logout  — revokes the `refresh_token`
+///   POST /api/auth/refresh — exchanges `refresh_token` for a new `access_token`
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
+use axum::extract::ConnectInfo;
 use axum::{Json, extract::State};
 use chrono::Utc;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
@@ -36,12 +38,7 @@ pub struct Claims {
 
 // ─── Token helpers ────────────────────────────────────────────────────────────
 
-pub fn generate_access_token(
-    user_id: Uuid,
-    username: &str,
-    role: &str,
-    secret: &str,
-) -> anyhow::Result<String> {
+pub fn generate_access_token(user_id: Uuid, username: &str, role: &str, secret: &str) -> anyhow::Result<String> {
     let exp = (Utc::now() + chrono::Duration::hours(24)).timestamp();
     let claims = Claims {
         sub: user_id.to_string(),
@@ -83,9 +80,7 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
     };
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok()
+    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
 }
 
 // ─── Request / Response types ─────────────────────────────────────────────────
@@ -113,8 +108,21 @@ pub struct RefreshRequest {
 
 pub async fn login(
     State(state): State<Arc<AppState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Enforce login-specific rate limit (stricter than general API)
+    if let Some(ref limiter) = state.login_rate_limiter {
+        let ip = connect_info
+            .as_ref()
+            .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |ci| ci.0.ip());
+        if !limiter.check(ip) {
+            return Err(ApiError::TooManyRequests(
+                "Too many login attempts, please try again later".into(),
+            ));
+        }
+    }
+
     let user = state
         .db
         .get_admin_user_by_username(&req.username)
@@ -130,8 +138,7 @@ pub async fn login(
     }
 
     let access_token =
-        generate_access_token(user.id, &user.username, &user.role, &state.jwt_secret)
-            .map_err(ApiError::Internal)?;
+        generate_access_token(user.id, &user.username, &user.role, &state.jwt_secret).map_err(ApiError::Internal)?;
 
     // Generate a random refresh token
     let raw_refresh: String = {
@@ -145,10 +152,7 @@ pub async fn login(
     let token_hash = hash_token(&raw_refresh);
     let expires_at = Utc::now() + chrono::Duration::days(7);
 
-    state
-        .db
-        .create_refresh_token(user.id, &token_hash, expires_at)
-        .await?;
+    state.db.create_refresh_token(user.id, &token_hash, expires_at).await?;
 
     state.db.update_admin_user_last_login(user.id).await?;
 
@@ -169,9 +173,7 @@ pub async fn logout(
 ) -> ApiResult<Json<serde_json::Value>> {
     let token_hash = hash_token(&req.refresh_token);
     state.db.revoke_refresh_token(&token_hash).await?;
-    Ok(Json(
-        serde_json::json!({ "success": true, "data": "logged out" }),
-    ))
+    Ok(Json(serde_json::json!({ "success": true, "data": "logged out" })))
 }
 
 pub async fn refresh_token(
@@ -196,8 +198,7 @@ pub async fn refresh_token(
     }
 
     let access_token =
-        generate_access_token(user.id, &user.username, &user.role, &state.jwt_secret)
-            .map_err(ApiError::Internal)?;
+        generate_access_token(user.id, &user.username, &user.role, &state.jwt_secret).map_err(ApiError::Internal)?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -245,14 +246,189 @@ pub async fn ensure_default_admin(state: &AppState) -> anyhow::Result<()> {
         if generated {
             // Print to stdout (not tracing) so operators can capture the initial password.
             // This is intentionally printed only once on first startup.
-            println!("============================================================");
-            println!("  ADMIN USER CREATED");
-            println!("  Username: admin");
-            println!("  Password: {password}");
-            println!("  CHANGE THIS PASSWORD IMMEDIATELY!");
-            println!("============================================================");
+            #[allow(clippy::print_stdout)]
+            {
+                println!("============================================================");
+                println!("  ADMIN USER CREATED");
+                println!("  Username: admin");
+                println!("  Password: {password}");
+                println!("  CHANGE THIS PASSWORD IMMEDIATELY!");
+                println!("============================================================");
+            }
         }
         tracing::info!("Created default admin user (username=admin)");
     }
     Ok(())
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    #[test]
+    fn password_hash_roundtrip() {
+        let hash = hash_password("test123").unwrap();
+        assert!(verify_password("test123", &hash));
+    }
+
+    #[test]
+    fn password_hash_wrong_password() {
+        let hash = hash_password("test123").unwrap();
+        assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn token_hash_deterministic() {
+        assert_eq!(hash_token("abc"), hash_token("abc"));
+    }
+
+    #[test]
+    fn token_hash_different_tokens() {
+        assert_ne!(hash_token("abc"), hash_token("def"));
+    }
+
+    #[test]
+    fn jwt_create_and_validate() {
+        let user_id = uuid::Uuid::new_v4();
+        let secret = "test-secret-key";
+        let token = generate_access_token(user_id, "alice", "admin", secret).unwrap();
+        let claims = validate_access_token(&token, secret).unwrap();
+        assert_eq!(claims.sub, user_id.to_string());
+        assert_eq!(claims.username, "alice");
+        assert_eq!(claims.role, "admin");
+    }
+
+    #[test]
+    fn jwt_expired_rejected() {
+        let claims = Claims {
+            sub: "some-id".into(),
+            username: "u".into(),
+            role: "admin".into(),
+            exp: 0,
+        };
+        let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(b"secret")).unwrap();
+        let result = validate_access_token(&token, "secret");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn jwt_wrong_secret_rejected() {
+        let user_id = uuid::Uuid::new_v4();
+        let token = generate_access_token(user_id, "bob", "user", "secret1").unwrap();
+        let result = validate_access_token(&token, "secret2");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn jwt_claims_roundtrip() {
+        let user_id = uuid::Uuid::new_v4();
+        let secret = "roundtrip-secret";
+        let token = generate_access_token(user_id, "carol", "viewer", secret).unwrap();
+        let claims = validate_access_token(&token, secret).unwrap();
+        assert_eq!(claims.sub, user_id.to_string());
+        assert_eq!(claims.username, "carol");
+        assert_eq!(claims.role, "viewer");
+    }
+
+    // JWT tampering: modifying the payload (role field) must be rejected by signature check.
+    #[test]
+    fn jwt_tampered_payload_rejected() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let user_id = uuid::Uuid::new_v4();
+        let secret = "tamper-test-secret";
+        let token = generate_access_token(user_id, "alice", "admin", secret).unwrap();
+
+        // Split into header, payload, signature
+        let mut iter = token.splitn(3, '.');
+        let header_part = iter.next().expect("header");
+        let payload_part = iter.next().expect("payload");
+        let sig_part = iter.next().expect("signature");
+
+        // Decode the payload
+        let payload_bytes = URL_SAFE_NO_PAD.decode(payload_part).expect("valid base64url payload");
+        let mut payload: serde_json::Value = serde_json::from_slice(&payload_bytes).expect("valid JSON payload");
+
+        // Tamper: change role to "superadmin"
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("role".to_owned(), serde_json::Value::String("superadmin".to_owned()));
+        }
+
+        // Re-encode the tampered payload
+        let tampered_payload = URL_SAFE_NO_PAD.encode(serde_json::to_string(&payload).expect("serialize"));
+
+        // Reassemble token with original header and signature but tampered payload
+        let tampered_token = format!("{header_part}.{tampered_payload}.{sig_part}");
+
+        // Validation must fail — signature no longer matches
+        let result = validate_access_token(&tampered_token, secret);
+        assert!(result.is_err(), "tampered JWT must be rejected");
+    }
+
+    // `hash_token("abc")` must produce the known SHA-256 hex digest for "abc".
+    #[test]
+    fn token_hash_known_answer() {
+        use sha2::{Digest, Sha256};
+
+        // Compute expected value independently
+        let mut hasher = Sha256::new();
+        hasher.update(b"abc");
+        let expected = hex::encode(hasher.finalize());
+
+        let got = hash_token("abc");
+        assert_eq!(got.len(), 64, "SHA-256 hex digest must be 64 chars");
+        assert_eq!(got, expected);
+    }
+
+    // `generate_access_token` should produce a token whose exp is ~now + 24h.
+    #[test]
+    fn jwt_exp_window() {
+        use chrono::Utc;
+
+        let user_id = uuid::Uuid::new_v4();
+        let secret = "exp-window-secret";
+        let before = Utc::now().timestamp();
+        let token = generate_access_token(user_id, "dave", "admin", secret).unwrap();
+        let after = Utc::now().timestamp();
+
+        let claims = validate_access_token(&token, secret).unwrap();
+        let expected_exp_low = before + 24 * 3600 - 60;
+        let expected_exp_high = after + 24 * 3600 + 60;
+        assert!(
+            claims.exp >= expected_exp_low && claims.exp <= expected_exp_high,
+            "exp={} not within 24h ±60s window [{}, {}]",
+            claims.exp,
+            expected_exp_low,
+            expected_exp_high
+        );
+    }
+
+    // `hash_password` and `verify_password` must work correctly with an empty string.
+    #[test]
+    fn password_hash_empty_string() {
+        let hash = hash_password("").unwrap();
+        assert!(
+            verify_password("", &hash),
+            "empty password must verify against its own hash"
+        );
+        assert!(
+            !verify_password("nonempty", &hash),
+            "non-empty password must not match empty hash"
+        );
+    }
+
+    // `hash_password` must handle a very long password without error.
+    #[test]
+    fn password_hash_long_string() {
+        let long_pw = "x".repeat(1000);
+        let hash = hash_password(&long_pw).unwrap();
+        assert!(
+            verify_password(&long_pw, &hash),
+            "long password must verify against its own hash"
+        );
+    }
 }

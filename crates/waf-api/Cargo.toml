@@ -34,5 +34,9 @@ futures-util = { workspace = true }
 ipnet = { workspace = true }
 parking_lot = { workspace = true }
 
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+base64 = { workspace = true }
+
 [lints]
 workspace = true

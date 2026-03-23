@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,9 +11,8 @@ use gateway::{HostRouter, TunnelConfig, WafProxy};
 use waf_api::{AppState, start_api_server};
 use waf_common::config::{AppConfig, load_config};
 use waf_engine::{
-    CrowdSecClient, CrowdSecConfig, ExportFormat, GeoIpService, RuleManager, WafEngine,
-    WafEngineConfig, XdbUpdater, cache_policy_from_str, init_community, init_crowdsec,
-    spawn_auto_updater,
+    CrowdSecClient, CrowdSecConfig, ExportFormat, GeoIpService, RuleManager, WafEngine, WafEngineConfig, XdbUpdater,
+    cache_policy_from_str, init_community, init_crowdsec, spawn_auto_updater,
 };
 use waf_storage::Database;
 
@@ -35,7 +36,7 @@ enum Commands {
     Migrate,
     /// Seed the default admin user (admin / admin) if none exist
     SeedAdmin,
-    /// CrowdSec integration management
+    /// `CrowdSec` integration management
     #[command(subcommand)]
     Crowdsec(CrowdSecCommands),
     /// Rule management (list, validate, reload, import, export, …)
@@ -47,7 +48,7 @@ enum Commands {
     /// Bot detection management (list, add, remove, test)
     #[command(subcommand)]
     Bot(BotCommands),
-    /// GeoIP database management (download, update, status)
+    /// `GeoIP` database management (download, update, status)
     #[command(subcommand)]
     Geoip(GeoIpCommands),
     /// Community threat intelligence sharing management
@@ -101,7 +102,7 @@ enum ClusterCommands {
     /// Generate cluster CA and per-node certificates for offline provisioning
     ///
     /// Run this once before starting a new cluster. The generated certificates
-    /// are written to OUTPUT_DIR and then mounted into each node's container.
+    /// are written to `OUTPUT_DIR` and then mounted into each node's container.
     CertInit {
         /// Comma-separated list of node names to generate certificates for
         #[arg(long, default_value = "node-a,node-b,node-c")]
@@ -131,10 +132,10 @@ enum ClusterTokenCommands {
 
 // ── CrowdSec sub-commands ─────────────────────────────────────────────────────
 
-/// CrowdSec sub-commands
+/// `CrowdSec` sub-commands
 #[derive(Subcommand, Debug)]
 enum CrowdSecCommands {
-    /// Show CrowdSec connection status and cache statistics
+    /// Show `CrowdSec` connection status and cache statistics
     Status,
     /// List active decisions cached from LAPI
     Decisions,
@@ -262,7 +263,7 @@ enum BotCommands {
 
 // ── GeoIP sub-commands ────────────────────────────────────────────────────────
 
-/// GeoIP database sub-commands
+/// `GeoIP` database sub-commands
 #[derive(Subcommand, Debug)]
 enum GeoIpCommands {
     /// Download xdb files from upstream (first-time setup or forced refresh)
@@ -278,20 +279,17 @@ enum GeoIpCommands {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(EnvFilter::from_default_env().add_directive(
-            tracing_subscriber::filter::Directive::from(tracing::Level::INFO),
-        ))
+        .with(
+            EnvFilter::from_default_env()
+                .add_directive(tracing_subscriber::filter::Directive::from(tracing::Level::INFO)),
+        )
         .init();
 
     let cli = Cli::parse();
     info!("PRX-WAF v{}", env!("CARGO_PKG_VERSION"));
 
     let config = load_config(&cli.config).unwrap_or_else(|e| {
-        tracing::warn!(
-            "Failed to load config from {}: {}. Using defaults.",
-            cli.config,
-            e
-        );
+        tracing::warn!("Failed to load config from {}: {}. Using defaults.", cli.config, e);
         AppConfig::default()
     });
 
@@ -309,7 +307,7 @@ fn main() -> anyhow::Result<()> {
                 .block_on(run_seed_admin(&config))?;
         }
         Commands::Run => {
-            run_server(config)?;
+            run_server(&config)?;
         }
         Commands::Crowdsec(sub) => {
             tokio::runtime::Builder::new_current_thread()
@@ -358,8 +356,7 @@ async fn run_geoip_cmd(cmd: GeoIpCommands, config: &AppConfig) -> anyhow::Result
     // Derive the data directory from the configured xdb path.
     let data_dir = PathBuf::from(&config.geoip.ipv4_xdb_path)
         .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("data"));
+        .map_or_else(|| PathBuf::from("data"), std::path::Path::to_path_buf);
 
     let source_url = config.geoip.auto_update.source_url.clone();
     let updater = XdbUpdater::new(data_dir.clone(), source_url);
@@ -383,7 +380,7 @@ async fn run_geoip_cmd(cmd: GeoIpCommands, config: &AppConfig) -> anyhow::Result
                     println!("Download complete.");
                 }
                 Err(e) => {
-                    eprintln!("ERROR: {}", e);
+                    eprintln!("ERROR: {e}");
                     std::process::exit(1);
                 }
             }
@@ -393,11 +390,7 @@ async fn run_geoip_cmd(cmd: GeoIpCommands, config: &AppConfig) -> anyhow::Result
             println!("Checking for ip2region xdb updates...");
 
             let policy = cache_policy_from_str(&config.geoip.cache_policy);
-            let geoip = GeoIpService::init(
-                &config.geoip.ipv4_xdb_path,
-                &config.geoip.ipv6_xdb_path,
-                policy,
-            )?;
+            let geoip = GeoIpService::init(&config.geoip.ipv4_xdb_path, &config.geoip.ipv6_xdb_path, policy)?;
 
             match updater.update(&geoip).await {
                 Ok(result) if result.ipv4_updated || result.ipv6_updated => {
@@ -413,7 +406,7 @@ async fn run_geoip_cmd(cmd: GeoIpCommands, config: &AppConfig) -> anyhow::Result
                     println!("Already up to date.");
                 }
                 Err(e) => {
-                    eprintln!("ERROR: {}", e);
+                    eprintln!("ERROR: {e}");
                     std::process::exit(1);
                 }
             }
@@ -435,10 +428,7 @@ async fn run_geoip_cmd(cmd: GeoIpCommands, config: &AppConfig) -> anyhow::Result
             println!("    Cache policy:   {}", config.geoip.cache_policy);
             println!("    Auto-update:    {}", config.geoip.auto_update.enabled);
             println!("    Interval:       {}", config.geoip.auto_update.interval);
-            println!(
-                "    Source URL:     {}",
-                config.geoip.auto_update.source_url
-            );
+            println!("    Source URL:     {}", config.geoip.auto_update.source_url);
         }
     }
 
@@ -447,6 +437,7 @@ async fn run_geoip_cmd(cmd: GeoIpCommands, config: &AppConfig) -> anyhow::Result
 
 // ── Rules commands ────────────────────────────────────────────────────────────
 
+#[allow(clippy::significant_drop_tightening)]
 async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result<()> {
     match cmd {
         RulesCommands::List { category, source } => {
@@ -490,10 +481,7 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
                     println!("Name:        {}", rule.name);
                     println!("Category:    {}", rule.category);
                     println!("Source:      {}", rule.source);
-                    println!(
-                        "Status:      {}",
-                        if rule.enabled { "enabled" } else { "disabled" }
-                    );
+                    println!("Status:      {}", if rule.enabled { "enabled" } else { "disabled" });
                     println!("Action:      {}", rule.action);
                     if let Some(sev) = &rule.severity {
                         println!("Severity:    {sev}");
@@ -613,14 +601,14 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
             let mut cats: Vec<_> = stats.by_category.iter().collect();
             cats.sort_by_key(|(k, _)| k.as_str());
             for (cat, count) in cats {
-                println!("  {:<20} {}", cat, count);
+                println!("  {cat:<20} {count}");
             }
             println!();
             println!("By Source:");
             let mut srcs: Vec<_> = stats.by_source.iter().collect();
             srcs.sort_by_key(|(k, _)| k.as_str());
             for (src, count) in srcs {
-                println!("  {:<20} {}", src, count);
+                println!("  {src:<20} {count}");
             }
         }
     }
@@ -630,17 +618,14 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
 
 // ── Sources commands ──────────────────────────────────────────────────────────
 
+#[allow(clippy::unnecessary_wraps)]
 fn run_sources_cmd(cmd: SourcesCommands, config: &AppConfig) -> anyhow::Result<()> {
     match cmd {
         SourcesCommands::List => {
             println!("{:<20} {:<12} URL/Path", "Name", "Type");
             println!("{}", "-".repeat(80));
             for src in &config.rules.sources {
-                let type_str = if src.url.is_some() {
-                    "remote_url"
-                } else {
-                    "local"
-                };
+                let type_str = if src.url.is_some() { "remote_url" } else { "local" };
                 let location = src.url.as_deref().or(src.path.as_deref()).unwrap_or("-");
                 println!("{:<20} {:<12} {}", src.name, type_str, location);
             }
@@ -664,9 +649,7 @@ fn run_sources_cmd(cmd: SourcesCommands, config: &AppConfig) -> anyhow::Result<(
             println!("format = \"{format}\"");
         }
         SourcesCommands::Remove { name } => {
-            println!(
-                "Remove source '{name}': edit configs/default.toml and remove the [[rules.sources]] entry."
-            );
+            println!("Remove source '{name}': edit configs/default.toml and remove the [[rules.sources]] entry.");
         }
         SourcesCommands::Update { name } => {
             if let Some(name) = name {
@@ -684,6 +667,7 @@ fn run_sources_cmd(cmd: SourcesCommands, config: &AppConfig) -> anyhow::Result<(
 
 // ── Bot commands ──────────────────────────────────────────────────────────────
 
+#[allow(clippy::significant_drop_tightening)]
 fn run_bot_cmd(cmd: BotCommands, config: &AppConfig) -> anyhow::Result<()> {
     match cmd {
         BotCommands::List => {
@@ -734,10 +718,7 @@ fn run_bot_cmd(cmd: BotCommands, config: &AppConfig) -> anyhow::Result<()> {
                     && let Ok(re) = regex::Regex::new(pattern.as_str())
                     && re.is_match(user_agent.as_str())
                 {
-                    println!(
-                        "MATCH: {} — {} (action: {})",
-                        rule.id, rule.name, rule.action
-                    );
+                    println!("MATCH: {} — {} (action: {})", rule.id, rule.name, rule.action);
                     matched = true;
                 }
             }
@@ -755,8 +736,7 @@ fn run_cluster_cmd(cmd: ClusterCommands, config: &AppConfig) -> anyhow::Result<(
     let cluster_addr = config
         .cluster
         .as_ref()
-        .map(|c| c.listen_addr.as_str())
-        .unwrap_or("(not configured)");
+        .map_or("(not configured)", |c| c.listen_addr.as_str());
 
     match cmd {
         ClusterCommands::Status => {
@@ -770,9 +750,7 @@ fn run_cluster_cmd(cmd: ClusterCommands, config: &AppConfig) -> anyhow::Result<(
                 println!("  Node ID:    {}", cluster.node_id);
                 println!("  Seeds:      {}", cluster.seeds.join(", "));
             } else {
-                println!(
-                    "  [INFO] Cluster is not configured. Add a [cluster] section to your config."
-                );
+                println!("  [INFO] Cluster is not configured. Add a [cluster] section to your config.");
             }
         }
 
@@ -781,10 +759,7 @@ fn run_cluster_cmd(cmd: ClusterCommands, config: &AppConfig) -> anyhow::Result<(
             println!("=============");
             println!();
             if let Some(cluster) = &config.cluster {
-                println!(
-                    "  This node:  {} ({})",
-                    cluster.node_id, cluster.listen_addr
-                );
+                println!("  This node:  {} ({})", cluster.node_id, cluster.listen_addr);
                 if cluster.seeds.is_empty() {
                     println!("  Peers:      (none configured)");
                 } else {
@@ -794,9 +769,7 @@ fn run_cluster_cmd(cmd: ClusterCommands, config: &AppConfig) -> anyhow::Result<(
                     }
                 }
                 println!();
-                println!(
-                    "  Note: live node list is only available through the running cluster API."
-                );
+                println!("  Note: live node list is only available through the running cluster API.");
             } else {
                 println!("  [INFO] Cluster is not configured.");
             }
@@ -843,12 +816,7 @@ fn run_cluster_cmd(cmd: ClusterCommands, config: &AppConfig) -> anyhow::Result<(
 }
 
 /// Generate cluster CA and per-node certificates and write them to `output_dir`.
-fn run_cert_init(
-    nodes: &str,
-    output_dir: &str,
-    ca_validity_days: u32,
-    node_validity_days: u32,
-) -> anyhow::Result<()> {
+fn run_cert_init(nodes: &str, output_dir: &str, ca_validity_days: u32, node_validity_days: u32) -> anyhow::Result<()> {
     use std::fs;
     use std::path::Path;
 
@@ -856,8 +824,7 @@ fn run_cert_init(
     use waf_cluster::crypto::node_cert::NodeCertificate;
 
     let output = Path::new(output_dir);
-    fs::create_dir_all(output)
-        .map_err(|e| anyhow::anyhow!("failed to create output directory '{output_dir}': {e}"))?;
+    fs::create_dir_all(output).map_err(|e| anyhow::anyhow!("failed to create output directory '{output_dir}': {e}"))?;
 
     // Generate cluster CA.
     let ca = CertificateAuthority::generate(ca_validity_days)
@@ -865,15 +832,10 @@ fn run_cert_init(
 
     let ca_cert_path = output.join("cluster-ca.pem");
     let ca_key_path = output.join("cluster-ca.key");
-    fs::write(&ca_cert_path, ca.cert_pem()).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to write CA cert to '{}': {e}",
-            ca_cert_path.display()
-        )
-    })?;
-    fs::write(&ca_key_path, ca.key_pem()).map_err(|e| {
-        anyhow::anyhow!("failed to write CA key to '{}': {e}", ca_key_path.display())
-    })?;
+    fs::write(&ca_cert_path, ca.cert_pem())
+        .map_err(|e| anyhow::anyhow!("failed to write CA cert to '{}': {e}", ca_cert_path.display()))?;
+    fs::write(&ca_key_path, ca.key_pem())
+        .map_err(|e| anyhow::anyhow!("failed to write CA key to '{}': {e}", ca_key_path.display()))?;
 
     println!("Generated cluster CA:");
     println!("  Cert: {}", ca_cert_path.display());
@@ -881,20 +843,14 @@ fn run_cert_init(
     println!();
 
     // Generate per-node certificates.
-    let node_names: Vec<&str> = nodes
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
+    let node_names: Vec<&str> = nodes.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
     if node_names.is_empty() {
         anyhow::bail!("--nodes must contain at least one node name");
     }
 
     for node_name in &node_names {
-        let node_cert =
-            NodeCertificate::generate(node_name, &ca, node_validity_days).map_err(|e| {
-                anyhow::anyhow!("failed to generate certificate for node '{node_name}': {e}")
-            })?;
+        let node_cert = NodeCertificate::generate(node_name, &ca, node_validity_days)
+            .map_err(|e| anyhow::anyhow!("failed to generate certificate for node '{node_name}': {e}"))?;
 
         let cert_path = output.join(format!("{node_name}.pem"));
         let key_path = output.join(format!("{node_name}.key"));
@@ -909,10 +865,7 @@ fn run_cert_init(
     }
 
     println!();
-    println!(
-        "Certificates generated for nodes: {}",
-        node_names.join(", ")
-    );
+    println!("Certificates generated for nodes: {}", node_names.join(", "));
     println!("Distribute 'cluster-ca.pem' to all nodes (read-only mount).");
     println!("Each node loads its own cert/key pair from the output directory.");
     println!("The CA key 'cluster-ca.key' is only needed on the main node.");
@@ -941,11 +894,7 @@ async fn run_community_cmd(cmd: CommunityCommands, config: &AppConfig) -> anyhow
             println!("  Server URL: {}", config.community.server_url);
             println!(
                 "  Machine ID: {}",
-                config
-                    .community
-                    .machine_id
-                    .as_deref()
-                    .unwrap_or("(not enrolled)")
+                config.community.machine_id.as_deref().unwrap_or("(not enrolled)")
             );
             println!(
                 "  API Key:    {}",
@@ -956,16 +905,11 @@ async fn run_community_cmd(cmd: CommunityCommands, config: &AppConfig) -> anyhow
                 }
             );
             println!("  Batch size: {}", config.community.batch_size);
-            println!(
-                "  Flush interval: {}s",
-                config.community.flush_interval_secs
-            );
+            println!("  Flush interval: {}s", config.community.flush_interval_secs);
             println!("  Sync interval:  {}s", config.community.sync_interval_secs);
             if !config.community.enabled {
                 println!();
-                println!(
-                    "  [INFO] Community sharing is disabled. Enable it in configs/default.toml."
-                );
+                println!("  [INFO] Community sharing is disabled. Enable it in configs/default.toml.");
             }
         }
 
@@ -1018,8 +962,7 @@ async fn run_community_cmd(cmd: CommunityCommands, config: &AppConfig) -> anyhow
 
 async fn run_migrate(config: &AppConfig) -> anyhow::Result<()> {
     info!("Running database migrations...");
-    let db =
-        Database::connect(&config.storage.database_url, config.storage.max_connections).await?;
+    let db = Database::connect(&config.storage.database_url, config.storage.max_connections).await?;
     db.migrate().await?;
     info!("Migrations complete.");
     Ok(())
@@ -1027,9 +970,7 @@ async fn run_migrate(config: &AppConfig) -> anyhow::Result<()> {
 
 async fn run_seed_admin(config: &AppConfig) -> anyhow::Result<()> {
     info!("Connecting to database...");
-    let db = Arc::new(
-        Database::connect(&config.storage.database_url, config.storage.max_connections).await?,
-    );
+    let db = Arc::new(Database::connect(&config.storage.database_url, config.storage.max_connections).await?);
     db.migrate().await?;
 
     let engine = Arc::new(WafEngine::new(Arc::clone(&db), WafEngineConfig::default()));
@@ -1041,7 +982,7 @@ async fn run_seed_admin(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Handle CrowdSec CLI sub-commands
+/// Handle `CrowdSec` CLI sub-commands
 async fn run_crowdsec_cmd(cmd: CrowdSecCommands, config: &AppConfig) -> anyhow::Result<()> {
     let cs_config = app_config_to_crowdsec(config);
 
@@ -1061,8 +1002,7 @@ async fn run_crowdsec_cmd(cmd: CrowdSecCommands, config: &AppConfig) -> anyhow::
                 println!("CrowdSec is not enabled.");
                 return Ok(());
             }
-            let client =
-                CrowdSecClient::new(cs_config.lapi_url.clone(), cs_config.api_key.clone())?;
+            let client = CrowdSecClient::new(cs_config.lapi_url.clone(), cs_config.api_key.clone())?;
             let stream = client.get_decisions_stream(true).await?;
             let decisions = stream.new.unwrap_or_default();
             println!("Active decisions ({}):", decisions.len());
@@ -1089,11 +1029,10 @@ async fn run_crowdsec_cmd(cmd: CrowdSecCommands, config: &AppConfig) -> anyhow::
                 return Ok(());
             }
             println!("Testing connection to: {}", cs_config.lapi_url);
-            let client =
-                CrowdSecClient::new(cs_config.lapi_url.clone(), cs_config.api_key.clone())?;
+            let client = CrowdSecClient::new(cs_config.lapi_url.clone(), cs_config.api_key.clone())?;
             match client.test_connection().await {
-                Ok(msg) => println!("OK: {}", msg),
-                Err(e) => println!("FAILED: {}", e),
+                Ok(msg) => println!("OK: {msg}"),
+                Err(e) => println!("FAILED: {e}"),
             }
         }
 
@@ -1120,9 +1059,7 @@ async fn run_crowdsec_cmd(cmd: CrowdSecCommands, config: &AppConfig) -> anyhow::
             #[cfg(target_os = "windows")]
             {
                 println!("Detected platform: Windows");
-                println!(
-                    "CrowdSec for Windows: https://docs.crowdsec.net/docs/getting_started/install_windows/"
-                );
+                println!("CrowdSec for Windows: https://docs.crowdsec.net/docs/getting_started/install_windows/");
                 println!();
             }
             #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -1147,7 +1084,7 @@ async fn run_crowdsec_cmd(cmd: CrowdSecCommands, config: &AppConfig) -> anyhow::
     Ok(())
 }
 
-/// Convert the flat AppConfig CrowdSecConfig to the engine's CrowdSecConfig type.
+/// Convert the flat `AppConfig` `CrowdSecConfig` to the engine's `CrowdSecConfig` type.
 fn app_config_to_crowdsec(config: &AppConfig) -> CrowdSecConfig {
     use waf_engine::crowdsec::config::{AppSecConfig, CrowdSecMode, FallbackAction, PusherConfig};
 
@@ -1163,16 +1100,12 @@ fn app_config_to_crowdsec(config: &AppConfig) -> CrowdSecConfig {
         _ => FallbackAction::Allow,
     };
 
-    let appsec = config
-        .crowdsec
-        .appsec_endpoint
-        .as_ref()
-        .map(|endpoint| AppSecConfig {
-            endpoint: endpoint.clone(),
-            api_key: config.crowdsec.appsec_key.clone().unwrap_or_default(),
-            timeout_ms: config.crowdsec.appsec_timeout_ms,
-            failure_action: FallbackAction::Allow,
-        });
+    let appsec = config.crowdsec.appsec_endpoint.as_ref().map(|endpoint| AppSecConfig {
+        endpoint: endpoint.clone(),
+        api_key: config.crowdsec.appsec_key.clone().unwrap_or_default(),
+        timeout_ms: config.crowdsec.appsec_timeout_ms,
+        failure_action: FallbackAction::Allow,
+    });
 
     let pusher = config
         .crowdsec
@@ -1200,23 +1133,18 @@ fn app_config_to_crowdsec(config: &AppConfig) -> CrowdSecConfig {
 }
 
 /// Start the full server: async init → API server thread → Pingora proxy
-fn run_server(config: AppConfig) -> anyhow::Result<()> {
+fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     use pingora_core::server::Server;
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 
-    let (engine, router, api_state) = rt.block_on(init_async(&config))?;
+    let (engine, router, api_state) = rt.block_on(init_async(config))?;
 
     // Start the management API in a background thread
     let api_listen = config.api.listen_addr.clone();
     let api_state_bg = Arc::clone(&api_state);
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
+        let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => rt,
             Err(e) => {
                 tracing::error!("Failed to build API runtime: {e}");
@@ -1236,10 +1164,7 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
         let h3_engine = Arc::clone(&engine);
         let h3_router = Arc::clone(&router);
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
+            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
                     tracing::error!("Failed to build HTTP/3 runtime: {e}");
@@ -1247,31 +1172,29 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
                 }
             };
             rt.block_on(async move {
-                let cert_pem = match h3_config.cert_pem.as_deref() {
-                    Some(p) => match std::fs::read_to_string(p) {
+                let cert_pem = if let Some(p) = h3_config.cert_pem.as_deref() {
+                    match std::fs::read_to_string(p) {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::error!("HTTP/3 cert read error: {e}");
                             return;
                         }
-                    },
-                    None => {
-                        tracing::error!("HTTP/3 cert_pem not configured");
-                        return;
                     }
+                } else {
+                    tracing::error!("HTTP/3 cert_pem not configured");
+                    return;
                 };
-                let key_pem = match h3_config.key_pem.as_deref() {
-                    Some(p) => match std::fs::read_to_string(p) {
+                let key_pem = if let Some(p) = h3_config.key_pem.as_deref() {
+                    match std::fs::read_to_string(p) {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::error!("HTTP/3 key read error: {e}");
                             return;
                         }
-                    },
-                    None => {
-                        tracing::error!("HTTP/3 key_pem not configured");
-                        return;
                     }
+                } else {
+                    tracing::error!("HTTP/3 key_pem not configured");
+                    return;
                 };
                 let addr: std::net::SocketAddr = match h3_config.listen_addr.parse() {
                     Ok(a) => a,
@@ -1302,10 +1225,7 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
         && cluster_cfg.enabled
     {
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
+            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
                     tracing::error!("Failed to build cluster runtime: {e}");
@@ -1331,6 +1251,29 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
 
     let mut proxy = WafProxy::new(router, engine);
     proxy.trust_proxy_headers = config.proxy.trust_proxy_headers;
+    proxy.trusted_proxies = config
+        .proxy
+        .trusted_proxies
+        .iter()
+        .filter_map(|s| match s.parse::<ipnet::IpNet>() {
+            Ok(net) => Some(net),
+            Err(e) => {
+                tracing::warn!("Ignoring invalid trusted_proxies entry '{}': {}", s, e);
+                None
+            }
+        })
+        .collect();
+
+    // Warn when XFF trust is enabled but no trusted proxy CIDRs are configured,
+    // meaning XFF headers from ANY source will be honoured (fail-open).
+    if proxy.trust_proxy_headers && proxy.trusted_proxies.is_empty() {
+        tracing::warn!(
+            "trust_proxy_headers is enabled but trusted_proxies is empty — \
+             XFF headers from ANY source will be trusted. \
+             Consider adding trusted proxy CIDRs for production use."
+        );
+    }
+
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
     proxy_service.add_tcp(&config.proxy.listen_addr);
     server.add_service(proxy_service);
@@ -1346,13 +1289,9 @@ fn run_server(config: AppConfig) -> anyhow::Result<()> {
 }
 
 /// Async initialization: database, engine, rules, Phases 5 & 6
-async fn init_async(
-    config: &AppConfig,
-) -> anyhow::Result<(Arc<WafEngine>, Arc<HostRouter>, Arc<AppState>)> {
+async fn init_async(config: &AppConfig) -> anyhow::Result<(Arc<WafEngine>, Arc<HostRouter>, Arc<AppState>)> {
     info!("Connecting to database...");
-    let db = Arc::new(
-        Database::connect(&config.storage.database_url, config.storage.max_connections).await?,
-    );
+    let db = Arc::new(Database::connect(&config.storage.database_url, config.storage.max_connections).await?);
 
     info!("Running database migrations...");
     db.migrate().await?;
@@ -1364,11 +1303,7 @@ async fn init_async(
     // GeoIP service
     if config.geoip.enabled {
         let policy = cache_policy_from_str(&config.geoip.cache_policy);
-        match GeoIpService::init(
-            &config.geoip.ipv4_xdb_path,
-            &config.geoip.ipv6_xdb_path,
-            policy,
-        ) {
+        match GeoIpService::init(&config.geoip.ipv4_xdb_path, &config.geoip.ipv6_xdb_path, policy) {
             Ok(service) => {
                 info!("GeoIP service initialized");
                 let service = Arc::new(service);
@@ -1378,14 +1313,9 @@ async fn init_async(
                 if config.geoip.auto_update.enabled {
                     let data_dir = std::path::PathBuf::from(&config.geoip.ipv4_xdb_path)
                         .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| std::path::PathBuf::from("data"));
+                        .map_or_else(|| std::path::PathBuf::from("data"), std::path::Path::to_path_buf);
 
-                    let handle = spawn_auto_updater(
-                        Arc::clone(&service),
-                        config.geoip.auto_update.clone(),
-                        data_dir,
-                    );
+                    let handle = spawn_auto_updater(Arc::clone(&service), config.geoip.auto_update.clone(), data_dir);
                     // Keep the task alive for the process lifetime.
                     std::mem::forget(handle);
 
@@ -1409,6 +1339,7 @@ async fn init_async(
     info!("Loading {} hosts from database", hosts.len());
     for host in &hosts {
         use waf_common::HostConfig;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let cfg = Arc::new(HostConfig {
             code: host.code.clone(),
             host: host.host.clone(),
@@ -1423,16 +1354,13 @@ async fn init_async(
             start_status: host.start_status,
             ..HostConfig::default()
         });
-        router.register(cfg);
+        router.register(&cfg);
     }
 
     // Register hosts from config file
     for entry in &config.hosts {
         use waf_common::HostConfig;
-        let code = format!(
-            "cfg-{}",
-            &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]
-        );
+        let code = format!("cfg-{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]);
         let cfg = Arc::new(HostConfig {
             code,
             host: entry.host.clone(),
@@ -1445,7 +1373,7 @@ async fn init_async(
             key_file: entry.key_file.clone(),
             ..HostConfig::default()
         });
-        router.register(cfg);
+        router.register(&cfg);
     }
 
     info!("Registered {} host routes", router.len());
@@ -1453,8 +1381,18 @@ async fn init_async(
     // Build app state
     let mut api_state = AppState::new(Arc::clone(&db), Arc::clone(&engine), Arc::clone(&router))?;
 
-    // Apply CORS origins from security config
+    // Apply security configuration
     api_state.cors_origins = config.security.cors_origins.clone();
+    api_state.security_config = config.security.clone();
+    if config.security.api_rate_limit_rps > 0 {
+        api_state.rate_limiter = Some(waf_api::security::ApiRateLimiter::new(
+            config.security.api_rate_limit_rps,
+        ));
+    }
+
+    // Login rate limiter: always enabled with a strict 10 req/s burst
+    // to mitigate brute-force credential attacks on /api/auth/login
+    api_state.login_rate_limiter = Some(waf_api::security::ApiRateLimiter::new(10));
 
     // Phase 4: create default admin user if none exist
     {
@@ -1489,26 +1427,25 @@ async fn init_async(
     let tunnels = db.list_tunnels().await.unwrap_or_default();
     info!("Loaded {} tunnel configs", tunnels.len());
     for t in &tunnels {
-        api_state
-            .tunnel_registry
-            .register(TunnelConfig {
-                id: t.id,
-                name: t.name.clone(),
-                token_hash: t.token_hash.clone(),
-                target_host: t.target_host.clone(),
-                target_port: t.target_port as u16,
-                enabled: t.enabled,
-            })
-            .await;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let tunnel_cfg = TunnelConfig {
+            id: t.id,
+            name: t.name.clone(),
+            token_hash: t.token_hash.clone(),
+            target_host: t.target_host.clone(),
+            target_port: t.target_port as u16,
+            enabled: t.enabled,
+        };
+        api_state.tunnel_registry.register(tunnel_cfg).await;
     }
 
     // Phase 6: CrowdSec integration
     let cs_config = app_config_to_crowdsec(config);
     if cs_config.enabled {
         // Create a channel for graceful shutdown signal
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        // Keep _shutdown_tx alive for the process lifetime by leaking it
-        std::mem::forget(_shutdown_tx);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // Keep shutdown_tx alive for the process lifetime by leaking it
+        std::mem::forget(shutdown_tx);
 
         match init_crowdsec(cs_config.clone(), shutdown_rx).await {
             Some(components) => {
@@ -1518,10 +1455,7 @@ async fn init_async(
                 );
 
                 // Plug bouncer checker and AppSec client into the WAF engine
-                engine.set_crowdsec(
-                    Arc::clone(&components.checker),
-                    components.appsec_client.clone(),
-                );
+                engine.set_crowdsec(Arc::clone(&components.checker), components.appsec_client.clone());
 
                 // Share cache and client with the API layer
                 api_state.crowdsec_cache = Some(Arc::clone(&components.cache));
@@ -1550,8 +1484,8 @@ async fn init_async(
         };
 
         // Create a shutdown channel for community tasks
-        let (_community_shutdown_tx, community_shutdown_rx) = tokio::sync::watch::channel(false);
-        std::mem::forget(_community_shutdown_tx);
+        let (community_shutdown_tx, community_shutdown_rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(community_shutdown_tx);
 
         match init_community(community_config, community_shutdown_rx).await {
             Some(components) => {

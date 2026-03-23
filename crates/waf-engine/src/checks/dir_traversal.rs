@@ -16,6 +16,7 @@ static TRAVERSAL_DESCS: &[&str] = &[
     "Windows drive-letter path (C:\\)",
 ];
 
+#[allow(clippy::expect_used)]
 static TRAVERSAL_SET: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         // Classic ../
@@ -42,7 +43,7 @@ static TRAVERSAL_SET: LazyLock<RegexSet> = LazyLock::new(|| {
 pub struct DirTraversalCheck;
 
 impl DirTraversalCheck {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -74,15 +75,12 @@ impl Check for DirTraversalCheck {
             let matches = TRAVERSAL_SET.matches(value);
             if matches.matched_any() {
                 let idx = matches.iter().next().unwrap_or(0);
-                let desc = TRAVERSAL_DESCS
-                    .get(idx)
-                    .copied()
-                    .unwrap_or("path traversal");
+                let desc = TRAVERSAL_DESCS.get(idx).copied().unwrap_or("path traversal");
                 return Some(DetectionResult {
                     rule_id: Some(format!("TRAV-{:03}", idx + 1)),
                     rule_name: "Directory Traversal".to_string(),
                     phase: Phase::DirTraversal,
-                    detail: format!("{} detected in {}", desc, location),
+                    detail: format!("{desc} detected in {location}"),
                 });
             }
         }

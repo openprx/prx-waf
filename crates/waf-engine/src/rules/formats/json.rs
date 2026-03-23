@@ -38,7 +38,7 @@ fn default_category() -> String {
 fn default_source() -> String {
     "file".to_string()
 }
-fn default_enabled() -> bool {
+const fn default_enabled() -> bool {
     true
 }
 fn default_action() -> String {
@@ -67,6 +67,7 @@ pub fn parse(content: &str) -> Result<Vec<Rule>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

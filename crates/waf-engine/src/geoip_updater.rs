@@ -16,8 +16,7 @@ use crate::geoip::GeoIpService;
 use waf_common::config::GeoIpAutoUpdateConfig;
 
 /// Default URL base for ip2region raw xdb files on GitHub.
-const DEFAULT_GITHUB_BASE_URL: &str =
-    "https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data";
+const DEFAULT_GITHUB_BASE_URL: &str = "https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -47,7 +46,7 @@ pub struct XdbUpdater {
 
 impl XdbUpdater {
     /// Create an updater that fetches from `github_base_url`.
-    pub fn new(data_dir: PathBuf, github_base_url: String) -> Self {
+    pub const fn new(data_dir: PathBuf, github_base_url: String) -> Self {
         Self {
             data_dir,
             github_base_url,
@@ -73,10 +72,7 @@ impl XdbUpdater {
 
             // Missing file → definitely need to download.
             if !local_path.exists() {
-                debug!(
-                    "GeoIP updater: {} not found locally — update needed",
-                    filename
-                );
+                debug!("GeoIP updater: {} not found locally — update needed", filename);
                 return Ok(true);
             }
 
@@ -104,11 +100,7 @@ impl XdbUpdater {
                     warn!("GeoIP updater: HEAD {} returned {}", url, resp.status());
                 }
                 Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "GeoIP HEAD check failed for {}: {}",
-                        url,
-                        e
-                    ));
+                    return Err(anyhow::anyhow!("GeoIP HEAD check failed for {url}: {e}"));
                 }
             }
         }
@@ -176,7 +168,7 @@ impl XdbUpdater {
     async fn download_one(&self, client: &reqwest::Client, filename: &str) -> Result<(bool, u64)> {
         let url = format!("{}/{}", self.github_base_url, filename);
         let final_path = self.data_dir.join(filename);
-        let tmp_path = self.data_dir.join(format!("{}.tmp", filename));
+        let tmp_path = self.data_dir.join(format!("{filename}.tmp"));
 
         info!("GeoIP updater: downloading {} from {}", filename, url);
 
@@ -184,49 +176,34 @@ impl XdbUpdater {
             .get(&url)
             .send()
             .await
-            .with_context(|| format!("GET request failed for {}", url))?;
+            .with_context(|| format!("GET request failed for {url}"))?;
 
         if !resp.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "HTTP {} downloading {}",
-                resp.status(),
-                url
-            ));
+            return Err(anyhow::anyhow!("HTTP {} downloading {}", resp.status(), url));
         }
 
         let bytes = resp
             .bytes()
             .await
-            .with_context(|| format!("Failed to read response body for {}", filename))?;
+            .with_context(|| format!("Failed to read response body for {filename}"))?;
 
         let size = bytes.len() as u64;
 
         // Write to tmp file first.
-        std::fs::write(&tmp_path, &bytes)
-            .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+        std::fs::write(&tmp_path, &bytes).with_context(|| format!("Failed to write {}", tmp_path.display()))?;
 
         // Validate: try to open the tmp file as a Searcher.
         // Use NoCache policy to avoid loading ~20 MB into memory just for validation.
-        if let Err(e) = ip2region::Searcher::new(
-            tmp_path.to_string_lossy().to_string(),
-            ip2region::CachePolicy::NoCache,
-        ) {
+        if let Err(e) =
+            ip2region::Searcher::new(tmp_path.to_string_lossy().to_string(), ip2region::CachePolicy::NoCache)
+        {
             let _ = std::fs::remove_file(&tmp_path);
-            return Err(anyhow::anyhow!(
-                "Downloaded {} failed validation: {}",
-                filename,
-                e
-            ));
+            return Err(anyhow::anyhow!("Downloaded {filename} failed validation: {e}"));
         }
 
         // Atomic rename to final path.
-        std::fs::rename(&tmp_path, &final_path).with_context(|| {
-            format!(
-                "Failed to rename {} → {}",
-                tmp_path.display(),
-                final_path.display()
-            )
-        })?;
+        std::fs::rename(&tmp_path, &final_path)
+            .with_context(|| format!("Failed to rename {} → {}", tmp_path.display(), final_path.display()))?;
 
         info!("GeoIP updater: {} updated ({} bytes)", filename, size);
 
@@ -283,11 +260,9 @@ pub fn spawn_auto_updater(
 /// Falls back to 7 days if the string is unrecognised.
 pub fn parse_duration(s: &str) -> Duration {
     let s = s.trim();
-    let (num_str, unit) = if let Some(pos) = s.find(|c: char| c.is_alphabetic()) {
-        (&s[..pos], &s[pos..])
-    } else {
-        (s, "s")
-    };
+    let (num_str, unit) = s
+        .find(|c: char| c.is_alphabetic())
+        .map_or((s, "s"), |pos| (&s[..pos], &s[pos..]));
 
     let n: u64 = num_str.parse().unwrap_or(7);
 
@@ -297,10 +272,7 @@ pub fn parse_duration(s: &str) -> Duration {
         "m" => n * 60,
         "s" => n,
         _ => {
-            warn!(
-                "GeoIP updater: unrecognised duration '{}', defaulting to 7d",
-                s
-            );
+            warn!("GeoIP updater: unrecognised duration '{}', defaulting to 7d", s);
             7 * 86_400
         }
     };
@@ -330,20 +302,20 @@ pub fn xdb_file_info(path: &Path) -> String {
     };
 
     let size = meta.len();
-    let modified = meta
-        .modified()
-        .map(|t| {
-            let secs = t
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+    let modified = meta.modified().map_or_else(
+        |_| "unknown".to_string(),
+        |t| {
+            let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             // Format as YYYY-MM-DD HH:MM:SS UTC (no chrono dep needed here)
-
-            chrono::DateTime::from_timestamp(secs as i64, 0)
-                .map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        })
-        .unwrap_or_else(|_| "unknown".to_string());
+            // SAFETY: secs from UNIX_EPOCH will not exceed i64::MAX in practice
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let ts = secs as i64;
+            chrono::DateTime::from_timestamp(ts, 0).map_or_else(
+                || "unknown".to_string(),
+                |d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            )
+        },
+    );
 
     format!("{} ({} bytes, modified {})", path.display(), size, modified)
 }

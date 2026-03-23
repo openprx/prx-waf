@@ -13,6 +13,4 @@ pub use lb::{Backend, LoadBalancer, LoadBalancerRegistry};
 pub use proxy::WafProxy;
 pub use router::HostRouter;
 pub use ssl::SslManager;
-pub use tunnel::{
-    TunnelConfig, TunnelConnection, TunnelRegistry, TunnelStatus, generate_token, hash_token,
-};
+pub use tunnel::{TunnelConfig, TunnelConnection, TunnelRegistry, TunnelStatus, generate_token, hash_token};

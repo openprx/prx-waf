@@ -84,9 +84,9 @@ impl ResponseCache {
     /// Build the cache key for a request.
     pub fn make_key(method: &str, host: &str, path: &str, query: &str) -> String {
         if query.is_empty() {
-            format!("{}:{}:{}", method, host, path)
+            format!("{method}:{host}:{path}")
         } else {
-            format!("{}:{}:{}?{}", method, host, path, query)
+            format!("{method}:{host}:{path}?{query}")
         }
     }
 
@@ -191,9 +191,8 @@ enum CacheDecision {
 }
 
 fn parse_cache_control(header: Option<&str>) -> CacheDecision {
-    let header = match header {
-        Some(h) => h,
-        None => return CacheDecision::Default,
+    let Some(header) = header else {
+        return CacheDecision::Default;
     };
     let lower = header.to_lowercase();
     if lower.contains("no-store") {

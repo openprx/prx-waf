@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-/// GeoIP information resolved from the client IP address.
+/// `GeoIP` information resolved from the client IP address.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GeoIpInfo {
     pub country: String,
@@ -30,8 +30,9 @@ pub struct RequestCtx {
     pub content_length: u64,
     pub is_tls: bool,
     pub host_config: Arc<HostConfig>,
-    /// GeoIP info populated by the WAF engine before checks run.
-    /// `None` if GeoIP is disabled or the xdb file is missing.
+    /// `GeoIP` info populated by the WAF engine before checks run.
+    ///
+    /// `None` if `GeoIP` is disabled or the xdb file is missing.
     pub geo: Option<GeoIpInfo>,
 }
 
@@ -53,21 +54,21 @@ pub struct WafDecision {
 }
 
 impl WafDecision {
-    pub fn allow() -> Self {
+    pub const fn allow() -> Self {
         Self {
             action: WafAction::Allow,
             result: None,
         }
     }
 
-    pub fn block(status: u16, body: Option<String>, result: DetectionResult) -> Self {
+    pub const fn block(status: u16, body: Option<String>, result: DetectionResult) -> Self {
         Self {
             action: WafAction::Block { status, body },
             result: Some(result),
         }
     }
 
-    pub fn is_allowed(&self) -> bool {
+    pub const fn is_allowed(&self) -> bool {
         matches!(self.action, WafAction::Allow | WafAction::LogOnly)
     }
 }
@@ -94,9 +95,9 @@ pub enum Phase {
     Sensitive = 14,
     /// Anti-hotlinking (Referer check)
     AntiHotlink = 15,
-    /// CrowdSec bouncer / AppSec decision
+    /// `CrowdSec` bouncer / `AppSec` decision
     CrowdSec = 16,
-    /// GeoIP-based access control
+    /// `GeoIP`-based access control
     GeoIp = 17,
     /// Community threat intelligence blocklist
     Community = 18,
@@ -105,24 +106,24 @@ pub enum Phase {
 impl std::fmt::Display for Phase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Phase::IpWhitelist => write!(f, "IP Whitelist"),
-            Phase::IpBlacklist => write!(f, "IP Blacklist"),
-            Phase::UrlWhitelist => write!(f, "URL Whitelist"),
-            Phase::UrlBlacklist => write!(f, "URL Blacklist"),
-            Phase::SqlInjection => write!(f, "SQL Injection"),
-            Phase::Xss => write!(f, "XSS"),
-            Phase::Rce => write!(f, "RCE"),
-            Phase::Scanner => write!(f, "Scanner"),
-            Phase::DirTraversal => write!(f, "Directory Traversal"),
-            Phase::Bot => write!(f, "Bot"),
-            Phase::RateLimit => write!(f, "Rate Limit"),
-            Phase::CustomRule => write!(f, "Custom Rule"),
-            Phase::Owasp => write!(f, "OWASP CRS"),
-            Phase::Sensitive => write!(f, "Sensitive Data"),
-            Phase::AntiHotlink => write!(f, "Anti-Hotlink"),
-            Phase::CrowdSec => write!(f, "CrowdSec"),
-            Phase::GeoIp => write!(f, "GeoIP"),
-            Phase::Community => write!(f, "Community"),
+            Self::IpWhitelist => write!(f, "IP Whitelist"),
+            Self::IpBlacklist => write!(f, "IP Blacklist"),
+            Self::UrlWhitelist => write!(f, "URL Whitelist"),
+            Self::UrlBlacklist => write!(f, "URL Blacklist"),
+            Self::SqlInjection => write!(f, "SQL Injection"),
+            Self::Xss => write!(f, "XSS"),
+            Self::Rce => write!(f, "RCE"),
+            Self::Scanner => write!(f, "Scanner"),
+            Self::DirTraversal => write!(f, "Directory Traversal"),
+            Self::Bot => write!(f, "Bot"),
+            Self::RateLimit => write!(f, "Rate Limit"),
+            Self::CustomRule => write!(f, "Custom Rule"),
+            Self::Owasp => write!(f, "OWASP CRS"),
+            Self::Sensitive => write!(f, "Sensitive Data"),
+            Self::AntiHotlink => write!(f, "Anti-Hotlink"),
+            Self::CrowdSec => write!(f, "CrowdSec"),
+            Self::GeoIp => write!(f, "GeoIP"),
+            Self::Community => write!(f, "Community"),
         }
     }
 }
@@ -136,7 +137,8 @@ pub struct DetectionResult {
     pub detail: String,
 }
 
-/// Host configuration matching SamWaf Hosts model
+/// Host configuration matching `SamWaf` Hosts model
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostConfig {
     pub code: String,
@@ -156,7 +158,7 @@ pub struct HostConfig {
     pub load_balance_strategy: LoadBalanceStrategy,
     pub defense_config: DefenseConfig,
     pub log_only_mode: bool,
-    /// Custom HTML block page template; placeholders: {{req_id}}, {{rule_name}}, {{client_ip}}
+    /// Custom HTML block page template; placeholders: `{{req_id}}`, `{{rule_name}}`, `{{client_ip}}`
     pub block_page_template: Option<String>,
 }
 
@@ -197,7 +199,9 @@ pub enum LoadBalanceStrategy {
 }
 
 /// Defense configuration per host
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)]
 pub struct DefenseConfig {
     pub bot: bool,
     pub sqli: bool,
@@ -222,27 +226,27 @@ pub struct DefenseConfig {
     /// Auto-ban duration in seconds
     #[serde(default = "default_cc_ban_duration_secs")]
     pub cc_ban_duration_secs: u64,
-    /// OWASP CRS paranoia level (1–4, default 1 = most permissive)
+    /// OWASP CRS paranoia level (1-4, default 1 = most permissive)
     #[serde(default = "default_owasp_paranoia")]
     pub owasp_paranoia: u8,
 }
 
-fn bool_true() -> bool {
+const fn bool_true() -> bool {
     true
 }
-fn default_cc_rps() -> f64 {
+const fn default_cc_rps() -> f64 {
     100.0
 }
-fn default_cc_burst() -> u32 {
+const fn default_cc_burst() -> u32 {
     200
 }
-fn default_cc_ban_threshold() -> u32 {
+const fn default_cc_ban_threshold() -> u32 {
     10
 }
-fn default_cc_ban_duration_secs() -> u64 {
+const fn default_cc_ban_duration_secs() -> u64 {
     300
 }
-fn default_owasp_paranoia() -> u8 {
+const fn default_owasp_paranoia() -> u8 {
     1
 }
 

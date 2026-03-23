@@ -1,4 +1,4 @@
-//! GeoIP lookup service backed by ip2region xdb files.
+//! `GeoIP` lookup service backed by ip2region xdb files.
 //!
 //! Uses `ArcSwapOption` for each searcher so the underlying xdb files can be
 //! atomically replaced at runtime (hot-reload) without any reader downtime.
@@ -11,7 +11,7 @@ use ip2region::{CachePolicy, Searcher};
 use tracing::{info, warn};
 use waf_common::GeoIpInfo;
 
-/// Thread-safe GeoIP lookup service with hot-reload support.
+/// Thread-safe `GeoIP` lookup service with hot-reload support.
 ///
 /// Construct once (during engine initialisation) then share via `Arc<GeoIpService>`.
 /// The internal searchers can be atomically swapped at any time via [`reload`].
@@ -33,13 +33,9 @@ impl GeoIpService {
     ///
     /// `ipv4_path` / `ipv6_path` may point to files that don't exist yet;
     /// missing files are silently skipped and the corresponding searcher is
-    /// left as `None`.  GeoIP lookups for that address family will return
+    /// left as `None`.  `GeoIP` lookups for that address family will return
     /// an empty `GeoIpInfo`.
-    pub fn init(
-        ipv4_path: &str,
-        ipv6_path: &str,
-        cache_policy: CachePolicy,
-    ) -> anyhow::Result<Self> {
+    pub fn init(ipv4_path: &str, ipv6_path: &str, cache_policy: CachePolicy) -> anyhow::Result<Self> {
         let ipv4 = load_searcher(ipv4_path, cache_policy, "IPv4");
         let ipv6 = load_searcher(ipv6_path, cache_policy, "IPv6");
 
@@ -90,7 +86,7 @@ impl GeoIpService {
         Ok(any_loaded)
     }
 
-    /// Look up the GeoIP information for `ip`.
+    /// Look up the `GeoIP` information for `ip`.
     ///
     /// Loads the current searcher via `ArcSwapOption::load` (lock-free) and
     /// performs the lookup.  Returns a default (all-empty) `GeoIpInfo` if no
@@ -104,9 +100,8 @@ impl GeoIpService {
         };
 
         // Deref chain: Guard -> Option<Arc<Searcher>> -> Option<&Searcher>
-        let searcher = match guard.as_deref() {
-            Some(s) => s,
-            None => return GeoIpInfo::default(),
+        let Some(searcher) = guard.as_deref() else {
+            return GeoIpInfo::default();
         };
 
         let raw = match searcher.search(ip.to_string().as_str()) {
@@ -129,10 +124,7 @@ impl GeoIpService {
 /// opened, so callers can continue with degraded but functional behaviour.
 fn load_searcher(path: &str, policy: CachePolicy, label: &str) -> Option<Arc<Searcher>> {
     if !std::path::Path::new(path).exists() {
-        info!(
-            "GeoIP: {} xdb file not found at '{}' — skipping",
-            label, path
-        );
+        info!("GeoIP: {} xdb file not found at '{}' — skipping", label, path);
         return None;
     }
 
@@ -142,10 +134,7 @@ fn load_searcher(path: &str, policy: CachePolicy, label: &str) -> Option<Arc<Sea
             Some(Arc::new(s))
         }
         Err(e) => {
-            warn!(
-                "GeoIP: failed to load {} searcher from '{}': {}",
-                label, path, e
-            );
+            warn!("GeoIP: failed to load {} searcher from '{}': {}", label, path, e);
             None
         }
     }
@@ -181,11 +170,7 @@ fn parse_region(raw: &str) -> GeoIpInfo {
 /// Return an empty string for the ip2region sentinel value `"0"`.
 #[inline]
 fn normalize(s: &str) -> String {
-    if s == "0" {
-        String::new()
-    } else {
-        s.to_string()
-    }
+    if s == "0" { String::new() } else { s.to_string() }
 }
 
 /// Convert a `cache_policy` string (from config) to ip2region's `CachePolicy`.
@@ -228,21 +213,12 @@ mod tests {
 
     #[test]
     fn cache_policy_mapping() {
-        assert!(matches!(
-            cache_policy_from_str("full_memory"),
-            CachePolicy::FullMemory
-        ));
+        assert!(matches!(cache_policy_from_str("full_memory"), CachePolicy::FullMemory));
         assert!(matches!(
             cache_policy_from_str("vector_index"),
             CachePolicy::VectorIndex
         ));
-        assert!(matches!(
-            cache_policy_from_str("no_cache"),
-            CachePolicy::NoCache
-        ));
-        assert!(matches!(
-            cache_policy_from_str("unknown"),
-            CachePolicy::FullMemory
-        ));
+        assert!(matches!(cache_policy_from_str("no_cache"), CachePolicy::NoCache));
+        assert!(matches!(cache_policy_from_str("unknown"), CachePolicy::FullMemory));
     }
 }

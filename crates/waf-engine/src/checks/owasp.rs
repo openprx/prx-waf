@@ -78,7 +78,7 @@ struct RuleSet {
     rules: Vec<YamlRule>,
 }
 
-fn default_paranoia_level() -> u8 {
+const fn default_paranoia_level() -> u8 {
     1
 }
 
@@ -142,27 +142,21 @@ impl CompiledRule {
                             || re.is_match(&body)
                             || ctx.headers.values().any(|v| re.is_match(v))
                     }
-                    _ => field_val.as_ref().map(|v| re.is_match(v)).unwrap_or(false),
+                    _ => field_val.as_ref().is_some_and(|v| re.is_match(v)),
                 }
             }
-            CompiledMatcher::Contains(s) => field_val
-                .as_ref()
-                .map(|v| v.contains(s.as_str()))
-                .unwrap_or(false),
+            CompiledMatcher::Contains(s) => field_val.as_ref().is_some_and(|v| v.contains(s.as_str())),
             CompiledMatcher::NotIn(list) => field_val
                 .as_ref()
-                .map(|v| !list.iter().any(|allowed| allowed.eq_ignore_ascii_case(v)))
-                .unwrap_or(false),
+                .is_some_and(|v| !list.iter().any(|allowed| allowed.eq_ignore_ascii_case(v))),
             CompiledMatcher::Gt(n) => field_val
                 .as_ref()
                 .and_then(|v| v.parse::<i64>().ok())
-                .map(|v| v > *n)
-                .unwrap_or(false),
+                .is_some_and(|v| v > *n),
             CompiledMatcher::Lt(n) => field_val
                 .as_ref()
                 .and_then(|v| v.parse::<i64>().ok())
-                .map(|v| v < *n)
-                .unwrap_or(false),
+                .is_some_and(|v| v < *n),
         }
     }
 
@@ -187,7 +181,7 @@ impl CompiledRule {
 
 // ── OWASPCheck ────────────────────────────────────────────────────────────────
 
-/// WAF checker implementing a subset of the OWASP CRS.
+/// WAF checker implementing a subset of the `OWASP` CRS.
 pub struct OWASPCheck {
     rules: Vec<CompiledRule>,
 }
@@ -217,7 +211,7 @@ impl OWASPCheck {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(err) => {
-                warn!("Cannot read OWASP rules dir {}: {}", dir.display(), err);
+                warn!("Cannot read OWASP rules dir {}: {err}", dir.display());
                 return Self { rules };
             }
         };
@@ -230,14 +224,14 @@ impl OWASPCheck {
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
-                    warn!("Failed to read {}: {}", path.display(), e);
+                    warn!("Failed to read {}: {e}", path.display());
                     continue;
                 }
             };
             let ruleset: RuleSet = match serde_yaml::from_str(&content) {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!("Failed to parse {}: {}", path.display(), e);
+                    warn!("Failed to parse {}: {e}", path.display());
                     continue;
                 }
             };
@@ -247,11 +241,7 @@ impl OWASPCheck {
                     rules.push(cr);
                 }
             }
-            debug!(
-                "Loaded {} rules from {}",
-                rules.len() - count_before,
-                path.display()
-            );
+            debug!("Loaded {} rules from {}", rules.len() - count_before, path.display());
         }
 
         Self { rules }
@@ -262,7 +252,7 @@ impl OWASPCheck {
         let ruleset: RuleSet = match serde_yaml::from_str(yaml) {
             Ok(r) => r,
             Err(e) => {
-                warn!("Failed to parse OWASP rules YAML: {}", e);
+                warn!("Failed to parse OWASP rules YAML: {e}");
                 return Self { rules: vec![] };
             }
         };
@@ -274,19 +264,19 @@ impl OWASPCheck {
 
     /// Try to load from a single YAML file, falling back to defaults on error.
     pub fn from_file_or_default(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                debug!("Loading OWASP rules from {}", path.display());
-                Self::from_yaml(&content)
-            }
-            Err(_) => {
+        std::fs::read_to_string(path).map_or_else(
+            |_| {
                 debug!("Using embedded OWASP rules");
                 Self::new()
-            }
-        }
+            },
+            |content| {
+                debug!("Loading OWASP rules from {}", path.display());
+                Self::from_yaml(&content)
+            },
+        )
     }
 
-    pub fn rule_count(&self) -> usize {
+    pub const fn rule_count(&self) -> usize {
         self.rules.len()
     }
 }
@@ -301,7 +291,7 @@ fn compile_rule(r: YamlRule) -> Option<CompiledRule> {
             match Regex::new(&pattern) {
                 Ok(re) => CompiledMatcher::Regex(re),
                 Err(e) => {
-                    warn!("Invalid regex in OWASP rule {}: {}", r.id, e);
+                    warn!("Invalid regex in OWASP rule {}: {e}", r.id);
                     return None;
                 }
             }
@@ -335,10 +325,7 @@ fn compile_rule(r: YamlRule) -> Option<CompiledRule> {
             CompiledMatcher::Lt(n)
         }
         op => {
-            debug!(
-                "Skipping OWASP rule {} with unsupported operator '{}'",
-                r.id, op
-            );
+            debug!("Skipping OWASP rule {} with unsupported operator '{op}'", r.id);
             return None;
         }
     };
@@ -427,10 +414,7 @@ mod tests {
     fn test_invalid_method_blocked() {
         let checker = OWASPCheck::new();
         let ctx = make_ctx("FOOBAR", "/", 0);
-        assert!(
-            checker.check(&ctx).is_some(),
-            "FOOBAR method should be blocked"
-        );
+        assert!(checker.check(&ctx).is_some(), "FOOBAR method should be blocked");
     }
 
     #[test]
@@ -440,8 +424,7 @@ mod tests {
             let ctx = make_ctx(method, "/", 0);
             assert!(
                 checker.check(&ctx).is_none(),
-                "{} should be allowed by OWASP method check",
-                method
+                "{method} should be allowed by OWASP method check"
             );
         }
     }

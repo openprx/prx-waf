@@ -1,20 +1,20 @@
 use serde::{Deserialize, Serialize};
 
-/// CrowdSec integration mode
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+/// `CrowdSec` integration mode
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CrowdSecMode {
     /// Pull decisions from LAPI (bouncer only)
     #[default]
     Bouncer,
-    /// Check requests via AppSec protocol
+    /// Check requests via `AppSec` protocol
     Appsec,
-    /// Both bouncer and AppSec
+    /// Both bouncer and `AppSec`
     Both,
 }
 
-/// What to do when LAPI / AppSec is unavailable
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+/// What to do when LAPI / `AppSec` is unavailable
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FallbackAction {
     /// Allow the request (fail open)
@@ -26,15 +26,15 @@ pub enum FallbackAction {
     Log,
 }
 
-/// Main CrowdSec integration configuration
+/// Main `CrowdSec` integration configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrowdSecConfig {
-    /// Enable CrowdSec integration
+    /// Enable `CrowdSec` integration
     pub enabled: bool,
     /// Integration mode
     #[serde(default)]
     pub mode: CrowdSecMode,
-    /// LAPI base URL (e.g. http://localhost:8080)
+    /// LAPI base URL (e.g. <http://localhost:8080>)
     pub lapi_url: String,
     /// Bouncer API key sent as X-Api-Key header
     pub api_key: String,
@@ -53,9 +53,9 @@ pub struct CrowdSecConfig {
     /// Exclude decisions whose scenario contains any of these strings
     #[serde(default)]
     pub scenarios_not_containing: Vec<String>,
-    /// AppSec engine config (used when mode = appsec or both)
+    /// `AppSec` engine config (used when mode = appsec or both)
     pub appsec: Option<AppSecConfig>,
-    /// Log pusher config (for pushing WAF events back to CrowdSec)
+    /// Log pusher config (for pushing WAF events back to `CrowdSec`)
     pub pusher: Option<PusherConfig>,
 }
 
@@ -77,17 +77,17 @@ impl Default for CrowdSecConfig {
     }
 }
 
-/// AppSec protocol configuration
+/// `AppSec` protocol configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSecConfig {
-    /// AppSec HTTP endpoint URL
+    /// `AppSec` HTTP endpoint URL
     pub endpoint: String,
-    /// AppSec API key
+    /// `AppSec` API key
     pub api_key: String,
     /// Request timeout in milliseconds
     #[serde(default = "default_appsec_timeout")]
     pub timeout_ms: u64,
-    /// Action when AppSec is unavailable
+    /// Action when `AppSec` is unavailable
     #[serde(default)]
     pub failure_action: FallbackAction,
 }
@@ -95,15 +95,15 @@ pub struct AppSecConfig {
 /// Log pusher configuration (machine credentials)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PusherConfig {
-    /// Machine login / machine_id
+    /// Machine login / `machine_id`
     pub login: String,
     /// Machine password
     pub password: String,
 }
 
-fn default_update_frequency() -> u64 {
+const fn default_update_frequency() -> u64 {
     10
 }
-fn default_appsec_timeout() -> u64 {
+const fn default_appsec_timeout() -> u64 {
     500
 }

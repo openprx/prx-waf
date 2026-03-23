@@ -1,4 +1,4 @@
-/// WebSocket handlers for real-time event/log streaming.
+/// `WebSocket` handlers for real-time event/log streaming.
 ///
 /// Endpoints:
 ///   GET /ws/events  — live security events
@@ -95,6 +95,7 @@ fn extract_ws_token(headers: &HeaderMap, params: &WsQuery) -> Option<String> {
     None
 }
 
+#[allow(clippy::unused_async)] // Axum handler signature requires async
 async fn auth_and_upgrade(
     ws: WebSocketUpgrade,
     headers: &HeaderMap,
@@ -103,23 +104,16 @@ async fn auth_and_upgrade(
     stream: &'static str,
 ) -> Response {
     // Extract JWT from headers or query parameter
-    let token = match extract_ws_token(headers, &params) {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "token required — use Authorization header" })),
-            )
-                .into_response();
-        }
+    let Some(token) = extract_ws_token(headers, &params) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "token required — use Authorization header" })),
+        )
+            .into_response();
     };
 
     if validate_access_token(&token, &state.jwt_secret).is_err() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "invalid token" })),
-        )
-            .into_response();
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid token" }))).into_response();
     }
 
     // Check connection limit
@@ -133,8 +127,7 @@ async fn auth_and_upgrade(
             .into_response();
     }
 
-    let s = state.clone();
-    ws.on_upgrade(move |socket| handle_ws(socket, s, stream))
+    ws.on_upgrade(move |socket| handle_ws(socket, state, stream))
 }
 
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, stream: &'static str) {
@@ -149,19 +142,14 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, stream: &'static
                 match msg {
                     Ok(val) => {
                         let text = val.to_string();
-                        // For /ws/logs, forward all events; for /ws/events, forward security events
-                        let send_it = match stream {
-                            "logs"   => true,
-                            _        => true, // all events by default
-                        };
-                        if send_it
-                            && socket.send(Message::Text(text)).await.is_err() {
-                                break;
-                            }
+                        // Forward all events for both /ws/logs and /ws/events
+                        let _ = stream; // all event types forwarded by default
+                        if socket.send(Message::Text(text)).await.is_err() {
+                            break;
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // Skip lagged messages
-                        continue;
                     }
                     Err(_) => break,
                 }
@@ -178,7 +166,6 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, stream: &'static
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(Message::Pong(_))) => {},
                     _ => {}
                 }
             }

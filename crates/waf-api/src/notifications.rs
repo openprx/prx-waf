@@ -1,11 +1,11 @@
 /// Notification system — channels, configuration CRUD, rate-limited dispatch.
 ///
 /// Supported channels:
-///   email   — SMTP via lettre (config_json: smtp_host, smtp_port, username, password, from, to)
-///   webhook — HTTP POST via reqwest (config_json: url, secret, headers)
-///   telegram — Telegram Bot API (config_json: bot_token, chat_id)
+///   email   — SMTP via lettre (`config_json`: `smtp_host`, `smtp_port`, username, password, from, to)
+///   webhook — HTTP POST via reqwest (`config_json`: url, secret, headers)
+///   telegram — Telegram Bot API (`config_json`: `bot_token`, `chat_id`)
 ///
-/// Event types: attack_detected | cert_expiry | high_traffic | backend_down
+/// Event types: `attack_detected` | `cert_expiry` | `high_traffic` | `backend_down`
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +24,7 @@ use crate::state::AppState;
 
 // ─── Rate-limit state (in-process) ───────────────────────────────────────────
 
-/// Per config_id last-sent timestamp for rate limiting.
+/// Per `config_id` last-sent timestamp for rate limiting.
 pub type NotifRateLimiter = Arc<DashMap<Uuid, chrono::DateTime<Utc>>>;
 
 pub fn new_rate_limiter() -> NotifRateLimiter {
@@ -32,12 +32,10 @@ pub fn new_rate_limiter() -> NotifRateLimiter {
 }
 
 fn is_rate_limited(rl: &NotifRateLimiter, id: Uuid) -> bool {
-    if let Some(last) = rl.get(&id) {
+    rl.get(&id).is_some_and(|last| {
         let elapsed = Utc::now().signed_duration_since(*last);
         elapsed < chrono::Duration::minutes(5)
-    } else {
-        false
-    }
+    })
 }
 
 fn mark_sent(rl: &NotifRateLimiter, id: Uuid) {
@@ -129,11 +127,9 @@ impl NotificationChannel for TelegramChannel {
     }
 
     async fn send(&self, payload: &NotificationPayload) -> anyhow::Result<()> {
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
-        let text = format!(
-            "*{}*\n{}\n\n_{}_",
-            payload.title, payload.message, payload.event_type
-        );
+        let bot_token = &self.bot_token;
+        let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+        let text = format!("*{}*\n{}\n\n_{}_", payload.title, payload.message, payload.event_type);
         let body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
@@ -166,8 +162,8 @@ impl NotificationChannel for EmailChannel {
 
     async fn send(&self, payload: &NotificationPayload) -> anyhow::Result<()> {
         use lettre::{
-            AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-            message::header::ContentType, transport::smtp::authentication::Credentials,
+            AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::header::ContentType,
+            transport::smtp::authentication::Credentials,
         };
 
         let from_addr: lettre::message::Mailbox = self.from.parse()?;
@@ -194,18 +190,15 @@ impl NotificationChannel for EmailChannel {
 
 // ─── Dispatch ─────────────────────────────────────────────────────────────────
 
-/// Build a channel from a NotificationConfig's config_json.
-pub fn build_channel(
-    channel_type: &str,
-    config: &serde_json::Value,
-) -> anyhow::Result<Box<dyn NotificationChannel>> {
+/// Build a channel from a `NotificationConfig`'s `config_json`.
+pub fn build_channel(channel_type: &str, config: &serde_json::Value) -> anyhow::Result<Box<dyn NotificationChannel>> {
     match channel_type {
         "webhook" => {
             let url = config["url"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("webhook.url missing"))?
                 .to_string();
-            let secret = config["secret"].as_str().map(str::to_owned);
+            let secret = config["secret"].as_str().map(ToOwned::to_owned);
             Ok(Box::new(WebhookChannel::new(url, secret)))
         }
         "telegram" => {
@@ -220,10 +213,8 @@ pub fn build_channel(
             Ok(Box::new(TelegramChannel::new(token, chat_id)))
         }
         "email" => {
-            let smtp_host = config["smtp_host"]
-                .as_str()
-                .unwrap_or("127.0.0.1")
-                .to_string();
+            let smtp_host = config["smtp_host"].as_str().unwrap_or("127.0.0.1").to_string();
+            #[allow(clippy::cast_possible_truncation)]
             let smtp_port = config["smtp_port"].as_u64().unwrap_or(25) as u16;
             let username = config["username"].as_str().unwrap_or("").to_string();
             let password = config["password"].as_str().unwrap_or("").to_string();
@@ -233,11 +224,7 @@ pub fn build_channel(
                 .to_string();
             let to: Vec<String> = config["to"]
                 .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect()
-                })
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect())
                 .unwrap_or_default();
             Ok(Box::new(EmailChannel {
                 smtp_host,
@@ -288,14 +275,7 @@ pub async fn dispatch_notification(
         if is_rate_limited(&state.notif_rate_limiter, cfg.id) {
             let _ = state
                 .db
-                .create_notification_log(
-                    Some(cfg.id),
-                    &event_type,
-                    &cfg.channel_type,
-                    "rate_limited",
-                    None,
-                    None,
-                )
+                .create_notification_log(Some(cfg.id), &event_type, &cfg.channel_type, "rate_limited", None, None)
                 .await;
             continue;
         }
@@ -351,10 +331,7 @@ pub async fn list_notifications(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HostFilter>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let rows = state
-        .db
-        .list_notification_configs(q.host_code.as_deref())
-        .await?;
+    let rows = state.db.list_notification_configs(q.host_code.as_deref()).await?;
     Ok(Json(serde_json::json!({ "success": true, "data": rows })))
 }
 
@@ -367,9 +344,7 @@ pub async fn create_notification(
     match req.channel_type.as_str() {
         "email" | "webhook" | "telegram" => {}
         other => {
-            return Err(ApiError::BadRequest(format!(
-                "unknown channel_type: {other}"
-            )));
+            return Err(ApiError::BadRequest(format!("unknown channel_type: {other}")));
         }
     }
     let row = state.db.create_notification_config(req).await?;
@@ -383,17 +358,13 @@ pub async fn delete_notification(
 ) -> ApiResult<Json<serde_json::Value>> {
     let deleted = state.db.delete_notification_config(id).await?;
     if !deleted {
-        return Err(ApiError::NotFound(format!(
-            "Notification config {id} not found"
-        )));
+        return Err(ApiError::NotFound(format!("Notification config {id} not found")));
     }
     Ok(Json(serde_json::json!({ "success": true, "data": null })))
 }
 
 /// GET /api/notifications/log
-pub async fn notification_log(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<serde_json::Value>> {
+pub async fn notification_log(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
     let rows = state.db.list_notification_log(100).await?;
     Ok(Json(serde_json::json!({ "success": true, "data": rows })))
 }
@@ -422,7 +393,5 @@ pub async fn test_notification(
 
     chan.send(&payload).await.map_err(ApiError::Internal)?;
 
-    Ok(Json(
-        serde_json::json!({ "success": true, "data": "test sent" }),
-    ))
+    Ok(Json(serde_json::json!({ "success": true, "data": "test sent" })))
 }

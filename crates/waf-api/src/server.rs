@@ -1,34 +1,40 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::http::{
+    HeaderValue, Method,
+    header::{AUTHORIZATION, CONTENT_TYPE},
+};
 use axum::{
     Router, middleware,
     routing::{delete, get, post},
 };
-use axum::http::{HeaderValue, Method, header::{AUTHORIZATION, CONTENT_TYPE}};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use crate::auth::{login, logout, refresh_token};
 use crate::cache_api::{cache_flush, cache_flush_host, cache_flush_key, cache_stats};
-use crate::cluster::{
-    cluster_status, generate_join_token, get_cluster_node, list_cluster_nodes, remove_cluster_node,
-};
+use crate::cluster::{cluster_status, generate_join_token, get_cluster_node, list_cluster_nodes, remove_cluster_node};
 use crate::crowdsec::{
-    crowdsec_stats, crowdsec_status, delete_crowdsec_decision, get_crowdsec_config,
-    list_crowdsec_decisions, list_crowdsec_events, test_crowdsec_connection,
-    update_crowdsec_config,
+    crowdsec_stats, crowdsec_status, delete_crowdsec_decision, get_crowdsec_config, list_crowdsec_decisions,
+    list_crowdsec_events, test_crowdsec_connection, update_crowdsec_config,
 };
-use crate::handlers::*;
+use crate::handlers::{
+    create_allow_ip, create_allow_url, create_block_ip, create_block_url, create_custom_rule, create_host,
+    create_lb_backend, create_sensitive_pattern, delete_allow_ip, delete_allow_url, delete_block_ip, delete_block_url,
+    delete_certificate, delete_custom_rule, delete_host, delete_lb_backend, delete_sensitive_pattern, get_host,
+    get_hotlink_config, get_status, list_allow_ips, list_allow_urls, list_attack_logs, list_block_ips, list_block_urls,
+    list_certificates, list_custom_rules, list_hosts, list_lb_backends, list_security_events, list_sensitive_patterns,
+    reload_rules, update_host, upload_certificate, upsert_hotlink_config,
+};
 use crate::health::health_check;
 use crate::middleware::require_auth;
 use crate::notifications::{
-    create_notification, delete_notification, list_notifications, notification_log,
-    test_notification,
+    create_notification, delete_notification, list_notifications, notification_log, test_notification,
 };
 use crate::plugins::{delete_plugin, disable_plugin, enable_plugin, list_plugins, upload_plugin};
-use crate::security::{list_audit_log, security_headers_middleware};
+use crate::security::{admin_ip_check_middleware, list_audit_log, rate_limit_middleware, security_headers_middleware};
 use crate::state::AppState;
 use crate::static_files::static_handler;
 use crate::stats::{stats_geo, stats_overview, stats_timeseries};
@@ -176,13 +182,24 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/crowdsec/stats", get(crowdsec_stats))
         .route("/api/crowdsec/events", get(list_crowdsec_events))
-        .layer(middleware::from_fn_with_state(state.clone(), require_auth));
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_ip_check_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ));
 
-    // WebSocket routes (auth via query param, no layer middleware)
+    // WebSocket routes — protected by admin IP allowlist and rate limiting.
+    // Auth is handled via query param inside each handler.
     let ws_routes = Router::new()
         .route("/ws/events", get(ws_events))
         .route("/ws/logs", get(ws_logs))
-        .route("/ws/tunnel", get(ws_tunnel));
+        .route("/ws/tunnel", get(ws_tunnel))
+        .layer(middleware::from_fn_with_state(state.clone(), admin_ip_check_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware));
 
     // Serve the embedded Vue 3 admin UI at /ui/*
     let ui_routes = Router::new()
@@ -209,7 +226,7 @@ pub async fn start_api_server(listen_addr: &str, state: Arc<AppState>) -> anyhow
     info!("Management API listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
 }

@@ -28,11 +28,8 @@ impl HotReloader {
     ///
     /// `manager` is shared (Arc<Mutex>) so the watcher thread can call `reload()`.
     /// `debounce_ms` controls how long to wait after the last event before reloading.
-    pub fn start(
-        manager: Arc<Mutex<RuleManager>>,
-        rules_dir: PathBuf,
-        debounce_ms: u64,
-    ) -> Result<Self> {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn start(manager: Arc<Mutex<RuleManager>>, rules_dir: PathBuf, debounce_ms: u64) -> Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
 
         let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
@@ -57,8 +54,10 @@ impl HotReloader {
                 match rx.recv_timeout(debounce) {
                     Ok(Ok(event)) => {
                         // Filter: only react to Create, Modify, Remove
-                        use notify::EventKind::*;
-                        let relevant = matches!(event.kind, Create(_) | Modify(_) | Remove(_));
+                        let relevant = matches!(
+                            event.kind,
+                            notify::EventKind::Create(_) | notify::EventKind::Modify(_) | notify::EventKind::Remove(_)
+                        );
                         if relevant {
                             last_event = std::time::Instant::now();
                             pending = true;

@@ -12,7 +12,7 @@ use super::models::{CacheStats, CachedDecision, Decision, DecisionStream};
 
 /// In-memory decision cache with exact-IP and CIDR-range matching.
 ///
-/// Thread-safe via DashMap (exact IPs), RwLock<Vec> (CIDR ranges), and
+/// Thread-safe via `DashMap` (exact IPs), `RwLock<Vec>` (CIDR ranges), and
 /// atomic counters for statistics.
 pub struct DecisionCache {
     /// Exact IP address decisions
@@ -73,7 +73,7 @@ impl DecisionCache {
     pub fn apply_stream(&self, stream: DecisionStream, config: &CrowdSecConfig) {
         if let Some(new_decisions) = stream.new {
             for decision in new_decisions {
-                if !self.should_cache(&decision, config) {
+                if !Self::should_cache(&decision, config) {
                     continue;
                 }
                 let expires_at = self.compute_expiry(&decision);
@@ -81,7 +81,7 @@ impl DecisionCache {
                     decision: decision.clone(),
                     expires_at,
                 };
-                self.insert_decision(decision, cached);
+                self.insert_decision(&decision, cached);
             }
         }
 
@@ -110,7 +110,7 @@ impl DecisionCache {
     pub fn list_decisions(&self) -> Vec<Decision> {
         let mut result = Vec::new();
 
-        for entry in self.ip_decisions.iter() {
+        for entry in &self.ip_decisions {
             if !entry.is_expired() {
                 result.push(entry.decision.clone());
             }
@@ -125,7 +125,7 @@ impl DecisionCache {
             }
         }
 
-        for entry in self.other_decisions.iter() {
+        for entry in &self.other_decisions {
             if !entry.is_expired() {
                 result.push(entry.decision.clone());
             }
@@ -139,6 +139,7 @@ impl DecisionCache {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
         let total_lookups = hits + misses;
+        #[allow(clippy::cast_precision_loss)]
         let hit_rate_pct = if total_lookups > 0 {
             (hits as f64 / total_lookups as f64) * 100.0
         } else {
@@ -154,7 +155,7 @@ impl DecisionCache {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    fn should_cache(&self, decision: &Decision, config: &CrowdSecConfig) -> bool {
+    fn should_cache(decision: &Decision, config: &CrowdSecConfig) -> bool {
         if !config.scenarios_containing.is_empty() {
             let matches = config
                 .scenarios_containing
@@ -185,7 +186,7 @@ impl DecisionCache {
         Instant::now() + Duration::from_secs(4 * 3600)
     }
 
-    fn insert_decision(&self, decision: Decision, cached: CachedDecision) {
+    fn insert_decision(&self, decision: &Decision, cached: CachedDecision) {
         let scope = decision.scope.to_lowercase();
         match scope.as_str() {
             "ip" => {
@@ -227,14 +228,13 @@ impl DecisionCache {
     }
 
     fn update_total(&self) {
-        let n = self.ip_decisions.len()
-            + self.range_decisions.read().len()
-            + self.other_decisions.len();
+        let n = self.ip_decisions.len() + self.range_decisions.read().len() + self.other_decisions.len();
         self.total_cached.store(n as u64, Ordering::Relaxed);
     }
 }
 
-/// Parse a CrowdSec duration string like "4h35m6.571762785s" into total seconds.
+/// Parse a `CrowdSec` duration string like "4h35m6.571762785s" into total seconds.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn parse_cs_duration(s: &str) -> Option<u64> {
     let mut total = 0u64;
     let mut current = String::new();

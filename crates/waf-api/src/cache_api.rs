@@ -36,10 +36,7 @@ pub async fn cache_flush(State(state): State<Arc<AppState>>) -> impl IntoRespons
 }
 
 /// DELETE /api/cache/host/:host — flush all entries for a given host
-pub async fn cache_flush_host(
-    State(state): State<Arc<AppState>>,
-    Path(host): Path<String>,
-) -> impl IntoResponse {
+pub async fn cache_flush_host(State(state): State<Arc<AppState>>, Path(host): Path<String>) -> impl IntoResponse {
     state.cache.purge_host(&host).await;
     (StatusCode::OK, Json(json!({ "flushed_host": host }))).into_response()
 }
@@ -47,6 +44,7 @@ pub async fn cache_flush_host(
 /// DELETE /api/cache/key — flush a specific cache key
 ///
 /// Query param: `?key=<encoded-key>`
+#[allow(clippy::implicit_hasher)]
 pub async fn cache_flush_key(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,

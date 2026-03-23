@@ -26,7 +26,7 @@ use crate::router::HostRouter;
 
 /// Returns the `Alt-Svc` header value advertising HTTP/3 on the given port.
 pub fn alt_svc_header(port: u16) -> String {
-    format!("h3=\":{}\"; ma=86400", port)
+    format!("h3=\":{port}\"; ma=86400")
 }
 
 // ─── TLS config builder ───────────────────────────────────────────────────────
@@ -74,8 +74,7 @@ pub async fn start_http3_server(
         .map_err(|e| anyhow::anyhow!("QUIC TLS config error: {e:?}"))?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
 
-    let endpoint = quinn::Endpoint::server(server_config, listen_addr)
-        .context("failed to bind QUIC endpoint")?;
+    let endpoint = quinn::Endpoint::server(server_config, listen_addr).context("failed to bind QUIC endpoint")?;
 
     info!("HTTP/3 listener on {}", listen_addr);
 
@@ -87,9 +86,7 @@ pub async fn start_http3_server(
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
-                    if let Err(e) =
-                        handle_quic_connection(conn, upstream, verify_tls, eng, rtr).await
-                    {
+                    if let Err(e) = handle_quic_connection(conn, upstream, verify_tls, eng, rtr).await {
                         warn!("HTTP/3 connection error: {e}");
                     }
                 }
@@ -134,9 +131,7 @@ async fn handle_quic_connection(
                     // h3 0.0.8: use resolver.resolve_request() to get (req, stream)
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
-                            if let Err(e) =
-                                handle_h3_request(req, stream, &client, &upstream, &eng, &rtr, remote)
-                                    .await
+                            if let Err(e) = handle_h3_request(req, stream, &client, &upstream, &eng, &rtr, remote).await
                             {
                                 warn!("HTTP/3 request error: {e}");
                             }
@@ -173,18 +168,10 @@ async fn handle_h3_request<C>(
 where
     C: h3::quic::BidiStream<bytes::Bytes>,
 {
-    let (parts, _) = req.into_parts();
-    let path_and_query = parts
-        .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
+    let (parts, ()) = req.into_parts();
+    let path_and_query = parts.uri.path_and_query().map_or("/", |p| p.as_str());
     let path = parts.uri.path().to_string();
-    let query = parts
-        .uri
-        .query()
-        .unwrap_or("")
-        .to_string();
+    let query = parts.uri.query().unwrap_or("").to_string();
     let method = parts.method.to_string();
 
     // Extract Host header for route resolution
@@ -192,21 +179,19 @@ where
         .headers
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or_default();
 
     // Resolve host config from router; if no route, still run WAF with default config
-    let host_config = router
-        .resolve(host_header)
-        .unwrap_or_else(|| {
-            Arc::new(waf_common::HostConfig {
-                host: host_header.to_string(),
-                ..waf_common::HostConfig::default()
-            })
-        });
+    let host_config = router.resolve(host_header).unwrap_or_else(|| {
+        Arc::new(waf_common::HostConfig {
+            host: host_header.to_string(),
+            ..waf_common::HostConfig::default()
+        })
+    });
 
     // Build request headers map
     let mut headers = HashMap::new();
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         if let Ok(v) = std::str::from_utf8(value.as_bytes()) {
             headers.insert(name.as_str().to_lowercase(), v.to_string());
         }
@@ -240,11 +225,8 @@ where
                     "WAF blocked HTTP/3 request: ip={} path={} host={}",
                     request_ctx.client_ip, request_ctx.path, request_ctx.host,
                 );
-                let status_code = http::StatusCode::from_u16(*status)
-                    .unwrap_or(http::StatusCode::FORBIDDEN);
-                let body_str = body
-                    .clone()
-                    .unwrap_or_else(|| "Access Denied".to_string());
+                let status_code = http::StatusCode::from_u16(*status).unwrap_or(http::StatusCode::FORBIDDEN);
+                let body_str = body.clone().unwrap_or_else(|| "Access Denied".to_string());
                 let body_bytes = Bytes::from(body_str);
 
                 let response = http::Response::builder()
@@ -283,10 +265,7 @@ where
     debug!(method = %request_ctx.method, %target, "HTTP/3 → upstream");
 
     let resp = client
-        .request(
-            reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?,
-            &target,
-        )
+        .request(reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?, &target)
         .send()
         .await
         .context("upstream request failed")?;

@@ -18,11 +18,7 @@ use crate::state::AppState;
 ///
 /// On success, the request passes through unchanged.
 /// On failure, a 401 JSON response is returned immediately.
-pub async fn require_auth(
-    State(state): State<Arc<AppState>>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn require_auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
     let token = req
         .headers()
         .get("authorization")

@@ -5,7 +5,7 @@ use tracing::debug;
 
 use super::models::{Decision, DecisionStream, MachineAuthResponse};
 
-/// CrowdSec Local API (LAPI) HTTP client.
+/// `CrowdSec` Local API (LAPI) HTTP client.
 pub struct CrowdSecClient {
     client: Client,
     lapi_url: String,
@@ -47,10 +47,7 @@ impl CrowdSecClient {
             anyhow::bail!("LAPI decisions/stream returned {status}: {body}");
         }
 
-        let stream: DecisionStream = resp
-            .json()
-            .await
-            .context("failed to parse decisions stream")?;
+        let stream: DecisionStream = resp.json().await.context("failed to parse decisions stream")?;
         Ok(stream)
     }
 
@@ -75,8 +72,7 @@ impl CrowdSecClient {
             anyhow::bail!("LAPI decisions returned {status}: {body}");
         }
 
-        let decisions: Option<Vec<Decision>> =
-            resp.json().await.context("failed to parse decisions")?;
+        let decisions: Option<Vec<Decision>> = resp.json().await.context("failed to parse decisions")?;
         Ok(decisions.unwrap_or_default())
     }
 
@@ -159,10 +155,7 @@ impl CrowdSecClient {
             anyhow::bail!("machine_auth returned {status}: {body}");
         }
 
-        let auth: MachineAuthResponse = resp
-            .json()
-            .await
-            .context("failed to parse machine auth response")?;
+        let auth: MachineAuthResponse = resp.json().await.context("failed to parse machine auth response")?;
         Ok(auth.token)
     }
 }

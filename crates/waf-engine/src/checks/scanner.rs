@@ -44,6 +44,7 @@ static SCANNER_UA_DESCS: &[&str] = &[
     "Scrapy (web scraper)",
 ];
 
+#[allow(clippy::expect_used)]
 static SCANNER_UA_SET: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)\bsqlmap\b",
@@ -91,7 +92,7 @@ static SCANNER_UA_SET: LazyLock<RegexSet> = LazyLock::new(|| {
 pub struct ScannerCheck;
 
 impl ScannerCheck {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -108,11 +109,7 @@ impl Check for ScannerCheck {
             return None;
         }
 
-        let ua = ctx
-            .headers
-            .get("user-agent")
-            .map(|s| s.as_str())
-            .unwrap_or("");
+        let ua = ctx.headers.get("user-agent").map_or("", String::as_str);
 
         let matches = SCANNER_UA_SET.matches(ua);
         if matches.matched_any() {
@@ -122,7 +119,7 @@ impl Check for ScannerCheck {
                 rule_id: Some(format!("SCAN-{:03}", idx + 1)),
                 rule_name: "Scanner".to_string(),
                 phase: Phase::Scanner,
-                detail: format!("{} User-Agent detected", desc),
+                detail: format!("{desc} User-Agent detected"),
             });
         }
 
@@ -192,9 +189,7 @@ mod tests {
     #[test]
     fn allows_regular_browser() {
         let checker = ScannerCheck::new();
-        let ctx = make_ctx(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
-        );
+        let ctx = make_ctx("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0");
         assert!(checker.check(&ctx).is_none());
     }
 }

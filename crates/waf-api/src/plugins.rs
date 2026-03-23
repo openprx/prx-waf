@@ -56,10 +56,7 @@ pub async fn list_plugins(State(state): State<Arc<AppState>>) -> impl IntoRespon
 ///   - `description` (text, optional)
 ///   - `author`      (text, optional)
 ///   - `file`        (binary) the .wasm file
-pub async fn upload_plugin(
-    State(state): State<Arc<AppState>>,
-    mut multipart: Multipart,
-) -> impl IntoResponse {
+pub async fn upload_plugin(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> impl IntoResponse {
     let mut name = String::new();
     let mut version = None::<String>;
     let mut description = None::<String>;
@@ -102,19 +99,16 @@ pub async fn upload_plugin(
             .into_response();
     }
 
-    let bytes = match wasm_bytes {
-        Some(b) => b,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "WASM file is required" })),
-            )
-                .into_response();
-        }
+    let Some(bytes) = wasm_bytes else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "WASM file is required" })),
+        )
+            .into_response();
     };
 
     // Validate WASM magic bytes (\0asm)
-    if bytes.len() < 4 || &bytes[..4] != b"\0asm" {
+    if bytes.get(..4) != Some(b"\0asm".as_slice()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid WASM file (bad magic bytes)" })),
@@ -176,18 +170,11 @@ pub async fn upload_plugin(
 }
 
 /// DELETE /api/plugins/:id — remove a plugin
-pub async fn delete_plugin(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-) -> impl IntoResponse {
+pub async fn delete_plugin(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> impl IntoResponse {
     state.plugin_manager.unload(id).await;
     match state.db.delete_wasm_plugin(id).await {
         Ok(true) => (StatusCode::NO_CONTENT).into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "plugin not found" })),
-        )
-            .into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not found" }))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -197,18 +184,12 @@ pub async fn delete_plugin(
 }
 
 /// POST /api/plugins/:id/enable
-pub async fn enable_plugin(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-) -> impl IntoResponse {
+pub async fn enable_plugin(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> impl IntoResponse {
     set_plugin_enabled(state, id, true).await
 }
 
 /// POST /api/plugins/:id/disable
-pub async fn disable_plugin(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-) -> impl IntoResponse {
+pub async fn disable_plugin(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> impl IntoResponse {
     set_plugin_enabled(state, id, false).await
 }
 
@@ -216,11 +197,7 @@ async fn set_plugin_enabled(state: Arc<AppState>, id: Uuid, enabled: bool) -> im
     state.plugin_manager.set_enabled(id, enabled).await;
     match state.db.set_wasm_plugin_enabled(id, enabled).await {
         Ok(true) => (StatusCode::OK, Json(json!({ "enabled": enabled }))).into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "plugin not found" })),
-        )
-            .into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not found" }))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),

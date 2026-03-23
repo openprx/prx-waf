@@ -22,11 +22,10 @@ type HmacSha256 = Hmac<Sha256>;
 pub fn generate_token(ca_key_pem: &str, ttl_ms: u64) -> Result<String> {
     let now_ms = now_unix_ms();
     let expiry_ms = now_ms.checked_add(ttl_ms).context("token TTL overflow")?;
-    let expiry_hex = format!("{:016x}", expiry_ms);
+    let expiry_hex = format!("{expiry_ms:016x}");
 
     let signing_key = derive_signing_key(ca_key_pem);
-    let mut mac = HmacSha256::new_from_slice(&signing_key)
-        .map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
+    let mut mac = HmacSha256::new_from_slice(&signing_key).map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
     mac.update(expiry_hex.as_bytes());
     let signature = mac.finalize().into_bytes();
     let signature_hex = hex::encode(signature);
@@ -42,16 +41,13 @@ pub fn validate_token(ca_key_pem: &str, token: &str) -> Result<()> {
         .split_once('.')
         .context("invalid token format: missing '.' separator")?;
 
-    let expiry_ms =
-        u64::from_str_radix(expiry_hex, 16).context("invalid token format: bad expiry hex")?;
+    let expiry_ms = u64::from_str_radix(expiry_hex, 16).context("invalid token format: bad expiry hex")?;
 
     let signing_key = derive_signing_key(ca_key_pem);
-    let mut mac = HmacSha256::new_from_slice(&signing_key)
-        .map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
+    let mut mac = HmacSha256::new_from_slice(&signing_key).map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
     mac.update(expiry_hex.as_bytes());
 
-    let provided_sig =
-        hex::decode(signature_hex).context("invalid token format: bad signature hex")?;
+    let provided_sig = hex::decode(signature_hex).context("invalid token format: bad signature hex")?;
 
     mac.verify_slice(&provided_sig)
         .map_err(|_| anyhow::anyhow!("token signature verification failed"))?;
@@ -75,18 +71,19 @@ fn derive_signing_key(ca_key_pem: &str) -> [u8; 32] {
 
 fn now_unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+    #[allow(clippy::cast_possible_truncation)]
+    let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis() as u64;
+    ms
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const FAKE_CA_KEY: &str =
-        "-----BEGIN PRIVATE KEY-----\nfake-key-for-test\n-----END PRIVATE KEY-----\n";
+    const FAKE_CA_KEY: &str = "-----BEGIN PRIVATE KEY-----\nfake-key-for-test\n-----END PRIVATE KEY-----\n";
 
     #[test]
     fn generate_and_validate_token() {

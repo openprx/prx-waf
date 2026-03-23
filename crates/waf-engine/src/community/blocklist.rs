@@ -104,7 +104,7 @@ impl CommunityBlocklistSync {
 
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                () = tokio::time::sleep(interval) => {}
                 result = shutdown_rx.changed() => {
                     if result.is_err() || *shutdown_rx.borrow() {
                         info!("Community blocklist sync task shutting down");
@@ -136,14 +136,7 @@ impl CommunityBlocklistSync {
     async fn full_pull(&self) {
         let url = format!("{}/api/v1/waf/blocklist/decoded", self.client.base_url);
 
-        let resp = match self
-            .client
-            .http
-            .get(&url)
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-        {
+        let resp = match self.client.http.get(&url).bearer_auth(&self.api_key).send().await {
             Ok(r) => r,
             Err(e) => {
                 warn!("Community blocklist full pull failed: {e}");

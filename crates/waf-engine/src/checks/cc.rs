@@ -69,10 +69,7 @@ impl CcCheck {
         // and whose ban has expired (or was never set).
         buckets.retain(|_key, state| {
             let idle = now.duration_since(state.last_check);
-            let still_banned = state
-                .banned_until
-                .map(|b| now < b)
-                .unwrap_or(false);
+            let still_banned = state.banned_until.is_some_and(|b| now < b);
 
             // Keep if still banned or recently active
             still_banned || idle < ENTRY_TTL
@@ -102,6 +99,7 @@ impl Default for CcCheck {
 }
 
 impl Check for CcCheck {
+    #[allow(clippy::significant_drop_tightening)] // lock must be held for atomic read-modify-write
     fn check(&self, ctx: &RequestCtx) -> Option<DetectionResult> {
         let dc = &ctx.host_config.defense_config;
         if !dc.cc {
@@ -109,7 +107,7 @@ impl Check for CcCheck {
         }
 
         let rps = dc.cc_rps;
-        let burst = dc.cc_burst as f64;
+        let burst = f64::from(dc.cc_burst);
         let ban_threshold = dc.cc_ban_threshold;
         let ban_duration_secs = dc.cc_ban_duration_secs;
 
@@ -118,14 +116,12 @@ impl Check for CcCheck {
 
         // Obtain or create the bucket entry.  DashMap's entry API holds the
         // shard lock for the duration of the operation, giving us atomic RMW.
-        let mut entry = self.buckets.entry(key).or_insert_with(|| BucketState {
+        let mut state = self.buckets.entry(key).or_insert_with(|| BucketState {
             tokens: burst,
             last_check: Instant::now(),
             violation_count: 0,
             banned_until: None,
         });
-
-        let state = entry.value_mut();
         let now = Instant::now();
 
         // Check if the IP is currently auto-banned.
@@ -137,22 +133,20 @@ impl Check for CcCheck {
                     rule_name: "Rate Limit (banned)".to_string(),
                     phase: Phase::RateLimit,
                     detail: format!(
-                        "IP auto-banned due to repeated rate-limit violations; {} second(s) remaining",
-                        remaining
+                        "IP auto-banned due to repeated rate-limit violations; {remaining} second(s) remaining"
                     ),
                 });
-            } else {
-                // Ban expired — reset state.
-                state.banned_until = None;
-                state.violation_count = 0;
-                state.tokens = burst;
-                state.last_check = now;
             }
+            // Ban expired — reset state.
+            state.banned_until = None;
+            state.violation_count = 0;
+            state.tokens = burst;
+            state.last_check = now;
         }
 
         // Refill tokens based on elapsed time.
         let elapsed = now.duration_since(state.last_check).as_secs_f64();
-        state.tokens = (state.tokens + elapsed * rps).min(burst);
+        state.tokens = elapsed.mul_add(rps, state.tokens).min(burst);
         state.last_check = now;
 
         if state.tokens >= 1.0 {
@@ -171,8 +165,8 @@ impl Check for CcCheck {
                     rule_name: "Rate Limit (auto-ban triggered)".to_string(),
                     phase: Phase::RateLimit,
                     detail: format!(
-                        "IP auto-banned for {} seconds after {} violations",
-                        ban_duration_secs, state.violation_count
+                        "IP auto-banned for {ban_duration_secs} seconds after {} violations",
+                        state.violation_count
                     ),
                 });
             }
@@ -182,8 +176,8 @@ impl Check for CcCheck {
                 rule_name: "Rate Limit".to_string(),
                 phase: Phase::RateLimit,
                 detail: format!(
-                    "Request rate exceeded {:.0} req/s (violation #{}/{})",
-                    rps, state.violation_count, ban_threshold
+                    "Request rate exceeded {rps:.0} req/s (violation #{}/{ban_threshold})",
+                    state.violation_count
                 ),
             })
         }

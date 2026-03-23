@@ -144,7 +144,8 @@ impl TunnelRegistry {
     }
 
     pub async fn disconnect(&self, tunnel_id: Uuid) {
-        if let Some(conn) = self.connections.write().await.remove(&tunnel_id) {
+        let removed = self.connections.write().await.remove(&tunnel_id);
+        if let Some(conn) = removed {
             info!(tunnel = %conn.name, "Tunnel client disconnected");
         }
     }
@@ -165,13 +166,9 @@ impl TunnelRegistry {
             .values()
             .map(|c| {
                 let connected = connections.contains_key(&c.id);
-                let last_seen = connections.get(&c.id).and_then(|conn| {
-                    conn.last_seen
-                        .try_lock()
-                        .ok()
-                        .and_then(|g| *g)
-                        .map(|_| Utc::now())
-                });
+                let last_seen = connections
+                    .get(&c.id)
+                    .and_then(|conn| conn.last_seen.try_lock().ok().and_then(|g| *g).map(|_| Utc::now()));
                 TunnelStatus {
                     id: c.id,
                     name: c.name.clone(),

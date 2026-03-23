@@ -60,10 +60,7 @@ impl RuleRegistry {
             .entry(rule.category.clone())
             .or_default()
             .push(id.clone());
-        self.by_source
-            .entry(rule.source.clone())
-            .or_default()
-            .push(id.clone());
+        self.by_source.entry(rule.source.clone()).or_default().push(id.clone());
         self.rules.insert(id, rule);
         self.version += 1;
     }
@@ -122,10 +119,7 @@ impl RuleRegistry {
             .filter(|r| {
                 r.id.to_lowercase().contains(&q)
                     || r.name.to_lowercase().contains(&q)
-                    || r.description
-                        .as_deref()
-                        .map(|d| d.to_lowercase().contains(&q))
-                        .unwrap_or(false)
+                    || r.description.as_deref().is_some_and(|d| d.to_lowercase().contains(&q))
                     || r.category.to_lowercase().contains(&q)
             })
             .collect()

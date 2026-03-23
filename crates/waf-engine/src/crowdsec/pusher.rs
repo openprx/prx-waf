@@ -22,7 +22,7 @@ struct AlertEvent {
     detail: String,
 }
 
-/// Pushes prx-waf WAF detections to CrowdSec as machine alerts.
+/// Pushes prx-waf WAF detections to `CrowdSec` as machine alerts.
 ///
 /// Events are buffered and sent either when the buffer reaches `BATCH_SIZE`
 /// or every `FLUSH_INTERVAL_SECS`, whichever comes first.
@@ -92,7 +92,7 @@ impl CrowdSecPusher {
         let interval = Duration::from_secs(FLUSH_INTERVAL_SECS);
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                () = tokio::time::sleep(interval) => {}
                 result = shutdown_rx.changed() => {
                     if result.is_err() || *shutdown_rx.borrow() {
                         // Final flush before exit

@@ -14,13 +14,13 @@ pub struct AppConfig {
     pub http3: Http3Config,
     #[serde(default)]
     pub security: SecurityConfig,
-    /// Phase 6: CrowdSec integration
+    /// Phase 6: `CrowdSec` integration
     #[serde(default)]
     pub crowdsec: CrowdSecConfig,
     /// Phase 7: Rule management
     #[serde(default)]
     pub rules: RulesConfig,
-    /// GeoIP lookup configuration
+    /// `GeoIP` lookup configuration
     #[serde(default)]
     pub geoip: GeoIpConfig,
     /// Community threat intelligence sharing
@@ -50,11 +50,12 @@ pub struct RuleSourceEntry {
 fn default_rule_format() -> String {
     "yaml".to_string()
 }
-fn default_update_interval() -> u64 {
+const fn default_update_interval() -> u64 {
     86400
 }
 
 /// Phase 7: Rule management configuration
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RulesConfig {
     /// Directory to watch for rule files
@@ -83,13 +84,13 @@ pub struct RulesConfig {
 fn default_rules_dir() -> String {
     "rules/".to_string()
 }
-fn default_hot_reload() -> bool {
+const fn default_hot_reload() -> bool {
     true
 }
-fn default_debounce_ms() -> u64 {
+const fn default_debounce_ms() -> u64 {
     500
 }
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -107,9 +108,11 @@ impl Default for RulesConfig {
     }
 }
 
-/// CrowdSec integration configuration (mirrors waf-engine CrowdSecConfig but
-/// lives in waf-common so it can be loaded from the TOML without pulling in
-/// the full engine crate as a dep of prx-waf's config loader).
+/// `CrowdSec` integration configuration.
+///
+/// Mirrors waf-engine `CrowdSecConfig` but lives in waf-common so it can be
+/// loaded from the TOML without pulling in the full engine crate as a dep of
+/// prx-waf's config loader.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrowdSecConfig {
     pub enabled: bool,
@@ -156,13 +159,13 @@ impl Default for CrowdSecConfig {
     }
 }
 
-fn default_cs_update_secs() -> u64 {
+const fn default_cs_update_secs() -> u64 {
     10
 }
 fn default_cs_fallback() -> String {
     "allow".to_string()
 }
-fn default_appsec_timeout() -> u64 {
+const fn default_appsec_timeout() -> u64 {
     500
 }
 
@@ -178,6 +181,12 @@ pub struct ProxyConfig {
     /// trusted reverse proxy.
     #[serde(default)]
     pub trust_proxy_headers: bool,
+    /// List of trusted proxy CIDRs. When `trust_proxy_headers` is true,
+    /// only XFF headers from connections originating in these ranges are
+    /// honoured. Empty list means trust XFF from any source (legacy
+    /// behaviour, NOT recommended for production).
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for ProxyConfig {
@@ -187,6 +196,7 @@ impl Default for ProxyConfig {
             listen_addr_tls: "0.0.0.0:443".to_string(),
             worker_threads: None,
             trust_proxy_headers: false,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -347,18 +357,18 @@ impl Default for GeoIpAutoUpdateConfig {
     }
 }
 
-/// GeoIP lookup configuration.
+/// `GeoIP` lookup configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoIpConfig {
-    /// Enable GeoIP lookups on every request.
+    /// Enable `GeoIP` lookups on every request.
     pub enabled: bool,
-    /// Path to the ip2region IPv4 xdb file (default: "data/ip2region_v4.xdb").
+    /// Path to the ip2region IPv4 xdb file (default: `data/ip2region_v4.xdb`).
     #[serde(default = "default_ipv4_xdb")]
     pub ipv4_xdb_path: String,
-    /// Path to the ip2region IPv6 xdb file (default: "data/ip2region_v6.xdb").
+    /// Path to the ip2region IPv6 xdb file (default: `data/ip2region_v6.xdb`).
     #[serde(default = "default_ipv6_xdb")]
     pub ipv6_xdb_path: String,
-    /// Cache policy: "full_memory" (fastest, ~20MB), "vector_index" (~2MB), "no_cache" (1-2MB).
+    /// Cache policy: `full_memory` (fastest, ~20MB), `vector_index` (~2MB), `no_cache` (1-2MB).
     #[serde(default = "default_geoip_cache_policy")]
     pub cache_policy: String,
     /// Automatic xdb update settings.
@@ -420,13 +430,13 @@ pub struct CommunityConfig {
 fn default_community_server_url() -> String {
     "https://community.openprx.dev".to_string()
 }
-fn default_community_batch_size() -> usize {
+const fn default_community_batch_size() -> usize {
     50
 }
-fn default_community_flush_interval() -> u64 {
+const fn default_community_flush_interval() -> u64 {
     30
 }
-fn default_community_sync_interval() -> u64 {
+const fn default_community_sync_interval() -> u64 {
     300
 }
 
@@ -451,7 +461,7 @@ pub fn load_config(path: &str) -> anyhow::Result<AppConfig> {
     Ok(config)
 }
 
-// ─── Cluster Configuration ─────────────────────────────────────────────────
+// --- Cluster Configuration ---
 
 /// Node role in the cluster
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -506,13 +516,13 @@ fn default_node_cert_path() -> String {
 fn default_node_key_path() -> String {
     "/app/certs/node.key".to_string()
 }
-fn default_ca_validity_days() -> u32 {
+const fn default_ca_validity_days() -> u32 {
     3650
 }
-fn default_node_validity_days() -> u32 {
+const fn default_node_validity_days() -> u32 {
     365
 }
-fn default_renewal_before_days() -> u32 {
+const fn default_renewal_before_days() -> u32 {
     7
 }
 
@@ -555,22 +565,22 @@ pub struct ClusterSyncConfig {
     pub events_queue_size: usize,
 }
 
-fn default_rules_interval() -> u64 {
+const fn default_rules_interval() -> u64 {
     10
 }
-fn default_config_interval() -> u64 {
+const fn default_config_interval() -> u64 {
     30
 }
-fn default_events_batch_size() -> usize {
+const fn default_events_batch_size() -> usize {
     100
 }
-fn default_events_flush_interval() -> u64 {
+const fn default_events_flush_interval() -> u64 {
     5
 }
-fn default_stats_interval() -> u64 {
+const fn default_stats_interval() -> u64 {
     10
 }
-fn default_events_queue_size() -> usize {
+const fn default_events_queue_size() -> usize {
     10_000
 }
 
@@ -607,19 +617,19 @@ pub struct ClusterElectionConfig {
     pub phi_dead: f64,
 }
 
-fn default_timeout_min_ms() -> u64 {
+const fn default_timeout_min_ms() -> u64 {
     150
 }
-fn default_timeout_max_ms() -> u64 {
+const fn default_timeout_max_ms() -> u64 {
     300
 }
-fn default_heartbeat_interval_ms() -> u64 {
+const fn default_heartbeat_interval_ms() -> u64 {
     50
 }
-fn default_phi_suspect() -> f64 {
+const fn default_phi_suspect() -> f64 {
     8.0
 }
-fn default_phi_dead() -> f64 {
+const fn default_phi_dead() -> f64 {
     12.0
 }
 
@@ -646,10 +656,10 @@ pub struct ClusterHealthConfig {
     pub max_missed_heartbeats: u32,
 }
 
-fn default_health_check_interval() -> u64 {
+const fn default_health_check_interval() -> u64 {
     5
 }
-fn default_max_missed_heartbeats() -> u32 {
+const fn default_max_missed_heartbeats() -> u32 {
     3
 }
 

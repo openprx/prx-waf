@@ -59,12 +59,7 @@ pub struct CommunityReporter {
 }
 
 impl CommunityReporter {
-    pub fn new(
-        client: Arc<CommunityClient>,
-        api_key: String,
-        batch_size: usize,
-        flush_interval_secs: u64,
-    ) -> Self {
+    pub fn new(client: Arc<CommunityClient>, api_key: String, batch_size: usize, flush_interval_secs: u64) -> Self {
         Self {
             client,
             api_key,
@@ -83,39 +78,22 @@ impl CommunityReporter {
     /// Invalid `client_ip` values (not parseable as `IpAddr`) are silently
     /// dropped with a warning log, because the backend deserialises the field
     /// as `std::net::IpAddr` and an invalid IP would reject the whole batch.
-    pub async fn push_detection(
-        &self,
-        client_ip: &str,
-        detection: &DetectionResult,
-        req_info: Option<&RequestInfo>,
-    ) {
+    pub async fn push_detection(&self, client_ip: &str, detection: &DetectionResult, req_info: Option<&RequestInfo>) {
         // Validate IP before queuing — backend expects std::net::IpAddr
-        let ip: IpAddr = match client_ip.parse() {
-            Ok(ip) => ip,
-            Err(_) => {
-                warn!(client_ip, "Dropping signal: invalid source IP");
-                return;
-            }
+        let Ok(ip) = client_ip.parse::<IpAddr>() else {
+            warn!(client_ip, "Dropping signal: invalid source IP");
+            return;
         };
 
         let signal = WafSignal {
             source_ip: ip.to_string(),
             scenario: detection.phase.to_string(),
-            rule_id: detection
-                .rule_id
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string()),
+            rule_id: detection.rule_id.clone().unwrap_or_else(|| "unknown".to_string()),
             rule_name: detection.rule_name.clone(),
             detail: detection.detail.clone(),
-            http_method: req_info
-                .map(|r| r.http_method.clone())
-                .unwrap_or_default(),
-            request_path: req_info
-                .map(|r| r.request_path.clone())
-                .unwrap_or_default(),
-            request_host: req_info
-                .map(|r| r.request_host.clone())
-                .unwrap_or_default(),
+            http_method: req_info.map(|r| r.http_method.clone()).unwrap_or_default(),
+            request_path: req_info.map(|r| r.request_path.clone()).unwrap_or_default(),
+            request_host: req_info.map(|r| r.request_host.clone()).unwrap_or_default(),
             geo_country: req_info
                 .and_then(|r| r.geo_country.clone())
                 .unwrap_or_else(|| "unknown".to_string()),
@@ -138,7 +116,7 @@ impl CommunityReporter {
         let interval = Duration::from_secs(self.flush_interval_secs);
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                () = tokio::time::sleep(interval) => {}
                 result = shutdown_rx.changed() => {
                     if result.is_err() || *shutdown_rx.borrow() {
                         // Final flush before exit

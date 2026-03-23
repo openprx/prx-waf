@@ -29,8 +29,8 @@ pub async fn run_decision_sync(
     // Full startup pull
     match client.get_decisions_stream(true).await {
         Ok(stream) => {
-            let n_new = stream.new.as_ref().map(|v| v.len()).unwrap_or(0);
-            info!("CrowdSec startup pull: {} decisions loaded", n_new);
+            let n_new = stream.new.as_ref().map_or(0, Vec::len);
+            info!("CrowdSec startup pull: {n_new} decisions loaded");
             cache.apply_stream(stream, &config);
         }
         Err(e) => warn!("CrowdSec startup pull failed: {}", e),
@@ -44,7 +44,7 @@ pub async fn run_decision_sync(
     loop {
         // Sleep until the next poll or shutdown signal
         tokio::select! {
-            _ = tokio::time::sleep(update_interval) => {}
+            () = tokio::time::sleep(update_interval) => {}
             result = shutdown_rx.changed() => {
                 if result.is_err() || *shutdown_rx.borrow() {
                     info!("CrowdSec sync task shutting down");
@@ -56,8 +56,8 @@ pub async fn run_decision_sync(
         // Incremental pull
         match client.get_decisions_stream(false).await {
             Ok(stream) => {
-                let n_new = stream.new.as_ref().map(|v| v.len()).unwrap_or(0);
-                let n_del = stream.deleted.as_ref().map(|v| v.len()).unwrap_or(0);
+                let n_new = stream.new.as_ref().map_or(0, Vec::len);
+                let n_del = stream.deleted.as_ref().map_or(0, Vec::len);
                 if n_new > 0 || n_del > 0 {
                     info!(new = n_new, deleted = n_del, "CrowdSec incremental update");
                     cache.apply_stream(stream, &config);

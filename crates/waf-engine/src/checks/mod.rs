@@ -36,15 +36,17 @@ pub trait Check: Send + Sync {
 // ─── Shared utilities ─────────────────────────────────────────────────────────
 
 /// Decode a percent-encoded string (URL decoding, ASCII only).
+#[allow(clippy::indexing_slicing)] // bounds checked by loop guard: i < len, i+2 < len
 pub(crate) fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
+            let hi = char::from(bytes[i + 1]).to_digit(16);
+            let lo = char::from(bytes[i + 2]).to_digit(16);
             if let (Some(h), Some(l)) = (hi, lo) {
+                #[allow(clippy::cast_possible_truncation)]
                 out.push((h * 16 + l) as u8);
                 i += 3;
                 continue;
@@ -65,7 +67,7 @@ pub(crate) fn url_decode(s: &str) -> String {
 /// Returns a list of `(location, value)` pairs so error messages can
 /// indicate where the pattern was found.
 pub(crate) fn request_targets(ctx: &RequestCtx) -> Vec<(&'static str, String)> {
-    let mut targets: Vec<(&'static str, String)> = Vec::new();
+    let mut targets = Vec::new();
 
     // Raw and decoded path
     targets.push(("path", ctx.path.clone()));

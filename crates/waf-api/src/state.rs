@@ -19,7 +19,7 @@ pub struct AppState {
     pub blocked_counter: Arc<AtomicU64>,
     /// Active WebSocket connection count (capped at 50)
     pub ws_connections: Arc<AtomicU32>,
-    /// JWT signing/verifying secret (from env JWT_SECRET)
+    /// JWT signing/verifying secret (from env `JWT_SECRET`)
     pub jwt_secret: String,
     /// In-process rate limiter for notifications
     pub notif_rate_limiter: NotifRateLimiter,
@@ -31,9 +31,9 @@ pub struct AppState {
     /// Reverse tunnel registry
     pub tunnel_registry: Arc<TunnelRegistry>,
     // ── Phase 6: CrowdSec ────────────────────────────────────────────────────
-    /// In-memory decision cache (None if CrowdSec not enabled)
+    /// In-memory decision cache (None if `CrowdSec` not enabled)
     pub crowdsec_cache: Option<Arc<DecisionCache>>,
-    /// LAPI client for delete/test operations (None if CrowdSec not enabled)
+    /// LAPI client for delete/test operations (None if `CrowdSec` not enabled)
     pub crowdsec_client: Option<Arc<CrowdSecClient>>,
     /// LAPI base URL (for display in status endpoint)
     pub crowdsec_lapi_url: Option<String>,
@@ -45,6 +45,13 @@ pub struct AppState {
     pub cluster_state: Option<Arc<waf_cluster::NodeState>>,
     /// Allowed CORS origins for admin API (empty = allow all — insecure default)
     pub cors_origins: Vec<String>,
+    /// Security config for IP allowlist and rate limiting
+    pub security_config: waf_common::config::SecurityConfig,
+    /// In-process API rate limiter (None if rate limiting disabled)
+    pub rate_limiter: Option<Arc<crate::security::ApiRateLimiter>>,
+    /// Dedicated rate limiter for login endpoint — stricter than general API
+    /// to mitigate brute-force credential attacks (None if disabled)
+    pub login_rate_limiter: Option<Arc<crate::security::ApiRateLimiter>>,
 }
 
 impl AppState {
@@ -52,11 +59,7 @@ impl AppState {
     ///
     /// Returns an error if the `JWT_SECRET` environment variable is not set or empty.
     /// In production this ensures the operator explicitly configures a strong secret.
-    pub fn new(
-        db: Arc<Database>,
-        engine: Arc<WafEngine>,
-        router: Arc<HostRouter>,
-    ) -> anyhow::Result<Self> {
+    pub fn new(db: Arc<Database>, engine: Arc<WafEngine>, router: Arc<HostRouter>) -> anyhow::Result<Self> {
         let jwt_secret = std::env::var("JWT_SECRET")
             .ok()
             .filter(|s| !s.is_empty())
@@ -85,6 +88,9 @@ impl AppState {
             community_reporter: None,
             cluster_state: None,
             cors_origins: Vec::new(),
+            security_config: waf_common::config::SecurityConfig::default(),
+            rate_limiter: None,
+            login_rate_limiter: None,
         })
     }
 

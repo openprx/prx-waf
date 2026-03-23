@@ -24,6 +24,7 @@ static XSS_DESCS: &[&str] = &[
     "<svg>/<math> inline vector",
 ];
 
+#[allow(clippy::expect_used)]
 static XSS_SET: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         // <script...>
@@ -66,7 +67,7 @@ static XSS_SET: LazyLock<RegexSet> = LazyLock::new(|| {
 pub struct XssCheck;
 
 impl XssCheck {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -92,7 +93,7 @@ impl Check for XssCheck {
                     rule_id: Some(format!("XSS-{:03}", idx + 1)),
                     rule_name: "XSS".to_string(),
                     phase: Phase::Xss,
-                    detail: format!("{} detected in {}", desc, location),
+                    detail: format!("{desc} detected in {location}"),
                 });
             }
         }

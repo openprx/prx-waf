@@ -1,6 +1,6 @@
 //! Custom WAF Rules Engine
 //!
-//! Evaluates user-defined rules stored in PostgreSQL against incoming requests.
+//! Evaluates user-defined rules stored in `PostgreSQL` against incoming requests.
 //! Each rule has:
 //!   - Conditions (AND/OR) matching fields of the request
 //!   - An action (Block / Allow / Log / Challenge)
@@ -96,7 +96,7 @@ pub enum ConditionOp {
 }
 
 impl ConditionOp {
-    pub fn parse_str(s: &str) -> Self {
+    pub const fn parse_str(s: &str) -> Self {
         if s.eq_ignore_ascii_case("or") {
             Self::Or
         } else {
@@ -233,11 +233,10 @@ impl CustomRulesEngine {
                 continue;
             }
 
-            let matched = if let Some(script) = &rule.script {
-                self.eval_script(ctx, script)
-            } else {
-                self.eval_conditions(ctx, &rule.conditions, &rule.condition_op)
-            };
+            let matched = rule.script.as_ref().map_or_else(
+                || self.eval_conditions(ctx, &rule.conditions, &rule.condition_op),
+                |script| self.eval_script(ctx, script),
+            );
 
             if matched {
                 return Some(DetectionResult {
@@ -258,34 +257,24 @@ impl CustomRulesEngine {
         scope.push("method", ctx.method.clone());
         scope.push("query", ctx.query.clone());
         scope.push("host", ctx.host.clone());
-        scope.push(
-            "user_agent",
-            ctx.headers.get("user-agent").cloned().unwrap_or_default(),
-        );
-        scope.push(
-            "referer",
-            ctx.headers.get("referer").cloned().unwrap_or_default(),
-        );
+        scope.push("user_agent", ctx.headers.get("user-agent").cloned().unwrap_or_default());
+        scope.push("referer", ctx.headers.get("referer").cloned().unwrap_or_default());
         scope.push(
             "content_type",
             ctx.headers.get("content-type").cloned().unwrap_or_default(),
         );
+        #[allow(clippy::cast_possible_wrap)]
         scope.push("content_length", ctx.content_length as i64);
 
         self.rhai
             .eval_expression_with_scope::<bool>(&mut scope, script)
             .unwrap_or_else(|e| {
-                warn!("Rhai script error: {}", e);
+                warn!("Rhai script error: {e}");
                 false
             })
     }
 
-    fn eval_conditions(
-        &self,
-        ctx: &RequestCtx,
-        conditions: &[Condition],
-        op: &ConditionOp,
-    ) -> bool {
+    fn eval_conditions(&self, ctx: &RequestCtx, conditions: &[Condition], op: &ConditionOp) -> bool {
         if conditions.is_empty() {
             return false;
         }
@@ -306,33 +295,22 @@ impl CustomRulesEngine {
             (Operator::NotContains, ConditionValue::Str(v)) => !fstr.contains(v.as_str()),
             (Operator::StartsWith, ConditionValue::Str(v)) => fstr.starts_with(v.as_str()),
             (Operator::EndsWith, ConditionValue::Str(v)) => fstr.ends_with(v.as_str()),
-            (Operator::Regex, ConditionValue::Str(v)) => Regex::new(v)
-                .ok()
-                .map(|r| r.is_match(fstr))
-                .unwrap_or(false),
+            (Operator::Regex, ConditionValue::Str(v)) => Regex::new(v).ok().is_some_and(|r| r.is_match(fstr)),
             (Operator::InList, ConditionValue::List(l)) => l.iter().any(|v| v == fstr),
             (Operator::NotInList, ConditionValue::List(l)) => !l.iter().any(|v| v == fstr),
             (Operator::CidrMatch, ConditionValue::Str(cidr)) => cidr
                 .parse::<ipnet::IpNet>()
                 .ok()
-                .map(|net| net.contains(&ctx.client_ip))
-                .unwrap_or(false),
-            (Operator::Gt, ConditionValue::Number(n)) => {
-                fstr.parse::<i64>().ok().map(|v| v > *n).unwrap_or(false)
-            }
-            (Operator::Lt, ConditionValue::Number(n)) => {
-                fstr.parse::<i64>().ok().map(|v| v < *n).unwrap_or(false)
-            }
-            (Operator::Gte, ConditionValue::Number(n)) => {
-                fstr.parse::<i64>().ok().map(|v| v >= *n).unwrap_or(false)
-            }
-            (Operator::Lte, ConditionValue::Number(n)) => {
-                fstr.parse::<i64>().ok().map(|v| v <= *n).unwrap_or(false)
-            }
+                .is_some_and(|net| net.contains(&ctx.client_ip)),
+            (Operator::Gt, ConditionValue::Number(n)) => fstr.parse::<i64>().ok().is_some_and(|v| v > *n),
+            (Operator::Lt, ConditionValue::Number(n)) => fstr.parse::<i64>().ok().is_some_and(|v| v < *n),
+            (Operator::Gte, ConditionValue::Number(n)) => fstr.parse::<i64>().ok().is_some_and(|v| v >= *n),
+            (Operator::Lte, ConditionValue::Number(n)) => fstr.parse::<i64>().ok().is_some_and(|v| v <= *n),
             _ => false,
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn field_value(&self, ctx: &RequestCtx, field: &ConditionField) -> Option<String> {
         match field {
             ConditionField::Ip => Some(ctx.client_ip.to_string()),
@@ -367,8 +345,7 @@ impl Default for CustomRulesEngine {
 use waf_storage::models::CustomRule as DbCustomRule;
 
 pub fn from_db_rule(row: &DbCustomRule) -> anyhow::Result<CustomRule> {
-    let conditions: Vec<Condition> =
-        serde_json::from_value(row.conditions.clone()).unwrap_or_default();
+    let conditions: Vec<Condition> = serde_json::from_value(row.conditions.clone()).unwrap_or_default();
 
     Ok(CustomRule {
         id: row.id.to_string(),
@@ -379,7 +356,7 @@ pub fn from_db_rule(row: &DbCustomRule) -> anyhow::Result<CustomRule> {
         condition_op: ConditionOp::parse_str(&row.condition_op),
         conditions,
         action: RuleAction::parse_str(&row.action),
-        action_status: row.action_status as u16,
+        action_status: u16::try_from(row.action_status).unwrap_or(403),
         action_msg: row.action_msg.clone(),
         script: row.script.clone(),
     })

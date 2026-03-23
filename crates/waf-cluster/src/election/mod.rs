@@ -66,13 +66,13 @@ impl ElectionManager {
         }
     }
 
-    /// Current term (non-blocking, parking_lot).
+    /// Current term (non-blocking, `parking_lot`).
     pub fn current_term_sync(&self) -> u64 {
         *self.term.read()
     }
 
     /// Current term (async-compatible wrapper).
-    pub async fn current_term(&self) -> u64 {
+    pub fn current_term(&self) -> u64 {
         self.current_term_sync()
     }
 
@@ -82,22 +82,21 @@ impl ElectionManager {
         rng.gen_range(self.timeout_min_ms..=self.timeout_max_ms.max(self.timeout_min_ms + 1))
     }
 
-    /// Increment the term, clear voted_for and votes_for_me, then vote for self.
+    /// Increment the term, clear `voted_for` and `votes_for_me`, then vote for self.
     ///
     /// Returns the new term. Called when this node starts an election.
     pub fn increment_term_and_vote_for_self(&self) -> u64 {
-        let mut term = self.term.write();
-        *term += 1;
-        let new_term = *term;
+        let new_term = {
+            let mut term = self.term.write();
+            *term += 1;
+            *term
+        };
         // Reset voting state for the new term
         *self.voted_for.write() = Some(self.node_id.clone());
         // Keep only the new term's vote bucket (remove older)
         let mut votes = self.votes_for_me.lock();
         votes.retain(|&t, _| t >= new_term);
-        votes
-            .entry(new_term)
-            .or_default()
-            .insert(self.node_id.clone());
+        votes.entry(new_term).or_default().insert(self.node_id.clone());
         new_term
     }
 
@@ -109,20 +108,12 @@ impl ElectionManager {
         if term < *self.term.read() {
             return false;
         }
-        self.votes_for_me
-            .lock()
-            .entry(term)
-            .or_default()
-            .insert(voter_id)
+        self.votes_for_me.lock().entry(term).or_default().insert(voter_id)
     }
 
     /// Number of votes received for `term`.
     pub fn vote_count_for_term(&self, term: u64) -> usize {
-        self.votes_for_me
-            .lock()
-            .get(&term)
-            .map(|s| s.len())
-            .unwrap_or(0)
+        self.votes_for_me.lock().get(&term).map_or(0, HashSet::len)
     }
 
     /// Collect voter IDs for `term` (used when broadcasting `ElectionResult`).
@@ -135,7 +126,7 @@ impl ElectionManager {
     }
 
     /// Returns `true` if `votes` is a majority of `total_nodes`.
-    pub fn is_majority(votes: usize, total_nodes: usize) -> bool {
+    pub const fn is_majority(votes: usize, total_nodes: usize) -> bool {
         total_nodes > 0 && votes > (total_nodes / 2)
     }
 
@@ -144,7 +135,7 @@ impl ElectionManager {
         incoming_term >= *self.term.read()
     }
 
-    /// Try to update the term if `incoming_term` is larger. Resets voted_for on
+    /// Try to update the term if `incoming_term` is larger. Resets `voted_for` on
     /// term advance. Returns the new current term.
     pub fn advance_term(&self, incoming_term: u64) -> u64 {
         let mut term = self.term.write();
@@ -160,7 +151,7 @@ impl ElectionManager {
     /// Grants if:
     /// - `vote.term >= current_term` (not stale), AND
     /// - We have not yet voted for a *different* candidate this term.
-    pub async fn process_vote(&self, vote: &ElectionVote) -> anyhow::Result<bool> {
+    pub fn process_vote(&self, vote: &ElectionVote) -> anyhow::Result<bool> {
         let current_term = *self.term.read();
         if vote.term < current_term {
             debug!(
@@ -178,8 +169,7 @@ impl ElectionManager {
             *self.voted_for.write() = None;
         }
         let mut voted_for = self.voted_for.write();
-        let can_vote =
-            voted_for.is_none() || voted_for.as_deref() == Some(vote.candidate_id.as_str());
+        let can_vote = voted_for.is_none() || voted_for.as_deref() == Some(vote.candidate_id.as_str());
         if can_vote {
             *voted_for = Some(vote.candidate_id.clone());
             info!(
@@ -204,7 +194,7 @@ impl ElectionManager {
     /// Returns the `NodeRole` this node should transition to:
     /// - `Main` if we are the elected leader.
     /// - `Worker` otherwise.
-    pub async fn process_result(&self, result: &ElectionResult) -> anyhow::Result<NodeRole> {
+    pub fn process_result(&self, result: &ElectionResult) -> anyhow::Result<NodeRole> {
         // Fencing: reject stale-term leaders
         if !self.is_valid_term(result.term) {
             warn!(
@@ -300,7 +290,7 @@ pub async fn run_election_loop(node_state: Arc<crate::node::NodeState>) {
             last_log_index: *node_state.rules_version.read().await,
             voter_id: None,
         });
-        node_state.broadcast(vote_req).await;
+        node_state.broadcast(&vote_req);
 
         // Wait another timeout for vote grants to arrive.
         let wait_ms = node_state.election.election_timeout_ms();
@@ -317,7 +307,7 @@ pub async fn run_election_loop(node_state: Arc<crate::node::NodeState>) {
                 elected_id: node_state.node_id.clone(),
                 voter_ids,
             });
-            node_state.broadcast(result_msg).await;
+            node_state.broadcast(&result_msg);
 
             info!(
                 node_id = %node_state.node_id,
@@ -347,19 +337,23 @@ pub async fn run_election_loop(node_state: Arc<crate::node::NodeState>) {
 /// - If no peers at all → false (stay quiet; handled by single-node path).
 async fn check_main_is_dead(node_state: &crate::node::NodeState, now_ms: u64) -> bool {
     let peers = node_state.peers.read().await;
-    let main_peer = peers.iter().find(|p| p.role == NodeRole::Main);
-    match main_peer {
-        Some(peer) => {
+    let main_node_id = peers
+        .iter()
+        .find(|p| p.role == NodeRole::Main)
+        .map(|p| p.node_id.clone());
+    let has_peers = !peers.is_empty();
+    drop(peers);
+    main_node_id.map_or_else(
+        // No main known — start election only if we have peers.
+        || has_peers,
+        |node_id| {
             let tracker = node_state.heartbeat_tracker.lock();
-            tracker.is_peer_dead(&peer.node_id, now_ms)
-        }
-        None => {
-            // No main known — start election only if we have peers.
-            !peers.is_empty()
-        }
-    }
+            tracker.is_peer_dead(&node_id, now_ms)
+        },
+    )
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

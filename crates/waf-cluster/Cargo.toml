@@ -47,5 +47,5 @@ lz4_flex = { workspace = true }
 workspace = true
 
 [dev-dependencies]
-tokio       = { workspace = true }
+tokio       = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }

@@ -37,17 +37,11 @@ impl CommunityClient {
             req = req.bearer_auth(key);
         }
 
-        let resp = req
-            .send()
-            .await
-            .context("community server connection test failed")?;
+        let resp = req.send().await.context("community server connection test failed")?;
 
         let status = resp.status();
         if status.is_success() {
-            Ok(format!(
-                "Connected to community server at {}",
-                self.base_url
-            ))
+            Ok(format!("Connected to community server at {}", self.base_url))
         } else {
             anyhow::bail!("community server returned {status}")
         }

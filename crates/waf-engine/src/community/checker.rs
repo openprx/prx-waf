@@ -9,13 +9,13 @@ use super::blocklist::CommunityBlocklistSync;
 /// WAF checker that looks up the client IP against the community blocklist.
 ///
 /// Runs as part of the detection pipeline, similar to `CrowdSecChecker`,
-/// performing a synchronous O(1) DashMap lookup.
+/// performing a synchronous O(1) `DashMap` lookup.
 pub struct CommunityChecker {
     blocklist: Arc<CommunityBlocklistSync>,
 }
 
 impl CommunityChecker {
-    pub fn new(blocklist: Arc<CommunityBlocklistSync>) -> Self {
+    pub const fn new(blocklist: Arc<CommunityBlocklistSync>) -> Self {
         Self { blocklist }
     }
 }

@@ -39,14 +39,14 @@ pub enum RuleSource {
 impl RuleSource {
     pub fn name(&self) -> &str {
         match self {
-            Self::LocalFile { name, .. } => name,
-            Self::LocalDir { name, .. } => name,
-            Self::RemoteUrl { name, .. } => name,
-            Self::Builtin { name } => name,
+            Self::LocalFile { name, .. }
+            | Self::LocalDir { name, .. }
+            | Self::RemoteUrl { name, .. }
+            | Self::Builtin { name } => name,
         }
     }
 
-    pub fn source_type(&self) -> &'static str {
+    pub const fn source_type(&self) -> &'static str {
         match self {
             Self::LocalFile { .. } => "local_file",
             Self::LocalDir { .. } => "local_dir",
@@ -55,11 +55,10 @@ impl RuleSource {
         }
     }
 
-    pub fn update_interval(&self) -> Option<Duration> {
+    pub const fn update_interval(&self) -> Option<Duration> {
         match self {
             Self::RemoteUrl {
-                update_interval_secs,
-                ..
+                update_interval_secs, ..
             } => Some(Duration::from_secs(*update_interval_secs)),
             _ => None,
         }
@@ -76,7 +75,7 @@ pub struct RuleLoadReport {
 }
 
 impl RuleLoadReport {
-    pub fn merge(&mut self, other: RuleLoadReport) {
+    pub fn merge(&mut self, other: Self) {
         self.sources_loaded += other.sources_loaded;
         self.rules_loaded += other.rules_loaded;
         self.rules_skipped += other.rules_skipped;

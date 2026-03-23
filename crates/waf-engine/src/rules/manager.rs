@@ -1,4 +1,4 @@
-//! RuleManager — loads, reloads, validates, enables/disables rules.
+//! `RuleManager` — loads, reloads, validates, enables/disables rules.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,9 +11,7 @@ use tracing::{info, warn};
 use waf_common::config::RulesConfig;
 
 use super::builtin::all_builtin_rules;
-use super::formats::{
-    ExportFormat, RuleFormat, ValidationError, export_rules, parse_rules, validate_rules,
-};
+use super::formats::{ExportFormat, RuleFormat, ValidationError, export_rules, parse_rules, validate_rules};
 use super::registry::{Rule, RuleRegistry, RuleStats};
 use super::sources::{RuleLoadReport, RuleReloadReport, RuleSource};
 
@@ -117,9 +115,9 @@ impl RuleManager {
             for rule in builtin {
                 reg.insert(rule);
             }
-            report.rules_loaded += builtin_count;
-            report.sources_loaded += 1;
         }
+        report.rules_loaded += builtin_count;
+        report.sources_loaded += 1;
 
         // Load from rules directory
         if self.rules_dir.is_dir() {
@@ -136,9 +134,11 @@ impl RuleManager {
                 RuleSource::LocalFile { path, format, name } => match load_file(path, *format) {
                     Ok(rules) => {
                         let count = rules.len();
-                        let mut reg = self.registry.write();
-                        for rule in rules {
-                            reg.insert(rule);
+                        {
+                            let mut reg = self.registry.write();
+                            for rule in rules {
+                                reg.insert(rule);
+                            }
                         }
                         info!(source = %name, rules = count, "Loaded rules from file");
                         report.rules_loaded += count;
@@ -177,24 +177,18 @@ impl RuleManager {
         Ok(report)
     }
 
-    /// Reload all rules (clear + load_all). Returns a diff report.
+    /// Reload all rules (clear + `load_all`). Returns a diff report.
     pub fn reload(&mut self) -> Result<RuleReloadReport> {
         let before = {
             let reg = self.registry.read();
-            reg.rules
-                .keys()
-                .cloned()
-                .collect::<std::collections::HashSet<_>>()
+            reg.rules.keys().cloned().collect::<std::collections::HashSet<_>>()
         };
 
         let load_report = self.load_all()?;
 
         let after = {
             let reg = self.registry.read();
-            reg.rules
-                .keys()
-                .cloned()
-                .collect::<std::collections::HashSet<_>>()
+            reg.rules.keys().cloned().collect::<std::collections::HashSet<_>>()
         };
 
         let added = after.difference(&before).count();
@@ -213,8 +207,7 @@ impl RuleManager {
     pub fn validate_file(&self, path: &Path) -> Result<Vec<ValidationError>> {
         let format = RuleFormat::from_path(path)
             .ok_or_else(|| anyhow::anyhow!("Unknown rule format for: {}", path.display()))?;
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let content = std::fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
         Ok(validate_rules(&content, format))
     }
 
@@ -224,9 +217,11 @@ impl RuleManager {
             .ok_or_else(|| anyhow::anyhow!("Unknown rule format for: {}", path.display()))?;
         let rules = load_file(path, format)?;
         let count = rules.len();
-        let mut reg = self.registry.write();
-        for rule in rules {
-            reg.insert(rule);
+        {
+            let mut reg = self.registry.write();
+            for rule in rules {
+                reg.insert(rule);
+            }
         }
         Ok(count)
     }
@@ -244,9 +239,11 @@ impl RuleManager {
             .with_context(|| format!("Failed to parse rules from {url}"))?;
 
         let count = rules.len();
-        let mut reg = self.registry.write();
-        for rule in rules {
-            reg.insert(rule);
+        {
+            let mut reg = self.registry.write();
+            for rule in rules {
+                reg.insert(rule);
+            }
         }
         info!(url, rules = count, "Imported rules from URL");
         Ok(count)
@@ -254,8 +251,10 @@ impl RuleManager {
 
     /// Export all enabled rules in the given format.
     pub fn export(&self, format: ExportFormat) -> Result<String> {
-        let reg = self.registry.read();
-        let rules: Vec<Rule> = reg.list().into_iter().cloned().collect();
+        let rules: Vec<Rule> = {
+            let reg = self.registry.read();
+            reg.list().into_iter().cloned().collect()
+        };
         export_rules(&rules, format)
     }
 
@@ -308,8 +307,7 @@ impl RuleManager {
             return Ok(report);
         }
 
-        let entries = std::fs::read_dir(dir)
-            .with_context(|| format!("Cannot read rules dir: {}", dir.display()))?;
+        let entries = std::fs::read_dir(dir).with_context(|| format!("Cannot read rules dir: {}", dir.display()))?;
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -322,9 +320,11 @@ impl RuleManager {
             match load_file(&path, format) {
                 Ok(rules) => {
                     let count = rules.len();
-                    let mut reg = self.registry.write();
-                    for rule in rules {
-                        reg.insert(rule);
+                    {
+                        let mut reg = self.registry.write();
+                        for rule in rules {
+                            reg.insert(rule);
+                        }
                     }
                     report.rules_loaded += count;
                     report.sources_loaded += 1;
@@ -342,7 +342,6 @@ impl RuleManager {
 
 /// Read and parse a single rule file.
 fn load_file(path: &Path, format: RuleFormat) -> Result<Vec<Rule>> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("Cannot read {}", path.display()))?;
+    let content = std::fs::read_to_string(path).with_context(|| format!("Cannot read {}", path.display()))?;
     parse_rules(&content, format).with_context(|| format!("Failed to parse {}", path.display()))
 }

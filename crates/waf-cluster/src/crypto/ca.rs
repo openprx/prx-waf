@@ -4,9 +4,7 @@
 //! is self-signed with 10-year validity and signs all node certificates.
 
 use anyhow::{Context, Result};
-use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ED25519,
-};
+use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ED25519};
 use time::OffsetDateTime;
 use tracing::info;
 
@@ -25,8 +23,7 @@ pub struct CertificateAuthority {
 impl CertificateAuthority {
     /// Generate a new self-signed Ed25519 CA keypair valid for `validity_days`.
     pub fn generate(validity_days: u32) -> Result<Self> {
-        let key_pair = KeyPair::generate_for(&PKCS_ED25519)
-            .context("failed to generate CA Ed25519 keypair")?;
+        let key_pair = KeyPair::generate_for(&PKCS_ED25519).context("failed to generate CA Ed25519 keypair")?;
 
         // CertificateParams::new() handles DNS SAN creation from strings
         let mut params = CertificateParams::new(vec![CLUSTER_SERVER_NAME.to_owned()])
@@ -34,7 +31,7 @@ impl CertificateAuthority {
 
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.not_before = OffsetDateTime::now_utc();
-        params.not_after = OffsetDateTime::now_utc() + time::Duration::days(validity_days as i64);
+        params.not_after = OffsetDateTime::now_utc() + time::Duration::days(i64::from(validity_days));
 
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, "prx-waf Cluster CA");
@@ -54,7 +51,7 @@ impl CertificateAuthority {
     }
 
     /// Load an existing CA from PEM strings.
-    pub fn from_pem(cert_pem: String, key_pem: String) -> Self {
+    pub const fn from_pem(cert_pem: String, key_pem: String) -> Self {
         Self { cert_pem, key_pem }
     }
 
@@ -63,7 +60,7 @@ impl CertificateAuthority {
     /// Useful for nodes that only need to verify peer certificates (e.g. worker
     /// nodes loading a pre-generated CA cert). Calling [`Self::as_rcgen_issuer`]
     /// on a cert-only instance will return an error.
-    pub fn from_cert_pem(cert_pem: String) -> Self {
+    pub const fn from_cert_pem(cert_pem: String) -> Self {
         Self {
             cert_pem,
             key_pem: String::new(),
@@ -102,8 +99,7 @@ impl CertificateAuthority {
             !self.key_pem.is_empty(),
             "CA private key is not available — this CA was loaded without a key (cert-only mode)"
         );
-        let ca_key =
-            KeyPair::from_pem(&self.key_pem).context("failed to load CA private key PEM")?;
+        let ca_key = KeyPair::from_pem(&self.key_pem).context("failed to load CA private key PEM")?;
 
         let mut ca_params = CertificateParams::new(vec![CLUSTER_SERVER_NAME.to_owned()])
             .context("invalid cluster server name for CA reconstruction")?;

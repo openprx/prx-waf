@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct CommunityConfig {
     /// Enable community threat intelligence sharing.
     pub enabled: bool,
-    /// Community server base URL (e.g. "https://community.openprx.dev").
+    /// Community server base URL (e.g. `https://community.openprx.dev`).
     #[serde(default = "default_server_url")]
     pub server_url: String,
     /// API key obtained during machine enrollment.
@@ -44,14 +44,14 @@ fn default_server_url() -> String {
     "https://community.openprx.dev".to_string()
 }
 
-fn default_batch_size() -> usize {
+const fn default_batch_size() -> usize {
     50
 }
 
-fn default_flush_interval() -> u64 {
+const fn default_flush_interval() -> u64 {
     30
 }
 
-fn default_sync_interval() -> u64 {
+const fn default_sync_interval() -> u64 {
     300
 }

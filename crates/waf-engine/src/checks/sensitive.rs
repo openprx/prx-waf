@@ -1,7 +1,7 @@
 //! Sensitive word / data-leak detection using Aho-Corasick multi-pattern search.
 //!
 //! Checks request fields (path, query, body, headers) for configured patterns.
-//! Patterns are loaded from PostgreSQL per host and cached in memory.
+//! Patterns are loaded from `PostgreSQL` per host and cached in memory.
 //!
 //! Built-in patterns detect common data-leak signatures:
 //!   - Credit card numbers (PAN patterns)
@@ -60,10 +60,7 @@ impl HostPatterns {
 
     fn find_in(&self, text: &str) -> Option<&str> {
         if let Some(m) = self.request_ac.find(text) {
-            return self
-                .patterns
-                .get(m.pattern().as_usize())
-                .map(|s| s.as_str());
+            return self.patterns.get(m.pattern().as_usize()).map(String::as_str);
         }
         None
     }
@@ -72,13 +69,16 @@ impl HostPatterns {
 // ── Built-in automaton ────────────────────────────────────────────────────────
 
 fn builtin_ac() -> Arc<AhoCorasick> {
-    Arc::new(
-        AhoCorasickBuilder::new()
-            .match_kind(MatchKind::LeftmostFirst)
-            .ascii_case_insensitive(true)
-            .build(BUILTIN_PATTERNS)
-            .expect("builtin sensitive patterns must compile"),
-    )
+    // SAFETY rationale: these are compile-time constant patterns that are
+    // guaranteed to be valid.  If they ever fail to compile it is a code bug
+    // that must be caught during development, not at runtime.
+    #[allow(clippy::expect_used)]
+    let ac = AhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostFirst)
+        .ascii_case_insensitive(true)
+        .build(BUILTIN_PATTERNS)
+        .expect("builtin sensitive patterns must compile");
+    Arc::new(ac)
 }
 
 // ── SensitiveCheck ───────────────────────────────────────────────────────────
@@ -87,7 +87,7 @@ fn builtin_ac() -> Arc<AhoCorasick> {
 pub struct SensitiveCheck {
     /// Global built-in patterns
     builtin: Arc<AhoCorasick>,
-    /// Per-host patterns: host_code → HostPatterns
+    /// Per-host patterns: `host_code` → `HostPatterns`
     per_host: Arc<DashMap<String, HostPatterns>>,
 }
 
@@ -100,8 +100,8 @@ impl SensitiveCheck {
     }
 
     /// Reload patterns for a host (called from engine reload).
-    pub fn load_host(&self, host_code: &str, patterns: Vec<String>) {
-        if let Some(hp) = HostPatterns::build(&patterns) {
+    pub fn load_host(&self, host_code: &str, patterns: &[String]) {
+        if let Some(hp) = HostPatterns::build(patterns) {
             self.per_host.insert(host_code.to_string(), hp);
         } else {
             self.per_host.remove(host_code);
@@ -115,8 +115,10 @@ impl SensitiveCheck {
 
     fn scan(&self, text: &str, host_code: &str) -> Option<String> {
         // Check built-in patterns
-        if let Some(m) = self.builtin.find(text) {
-            return Some(BUILTIN_PATTERNS[m.pattern().as_usize()].to_string());
+        if let Some(m) = self.builtin.find(text)
+            && let Some(pat) = BUILTIN_PATTERNS.get(m.pattern().as_usize())
+        {
+            return Some((*pat).to_string());
         }
 
         // Check per-host patterns
@@ -151,7 +153,7 @@ impl Check for SensitiveCheck {
                     rule_id: None,
                     rule_name: "Sensitive Data Detection".to_string(),
                     phase: Phase::Sensitive,
-                    detail: format!("Sensitive pattern '{}' found in {}", pattern, location),
+                    detail: format!("Sensitive pattern '{pattern}' found in {location}"),
                 });
             }
         }
@@ -164,7 +166,7 @@ impl Check for SensitiveCheck {
                     rule_id: None,
                     rule_name: "Sensitive Data Detection".to_string(),
                     phase: Phase::Sensitive,
-                    detail: format!("Sensitive pattern '{}' found in body", pattern),
+                    detail: format!("Sensitive pattern '{pattern}' found in body"),
                 });
             }
         }
@@ -220,7 +222,7 @@ mod tests {
     #[test]
     fn test_custom_word() {
         let checker = SensitiveCheck::new();
-        checker.load_host("test", vec!["super_secret_token".to_string()]);
+        checker.load_host("test", &["super_secret_token".to_string()]);
         let ctx = make_ctx("/api?token=super_secret_token", b"");
         let result = checker.check(&ctx);
         assert!(result.is_some());

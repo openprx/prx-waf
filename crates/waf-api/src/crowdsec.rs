@@ -1,4 +1,4 @@
-//! Phase 6: CrowdSec API handlers
+//! Phase 6: `CrowdSec` API handlers
 //!
 //! Routes:
 //!   GET  /api/crowdsec/status        — connection + cache stats
@@ -8,7 +8,7 @@
 //!   GET  /api/crowdsec/config        — get stored config
 //!   PUT  /api/crowdsec/config        — update stored config
 //!   GET  /api/crowdsec/stats         — cache hit/miss statistics
-//!   GET  /api/crowdsec/events        — recent CrowdSec trigger events
+//!   GET  /api/crowdsec/events        — recent `CrowdSec` trigger events
 
 use std::sync::Arc;
 
@@ -59,43 +59,48 @@ pub struct CrowdSecConfigResponse {
 // ── Handlers ───────────────────────────────────────────────────────────────────
 
 /// GET /api/crowdsec/status
+#[allow(clippy::similar_names)]
 pub async fn crowdsec_status(State(state): State<Arc<AppState>>) -> Json<CrowdSecStatus> {
-    if let Some(ref cache) = state.crowdsec_cache {
-        let stats = cache.stats();
-        Json(CrowdSecStatus {
-            enabled: true,
-            lapi_url: state.crowdsec_lapi_url.clone(),
-            mode: Some("active".to_string()),
-            cache_stats: Some(stats),
-            connection_ok: None,
-            connection_msg: None,
-        })
-    } else {
-        Json(CrowdSecStatus {
-            enabled: false,
-            lapi_url: None,
-            mode: None,
-            cache_stats: None,
-            connection_ok: None,
-            connection_msg: Some("CrowdSec integration not enabled".to_string()),
-        })
-    }
+    state.crowdsec_cache.as_ref().map_or_else(
+        || {
+            Json(CrowdSecStatus {
+                enabled: false,
+                lapi_url: None,
+                mode: None,
+                cache_stats: None,
+                connection_ok: None,
+                connection_msg: Some("CrowdSec integration not enabled".to_string()),
+            })
+        },
+        |cache| {
+            let cache_stats = cache.stats();
+            Json(CrowdSecStatus {
+                enabled: true,
+                lapi_url: state.crowdsec_lapi_url.clone(),
+                mode: Some("active".to_string()),
+                cache_stats: Some(cache_stats),
+                connection_ok: None,
+                connection_msg: None,
+            })
+        },
+    )
 }
 
 /// GET /api/crowdsec/decisions
-pub async fn list_crowdsec_decisions(
-    State(state): State<Arc<AppState>>,
-) -> Json<DecisionListResponse> {
-    if let Some(ref cache) = state.crowdsec_cache {
-        let decisions = cache.list_decisions();
-        let total = decisions.len();
-        Json(DecisionListResponse { decisions, total })
-    } else {
-        Json(DecisionListResponse {
-            decisions: Vec::new(),
-            total: 0,
-        })
-    }
+pub async fn list_crowdsec_decisions(State(state): State<Arc<AppState>>) -> Json<DecisionListResponse> {
+    state.crowdsec_cache.as_ref().map_or_else(
+        || {
+            Json(DecisionListResponse {
+                decisions: Vec::new(),
+                total: 0,
+            })
+        },
+        |cache| {
+            let decisions = cache.list_decisions();
+            let total = decisions.len();
+            Json(DecisionListResponse { decisions, total })
+        },
+    )
 }
 
 /// DELETE /api/crowdsec/decisions/:id
@@ -128,12 +133,9 @@ pub async fn test_crowdsec_connection(
     let lapi_url = body
         .get("lapi_url")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
+        .map(ToString::to_string)
         .or_else(|| state.crowdsec_lapi_url.clone());
-    let api_key = body
-        .get("api_key")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let api_key = body.get("api_key").and_then(|v| v.as_str()).map(ToString::to_string);
 
     match (lapi_url, api_key) {
         (Some(url), Some(key)) => match waf_engine::CrowdSecClient::new(url, key) {
@@ -148,9 +150,7 @@ pub async fn test_crowdsec_connection(
             if let Some(ref client) = state.crowdsec_client {
                 match client.test_connection().await {
                     Ok(msg) => Json(serde_json::json!({ "success": true, "message": msg })),
-                    Err(e) => {
-                        Json(serde_json::json!({ "success": false, "message": e.to_string() }))
-                    }
+                    Err(e) => Json(serde_json::json!({ "success": false, "message": e.to_string() })),
                 }
             } else {
                 Json(serde_json::json!({
@@ -163,9 +163,7 @@ pub async fn test_crowdsec_connection(
 }
 
 /// GET /api/crowdsec/config
-pub async fn get_crowdsec_config(
-    State(state): State<Arc<AppState>>,
-) -> Json<CrowdSecConfigResponse> {
+pub async fn get_crowdsec_config(State(state): State<Arc<AppState>>) -> Json<CrowdSecConfigResponse> {
     match state.db.get_crowdsec_config().await {
         Ok(Some(row)) => Json(CrowdSecConfigResponse {
             id: Some(row.id),
@@ -258,11 +256,7 @@ pub async fn update_crowdsec_config(
         fallback_action: body.fallback_action,
     };
 
-    match state
-        .db
-        .upsert_crowdsec_config(&req, api_key_enc, appsec_key_enc)
-        .await
-    {
+    match state.db.upsert_crowdsec_config(&req, api_key_enc, appsec_key_enc).await {
         Ok(row) => Ok(Json(CrowdSecConfigResponse {
             id: Some(row.id),
             enabled: row.enabled,
@@ -282,36 +276,39 @@ pub async fn update_crowdsec_config(
 }
 
 /// GET /api/crowdsec/stats
+#[allow(clippy::similar_names)]
 pub async fn crowdsec_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    if let Some(ref cache) = state.crowdsec_cache {
-        let stats = cache.stats();
-        let decisions = cache.list_decisions();
+    state.crowdsec_cache.as_ref().map_or_else(
+        || {
+            Json(serde_json::json!({
+                "enabled": false,
+                "message": "CrowdSec integration not active"
+            }))
+        },
+        |cache| {
+            let cache_stats = cache.stats();
+            let decisions = cache.list_decisions();
 
-        // Scenario breakdown
-        let mut by_scenario: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::new();
-        for d in &decisions {
-            *by_scenario.entry(d.scenario.clone()).or_default() += 1;
-        }
+            // Scenario breakdown
+            let mut by_scenario: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for d in &decisions {
+                *by_scenario.entry(d.scenario.clone()).or_default() += 1;
+            }
 
-        // Decision type breakdown
-        let mut by_type: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        for d in &decisions {
-            *by_type.entry(d.type_.clone()).or_default() += 1;
-        }
+            // Decision type breakdown
+            let mut by_type: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for d in &decisions {
+                *by_type.entry(d.type_.clone()).or_default() += 1;
+            }
 
-        Json(serde_json::json!({
-            "cache": stats,
-            "by_scenario": by_scenario,
-            "by_type": by_type,
-            "total_decisions": decisions.len(),
-        }))
-    } else {
-        Json(serde_json::json!({
-            "enabled": false,
-            "message": "CrowdSec integration not active"
-        }))
-    }
+            Json(serde_json::json!({
+                "cache": cache_stats,
+                "by_scenario": by_scenario,
+                "by_type": by_type,
+                "total_decisions": decisions.len(),
+            }))
+        },
+    )
 }
 
 /// GET /api/crowdsec/events

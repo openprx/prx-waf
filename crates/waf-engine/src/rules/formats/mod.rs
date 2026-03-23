@@ -1,4 +1,4 @@
-//! Rule format parsers — YAML, ModSecurity (SecRule), JSON.
+//! Rule format parsers — YAML, `ModSecurity` (`SecRule`), JSON.
 
 pub mod json;
 pub mod modsec;
@@ -32,7 +32,7 @@ impl RuleFormat {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Yaml => "yaml",
             Self::ModSec => "modsec",
@@ -67,7 +67,7 @@ pub struct ValidationError {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(line) = self.line {
-            write!(f, "line {}: ", line)?;
+            write!(f, "line {line}: ")?;
         }
         write!(f, "{}", self.message)
     }
@@ -82,14 +82,14 @@ pub fn validate_rules(content: &str, format: RuleFormat) -> Vec<ValidationError>
                 if rule.id.is_empty() {
                     errors.push(ValidationError {
                         line: None,
-                        field: Some(format!("rules[{}].id", i)),
+                        field: Some(format!("rules[{i}].id")),
                         message: "Rule id must not be empty".to_string(),
                     });
                 }
                 if rule.name.is_empty() {
                     errors.push(ValidationError {
                         line: None,
-                        field: Some(format!("rules[{}].name", i)),
+                        field: Some(format!("rules[{i}].name")),
                         message: "Rule name must not be empty".to_string(),
                     });
                 }

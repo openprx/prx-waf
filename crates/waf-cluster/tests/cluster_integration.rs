@@ -1,4 +1,5 @@
 //! Integration tests: two-node QUIC mTLS cluster — connect and exchange heartbeats.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -120,7 +121,7 @@ async fn two_nodes_connect_and_exchange_heartbeat() {
     let server_state_srv = Arc::clone(&server_state);
     tokio::spawn(async move {
         if let Err(e) = server.serve(server_state_srv).await {
-            eprintln!("Server error: {e}");
+            tracing::error!("Server error: {e}");
         }
     });
 
@@ -144,7 +145,7 @@ async fn two_nodes_connect_and_exchange_heartbeat() {
     let client_state_for_task = Arc::clone(&client_state);
     tokio::spawn(async move {
         if let Err(e) = client.run_with_reconnect(client_state_for_task, rx).await {
-            eprintln!("Client error: {e}");
+            tracing::error!("Client error: {e}");
         }
     });
 
@@ -165,9 +166,7 @@ async fn two_nodes_connect_and_exchange_heartbeat() {
         config_version: 0,
     };
 
-    tx.send(ClusterMessage::Heartbeat(hb))
-        .await
-        .expect("send heartbeat");
+    tx.send(ClusterMessage::Heartbeat(hb)).await.expect("send heartbeat");
 
     // ── Verify server updated peer last_seen_ms ────────────────────────────
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -177,11 +176,12 @@ async fn two_nodes_connect_and_exchange_heartbeat() {
         .iter()
         .find(|p| p.node_id == "integration-client")
         .expect("client peer not found in server state");
+    let last_seen = client_peer.last_seen_ms;
+    drop(peers);
 
     assert!(
-        client_peer.last_seen_ms > 0,
-        "server should have recorded a heartbeat from the client (last_seen_ms={})",
-        client_peer.last_seen_ms
+        last_seen > 0,
+        "server should have recorded a heartbeat from the client (last_seen_ms={last_seen})",
     );
 }
 
@@ -270,18 +270,14 @@ async fn rule_created_on_main_synced_to_worker() {
     };
 
     let all_rules = [rule_a.clone(), rule_b.clone()];
-    let resp_incr = handle_sync_request(&changelog, &request_v1, &all_rules)
-        .expect("handle_sync_request (incremental) failed");
+    let resp_incr =
+        handle_sync_request(&changelog, &request_v1, &all_rules).expect("handle_sync_request (incremental) failed");
 
     assert!(
         matches!(resp_incr.sync_type, SyncType::Incremental),
         "existing worker should receive incremental diff, not full snapshot"
     );
-    assert_eq!(
-        resp_incr.changes.len(),
-        1,
-        "exactly one rule change since last sync"
-    );
+    assert_eq!(resp_incr.changes.len(), 1, "exactly one rule change since last sync");
     assert_eq!(resp_incr.changes[0].rule_id, "xss-001");
     let incr_version = resp_incr.version;
 
@@ -310,8 +306,8 @@ async fn rule_created_on_main_synced_to_worker() {
         current_version: worker_registry.version,
     };
     let remaining_rules = [rule_b.clone()];
-    let resp_delete = handle_sync_request(&changelog, &request_v2, &remaining_rules)
-        .expect("handle_sync_request (delete) failed");
+    let resp_delete =
+        handle_sync_request(&changelog, &request_v2, &remaining_rules).expect("handle_sync_request (delete) failed");
 
     assert!(
         matches!(resp_delete.sync_type, SyncType::Incremental),
@@ -348,11 +344,8 @@ async fn rule_sync_falls_back_to_full_when_worker_too_far_behind() {
     // the ring buffer has been populated past its capacity.  With max_retained=3
     // and 3 insertions, the oldest entry is version 1, so version 0 < 1 → Full.
     let request = RuleSyncRequest { current_version: 0 };
-    let rules: Vec<Rule> = (0..3u32)
-        .map(|i| make_test_rule(&format!("rule-{i:03}")))
-        .collect();
-    let resp =
-        handle_sync_request(&changelog, &request, &rules).expect("handle_sync_request failed");
+    let rules: Vec<Rule> = (0..3u32).map(|i| make_test_rule(&format!("rule-{i:03}"))).collect();
+    let resp = handle_sync_request(&changelog, &request, &rules).expect("handle_sync_request failed");
 
     assert!(
         matches!(resp.sync_type, SyncType::Full),
@@ -365,10 +358,6 @@ async fn rule_sync_falls_back_to_full_when_worker_too_far_behind() {
         .await
         .expect("apply full snapshot after fallback failed");
 
-    assert_eq!(
-        registry.rules.len(),
-        3,
-        "all 3 rules should be in worker registry"
-    );
+    assert_eq!(registry.rules.len(), 3, "all 3 rules should be in worker registry");
     assert_eq!(registry.version, changelog.current_version());
 }

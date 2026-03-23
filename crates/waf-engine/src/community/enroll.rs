@@ -51,10 +51,7 @@ pub async fn enroll_machine(client: &CommunityClient) -> Result<EnrollResponse> 
         anyhow::bail!("enrollment returned {status}: {body_text}");
     }
 
-    let enroll_resp: EnrollResponse = resp
-        .json()
-        .await
-        .context("failed to parse enrollment response")?;
+    let enroll_resp: EnrollResponse = resp.json().await.context("failed to parse enrollment response")?;
     Ok(enroll_resp)
 }
 

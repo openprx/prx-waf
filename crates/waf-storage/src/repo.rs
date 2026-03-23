@@ -3,7 +3,15 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::StorageError;
-use crate::models::*;
+use crate::models::{
+    AdminUser, AllowIp, AllowUrl, AttackLog, AttackLogQuery, AuditLogEntry, AuditLogQuery, BlockIp, BlockUrl,
+    Certificate, CreateAdminUser, CreateCertificate, CreateCrowdSecEvent, CreateCustomRule, CreateHost, CreateIpRule,
+    CreateLbBackend, CreateNotificationConfig, CreateSecurityEvent, CreateSensitivePattern, CreateTunnel,
+    CreateUrlRule, CreateWasmPlugin, CrowdSecConfigRow, CrowdSecEventQuery, CrowdSecEventRow, CustomRule, GeoDistEntry,
+    GeoStats, Host, HotlinkConfig, LbBackend, NotificationConfig, NotificationLog, RefreshToken, SecurityEvent,
+    SecurityEventQuery, SensitivePattern, StatsOverview, TimeSeriesPoint, TopEntry, TunnelRow, UpdateCertificatePem,
+    UpdateHost, UpsertCrowdSecConfig, UpsertHotlinkConfig, WasmPluginRow,
+};
 
 impl Database {
     // ─── Hosts ───────────────────────────────────────────────────────────────
@@ -37,7 +45,7 @@ impl Database {
         let now = chrono::Utc::now();
 
         let row = sqlx::query_as::<_, Host>(
-            r#"INSERT INTO hosts (
+            r"INSERT INTO hosts (
                 id, code, host, port, ssl, guard_status,
                 remote_host, remote_port, remote_ip, cert_file, key_file,
                 remarks, start_status, log_only_mode,
@@ -49,7 +57,7 @@ impl Database {
                 $12, $13, $14,
                 false, 0,
                 $15, $15
-            ) RETURNING *"#,
+            ) RETURNING *",
         )
         .bind(id)
         .bind(&code)
@@ -73,15 +81,11 @@ impl Database {
         Ok(row)
     }
 
-    pub async fn update_host(
-        &self,
-        id: Uuid,
-        req: UpdateHost,
-    ) -> Result<Option<Host>, StorageError> {
+    pub async fn update_host(&self, id: Uuid, req: UpdateHost) -> Result<Option<Host>, StorageError> {
         let now = chrono::Utc::now();
 
         let row = sqlx::query_as::<_, Host>(
-            r#"UPDATE hosts SET
+            r"UPDATE hosts SET
                 host = COALESCE($2, host),
                 port = COALESCE($3, port),
                 ssl = COALESCE($4, ssl),
@@ -96,7 +100,7 @@ impl Database {
                 log_only_mode = COALESCE($13, log_only_mode),
                 updated_at = $14
             WHERE id = $1
-            RETURNING *"#,
+            RETURNING *",
         )
         .bind(id)
         .bind(req.host)
@@ -128,18 +132,13 @@ impl Database {
 
     // ─── Allow IPs ───────────────────────────────────────────────────────────
 
-    pub async fn list_allow_ips(
-        &self,
-        host_code: Option<&str>,
-    ) -> Result<Vec<AllowIp>, StorageError> {
+    pub async fn list_allow_ips(&self, host_code: Option<&str>) -> Result<Vec<AllowIp>, StorageError> {
         let rows = match host_code {
             Some(code) => {
-                sqlx::query_as::<_, AllowIp>(
-                    "SELECT * FROM allow_ips WHERE host_code = $1 ORDER BY created_at DESC",
-                )
-                .bind(code)
-                .fetch_all(&self.pool)
-                .await?
+                sqlx::query_as::<_, AllowIp>("SELECT * FROM allow_ips WHERE host_code = $1 ORDER BY created_at DESC")
+                    .bind(code)
+                    .fetch_all(&self.pool)
+                    .await?
             }
             None => {
                 sqlx::query_as::<_, AllowIp>("SELECT * FROM allow_ips ORDER BY created_at DESC")
@@ -154,9 +153,9 @@ impl Database {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         let row = sqlx::query_as::<_, AllowIp>(
-            r#"INSERT INTO allow_ips (id, host_code, ip_cidr, remarks, created_at, updated_at)
+            r"INSERT INTO allow_ips (id, host_code, ip_cidr, remarks, created_at, updated_at)
                VALUES ($1, $2, $3, $4, $5, $5)
-               RETURNING *"#,
+               RETURNING *",
         )
         .bind(id)
         .bind(&req.host_code)
@@ -178,18 +177,13 @@ impl Database {
 
     // ─── Block IPs ───────────────────────────────────────────────────────────
 
-    pub async fn list_block_ips(
-        &self,
-        host_code: Option<&str>,
-    ) -> Result<Vec<BlockIp>, StorageError> {
+    pub async fn list_block_ips(&self, host_code: Option<&str>) -> Result<Vec<BlockIp>, StorageError> {
         let rows = match host_code {
             Some(code) => {
-                sqlx::query_as::<_, BlockIp>(
-                    "SELECT * FROM block_ips WHERE host_code = $1 ORDER BY created_at DESC",
-                )
-                .bind(code)
-                .fetch_all(&self.pool)
-                .await?
+                sqlx::query_as::<_, BlockIp>("SELECT * FROM block_ips WHERE host_code = $1 ORDER BY created_at DESC")
+                    .bind(code)
+                    .fetch_all(&self.pool)
+                    .await?
             }
             None => {
                 sqlx::query_as::<_, BlockIp>("SELECT * FROM block_ips ORDER BY created_at DESC")
@@ -204,9 +198,9 @@ impl Database {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         let row = sqlx::query_as::<_, BlockIp>(
-            r#"INSERT INTO block_ips (id, host_code, ip_cidr, remarks, created_at, updated_at)
+            r"INSERT INTO block_ips (id, host_code, ip_cidr, remarks, created_at, updated_at)
                VALUES ($1, $2, $3, $4, $5, $5)
-               RETURNING *"#,
+               RETURNING *",
         )
         .bind(id)
         .bind(&req.host_code)
@@ -228,18 +222,13 @@ impl Database {
 
     // ─── Allow URLs ──────────────────────────────────────────────────────────
 
-    pub async fn list_allow_urls(
-        &self,
-        host_code: Option<&str>,
-    ) -> Result<Vec<AllowUrl>, StorageError> {
+    pub async fn list_allow_urls(&self, host_code: Option<&str>) -> Result<Vec<AllowUrl>, StorageError> {
         let rows = match host_code {
             Some(code) => {
-                sqlx::query_as::<_, AllowUrl>(
-                    "SELECT * FROM allow_urls WHERE host_code = $1 ORDER BY created_at DESC",
-                )
-                .bind(code)
-                .fetch_all(&self.pool)
-                .await?
+                sqlx::query_as::<_, AllowUrl>("SELECT * FROM allow_urls WHERE host_code = $1 ORDER BY created_at DESC")
+                    .bind(code)
+                    .fetch_all(&self.pool)
+                    .await?
             }
             None => {
                 sqlx::query_as::<_, AllowUrl>("SELECT * FROM allow_urls ORDER BY created_at DESC")
@@ -254,9 +243,9 @@ impl Database {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         let row = sqlx::query_as::<_, AllowUrl>(
-            r#"INSERT INTO allow_urls (id, host_code, url_pattern, match_type, remarks, created_at, updated_at)
+            r"INSERT INTO allow_urls (id, host_code, url_pattern, match_type, remarks, created_at, updated_at)
                VALUES ($1, $2, $3, $4, $5, $6, $6)
-               RETURNING *"#
+               RETURNING *",
         )
         .bind(id)
         .bind(&req.host_code)
@@ -279,18 +268,13 @@ impl Database {
 
     // ─── Block URLs ──────────────────────────────────────────────────────────
 
-    pub async fn list_block_urls(
-        &self,
-        host_code: Option<&str>,
-    ) -> Result<Vec<BlockUrl>, StorageError> {
+    pub async fn list_block_urls(&self, host_code: Option<&str>) -> Result<Vec<BlockUrl>, StorageError> {
         let rows = match host_code {
             Some(code) => {
-                sqlx::query_as::<_, BlockUrl>(
-                    "SELECT * FROM block_urls WHERE host_code = $1 ORDER BY created_at DESC",
-                )
-                .bind(code)
-                .fetch_all(&self.pool)
-                .await?
+                sqlx::query_as::<_, BlockUrl>("SELECT * FROM block_urls WHERE host_code = $1 ORDER BY created_at DESC")
+                    .bind(code)
+                    .fetch_all(&self.pool)
+                    .await?
             }
             None => {
                 sqlx::query_as::<_, BlockUrl>("SELECT * FROM block_urls ORDER BY created_at DESC")
@@ -305,9 +289,9 @@ impl Database {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         let row = sqlx::query_as::<_, BlockUrl>(
-            r#"INSERT INTO block_urls (id, host_code, url_pattern, match_type, remarks, created_at, updated_at)
+            r"INSERT INTO block_urls (id, host_code, url_pattern, match_type, remarks, created_at, updated_at)
                VALUES ($1, $2, $3, $4, $5, $6, $6)
-               RETURNING *"#
+               RETURNING *",
         )
         .bind(id)
         .bind(&req.host_code)
@@ -332,11 +316,11 @@ impl Database {
 
     pub async fn create_attack_log(&self, log: AttackLog) -> Result<(), StorageError> {
         sqlx::query(
-            r#"INSERT INTO attack_logs (
+            r"INSERT INTO attack_logs (
                 id, host_code, host, client_ip, method, path, query,
                 rule_id, rule_name, action, phase, detail,
                 request_headers, geo_info, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"#,
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
         )
         .bind(log.id)
         .bind(&log.host_code)
@@ -358,22 +342,19 @@ impl Database {
         Ok(())
     }
 
-    pub async fn list_attack_logs(
-        &self,
-        query: &AttackLogQuery,
-    ) -> Result<(Vec<AttackLog>, i64), StorageError> {
+    pub async fn list_attack_logs(&self, query: &AttackLogQuery) -> Result<(Vec<AttackLog>, i64), StorageError> {
         let page = query.page.unwrap_or(1).max(1);
         let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
         let offset = (page - 1) * page_size;
 
         // Count query
         let total: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM attack_logs
+            r"SELECT COUNT(*) FROM attack_logs
                WHERE ($1::text IS NULL OR host_code = $1)
                  AND ($2::text IS NULL OR client_ip = $2)
                  AND ($3::text IS NULL OR action = $3)
                  AND ($4::text IS NULL OR geo_info->>'iso_code' = $4)
-                 AND ($5::text IS NULL OR geo_info->>'country' ILIKE '%' || $5 || '%')"#,
+                 AND ($5::text IS NULL OR geo_info->>'country' ILIKE '%' || $5 || '%')",
         )
         .bind(&query.host_code)
         .bind(&query.client_ip)
@@ -384,14 +365,14 @@ impl Database {
         .await?;
 
         let rows = sqlx::query_as::<_, AttackLog>(
-            r#"SELECT * FROM attack_logs
+            r"SELECT * FROM attack_logs
                WHERE ($1::text IS NULL OR host_code = $1)
                  AND ($2::text IS NULL OR client_ip = $2)
                  AND ($3::text IS NULL OR action = $3)
                  AND ($4::text IS NULL OR geo_info->>'iso_code' = $4)
                  AND ($5::text IS NULL OR geo_info->>'country' ILIKE '%' || $5 || '%')
                ORDER BY created_at DESC
-               LIMIT $6 OFFSET $7"#,
+               LIMIT $6 OFFSET $7",
         )
         .bind(&query.host_code)
         .bind(&query.client_ip)
@@ -408,14 +389,11 @@ impl Database {
 
     // ─── Security Events ─────────────────────────────────────────────────────
 
-    pub async fn create_security_event(
-        &self,
-        req: CreateSecurityEvent,
-    ) -> Result<(), StorageError> {
+    pub async fn create_security_event(&self, req: CreateSecurityEvent) -> Result<(), StorageError> {
         sqlx::query(
-            r#"INSERT INTO security_events
+            r"INSERT INTO security_events
                (host_code, client_ip, method, path, rule_id, rule_name, action, detail, geo_info)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(&req.host_code)
         .bind(&req.client_ip)
@@ -439,10 +417,7 @@ impl Database {
 
     // ─── Certificates ─────────────────────────────────────────────────────────
 
-    pub async fn list_certificates(
-        &self,
-        host_code: Option<&str>,
-    ) -> Result<Vec<Certificate>, StorageError> {
+    pub async fn list_certificates(&self, host_code: Option<&str>) -> Result<Vec<Certificate>, StorageError> {
         let rows = match host_code {
             Some(code) => {
                 sqlx::query_as::<_, Certificate>(
@@ -453,11 +428,9 @@ impl Database {
                 .await?
             }
             None => {
-                sqlx::query_as::<_, Certificate>(
-                    "SELECT * FROM certificates ORDER BY created_at DESC",
-                )
-                .fetch_all(&self.pool)
-                .await?
+                sqlx::query_as::<_, Certificate>("SELECT * FROM certificates ORDER BY created_at DESC")
+                    .fetch_all(&self.pool)
+                    .await?
             }
         };
         Ok(rows)
@@ -472,10 +445,7 @@ impl Database {
         )
     }
 
-    pub async fn get_certificate_by_domain(
-        &self,
-        domain: &str,
-    ) -> Result<Option<Certificate>, StorageError> {
+    pub async fn get_certificate_by_domain(&self, domain: &str) -> Result<Option<Certificate>, StorageError> {
         Ok(sqlx::query_as::<_, Certificate>(
             "SELECT * FROM certificates WHERE domain = $1 ORDER BY created_at DESC LIMIT 1",
         )
@@ -484,15 +454,12 @@ impl Database {
         .await?)
     }
 
-    pub async fn create_certificate(
-        &self,
-        req: CreateCertificate,
-    ) -> Result<Certificate, StorageError> {
+    pub async fn create_certificate(&self, req: CreateCertificate) -> Result<Certificate, StorageError> {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         let row = sqlx::query_as::<_, Certificate>(
-            r#"INSERT INTO certificates (id, host_code, domain, cert_pem, key_pem, chain_pem, auto_renew, status, created_at, updated_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$8) RETURNING *"#
+            r"INSERT INTO certificates (id, host_code, domain, cert_pem, key_pem, chain_pem, auto_renew, status, created_at, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$8) RETURNING *"
         )
         .bind(id).bind(&req.host_code).bind(&req.domain)
         .bind(&req.cert_pem).bind(&req.key_pem).bind(&req.chain_pem)
@@ -507,25 +474,20 @@ impl Database {
         status: &str,
         error_msg: Option<&str>,
     ) -> Result<(), StorageError> {
-        sqlx::query(
-            "UPDATE certificates SET status=$2, error_msg=$3, updated_at=NOW() WHERE id=$1",
-        )
-        .bind(id)
-        .bind(status)
-        .bind(error_msg)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE certificates SET status=$2, error_msg=$3, updated_at=NOW() WHERE id=$1")
+            .bind(id)
+            .bind(status)
+            .bind(error_msg)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
-    pub async fn update_certificate_pem(
-        &self,
-        params: &UpdateCertificatePem<'_>,
-    ) -> Result<(), StorageError> {
+    pub async fn update_certificate_pem(&self, params: &UpdateCertificatePem<'_>) -> Result<(), StorageError> {
         sqlx::query(
-            r#"UPDATE certificates SET cert_pem=$2, key_pem=$3, chain_pem=$4,
+            r"UPDATE certificates SET cert_pem=$2, key_pem=$3, chain_pem=$4,
                not_before=$5, not_after=$6, issuer=$7, subject=$8,
-               status='active', error_msg=NULL, updated_at=NOW() WHERE id=$1"#,
+               status='active', error_msg=NULL, updated_at=NOW() WHERE id=$1",
         )
         .bind(params.id)
         .bind(params.cert_pem)
@@ -540,15 +502,12 @@ impl Database {
         Ok(())
     }
 
-    pub async fn list_certificates_due_renewal(
-        &self,
-        days_before: i64,
-    ) -> Result<Vec<Certificate>, StorageError> {
+    pub async fn list_certificates_due_renewal(&self, days_before: i64) -> Result<Vec<Certificate>, StorageError> {
         let threshold = chrono::Utc::now() + chrono::Duration::days(days_before);
         let rows = sqlx::query_as::<_, Certificate>(
-            r#"SELECT * FROM certificates
+            r"SELECT * FROM certificates
                WHERE auto_renew = TRUE AND status = 'active'
-                 AND not_after IS NOT NULL AND not_after < $1"#,
+                 AND not_after IS NOT NULL AND not_after < $1",
         )
         .bind(threshold)
         .fetch_all(&self.pool)
@@ -566,26 +525,22 @@ impl Database {
 
     // ─── Custom Rules ─────────────────────────────────────────────────────────
 
-    pub async fn list_custom_rules(
-        &self,
-        host_code: Option<&str>,
-    ) -> Result<Vec<CustomRule>, StorageError> {
-        let rows =
-            match host_code {
-                Some(code) => sqlx::query_as::<_, CustomRule>(
+    pub async fn list_custom_rules(&self, host_code: Option<&str>) -> Result<Vec<CustomRule>, StorageError> {
+        let rows = match host_code {
+            Some(code) => {
+                sqlx::query_as::<_, CustomRule>(
                     "SELECT * FROM custom_rules WHERE host_code = $1 ORDER BY priority, created_at",
                 )
                 .bind(code)
                 .fetch_all(&self.pool)
-                .await?,
-                None => {
-                    sqlx::query_as::<_, CustomRule>(
-                        "SELECT * FROM custom_rules ORDER BY priority, created_at",
-                    )
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, CustomRule>("SELECT * FROM custom_rules ORDER BY priority, created_at")
                     .fetch_all(&self.pool)
                     .await?
-                }
-            };
+            }
+        };
         Ok(rows)
     }
 
@@ -598,17 +553,14 @@ impl Database {
         )
     }
 
-    pub async fn create_custom_rule(
-        &self,
-        req: CreateCustomRule,
-    ) -> Result<CustomRule, StorageError> {
+    pub async fn create_custom_rule(&self, req: CreateCustomRule) -> Result<CustomRule, StorageError> {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         let row = sqlx::query_as::<_, CustomRule>(
-            r#"INSERT INTO custom_rules
+            r"INSERT INTO custom_rules
                (id, host_code, name, description, priority, enabled, condition_op, conditions,
                 action, action_status, action_msg, script, created_at, updated_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13) RETURNING *"#,
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13) RETURNING *",
         )
         .bind(id)
         .bind(&req.host_code)
@@ -636,11 +588,7 @@ impl Database {
         Ok(r.rows_affected() > 0)
     }
 
-    pub async fn set_custom_rule_enabled(
-        &self,
-        id: Uuid,
-        enabled: bool,
-    ) -> Result<bool, StorageError> {
+    pub async fn set_custom_rule_enabled(&self, id: Uuid, enabled: bool) -> Result<bool, StorageError> {
         let r = sqlx::query("UPDATE custom_rules SET enabled=$2, updated_at=NOW() WHERE id=$1")
             .bind(id)
             .bind(enabled)
@@ -656,12 +604,21 @@ impl Database {
         host_code: Option<&str>,
     ) -> Result<Vec<SensitivePattern>, StorageError> {
         let rows = match host_code {
-            Some(code) => sqlx::query_as::<_, SensitivePattern>(
-                "SELECT * FROM sensitive_patterns WHERE host_code = $1 AND enabled = TRUE ORDER BY created_at"
-            ).bind(code).fetch_all(&self.pool).await?,
-            None => sqlx::query_as::<_, SensitivePattern>(
-                "SELECT * FROM sensitive_patterns WHERE enabled = TRUE ORDER BY created_at"
-            ).fetch_all(&self.pool).await?,
+            Some(code) => {
+                sqlx::query_as::<_, SensitivePattern>(
+                    "SELECT * FROM sensitive_patterns WHERE host_code = $1 AND enabled = TRUE ORDER BY created_at",
+                )
+                .bind(code)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, SensitivePattern>(
+                    "SELECT * FROM sensitive_patterns WHERE enabled = TRUE ORDER BY created_at",
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
         };
         Ok(rows)
     }
@@ -673,9 +630,9 @@ impl Database {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         let row = sqlx::query_as::<_, SensitivePattern>(
-            r#"INSERT INTO sensitive_patterns
+            r"INSERT INTO sensitive_patterns
                (id, host_code, pattern, pattern_type, check_request, check_response, action, remarks, enabled, created_at, updated_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,$9,$9) RETURNING *"#
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,$9,$9) RETURNING *"
         )
         .bind(id).bind(&req.host_code).bind(&req.pattern)
         .bind(req.pattern_type.as_deref().unwrap_or("word"))
@@ -697,17 +654,12 @@ impl Database {
 
     // ─── Hotlink Configs ──────────────────────────────────────────────────────
 
-    pub async fn get_hotlink_config(
-        &self,
-        host_code: &str,
-    ) -> Result<Option<HotlinkConfig>, StorageError> {
+    pub async fn get_hotlink_config(&self, host_code: &str) -> Result<Option<HotlinkConfig>, StorageError> {
         Ok(
-            sqlx::query_as::<_, HotlinkConfig>(
-                "SELECT * FROM hotlink_configs WHERE host_code = $1",
-            )
-            .bind(host_code)
-            .fetch_optional(&self.pool)
-            .await?,
+            sqlx::query_as::<_, HotlinkConfig>("SELECT * FROM hotlink_configs WHERE host_code = $1")
+                .bind(host_code)
+                .fetch_optional(&self.pool)
+                .await?,
         )
     }
 
@@ -719,22 +671,19 @@ impl Database {
         )
     }
 
-    pub async fn upsert_hotlink_config(
-        &self,
-        req: UpsertHotlinkConfig,
-    ) -> Result<HotlinkConfig, StorageError> {
+    pub async fn upsert_hotlink_config(&self, req: UpsertHotlinkConfig) -> Result<HotlinkConfig, StorageError> {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         let domains = serde_json::to_value(req.allowed_domains.unwrap_or_default())
-            .unwrap_or(serde_json::Value::Array(vec![]));
+            .unwrap_or_else(|_| serde_json::Value::Array(vec![]));
         let row = sqlx::query_as::<_, HotlinkConfig>(
-            r#"INSERT INTO hotlink_configs (id, host_code, enabled, allow_empty_referer, allowed_domains, redirect_url, created_at, updated_at)
+            r"INSERT INTO hotlink_configs (id, host_code, enabled, allow_empty_referer, allowed_domains, redirect_url, created_at, updated_at)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$7)
                ON CONFLICT (host_code) DO UPDATE SET
                  enabled=EXCLUDED.enabled, allow_empty_referer=EXCLUDED.allow_empty_referer,
                  allowed_domains=EXCLUDED.allowed_domains, redirect_url=EXCLUDED.redirect_url,
                  updated_at=NOW()
-               RETURNING *"#
+               RETURNING *"
         )
         .bind(id).bind(&req.host_code).bind(req.enabled.unwrap_or(true))
         .bind(req.allow_empty_referer.unwrap_or(true))
@@ -745,17 +694,16 @@ impl Database {
 
     // ─── LB Backends ─────────────────────────────────────────────────────────
 
-    pub async fn list_lb_backends(
-        &self,
-        host_code: Option<&str>,
-    ) -> Result<Vec<LbBackend>, StorageError> {
+    pub async fn list_lb_backends(&self, host_code: Option<&str>) -> Result<Vec<LbBackend>, StorageError> {
         let rows = match host_code {
-            Some(code) => sqlx::query_as::<_, LbBackend>(
-                "SELECT * FROM lb_backends WHERE host_code = $1 ORDER BY weight DESC, created_at",
-            )
-            .bind(code)
-            .fetch_all(&self.pool)
-            .await?,
+            Some(code) => {
+                sqlx::query_as::<_, LbBackend>(
+                    "SELECT * FROM lb_backends WHERE host_code = $1 ORDER BY weight DESC, created_at",
+                )
+                .bind(code)
+                .fetch_all(&self.pool)
+                .await?
+            }
             None => {
                 sqlx::query_as::<_, LbBackend>("SELECT * FROM lb_backends ORDER BY created_at")
                     .fetch_all(&self.pool)
@@ -769,9 +717,9 @@ impl Database {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         let row = sqlx::query_as::<_, LbBackend>(
-            r#"INSERT INTO lb_backends
+            r"INSERT INTO lb_backends
                (id, host_code, backend_host, backend_port, weight, enabled, health_check_url, health_check_interval_secs, created_at, updated_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *"#
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *"
         )
         .bind(id).bind(&req.host_code).bind(&req.backend_host).bind(req.backend_port)
         .bind(req.weight.unwrap_or(1)).bind(req.enabled.unwrap_or(true))
@@ -790,13 +738,12 @@ impl Database {
         Ok(r.rows_affected() > 0)
     }
 
-    pub async fn update_lb_backend_health(
-        &self,
-        id: Uuid,
-        is_healthy: bool,
-    ) -> Result<(), StorageError> {
+    pub async fn update_lb_backend_health(&self, id: Uuid, is_healthy: bool) -> Result<(), StorageError> {
         sqlx::query("UPDATE lb_backends SET is_healthy=$2, last_health_check=NOW(), updated_at=NOW() WHERE id=$1")
-            .bind(id).bind(is_healthy).execute(&self.pool).await?;
+            .bind(id)
+            .bind(is_healthy)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -819,10 +766,7 @@ impl Database {
         )
     }
 
-    pub async fn get_admin_user_by_username(
-        &self,
-        username: &str,
-    ) -> Result<Option<AdminUser>, StorageError> {
+    pub async fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>, StorageError> {
         Ok(
             sqlx::query_as::<_, AdminUser>("SELECT * FROM admin_users WHERE username = $1")
                 .bind(username)
@@ -839,9 +783,9 @@ impl Database {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         Ok(sqlx::query_as::<_, AdminUser>(
-            r#"INSERT INTO admin_users
+            r"INSERT INTO admin_users
                (id, username, email, password_hash, role, is_active, created_at, updated_at)
-               VALUES ($1,$2,$3,$4,$5,true,$6,$6) RETURNING *"#,
+               VALUES ($1,$2,$3,$4,$5,true,$6,$6) RETURNING *",
         )
         .bind(id)
         .bind(&req.username)
@@ -878,9 +822,9 @@ impl Database {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         Ok(sqlx::query_as::<_, RefreshToken>(
-            r#"INSERT INTO refresh_tokens
+            r"INSERT INTO refresh_tokens
                (id, user_id, token_hash, expires_at, revoked, created_at)
-               VALUES ($1,$2,$3,$4,false,$5) RETURNING *"#,
+               VALUES ($1,$2,$3,$4,false,$5) RETURNING *",
         )
         .bind(id)
         .bind(user_id)
@@ -891,10 +835,7 @@ impl Database {
         .await?)
     }
 
-    pub async fn get_refresh_token_by_hash(
-        &self,
-        token_hash: &str,
-    ) -> Result<Option<RefreshToken>, StorageError> {
+    pub async fn get_refresh_token_by_hash(&self, token_hash: &str) -> Result<Option<RefreshToken>, StorageError> {
         Ok(sqlx::query_as::<_, RefreshToken>(
             "SELECT * FROM refresh_tokens WHERE token_hash = $1 AND revoked = false AND expires_at > NOW()",
         )
@@ -922,20 +863,18 @@ impl Database {
     // ─── Phase 4: Statistics ──────────────────────────────────────────────────
 
     pub async fn get_stats_overview(&self) -> Result<StatsOverview, StorageError> {
-        let total_blocked_logs: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM attack_logs WHERE action = 'block'")
-                .fetch_one(&self.pool)
-                .await?;
+        let total_blocked_logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attack_logs WHERE action = 'block'")
+            .fetch_one(&self.pool)
+            .await?;
         let total_blocked_events: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM security_events WHERE action = 'block'")
                 .fetch_one(&self.pool)
                 .await?;
         let total_blocked = total_blocked_logs + total_blocked_events;
 
-        let total_allowed: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM attack_logs WHERE action = 'allow'")
-                .fetch_one(&self.pool)
-                .await?;
+        let total_allowed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attack_logs WHERE action = 'allow'")
+            .fetch_one(&self.pool)
+            .await?;
 
         let total_requests = total_blocked + total_allowed;
 
@@ -999,7 +938,7 @@ impl Database {
         .await?;
 
         // Top ISPs
-        let top_isps: Vec<TopEntry> = sqlx::query(
+        let top_isp_list: Vec<TopEntry> = sqlx::query(
             "SELECT geo_info->>'isp' AS entry_key, COUNT(*)::bigint AS cnt \
              FROM security_events \
              WHERE geo_info->>'isp' IS NOT NULL AND geo_info->>'isp' != '' \
@@ -1025,7 +964,7 @@ impl Database {
             top_ips,
             top_rules,
             top_countries,
-            top_isps,
+            top_isps: top_isp_list,
         })
     }
 
@@ -1045,7 +984,7 @@ impl Database {
              GROUP BY date_trunc('hour', created_at) \
              ORDER BY ts ASC",
         )
-        .bind(hours as i32)
+        .bind(i32::try_from(hours).unwrap_or(i32::MAX))
         .bind(host_code)
         .map(|row: sqlx::postgres::PgRow| {
             use sqlx::Row;
@@ -1151,12 +1090,10 @@ impl Database {
     }
 
     pub async fn delete_old_stats(&self, days: i64) -> Result<u64, StorageError> {
-        let r = sqlx::query(
-            "DELETE FROM request_stats WHERE period_start < NOW() - make_interval(days => $1::int)",
-        )
-        .bind(days as i32)
-        .execute(&self.pool)
-        .await?;
+        let r = sqlx::query("DELETE FROM request_stats WHERE period_start < NOW() - make_interval(days => $1::int)")
+            .bind(i32::try_from(days).unwrap_or(i32::MAX))
+            .execute(&self.pool)
+            .await?;
         Ok(r.rows_affected())
     }
 
@@ -1176,25 +1113,20 @@ impl Database {
                 .await?
             }
             None => {
-                sqlx::query_as::<_, NotificationConfig>(
-                    "SELECT * FROM notification_configs ORDER BY created_at",
-                )
-                .fetch_all(&self.pool)
-                .await?
+                sqlx::query_as::<_, NotificationConfig>("SELECT * FROM notification_configs ORDER BY created_at")
+                    .fetch_all(&self.pool)
+                    .await?
             }
         })
     }
 
-    pub async fn get_notification_config(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<NotificationConfig>, StorageError> {
-        Ok(sqlx::query_as::<_, NotificationConfig>(
-            "SELECT * FROM notification_configs WHERE id = $1",
+    pub async fn get_notification_config(&self, id: Uuid) -> Result<Option<NotificationConfig>, StorageError> {
+        Ok(
+            sqlx::query_as::<_, NotificationConfig>("SELECT * FROM notification_configs WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
         )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?)
     }
 
     pub async fn create_notification_config(
@@ -1204,9 +1136,9 @@ impl Database {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         Ok(sqlx::query_as::<_, NotificationConfig>(
-            r#"INSERT INTO notification_configs
+            r"INSERT INTO notification_configs
                (id, name, host_code, event_type, channel_type, config_json, enabled, rate_limit_secs, created_at, updated_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *"#,
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *",
         )
         .bind(id)
         .bind(&req.name)
@@ -1230,12 +1162,10 @@ impl Database {
     }
 
     pub async fn update_notification_last_triggered(&self, id: Uuid) -> Result<(), StorageError> {
-        sqlx::query(
-            "UPDATE notification_configs SET last_triggered = NOW(), updated_at = NOW() WHERE id = $1",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE notification_configs SET last_triggered = NOW(), updated_at = NOW() WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1261,9 +1191,9 @@ impl Database {
         error_msg: Option<&str>,
     ) -> Result<(), StorageError> {
         sqlx::query(
-            r#"INSERT INTO notification_log
+            r"INSERT INTO notification_log
                (id, config_id, event_type, channel_type, status, message, error_msg)
-               VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)"#,
+               VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)",
         )
         .bind(config_id)
         .bind(event_type)
@@ -1276,16 +1206,13 @@ impl Database {
         Ok(())
     }
 
-    pub async fn list_notification_log(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<NotificationLog>, StorageError> {
-        Ok(sqlx::query_as::<_, NotificationLog>(
-            "SELECT * FROM notification_log ORDER BY created_at DESC LIMIT $1",
+    pub async fn list_notification_log(&self, limit: i64) -> Result<Vec<NotificationLog>, StorageError> {
+        Ok(
+            sqlx::query_as::<_, NotificationLog>("SELECT * FROM notification_log ORDER BY created_at DESC LIMIT $1")
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?,
         )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
     }
 
     pub async fn list_security_events(
@@ -1297,13 +1224,13 @@ impl Database {
         let offset = (page - 1) * page_size;
 
         let total: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM security_events
+            r"SELECT COUNT(*) FROM security_events
                WHERE ($1::text IS NULL OR host_code = $1)
                  AND ($2::text IS NULL OR client_ip = $2)
                  AND ($3::text IS NULL OR rule_name = $3)
                  AND ($4::text IS NULL OR action = $4)
                  AND ($5::text IS NULL OR geo_info->>'iso_code' = $5)
-                 AND ($6::text IS NULL OR geo_info->>'country' ILIKE '%' || $6 || '%')"#,
+                 AND ($6::text IS NULL OR geo_info->>'country' ILIKE '%' || $6 || '%')",
         )
         .bind(&query.host_code)
         .bind(&query.client_ip)
@@ -1315,7 +1242,7 @@ impl Database {
         .await?;
 
         let rows = sqlx::query_as::<_, SecurityEvent>(
-            r#"SELECT * FROM security_events
+            r"SELECT * FROM security_events
                WHERE ($1::text IS NULL OR host_code = $1)
                  AND ($2::text IS NULL OR client_ip = $2)
                  AND ($3::text IS NULL OR rule_name = $3)
@@ -1323,7 +1250,7 @@ impl Database {
                  AND ($5::text IS NULL OR geo_info->>'iso_code' = $5)
                  AND ($6::text IS NULL OR geo_info->>'country' ILIKE '%' || $6 || '%')
                ORDER BY created_at DESC
-               LIMIT $7 OFFSET $8"#,
+               LIMIT $7 OFFSET $8",
         )
         .bind(&query.host_code)
         .bind(&query.client_ip)
@@ -1342,11 +1269,11 @@ impl Database {
     // ─── Phase 5: WASM Plugins ────────────────────────────────────────────────
 
     pub async fn list_wasm_plugins(&self) -> Result<Vec<WasmPluginRow>, StorageError> {
-        Ok(sqlx::query_as::<_, WasmPluginRow>(
-            "SELECT * FROM wasm_plugins ORDER BY created_at DESC",
+        Ok(
+            sqlx::query_as::<_, WasmPluginRow>("SELECT * FROM wasm_plugins ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?,
         )
-        .fetch_all(&self.pool)
-        .await?)
     }
 
     pub async fn get_wasm_plugin(&self, id: Uuid) -> Result<Option<WasmPluginRow>, StorageError> {
@@ -1358,16 +1285,13 @@ impl Database {
         )
     }
 
-    pub async fn create_wasm_plugin(
-        &self,
-        req: CreateWasmPlugin,
-    ) -> Result<WasmPluginRow, StorageError> {
+    pub async fn create_wasm_plugin(&self, req: CreateWasmPlugin) -> Result<WasmPluginRow, StorageError> {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         Ok(sqlx::query_as::<_, WasmPluginRow>(
-            r#"INSERT INTO wasm_plugins
+            r"INSERT INTO wasm_plugins
                (id, name, version, description, author, wasm_binary, enabled, config_json, created_at, updated_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *"#,
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *",
         )
         .bind(id)
         .bind(&req.name)
@@ -1376,17 +1300,16 @@ impl Database {
         .bind(&req.author)
         .bind(&req.wasm_binary)
         .bind(req.enabled.unwrap_or(true))
-        .bind(req.config_json.unwrap_or(serde_json::Value::Object(Default::default())))
+        .bind(
+            req.config_json
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::default())),
+        )
         .bind(now)
         .fetch_one(&self.pool)
         .await?)
     }
 
-    pub async fn set_wasm_plugin_enabled(
-        &self,
-        id: Uuid,
-        enabled: bool,
-    ) -> Result<bool, StorageError> {
+    pub async fn set_wasm_plugin_enabled(&self, id: Uuid, enabled: bool) -> Result<bool, StorageError> {
         let r = sqlx::query("UPDATE wasm_plugins SET enabled=$2, updated_at=NOW() WHERE id=$1")
             .bind(id)
             .bind(enabled)
@@ -1414,37 +1337,28 @@ impl Database {
     }
 
     pub async fn get_tunnel(&self, id: Uuid) -> Result<Option<TunnelRow>, StorageError> {
+        Ok(sqlx::query_as::<_, TunnelRow>("SELECT * FROM tunnels WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    pub async fn get_tunnel_by_token_hash(&self, token_hash: &str) -> Result<Option<TunnelRow>, StorageError> {
         Ok(
-            sqlx::query_as::<_, TunnelRow>("SELECT * FROM tunnels WHERE id = $1")
-                .bind(id)
+            sqlx::query_as::<_, TunnelRow>("SELECT * FROM tunnels WHERE token_hash = $1 AND enabled = true")
+                .bind(token_hash)
                 .fetch_optional(&self.pool)
                 .await?,
         )
     }
 
-    pub async fn get_tunnel_by_token_hash(
-        &self,
-        token_hash: &str,
-    ) -> Result<Option<TunnelRow>, StorageError> {
-        Ok(sqlx::query_as::<_, TunnelRow>(
-            "SELECT * FROM tunnels WHERE token_hash = $1 AND enabled = true",
-        )
-        .bind(token_hash)
-        .fetch_optional(&self.pool)
-        .await?)
-    }
-
-    pub async fn create_tunnel(
-        &self,
-        req: &CreateTunnel,
-        token_hash: &str,
-    ) -> Result<TunnelRow, StorageError> {
+    pub async fn create_tunnel(&self, req: &CreateTunnel, token_hash: &str) -> Result<TunnelRow, StorageError> {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
         Ok(sqlx::query_as::<_, TunnelRow>(
-            r#"INSERT INTO tunnels
+            r"INSERT INTO tunnels
                (id, name, token_hash, target_host, target_port, enabled, status, created_at, updated_at)
-               VALUES ($1,$2,$3,$4,$5,$6,'disconnected',$7,$7) RETURNING *"#,
+               VALUES ($1,$2,$3,$4,$5,$6,'disconnected',$7,$7) RETURNING *",
         )
         .bind(id)
         .bind(&req.name)
@@ -1471,14 +1385,12 @@ impl Database {
         } else {
             None
         };
-        sqlx::query(
-            "UPDATE tunnels SET status=$2, last_seen=COALESCE($3, last_seen), updated_at=NOW() WHERE id=$1",
-        )
-        .bind(id)
-        .bind(status)
-        .bind(last_seen)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE tunnels SET status=$2, last_seen=COALESCE($3, last_seen), updated_at=NOW() WHERE id=$1")
+            .bind(id)
+            .bind(status)
+            .bind(last_seen)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1494,9 +1406,9 @@ impl Database {
         ip_addr: Option<&str>,
     ) -> Result<(), StorageError> {
         sqlx::query(
-            r#"INSERT INTO audit_log
+            r"INSERT INTO audit_log
                (admin_username, action, resource_type, resource_id, detail, ip_addr)
-               VALUES ($1,$2,$3,$4,$5,$6)"#,
+               VALUES ($1,$2,$3,$4,$5,$6)",
         )
         .bind(admin_username)
         .bind(action)
@@ -1509,10 +1421,7 @@ impl Database {
         Ok(())
     }
 
-    pub async fn list_audit_log(
-        &self,
-        query: &AuditLogQuery,
-    ) -> Result<(Vec<AuditLogEntry>, i64), StorageError> {
+    pub async fn list_audit_log(&self, query: &AuditLogQuery) -> Result<(Vec<AuditLogEntry>, i64), StorageError> {
         let page = query.page.unwrap_or(1).max(1);
         let page_size = query.page_size.unwrap_or(50).clamp(1, 200);
         let offset = (page - 1) * page_size;
@@ -1547,11 +1456,11 @@ impl Database {
     // ─── Phase 6: CrowdSec ───────────────────────────────────────────────────
 
     pub async fn get_crowdsec_config(&self) -> Result<Option<CrowdSecConfigRow>, StorageError> {
-        Ok(sqlx::query_as::<_, CrowdSecConfigRow>(
-            "SELECT * FROM crowdsec_config ORDER BY id LIMIT 1",
+        Ok(
+            sqlx::query_as::<_, CrowdSecConfigRow>("SELECT * FROM crowdsec_config ORDER BY id LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await?,
         )
-        .fetch_optional(&self.pool)
-        .await?)
     }
 
     pub async fn upsert_crowdsec_config(
@@ -1562,13 +1471,10 @@ impl Database {
     ) -> Result<CrowdSecConfigRow, StorageError> {
         let now = chrono::Utc::now();
         let freq = req.update_frequency_secs.unwrap_or(10);
-        let fallback = req
-            .fallback_action
-            .clone()
-            .unwrap_or_else(|| "allow".to_string());
+        let fallback = req.fallback_action.clone().unwrap_or_else(|| "allow".to_string());
 
         let row = sqlx::query_as::<_, CrowdSecConfigRow>(
-            r#"INSERT INTO crowdsec_config
+            r"INSERT INTO crowdsec_config
                (host_id, enabled, mode, lapi_url, api_key_encrypted,
                 appsec_endpoint, appsec_key_encrypted,
                 update_frequency_secs, fallback_action, created_at, updated_at)
@@ -1583,7 +1489,7 @@ impl Database {
                  update_frequency_secs = EXCLUDED.update_frequency_secs,
                  fallback_action = EXCLUDED.fallback_action,
                  updated_at = EXCLUDED.updated_at
-               RETURNING *"#,
+               RETURNING *",
         )
         .bind(req.host_id)
         .bind(req.enabled)
@@ -1602,9 +1508,9 @@ impl Database {
 
     pub async fn log_crowdsec_event(&self, req: &CreateCrowdSecEvent) -> Result<(), StorageError> {
         sqlx::query(
-            r#"INSERT INTO crowdsec_events
+            r"INSERT INTO crowdsec_events
                (host_id, client_ip, decision_type, scenario, action_taken, request_path)
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
+               VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(req.host_id)
         .bind(&req.client_ip)

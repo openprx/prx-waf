@@ -1,7 +1,7 @@
 //! Encrypted on-disk store for the cluster CA private key.
 //!
 //! The CA key is encrypted at rest with AES-256-GCM using a passphrase-derived
-//! key. The same patterns are used as in waf_common::crypto, but applied to raw
+//! key. The same patterns are used as in `waf_common::crypto`, but applied to raw
 //! bytes (the CA key PEM) instead of config field strings.
 //!
 //! File format (binary):
@@ -27,9 +27,7 @@ pub struct KeyStore {
 impl KeyStore {
     /// Create a new key store pointing at `path`.
     pub fn new(path: &str) -> Self {
-        Self {
-            path: path.to_string(),
-        }
+        Self { path: path.to_string() }
     }
 
     /// File path for the encrypted CA key.
@@ -41,8 +39,7 @@ impl KeyStore {
     ///
     /// Returns the raw PEM string of the CA private key.
     pub fn load_ca_key(&self, passphrase: &str) -> Result<String> {
-        let data = fs::read(&self.path)
-            .with_context(|| format!("failed to read key store: {}", self.path))?;
+        let data = fs::read(&self.path).with_context(|| format!("failed to read key store: {}", self.path))?;
         if data.len() < 12 {
             return Err(anyhow::anyhow!("key store file is too short (corrupt?)"));
         }
@@ -72,12 +69,10 @@ impl KeyStore {
         if let Some(parent) = Path::new(&self.path).parent()
             && !parent.as_os_str().is_empty()
         {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create dir: {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("failed to create dir: {}", parent.display()))?;
         }
 
-        fs::write(&self.path, &data)
-            .with_context(|| format!("failed to write key store: {}", self.path))?;
+        fs::write(&self.path, &data).with_context(|| format!("failed to write key store: {}", self.path))?;
 
         info!(path = %self.path, "CA key encrypted and saved to disk");
         Ok(())
@@ -141,8 +136,7 @@ mod tests {
         let path = dir.join("test_cluster_ca_key.bin");
         let store = KeyStore::new(path.to_str().unwrap());
 
-        let fake_key_pem =
-            "-----BEGIN PRIVATE KEY-----\nfake-key-for-testing\n-----END PRIVATE KEY-----\n";
+        let fake_key_pem = "-----BEGIN PRIVATE KEY-----\nfake-key-for-testing\n-----END PRIVATE KEY-----\n";
         let passphrase = "test-passphrase-123";
 
         store.save_ca_key(fake_key_pem, passphrase).unwrap();

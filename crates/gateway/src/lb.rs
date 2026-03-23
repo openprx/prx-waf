@@ -126,6 +126,7 @@ impl LoadBalancer {
     /// Pick the next backend according to the strategy.
     ///
     /// Returns `None` if there are no healthy backends.
+    #[allow(clippy::indexing_slicing)] // indices are computed via modulo of non-empty len
     pub fn next_backend(&self, client_ip: IpAddr) -> Option<String> {
         let healthy = self.healthy_backends();
         if healthy.is_empty() {
@@ -139,27 +140,32 @@ impl LoadBalancer {
         }
 
         match &self.strategy {
-            LoadBalanceStrategy::RoundRobin => self.round_robin(&healthy),
-            LoadBalanceStrategy::IpHash => self.ip_hash(client_ip, &healthy),
-            LoadBalanceStrategy::WeightedRoundRobin => self.weighted_round_robin(&healthy),
-            LoadBalanceStrategy::LeastConnections => self.least_connections(&healthy),
+            LoadBalanceStrategy::RoundRobin => Some(self.round_robin(&healthy)),
+            LoadBalanceStrategy::IpHash => Some(Self::ip_hash(client_ip, &healthy)),
+            LoadBalanceStrategy::WeightedRoundRobin => Some(self.weighted_round_robin(&healthy)),
+            LoadBalanceStrategy::LeastConnections => Self::least_connections(&healthy),
         }
     }
 
     // ── Strategies ────────────────────────────────────────────────────────────
 
-    fn round_robin(&self, backends: &[Backend]) -> Option<String> {
+    #[allow(clippy::indexing_slicing)] // idx is computed via modulo of non-empty len
+    fn round_robin(&self, backends: &[Backend]) -> String {
         let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % backends.len();
-        Some(backends[idx].addr())
+        backends[idx].addr()
     }
 
-    fn ip_hash(&self, ip: IpAddr, backends: &[Backend]) -> Option<String> {
+    #[allow(clippy::indexing_slicing)] // idx is computed via modulo of non-empty len
+    #[allow(clippy::cast_possible_truncation)] // hash truncation is intentional for index selection
+    fn ip_hash(ip: IpAddr, backends: &[Backend]) -> String {
         let hash = fnv_hash_ip(ip);
         let idx = (hash as usize) % backends.len();
-        Some(backends[idx].addr())
+        backends[idx].addr()
     }
 
-    fn weighted_round_robin(&self, backends: &[Backend]) -> Option<String> {
+    #[allow(clippy::indexing_slicing)] // fallback index 0 only reached when backends is non-empty
+    #[allow(clippy::cast_possible_truncation)] // counter truncation to u32 is intentional
+    fn weighted_round_robin(&self, backends: &[Backend]) -> String {
         // Build a weighted list: each backend appears `weight` times
         let total_weight: u32 = backends.iter().map(|b| b.weight.max(1)).sum();
         if total_weight == 0 {
@@ -173,19 +179,19 @@ impl LoadBalancer {
         for backend in backends {
             cumulative += backend.weight.max(1);
             if pos < cumulative {
-                return Some(backend.addr());
+                return backend.addr();
             }
         }
 
         // Fallback
-        Some(backends[0].addr())
+        backends[0].addr()
     }
 
-    fn least_connections(&self, backends: &[Backend]) -> Option<String> {
+    fn least_connections(backends: &[Backend]) -> Option<String> {
         backends
             .iter()
             .min_by_key(|b| b.active_connections.load(Ordering::Relaxed))
-            .map(|b| b.addr())
+            .map(Backend::addr)
     }
 }
 
@@ -202,7 +208,7 @@ fn fnv_hash_ip(ip: IpAddr) -> u64 {
 
     let mut hash = FNV_OFFSET;
     for byte in bytes {
-        hash ^= byte as u64;
+        hash ^= u64::from(byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
@@ -210,16 +216,14 @@ fn fnv_hash_ip(ip: IpAddr) -> u64 {
 
 // ── LoadBalancerRegistry ──────────────────────────────────────────────────────
 
-/// Global registry mapping host_code → LoadBalancer.
+/// Global registry mapping `host_code` to `LoadBalancer`.
 pub struct LoadBalancerRegistry {
     lbs: DashMap<String, Arc<LoadBalancer>>,
 }
 
 impl LoadBalancerRegistry {
     pub fn new() -> Self {
-        Self {
-            lbs: DashMap::new(),
-        }
+        Self { lbs: DashMap::new() }
     }
 
     pub fn get(&self, host_code: &str) -> Option<Arc<LoadBalancer>> {
@@ -255,31 +259,23 @@ impl Default for LoadBalancerRegistry {
 ///
 /// Returns `true` if the connection succeeds within `timeout`.
 pub async fn tcp_health_check(host: &str, port: u16, timeout: Duration) -> bool {
-    match tokio::time::timeout(
-        timeout,
-        tokio::net::TcpStream::connect(format!("{}:{}", host, port)),
-    )
-    .await
-    {
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(format!("{host}:{port}"))).await {
         Ok(Ok(_)) => true,
         Ok(Err(e)) => {
-            debug!("Health check {}:{} failed: {}", host, port, e);
+            debug!("Health check {host}:{port} failed: {e}");
             false
         }
         Err(_) => {
-            debug!("Health check {}:{} timed out", host, port);
+            debug!("Health check {host}:{port} timed out");
             false
         }
     }
 }
 
-/// Spawn a background health-check task for a LoadBalancer.
+/// Spawn a background health-check task for a `LoadBalancer`.
 ///
 /// Periodically checks each backend and updates the `is_healthy` flag.
-pub fn spawn_health_checker(
-    lb: Arc<LoadBalancer>,
-    interval: Duration,
-) -> tokio::task::JoinHandle<()> {
+pub fn spawn_health_checker(lb: Arc<LoadBalancer>, interval: Duration) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let timeout = Duration::from_secs(5);
         loop {
@@ -314,11 +310,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn test_round_robin() {
         let lb = make_lb(LoadBalanceStrategy::RoundRobin);
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-        let backends: std::collections::HashSet<String> =
-            (0..6).map(|_| lb.next_backend(ip).unwrap()).collect();
+        let backends: std::collections::HashSet<String> = (0..6).map(|_| lb.next_backend(ip).unwrap()).collect();
         // Should hit all 3 backends over 6 requests
         assert_eq!(backends.len(), 3);
     }
@@ -329,15 +325,12 @@ mod tests {
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let first = lb.next_backend(ip).unwrap();
         for _ in 0..10 {
-            assert_eq!(
-                lb.next_backend(ip).unwrap(),
-                first,
-                "IP hash should be sticky"
-            );
+            assert_eq!(lb.next_backend(ip).unwrap(), first, "IP hash should be sticky");
         }
     }
 
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn test_least_connections() {
         let lb = make_lb(LoadBalanceStrategy::LeastConnections);
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
@@ -352,8 +345,7 @@ mod tests {
         let next = lb.next_backend(ip).unwrap();
         assert!(
             next == "10.0.0.2:8080" || next == "10.0.0.3:8080",
-            "Should pick backend with fewest connections, got {}",
-            next
+            "Should pick backend with fewest connections, got {next}",
         );
     }
 
@@ -373,13 +365,11 @@ mod tests {
         // Expected distribution: b2 ≈ 50%, b1 ≈ 25%, b3 ≈ 25%
         let b2 = counts.get("10.0.0.2:8080").copied().unwrap_or(0);
         let b1 = counts.get("10.0.0.1:8080").copied().unwrap_or(0);
-        assert!(
-            b2 > b1,
-            "b2 (weight 2) should get more traffic than b1 (weight 1)"
-        );
+        assert!(b2 > b1, "b2 (weight 2) should get more traffic than b1 (weight 1)");
     }
 
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn test_unhealthy_backend_skipped() {
         let lb = make_lb(LoadBalanceStrategy::RoundRobin);
         // Mark b1 and b3 unhealthy
@@ -390,10 +380,7 @@ mod tests {
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         for _ in 0..10 {
             let addr = lb.next_backend(ip).unwrap();
-            assert_eq!(
-                addr, "10.0.0.2:8080",
-                "Should only pick the healthy backend"
-            );
+            assert_eq!(addr, "10.0.0.2:8080", "Should only pick the healthy backend");
         }
     }
 }

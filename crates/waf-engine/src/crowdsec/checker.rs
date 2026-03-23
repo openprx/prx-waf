@@ -7,7 +7,7 @@ use crate::checks::Check;
 use super::cache::DecisionCache;
 use super::config::{CrowdSecConfig, CrowdSecMode};
 
-/// CrowdSec bouncer WAF checker.
+/// `CrowdSec` bouncer WAF checker.
 ///
 /// Performs a synchronous lookup against the in-memory `DecisionCache`.
 /// Runs early in the pipeline (after Phase 1-4 IP/URL checks) so that
@@ -18,7 +18,7 @@ pub struct CrowdSecChecker {
 }
 
 impl CrowdSecChecker {
-    pub fn new(cache: Arc<DecisionCache>, config: CrowdSecConfig) -> Self {
+    pub const fn new(cache: Arc<DecisionCache>, config: CrowdSecConfig) -> Self {
         Self { cache, config }
     }
 }
@@ -44,10 +44,7 @@ impl Check for CrowdSecChecker {
                 phase: Phase::CrowdSec,
                 detail: format!(
                     "CrowdSec decision: {} for {} (scenario: {}, origin: {})",
-                    cached.decision.type_,
-                    ctx.client_ip,
-                    cached.decision.scenario,
-                    cached.decision.origin,
+                    cached.decision.type_, ctx.client_ip, cached.decision.scenario, cached.decision.origin,
                 ),
             });
         }

@@ -35,6 +35,7 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 rustls-pemfile = { workspace = true }
 parking_lot = { workspace = true }
+ipnet = { workspace = true }
 
 [lints]
 workspace = true

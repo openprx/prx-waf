@@ -38,9 +38,7 @@ impl HotlinkConfig {
     /// Returns `true` if the given referer URL is allowed.
     pub fn is_allowed(&self, referer: &str) -> bool {
         let domain = extract_domain(referer);
-        self.allowed_domains
-            .iter()
-            .any(|pat| domain_matches(pat, &domain))
+        self.allowed_domains.iter().any(|pat| domain_matches(pat, &domain))
     }
 }
 
@@ -76,7 +74,7 @@ fn domain_matches(pattern: &str, domain: &str) -> bool {
 
 /// WAF checker for anti-hotlinking (Referer validation).
 pub struct AntiHotlinkCheck {
-    /// host_code → HotlinkConfig
+    /// `host_code` → `HotlinkConfig`
     configs: DashMap<String, HotlinkConfig>,
 }
 
@@ -125,20 +123,19 @@ impl Check for AntiHotlinkCheck {
             return None;
         }
 
-        let referer = ctx.headers.get("referer").map(|s| s.as_str()).unwrap_or("");
+        let referer = ctx.headers.get("referer").map_or("", String::as_str);
 
         // Empty referer handling
         if referer.is_empty() {
             if config.allow_empty_referer {
                 return None;
-            } else {
-                return Some(DetectionResult {
-                    rule_id: None,
-                    rule_name: "Anti-Hotlink".to_string(),
-                    phase: Phase::AntiHotlink,
-                    detail: "Request blocked: missing Referer header".to_string(),
-                });
             }
+            return Some(DetectionResult {
+                rule_id: None,
+                rule_name: "Anti-Hotlink".to_string(),
+                phase: Phase::AntiHotlink,
+                detail: "Request blocked: missing Referer header".to_string(),
+            });
         }
 
         // Check allow-list
@@ -150,7 +147,7 @@ impl Check for AntiHotlinkCheck {
             rule_id: None,
             rule_name: "Anti-Hotlink".to_string(),
             phase: Phase::AntiHotlink,
-            detail: format!("Referer '{}' not in allow-list", referer),
+            detail: format!("Referer '{referer}' not in allow-list"),
         })
     }
 }
@@ -205,23 +202,11 @@ mod tests {
         );
 
         // Exact match
-        assert!(
-            checker
-                .check(&make_ctx(Some("https://example.com/page")))
-                .is_none()
-        );
+        assert!(checker.check(&make_ctx(Some("https://example.com/page"))).is_none());
         // Wildcard match
-        assert!(
-            checker
-                .check(&make_ctx(Some("https://sub.mysite.com/page")))
-                .is_none()
-        );
+        assert!(checker.check(&make_ctx(Some("https://sub.mysite.com/page"))).is_none());
         // Not allowed
-        assert!(
-            checker
-                .check(&make_ctx(Some("https://evil.com/page")))
-                .is_some()
-        );
+        assert!(checker.check(&make_ctx(Some("https://evil.com/page"))).is_some());
         // Empty allowed (allow_empty_referer = true)
         assert!(checker.check(&make_ctx(None)).is_none());
     }
@@ -240,11 +225,7 @@ mod tests {
         );
 
         assert!(checker.check(&make_ctx(None)).is_some());
-        assert!(
-            checker
-                .check(&make_ctx(Some("https://example.com/")))
-                .is_none()
-        );
+        assert!(checker.check(&make_ctx(Some("https://example.com/"))).is_none());
     }
 
     #[test]
@@ -261,20 +242,13 @@ mod tests {
         );
 
         // Disabled — always passes
-        assert!(
-            checker
-                .check(&make_ctx(Some("https://evil.com/")))
-                .is_none()
-        );
+        assert!(checker.check(&make_ctx(Some("https://evil.com/"))).is_none());
     }
 
     #[test]
     fn test_extract_domain() {
         assert_eq!(extract_domain("https://example.com/path"), "example.com");
-        assert_eq!(
-            extract_domain("http://sub.example.com:8080/"),
-            "sub.example.com"
-        );
+        assert_eq!(extract_domain("http://sub.example.com:8080/"), "sub.example.com");
         assert_eq!(extract_domain("example.com"), "example.com");
     }
 
