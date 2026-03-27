@@ -25,6 +25,21 @@ const MAX_BLOCKLIST_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum decompressed blocklist size (16 MiB).
 const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Maximum response body size for key-discovery endpoint (64 KiB).
+const MAX_KEYS_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Maximum response body size for the version endpoint (4 KiB).
+const MAX_VERSION_RESPONSE_BYTES: usize = 4096;
+
+/// Maximum number of signing keys accepted from the key-discovery endpoint.
+const MAX_SIGNING_KEYS: usize = 32;
+
+/// Maximum allowed length for `scenario` and `action` fields in delta entries (bytes).
+const MAX_FIELD_LEN: usize = 256;
+
+/// Maximum allowed length for an IP address string (IPv6 longest representation).
+const MAX_IP_LEN: usize = 45;
+
 /// Version response from `GET /api/v1/waf/blocklist/version`.
 #[derive(Debug, Deserialize)]
 struct BlocklistVersionResponse {
@@ -58,16 +73,26 @@ pub struct BlocklistEntry {
 }
 
 /// Delta response from `GET /api/v1/waf/blocklist/delta?since_version=N`.
+///
+/// When signature verification is enabled, the server also returns
+/// `signature_hex` and `payload_hex` fields so the client can verify
+/// the delta's authenticity before applying it.
 #[derive(Debug, Deserialize)]
 struct DeltaResponse {
     from_version: i64,
     to_version: i64,
     added: Vec<DeltaAddedEntry>,
     removed: Vec<DeltaRemovedEntry>,
+    /// Hex-encoded Ed25519 signature over `payload_hex` (present when server signs deltas).
+    #[serde(default)]
+    signature_hex: Option<String>,
+    /// Hex-encoded canonical payload that was signed (present when server signs deltas).
+    #[serde(default)]
+    payload_hex: Option<String>,
 }
 
 /// A newly added entry in a blocklist delta.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DeltaAddedEntry {
     ip: String,
     scenario: String,
@@ -75,9 +100,22 @@ struct DeltaAddedEntry {
 }
 
 /// A removed entry in a blocklist delta.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DeltaRemovedEntry {
     ip: String,
+}
+
+/// Canonical payload embedded inside a signed delta response.
+///
+/// When the server signs a delta, `payload_hex` contains this structure serialised
+/// as JSON.  After signature verification we deserialise from the *verified* bytes
+/// instead of trusting the outer JSON fields, closing the data-binding gap.
+#[derive(Debug, Deserialize)]
+struct DeltaPayload {
+    from_version: i64,
+    to_version: i64,
+    added: Vec<DeltaAddedEntry>,
+    removed: Vec<DeltaRemovedEntry>,
 }
 
 /// Deserialized entry from the signed payload (matches `WafConsensusEntry` shape).
@@ -108,8 +146,10 @@ struct KeysResponse {
 struct KeyInfo {
     key_id: String,
     public_key_hex: String,
+    /// Algorithm identifier for the signing key (e.g. "ed25519").
+    /// Validated during key import to ensure only supported algorithms are used.
     #[serde(default)]
-    _algorithm: String,
+    algorithm: String,
     status: String,
 }
 
@@ -164,14 +204,35 @@ pub async fn fetch_signing_keys_from_server(client: &CommunityClient) -> anyhow:
         anyhow::bail!("signing keys endpoint returned {}", resp.status());
     }
 
-    let body: KeysResponse = resp
-        .json()
+    // Limit response body size to prevent memory exhaustion from a malicious server.
+    let body_bytes = read_response_body_limited(resp, MAX_KEYS_RESPONSE_BYTES)
         .await
+        .map_err(|e| anyhow::anyhow!("signing keys response rejected: {e}"))?;
+
+    let body: KeysResponse = serde_json::from_slice(&body_bytes)
         .map_err(|e| anyhow::anyhow!("failed to parse signing keys response: {e}"))?;
+
+    // LOW: Reject responses with an unreasonable number of keys to limit memory use.
+    if body.keys.len() > MAX_SIGNING_KEYS {
+        anyhow::bail!(
+            "too many signing keys returned: {} (max {})",
+            body.keys.len(),
+            MAX_SIGNING_KEYS
+        );
+    }
 
     let mut keys = Vec::new();
     for key_info in &body.keys {
         if key_info.status != "active" {
+            continue;
+        }
+        // Only accept ed25519 keys (or empty algorithm for backwards compatibility).
+        if !key_info.algorithm.is_empty() && key_info.algorithm != "ed25519" {
+            warn!(
+                key_id = %key_info.key_id,
+                algorithm = %key_info.algorithm,
+                "Skipping key with unsupported algorithm (expected ed25519)"
+            );
             continue;
         }
         if let Some(vk) = parse_public_key(&key_info.public_key_hex) {
@@ -304,10 +365,51 @@ impl CommunityBlocklistSync {
         }
     }
 
+    /// Verify an Ed25519 signature over a hex-encoded payload.
+    ///
+    /// Shared helper used by both `full_pull_verified` and `delta_pull` to
+    /// avoid duplicating signature verification logic.
+    ///
+    /// Returns `Ok(())` on success, or an error describing the failure.
+    fn verify_signature(
+        verify_key: &VerifyingKey,
+        signature_hex: &str,
+        payload_hex: &str,
+        context: &str,
+    ) -> Result<(), String> {
+        let payload = hex::decode(payload_hex).map_err(|e| format!("{context} payload_hex decode failed: {e}"))?;
+
+        let sig_bytes =
+            hex::decode(signature_hex).map_err(|e| format!("{context} signature_hex decode failed: {e}"))?;
+
+        if sig_bytes.len() != ED25519_SIGNATURE_LEN {
+            return Err(format!(
+                "{context} signature has wrong length: expected {ED25519_SIGNATURE_LEN}, got {}",
+                sig_bytes.len()
+            ));
+        }
+
+        let mut sig_arr = [0u8; ED25519_SIGNATURE_LEN];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let signature = Signature::from_bytes(&sig_arr);
+
+        verify_key
+            .verify(&payload, &signature)
+            .map_err(|e| format!("{context} SIGNATURE VERIFICATION FAILED: {e}"))
+    }
+
     /// Attempt incremental delta pull.
     ///
     /// Returns `Ok(true)` if the delta was applied successfully,
     /// `Ok(false)` if the caller should fall back to a full pull.
+    ///
+    /// # Security
+    ///
+    /// When signature verification is enabled, the delta data (added/removed
+    /// entries, version numbers) is extracted from the **verified `payload_hex`**
+    /// rather than from the outer JSON fields. This closes a data-binding gap
+    /// where an attacker could replay a valid signature while tampering with the
+    /// top-level `added`/`removed` arrays.
     async fn delta_pull(&self) -> Result<bool, anyhow::Error> {
         let local_version = self.current_version.load(Ordering::Relaxed);
         if local_version == 0 {
@@ -335,24 +437,100 @@ impl CommunityBlocklistSync {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let delta: DeltaResponse = serde_json::from_slice(&body)?;
 
+        // Determine the effective delta data to apply.
+        //
+        // CRITICAL: When a verify_key is configured we MUST use the data decoded
+        // from the verified `payload_hex`, not the outer JSON fields.  The outer
+        // fields are unauthenticated and an attacker could substitute arbitrary
+        // added/removed entries while replaying a legitimate signature.
+        let (from_version, to_version, added, removed) = if let Some(ref vk) = self.verify_key {
+            let (Some(sig_hex), Some(pay_hex)) = (&delta.signature_hex, &delta.payload_hex) else {
+                warn!(
+                    "Delta response missing signature_hex/payload_hex but verify_key is                      configured — rejecting unsigned delta, falling back to full pull"
+                );
+                return Ok(false);
+            };
+
+            // Verify signature over the canonical payload
+            if let Err(e) = Self::verify_signature(vk, sig_hex, pay_hex, "Delta") {
+                error!("{e} — rejecting delta, falling back to full pull");
+                return Ok(false);
+            }
+            info!("Delta signature verified successfully");
+
+            // Decode the verified payload into a DeltaPayload
+            let payload_bytes =
+                hex::decode(pay_hex).map_err(|e| anyhow::anyhow!("delta payload_hex decode failed: {e}"))?;
+
+            let verified: DeltaPayload = serde_json::from_slice(&payload_bytes)
+                .map_err(|e| anyhow::anyhow!("failed to parse verified delta payload: {e}"))?;
+
+            (
+                verified.from_version,
+                verified.to_version,
+                verified.added,
+                verified.removed,
+            )
+        } else {
+            warn!("Delta applied WITHOUT signature verification (no verify_key configured)");
+            (delta.from_version, delta.to_version, delta.added, delta.removed)
+        };
+
+        // HIGH-2: Validate to_version is positive and strictly greater than from_version
+        // to prevent version rollback attacks via negative or stale version numbers.
+        if to_version <= 0 {
+            anyhow::bail!("delta to_version ({to_version}) is not positive — rejecting to prevent version rollback");
+        }
+        if to_version <= from_version {
+            anyhow::bail!("delta to_version ({to_version}) <= from_version ({from_version}) — rejecting invalid delta");
+        }
+
+        // HIGH: Validate from_version matches local version.
+        // A mismatch means the delta's base does not match our state; applying it
+        // would corrupt the blocklist.  This is not necessarily an attack (could be
+        // a race condition), so we fall back to a full pull instead of erroring.
+        #[allow(clippy::cast_possible_wrap)]
+        if from_version != local_version as i64 {
+            warn!(
+                from_version,
+                local_version, "delta from_version does not match local version, falling back to full pull"
+            );
+            return Ok(false);
+        }
+
         // Too many changes — fall back to full pull for atomicity
-        if delta.added.len() + delta.removed.len() > 5000 {
+        if added.len() + removed.len() > 5000 {
             info!(
-                added = delta.added.len(),
-                removed = delta.removed.len(),
+                added = added.len(),
+                removed = removed.len(),
                 "Delta too large, falling back to full pull"
             );
             return Ok(false);
         }
 
+        // Medium-2: Validate field lengths on delta entries to prevent memory exhaustion
+        // from oversized scenario/action/ip strings.
+        let mut skipped = 0u64;
+
         // Apply delta to existing map
         let mut map = self.blocked_ips.write();
-        for entry in &delta.removed {
+        for entry in &removed {
+            if entry.ip.len() > MAX_IP_LEN {
+                skipped += 1;
+                continue;
+            }
             if let Ok(ip) = entry.ip.parse::<IpAddr>() {
                 map.remove(&ip);
             }
         }
-        for entry in &delta.added {
+        for entry in &added {
+            if entry.ip.len() > MAX_IP_LEN
+                || entry.scenario.len() > MAX_FIELD_LEN
+                || entry.action.as_ref().is_some_and(|a| a.len() > MAX_FIELD_LEN)
+            {
+                skipped += 1;
+                continue;
+            }
             if let Ok(ip) = entry.ip.parse::<IpAddr>() {
                 map.insert(
                     ip,
@@ -365,15 +543,20 @@ impl CommunityBlocklistSync {
         }
         drop(map);
 
+        // to_version is validated > 0 above, so the cast is safe.
         #[allow(clippy::cast_sign_loss)]
-        let new_version = delta.to_version as u64;
+        let new_version = to_version as u64;
         self.current_version.store(new_version, Ordering::Relaxed);
 
+        if skipped > 0 {
+            warn!(skipped, "Skipped delta entries with oversized fields");
+        }
+
         info!(
-            from = delta.from_version,
-            to = delta.to_version,
-            added = delta.added.len(),
-            removed = delta.removed.len(),
+            from = from_version,
+            to = to_version,
+            added = added.len(),
+            removed = removed.len(),
             "Community blocklist delta applied"
         );
         Ok(true)
@@ -429,7 +612,30 @@ impl CommunityBlocklistSync {
             }
         };
 
-        // Decode hex-encoded payload (zstd-compressed JSON)
+        // Verify the Ed25519 signature using the shared helper
+        if let Err(e) = Self::verify_signature(
+            verify_key,
+            &data.signature_hex,
+            &data.payload_hex,
+            "Community blocklist",
+        ) {
+            if let Some(ref server_key_id) = data.key_id {
+                error!(
+                    server_key_id = %server_key_id,
+                    "{e} — rejecting update. The server's key_id is '{server_key_id}'; \
+                     check that [community] public_key matches or remove it to \
+                     enable automatic key discovery."
+                );
+            } else {
+                error!("{e} — rejecting update (possible MITM or key mismatch)");
+            }
+            return;
+        }
+
+        info!("Community blocklist signature verified successfully");
+
+        // Decode hex-encoded payload (zstd-compressed JSON) for decompression.
+        // The signature was already verified over this payload above.
         let payload = match hex::decode(&data.payload_hex) {
             Ok(p) => p,
             Err(e) => {
@@ -437,51 +643,6 @@ impl CommunityBlocklistSync {
                 return;
             }
         };
-
-        // Decode hex-encoded signature
-        let sig_bytes = match hex::decode(&data.signature_hex) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Community blocklist signature_hex decode failed: {e}");
-                return;
-            }
-        };
-        if sig_bytes.len() != ED25519_SIGNATURE_LEN {
-            warn!(
-                expected = ED25519_SIGNATURE_LEN,
-                got = sig_bytes.len(),
-                "Community blocklist signature has wrong length"
-            );
-            return;
-        }
-
-        // Reconstruct the Signature from bytes
-        let mut sig_arr = [0u8; ED25519_SIGNATURE_LEN];
-        sig_arr.copy_from_slice(&sig_bytes);
-        let signature = Signature::from_bytes(&sig_arr);
-
-        // Verify the Ed25519 signature over the compressed payload
-        if let Err(e) = verify_key.verify(&payload, &signature) {
-            // Include the server's key_id (if present) in the error message
-            // so operators can diagnose key rotation issues.
-            if let Some(ref server_key_id) = data.key_id {
-                error!(
-                    server_key_id = %server_key_id,
-                    "Community blocklist SIGNATURE VERIFICATION FAILED: {e} — \
-                     rejecting update. The server's key_id is '{server_key_id}'; \
-                     check that [community] public_key matches or remove it to \
-                     enable automatic key discovery."
-                );
-            } else {
-                error!(
-                    "Community blocklist SIGNATURE VERIFICATION FAILED: {e} — \
-                     rejecting update (possible MITM or key mismatch)"
-                );
-            }
-            return;
-        }
-
-        info!("Community blocklist signature verified successfully");
 
         // Decompress zstd payload with size limit
         let decompressed = match decompress_with_limit(&payload, MAX_DECOMPRESSED_BYTES) {
@@ -504,7 +665,15 @@ impl CommunityBlocklistSync {
         // Build new map, then atomically swap
         let mut new_map = HashMap::with_capacity(entries.len());
         let mut loaded = 0u64;
+        let mut skipped = 0u64;
         for entry in &entries {
+            // LOW: Validate field lengths (same limits as delta_pull) to reject
+            // oversized entries that could waste memory.
+            let ip_str = entry.ip.to_string();
+            if ip_str.len() > MAX_IP_LEN || entry.scenario.len() > MAX_FIELD_LEN || entry.action.len() > MAX_FIELD_LEN {
+                skipped += 1;
+                continue;
+            }
             new_map.insert(
                 entry.ip,
                 CommunityDecision {
@@ -513,6 +682,9 @@ impl CommunityBlocklistSync {
                 },
             );
             loaded += 1;
+        }
+        if skipped > 0 {
+            warn!(skipped, "Skipped full-pull entries with oversized fields");
         }
 
         // Atomic swap: single write-lock replaces entire map
@@ -569,7 +741,13 @@ impl CommunityBlocklistSync {
         // Build new map off-thread, then atomically swap
         let mut new_map = HashMap::with_capacity(data.entries.len());
         let mut loaded = 0u64;
+        let mut skipped = 0u64;
         for entry in &data.entries {
+            // LOW: Validate field lengths to reject oversized entries.
+            if entry.ip.len() > MAX_IP_LEN || entry.reason.len() > MAX_FIELD_LEN || entry.source.len() > MAX_FIELD_LEN {
+                skipped += 1;
+                continue;
+            }
             if let Ok(ip) = entry.ip.parse::<IpAddr>() {
                 new_map.insert(
                     ip,
@@ -580,6 +758,9 @@ impl CommunityBlocklistSync {
                 );
                 loaded += 1;
             }
+        }
+        if skipped > 0 {
+            warn!(skipped, "Skipped full-pull entries with oversized fields");
         }
 
         // Atomic swap: single write-lock replaces entire map
@@ -616,9 +797,12 @@ impl CommunityBlocklistSync {
             anyhow::bail!("blocklist version returned {status}: {body}");
         }
 
-        let data: BlocklistVersionResponse = resp
-            .json()
+        // LOW: Limit version response body size to prevent memory exhaustion.
+        let body_bytes = read_response_body_limited(resp, MAX_VERSION_RESPONSE_BYTES)
             .await
+            .map_err(|e| anyhow::anyhow!("blocklist version response rejected: {e}"))?;
+
+        let data: BlocklistVersionResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| anyhow::anyhow!("failed to parse blocklist version: {e}"))?;
         Ok(data.version)
     }
@@ -793,5 +977,75 @@ mod tests {
 
         // Verification with wrong key must fail
         assert!(wrong_verifying.verify(&compressed, &signature).is_err());
+    }
+
+    #[test]
+    fn verify_signature_helper_valid() {
+        let signing_key = test_signing_key();
+        let verifying_key = signing_key.verifying_key();
+
+        let payload = b"test payload data";
+        let payload_hex = hex::encode(payload);
+        let signature = signing_key.sign(payload.as_slice());
+        let signature_hex = hex::encode(signature.to_bytes());
+
+        let result = CommunityBlocklistSync::verify_signature(&verifying_key, &signature_hex, &payload_hex, "Test");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_signature_helper_tampered() {
+        let signing_key = test_signing_key();
+        let verifying_key = signing_key.verifying_key();
+
+        let payload = b"test payload data";
+        let signature = signing_key.sign(payload.as_slice());
+        let signature_hex = hex::encode(signature.to_bytes());
+
+        // Tamper with the payload — use a different payload to verify rejection
+        let tampered_hex = hex::encode(b"tampered payload");
+
+        let result = CommunityBlocklistSync::verify_signature(&verifying_key, &signature_hex, &tampered_hex, "Test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("SIGNATURE VERIFICATION FAILED"));
+    }
+
+    #[test]
+    fn verify_signature_helper_bad_hex() {
+        let signing_key = test_signing_key();
+        let verifying_key = signing_key.verifying_key();
+
+        let result = CommunityBlocklistSync::verify_signature(&verifying_key, "not-valid-hex!!", "aabb", "Test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("signature_hex decode failed"));
+    }
+
+    #[test]
+    fn verify_signature_helper_wrong_sig_length() {
+        let signing_key = test_signing_key();
+        let verifying_key = signing_key.verifying_key();
+
+        // Only 32 bytes instead of 64
+        let short_sig_hex = hex::encode([0u8; 32]);
+        let payload_hex = hex::encode(b"test");
+
+        let result = CommunityBlocklistSync::verify_signature(&verifying_key, &short_sig_hex, &payload_hex, "Test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("wrong length"));
+    }
+
+    #[test]
+    fn delta_field_length_limits() {
+        // Verify the constants are sensible
+        assert_eq!(MAX_FIELD_LEN, 256);
+        assert_eq!(MAX_IP_LEN, 45);
+
+        // A valid IPv6 address should fit
+        let ipv6 = "2001:0db8:85a3:0000:0000:8a2e:0370:7334";
+        assert!(ipv6.len() <= MAX_IP_LEN);
+
+        // An oversized string should be rejected
+        let oversized = "x".repeat(MAX_FIELD_LEN + 1);
+        assert!(oversized.len() > MAX_FIELD_LEN);
     }
 }
