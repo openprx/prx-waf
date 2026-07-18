@@ -12,7 +12,9 @@ use pingora_proxy::{ProxyHttp, Session};
 use waf_common::{HostConfig, RequestCtx, WafAction};
 use waf_engine::WafEngine;
 
-use crate::context::{BODY_PREVIEW_LIMIT, GatewayCtx};
+use crate::cache::ResponseCache;
+use crate::context::{BODY_PREVIEW_LIMIT, CACHE_BODY_LIMIT, GatewayCtx};
+use crate::lb::LoadBalancerRegistry;
 use crate::router::HostRouter;
 use crate::ssl::ChallengeStore;
 
@@ -31,6 +33,15 @@ pub struct WafProxy {
     /// `/.well-known/acme-challenge/{token}`. Shared with the `SslManager`
     /// when ACME is enabled; an empty store otherwise.
     pub acme_challenges: Arc<ChallengeStore>,
+    /// Per-host load balancers keyed by `HostConfig::code`. A host with a
+    /// registered balancer distributes traffic across its backend pool; hosts
+    /// absent from the registry fall back to their single
+    /// `remote_host`/`remote_port` (backward compatible).
+    pub lb_registry: Arc<LoadBalancerRegistry>,
+    /// Shared response cache. `None` when caching is disabled — in which case
+    /// the request/response paths behave exactly as before (no cache lookups or
+    /// stores are performed).
+    pub cache: Option<Arc<ResponseCache>>,
 }
 
 impl WafProxy {
@@ -41,6 +52,8 @@ impl WafProxy {
             trust_proxy_headers: false,
             trusted_proxies: Vec::new(),
             acme_challenges: Arc::new(ChallengeStore::new()),
+            lb_registry: Arc::new(LoadBalancerRegistry::new()),
+            cache: None,
         }
     }
 
@@ -127,6 +140,65 @@ impl WafProxy {
             geo: None, // populated by WafEngine::inspect when GeoIP is enabled
         }
     }
+
+    /// Compute the cache key for a request **iff** it is safe to cache.
+    ///
+    /// Only `GET`/`HEAD` requests that carry no credentials (`Authorization` /
+    /// `Cookie`) are cacheable. Anything else returns `None` so it is never
+    /// served from — nor stored in — the shared cache (prevents cross-user
+    /// leakage / cache poisoning). Returns `None` unless a host is resolved.
+    fn cacheable_request_key(session: &Session, ctx: &GatewayCtx) -> Option<String> {
+        let head = session.req_header();
+        let method = head.method.as_str();
+        if method != "GET" && method != "HEAD" {
+            return None;
+        }
+        // Requests that carry credentials are user-specific: never share them.
+        if session.get_header("authorization").is_some() || session.get_header("cookie").is_some() {
+            return None;
+        }
+
+        let host_config = ctx.host_config.as_ref()?;
+        let scheme = if session.digest().and_then(|d| d.ssl_digest.as_ref()).is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        let accept_encoding = session
+            .get_header("accept-encoding")
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+            .unwrap_or("");
+        let path = head.uri.path();
+        let query = head.uri.query().unwrap_or("");
+
+        Some(ResponseCache::make_key(
+            scheme,
+            method,
+            &host_config.host,
+            host_config.port,
+            path,
+            query,
+            accept_encoding,
+        ))
+    }
+}
+
+/// Hop-by-hop headers (RFC 7230 §6.1) that must not be forwarded from a cached
+/// response, plus `set-cookie` which is already rejected at store time. These
+/// are connection-specific and would corrupt a replayed response.
+fn is_uncacheable_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "set-cookie"
+    )
 }
 
 #[async_trait]
@@ -152,11 +224,43 @@ impl ProxyHttp for WafProxy {
             )
         })?;
 
-        let upstream_addr = format!("{}:{}", host_config.remote_host, host_config.remote_port);
         let use_tls = host_config.ssl;
 
-        info!("Proxying {} → {}", host_config.host, upstream_addr);
+        // Multi-backend path: if this host has a registered load balancer, pick a
+        // backend from the pool. The client IP (already resolved in
+        // `request_filter`) feeds the IpHash strategy for sticky sessions.
+        if let Some(lb) = self.lb_registry.get(&host_config.code) {
+            let client_ip = ctx
+                .request_ctx
+                .as_ref()
+                .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |c| c.client_ip);
 
+            if let Some(backend) = lb.select_backend(client_ip) {
+                // Track the active connection for Least-Connections accounting;
+                // released in `logging`. Guard against a retry re-entering this
+                // callback by releasing any previously selected backend first.
+                if let Some(prev) = ctx.selected_backend.take() {
+                    prev.release_connection();
+                }
+                backend.acquire_connection();
+                let upstream_addr = backend.addr();
+                let sni = backend.host.clone();
+                ctx.selected_backend = Some(backend);
+
+                info!("Proxying {} → {} (load-balanced)", host_config.host, upstream_addr);
+                let peer = HttpPeer::new(&upstream_addr, use_tls, sni);
+                return Ok(Box::new(peer));
+            }
+            // Empty / fully-drained pool → fall through to the single backend.
+            warn!(
+                "Load balancer for host {} returned no backend; using single upstream",
+                host_config.host
+            );
+        }
+
+        // Single-backend path (unchanged, backward compatible).
+        let upstream_addr = format!("{}:{}", host_config.remote_host, host_config.remote_port);
+        info!("Proxying {} → {}", host_config.host, upstream_addr);
         let peer = HttpPeer::new(&upstream_addr, use_tls, host_config.remote_host.clone());
         Ok(Box::new(peer))
     }
@@ -262,6 +366,28 @@ impl ProxyHttp for WafProxy {
             }
         }
 
+        // ── Response cache lookup ─────────────────────────────────────────────
+        // Runs only after the WAF has cleared the request (a cache hit still
+        // must pass every detection above; it only lets us skip the upstream).
+        if let Some(cache) = &self.cache
+            && let Some(key) = Self::cacheable_request_key(session, ctx)
+        {
+            if let Some(hit) = cache.get(&key).await {
+                let mut response = pingora_http::ResponseHeader::build(hit.status, None)?;
+                for (name, value) in &hit.headers {
+                    // Individual malformed headers must not fail the whole
+                    // response; skip them rather than aborting.
+                    let _ = response.insert_header(name.clone(), value.clone());
+                }
+                let _ = response.insert_header("x-cache", "HIT");
+                session.write_response_header(Box::new(response), false).await?;
+                session.write_response_body(Some(hit.body.clone()), true).await?;
+                return Ok(true);
+            }
+            // Miss: remember the key so the response phase can store the result.
+            ctx.cache_key = Some(key);
+        }
+
         Ok(false)
     }
 
@@ -364,7 +490,115 @@ impl ProxyHttp for WafProxy {
         Ok(())
     }
 
+    /// Capture the upstream response headers and decide whether the body is
+    /// worth buffering for a cache store. Runs only when the request was a
+    /// cache-store candidate (`ctx.cache_key` set in `request_filter`).
+    async fn upstream_response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut pingora_http::ResponseHeader,
+        ctx: &mut GatewayCtx,
+    ) -> pingora_core::Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if self.cache.is_none() || ctx.cache_key.is_none() {
+            return Ok(());
+        }
+
+        let status = upstream_response.status.as_u16();
+        let has_set_cookie = upstream_response.headers.contains_key("set-cookie");
+        let cache_control = upstream_response
+            .headers
+            .get("cache-control")
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+            .map(str::to_string);
+
+        // Early rejection so a no-store / private / non-2xx / cookie-bearing
+        // response is never buffered. `put()` re-checks these as a safety net.
+        let cc_forbids = cache_control.as_deref().is_some_and(|cc| {
+            let lower = cc.to_ascii_lowercase();
+            lower.contains("no-store") || lower.contains("no-cache") || lower.contains("private")
+        });
+        let storable = (200..300).contains(&status) && !has_set_cookie && !cc_forbids;
+        if !storable {
+            // Abandon the store; leave nothing to buffer.
+            ctx.cache_key = None;
+            return Ok(());
+        }
+
+        let mut headers = Vec::new();
+        for (name, value) in &upstream_response.headers {
+            let name = name.as_str();
+            if is_uncacheable_header(name) {
+                continue;
+            }
+            if let Ok(v) = std::str::from_utf8(value.as_bytes()) {
+                headers.push((name.to_string(), v.to_string()));
+            }
+        }
+
+        ctx.cache_status = status;
+        ctx.cache_headers = headers;
+        ctx.cache_control = cache_control;
+        ctx.cache_store = true;
+        Ok(())
+    }
+
+    /// Accumulate the upstream response body (bounded by [`CACHE_BODY_LIMIT`])
+    /// and, at end of stream, hand the complete response off to the cache.
+    ///
+    /// This callback is synchronous, so the (async) `moka` insert is performed
+    /// on a detached Tokio task rather than blocking the proxy hot path.
+    fn upstream_response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut GatewayCtx,
+    ) -> pingora_core::Result<Option<std::time::Duration>> {
+        if !ctx.cache_store {
+            return Ok(None);
+        }
+
+        if let Some(chunk) = body {
+            if ctx.cache_body.len().saturating_add(chunk.len()) > CACHE_BODY_LIMIT {
+                // Response too large to cache: abandon and release the buffer.
+                debug!("Response exceeds {CACHE_BODY_LIMIT} byte cache limit; not caching");
+                ctx.cache_store = false;
+                ctx.cache_key = None;
+                ctx.cache_body.clear();
+                return Ok(None);
+            }
+            ctx.cache_body.extend_from_slice(chunk);
+        }
+
+        if end_of_stream && let (Some(cache), Some(key)) = (self.cache.clone(), ctx.cache_key.take()) {
+            let status = ctx.cache_status;
+            let headers = std::mem::take(&mut ctx.cache_headers);
+            let body_bytes = Bytes::copy_from_slice(&ctx.cache_body);
+            let cache_control = ctx.cache_control.take();
+            ctx.cache_store = false;
+            ctx.cache_body.clear();
+
+            tokio::spawn(async move {
+                cache
+                    .put(key, status, headers, body_bytes, cache_control.as_deref())
+                    .await;
+            });
+        }
+
+        Ok(None)
+    }
+
     async fn logging(&self, _session: &mut Session, _error: Option<&pingora_core::Error>, ctx: &mut GatewayCtx) {
+        // Release the load-balanced backend's active-connection slot (paired
+        // with the acquire in `upstream_peer`) so Least-Connections accounting
+        // stays balanced even on errors / early termination.
+        if let Some(backend) = ctx.selected_backend.take() {
+            backend.release_connection();
+        }
+
         if let Some(req_ctx) = &ctx.request_ctx {
             debug!(
                 "Request completed: {} {} {} → upstream={}",
