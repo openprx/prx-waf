@@ -31,8 +31,13 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      # ⚠️ Required security secrets — the server refuses to start without them.
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set to a strong random secret (>= 32 chars); see .env.example}
-      DATABASE_URL: postgresql://prx_waf:prx_waf@postgres:5432/prx_waf
+      MASTER_KEY: ${MASTER_KEY:?MASTER_KEY must be set to a strong random secret (>= 32 chars) for encryption at rest; see .env.example}
+      # Optional bootstrap admin password (random one is generated & logged if unset).
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://prx_waf:prx_waf@postgres:5432/prx_waf}
+      RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - ./configs:/app/configs:ro
       - ./rules:/app/rules:ro

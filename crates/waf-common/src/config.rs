@@ -518,6 +518,124 @@ pub fn load_config(path: &str) -> anyhow::Result<AppConfig> {
     Ok(config)
 }
 
+// --- Environment-variable override layer ---
+//
+// Security-critical and deployment-specific settings can be overridden from the
+// environment so operators configure everything in one place (`.env` /
+// systemd `EnvironmentFile` / container env) without editing TOML per node.
+//
+// Naming convention:
+//   * `DATABASE_URL`            — ecosystem-standard, honoured as-is.
+//   * `PRXWAF_*`                — everything that overrides a TOML field.
+//
+// An unset **or empty** variable leaves the TOML/default value untouched, so a
+// docker-compose `${VAR}` that expands to an empty string never clobbers a
+// configured value. Comma-separated lists are trimmed with empty entries
+// dropped.
+
+/// Parse a boolean environment value, accepting common truthy/falsy spellings.
+///
+/// Returns an explicit error (never panics) on an unrecognised value so a
+/// typo becomes a hard startup failure rather than a silent wrong default.
+fn parse_env_bool(key: &str, raw: &str) -> anyhow::Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => anyhow::bail!(
+            "environment variable {key} has invalid boolean value '{other}' \
+             (expected one of: true/false, 1/0, yes/no, on/off)"
+        ),
+    }
+}
+
+/// Split a comma-separated environment value into trimmed, non-empty entries.
+fn parse_env_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Apply environment-variable overrides on top of a loaded [`AppConfig`].
+///
+/// Existing environment variables override the corresponding TOML/default
+/// value; unset (or empty) variables leave the loaded value untouched. Cluster
+/// overrides only apply when the TOML already declares a `[cluster]` section,
+/// since that section is what enables clustering in the first place.
+///
+/// Returns an error (never panics) when a boolean-valued override cannot be
+/// parsed, so a misconfigured environment fails startup loudly.
+///
+/// # Recognised variables
+///
+/// | Variable | Overrides | Format |
+/// |----------|-----------|--------|
+/// | `DATABASE_URL` | `storage.database_url` | string |
+/// | `PRXWAF_TRUST_PROXY_HEADERS` | `proxy.trust_proxy_headers` | bool |
+/// | `PRXWAF_TRUSTED_PROXIES` | `proxy.trusted_proxies` | comma-separated CIDRs |
+/// | `PRXWAF_CLUSTER_JOIN_TOKEN` | `cluster.join_token` | string |
+/// | `PRXWAF_CLUSTER_MEMBERS` | `cluster.members` | comma-separated node ids |
+/// | `PRXWAF_CLUSTER_SEEDS` | `cluster.seeds` | comma-separated host:port |
+/// | `PRXWAF_CLUSTER_REPLICATE_CA_KEY` | `cluster.replicate_ca_key` | bool |
+/// | `PRXWAF_CLUSTER_AUTO_GENERATE` | `cluster.crypto.auto_generate` | bool |
+/// | `PRXWAF_CLUSTER_CA_PASSPHRASE` | `cluster.crypto.ca_passphrase` | string |
+pub fn apply_env_overrides(config: &mut AppConfig) -> anyhow::Result<()> {
+    apply_env_overrides_from(config, |key| std::env::var(key).ok())
+}
+
+/// Core override logic, parameterised over the environment source so it can be
+/// exercised deterministically in tests without mutating the process
+/// environment. `get_raw` returns the raw value for a key (or `None` when
+/// unset); a value that is empty or whitespace-only is treated as unset here so
+/// a docker-compose `${VAR}` expanding to an empty string never clobbers a
+/// configured value.
+fn apply_env_overrides_from<F>(config: &mut AppConfig, get_raw: F) -> anyhow::Result<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let get = |key: &str| get_raw(key).filter(|v| !v.trim().is_empty());
+
+    // Database connection string (ecosystem-standard name).
+    if let Some(v) = get("DATABASE_URL") {
+        config.storage.database_url = v;
+    }
+
+    // Reverse-proxy trust settings. A wrong pairing here is a hard startup
+    // error downstream (see M-1 check in prx-waf/main.rs), so allowing env
+    // overrides keeps that safety net configurable in one place.
+    if let Some(v) = get("PRXWAF_TRUST_PROXY_HEADERS") {
+        config.proxy.trust_proxy_headers = parse_env_bool("PRXWAF_TRUST_PROXY_HEADERS", &v)?;
+    }
+    if let Some(v) = get("PRXWAF_TRUSTED_PROXIES") {
+        config.proxy.trusted_proxies = parse_env_list(&v);
+    }
+
+    // Cluster overrides only when a [cluster] section is present.
+    if let Some(cluster) = config.cluster.as_mut() {
+        if let Some(v) = get("PRXWAF_CLUSTER_JOIN_TOKEN") {
+            cluster.join_token = v;
+        }
+        if let Some(v) = get("PRXWAF_CLUSTER_MEMBERS") {
+            cluster.members = parse_env_list(&v);
+        }
+        if let Some(v) = get("PRXWAF_CLUSTER_SEEDS") {
+            cluster.seeds = parse_env_list(&v);
+        }
+        if let Some(v) = get("PRXWAF_CLUSTER_REPLICATE_CA_KEY") {
+            cluster.replicate_ca_key = parse_env_bool("PRXWAF_CLUSTER_REPLICATE_CA_KEY", &v)?;
+        }
+        if let Some(v) = get("PRXWAF_CLUSTER_AUTO_GENERATE") {
+            cluster.crypto.auto_generate = parse_env_bool("PRXWAF_CLUSTER_AUTO_GENERATE", &v)?;
+        }
+        if let Some(v) = get("PRXWAF_CLUSTER_CA_PASSPHRASE") {
+            cluster.crypto.ca_passphrase = v;
+        }
+    }
+
+    Ok(())
+}
+
 // --- Cluster Configuration ---
 
 /// Node role in the cluster
@@ -803,5 +921,157 @@ impl Default for ClusterConfig {
             election: ClusterElectionConfig::default(),
             health: ClusterHealthConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod env_override_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    /// Build an env getter closure backed by a fixed map, so overrides are
+    /// tested deterministically without touching the process environment.
+    fn getter(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |key: &str| map.get(key).cloned()
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_common_spellings() {
+        for v in ["1", "true", "TRUE", "Yes", "on"] {
+            assert!(parse_env_bool("K", v).expect("should parse truthy"));
+        }
+        for v in ["0", "false", "FALSE", "No", "off"] {
+            assert!(!parse_env_bool("K", v).expect("should parse falsy"));
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_rejects_garbage() {
+        let err = parse_env_bool("PRXWAF_TRUST_PROXY_HEADERS", "maybe").expect_err("must reject");
+        assert!(err.to_string().contains("PRXWAF_TRUST_PROXY_HEADERS"));
+    }
+
+    #[test]
+    fn parse_env_list_trims_and_drops_empty() {
+        assert_eq!(
+            parse_env_list(" 10.0.0.0/8 , ,192.168.0.0/16,"),
+            vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()]
+        );
+        assert!(parse_env_list("   ").is_empty());
+    }
+
+    /// A cluster section carrying distinct TOML values, so overrides are
+    /// observable as changes away from these.
+    fn toml_cluster() -> ClusterConfig {
+        ClusterConfig {
+            enabled: true,
+            join_token: "toml-token".to_string(),
+            members: vec!["toml-a".to_string()],
+            seeds: vec!["toml-seed:1".to_string()],
+            replicate_ca_key: false,
+            crypto: ClusterCryptoConfig {
+                auto_generate: true,
+                ca_passphrase: "toml-pass".to_string(),
+                ..ClusterCryptoConfig::default()
+            },
+            ..ClusterConfig::default()
+        }
+    }
+
+    #[test]
+    fn env_set_overrides_toml() {
+        let mut cfg = AppConfig {
+            cluster: Some(toml_cluster()),
+            ..AppConfig::default()
+        };
+        let get = getter(&[
+            ("DATABASE_URL", "postgres://env/db"),
+            ("PRXWAF_TRUST_PROXY_HEADERS", "true"),
+            ("PRXWAF_TRUSTED_PROXIES", "10.0.0.0/8, 172.16.0.0/12"),
+            ("PRXWAF_CLUSTER_JOIN_TOKEN", "env-token"),
+            ("PRXWAF_CLUSTER_MEMBERS", "env-a,env-b"),
+            ("PRXWAF_CLUSTER_SEEDS", "env-seed:16851"),
+            ("PRXWAF_CLUSTER_REPLICATE_CA_KEY", "yes"),
+            ("PRXWAF_CLUSTER_AUTO_GENERATE", "false"),
+            ("PRXWAF_CLUSTER_CA_PASSPHRASE", "env-pass"),
+        ]);
+
+        apply_env_overrides_from(&mut cfg, get).expect("overrides should apply cleanly");
+
+        assert_eq!(cfg.storage.database_url, "postgres://env/db");
+        assert!(cfg.proxy.trust_proxy_headers);
+        assert_eq!(cfg.proxy.trusted_proxies, vec!["10.0.0.0/8", "172.16.0.0/12"]);
+        let c = cfg.cluster.as_ref().expect("cluster present");
+        assert_eq!(c.join_token, "env-token");
+        assert_eq!(c.members, vec!["env-a", "env-b"]);
+        assert_eq!(c.seeds, vec!["env-seed:16851"]);
+        assert!(c.replicate_ca_key);
+        assert!(!c.crypto.auto_generate);
+        assert_eq!(c.crypto.ca_passphrase, "env-pass");
+    }
+
+    #[test]
+    fn env_unset_preserves_toml() {
+        let default_db = StorageConfig::default().database_url;
+        let mut cfg = AppConfig {
+            cluster: Some(toml_cluster()),
+            ..AppConfig::default()
+        };
+
+        // Empty getter: nothing is overridden.
+        apply_env_overrides_from(&mut cfg, getter(&[])).expect("no-op overrides should apply cleanly");
+
+        assert_eq!(cfg.storage.database_url, default_db);
+        assert!(!cfg.proxy.trust_proxy_headers);
+        assert!(cfg.proxy.trusted_proxies.is_empty());
+        let c = cfg.cluster.as_ref().expect("cluster present");
+        assert_eq!(c.join_token, "toml-token");
+        assert_eq!(c.members, vec!["toml-a"]);
+        assert_eq!(c.seeds, vec!["toml-seed:1"]);
+        assert!(!c.replicate_ca_key);
+        assert!(c.crypto.auto_generate);
+        assert_eq!(c.crypto.ca_passphrase, "toml-pass");
+    }
+
+    #[test]
+    fn empty_env_value_does_not_clobber_toml() {
+        let mut cfg = AppConfig {
+            cluster: Some(toml_cluster()),
+            ..AppConfig::default()
+        };
+        // A set-but-empty value (as a docker-compose `${VAR}` expands when unset)
+        // must be treated as "not set".
+        apply_env_overrides_from(&mut cfg, getter(&[("PRXWAF_CLUSTER_JOIN_TOKEN", "")]))
+            .expect("empty override should be a no-op");
+        assert_eq!(
+            cfg.cluster.as_ref().expect("cluster present").join_token,
+            "toml-token",
+            "an empty env value must not clobber the TOML value"
+        );
+    }
+
+    #[test]
+    fn cluster_overrides_ignored_without_cluster_section() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.cluster.is_none());
+        apply_env_overrides_from(&mut cfg, getter(&[("PRXWAF_CLUSTER_JOIN_TOKEN", "env-token")]))
+            .expect("should apply cleanly");
+        assert!(
+            cfg.cluster.is_none(),
+            "cluster overrides must not materialise a [cluster] section on their own"
+        );
+    }
+
+    #[test]
+    fn invalid_bool_is_a_hard_error() {
+        let mut cfg = AppConfig::default();
+        let err = apply_env_overrides_from(&mut cfg, getter(&[("PRXWAF_TRUST_PROXY_HEADERS", "notabool")]))
+            .expect_err("invalid bool must error");
+        assert!(err.to_string().contains("PRXWAF_TRUST_PROXY_HEADERS"));
     }
 }
