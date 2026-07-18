@@ -82,14 +82,43 @@ pub(crate) fn url_decode_recursive(input: &str) -> String {
     current
 }
 
+/// Curated request headers that are commonly abused for injection payloads
+/// (`H-5`).  Only these headers are scanned — not every arbitrary header — to
+/// bound work and false positives.
+const SCANNED_HEADERS: &[&str] = &[
+    "user-agent",
+    "referer",
+    "x-forwarded-for",
+    "x-real-ip",
+    "x-original-url",
+    "x-forwarded-host",
+    "forwarded",
+];
+
+/// Static `<header>(decoded)` location label for a scanned header.
+fn header_decoded_label(name: &str) -> &'static str {
+    match name {
+        "user-agent" => "user-agent(decoded)",
+        "referer" => "referer(decoded)",
+        "x-forwarded-for" => "x-forwarded-for(decoded)",
+        "x-real-ip" => "x-real-ip(decoded)",
+        "x-original-url" => "x-original-url(decoded)",
+        "x-forwarded-host" => "x-forwarded-host(decoded)",
+        "forwarded" => "forwarded(decoded)",
+        _ => "header(decoded)",
+    }
+}
+
 /// Collect all strings to inspect from the request context.
 ///
 /// Returns a list of `(location, value)` pairs so error messages can
 /// indicate where the pattern was found.
 ///
-/// Each field is included in three forms: raw, single-decoded, and
-/// recursively-decoded (up to 3 passes) so that double/triple-encoded
-/// evasion attempts are caught alongside the plain variants.
+/// Path / query / cookie / body are included in three forms: raw,
+/// single-decoded, and recursively-decoded (up to 3 passes) so that
+/// double/triple-encoded evasion attempts are caught alongside the plain
+/// variants.  A curated set of request headers ([`SCANNED_HEADERS`]) is
+/// additionally scanned in raw + single-decoded form.
 pub(crate) fn request_targets(ctx: &RequestCtx) -> Vec<(&'static str, String)> {
     let mut targets = Vec::new();
 
@@ -144,12 +173,81 @@ pub(crate) fn request_targets(ctx: &RequestCtx) -> Vec<(&'static str, String)> {
         }
     }
 
+    // Curated request headers (raw + single decode) — H-5.
+    for name in SCANNED_HEADERS {
+        let Some(value) = ctx.headers.get(*name) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        targets.push((*name, value.clone()));
+        let decoded = url_decode(value);
+        if decoded != *value {
+            targets.push((header_decoded_label(name), decoded));
+        }
+    }
+
     targets
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use waf_common::HostConfig;
+
+    fn ctx_with_headers(headers: HashMap<String, String>) -> RequestCtx {
+        RequestCtx {
+            req_id: "t".to_string(),
+            client_ip: "127.0.0.1".parse().expect("valid ip literal"),
+            client_port: 0,
+            method: "GET".to_string(),
+            host: "example.com".to_string(),
+            port: 80,
+            path: "/".to_string(),
+            query: String::new(),
+            headers,
+            body_preview: Bytes::new(),
+            content_length: 0,
+            is_tls: false,
+            host_config: Arc::new(HostConfig::default()),
+            geo: None,
+        }
+    }
+
+    #[test]
+    fn request_targets_scans_curated_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("user-agent".to_string(), "sqlmap/1.0".to_string());
+        headers.insert("x-forwarded-for".to_string(), "1.2.3.4".to_string());
+        // A header not on the allowlist must be ignored.
+        headers.insert("x-custom".to_string(), "ignored".to_string());
+        let ctx = ctx_with_headers(headers);
+        let targets = request_targets(&ctx);
+        assert!(targets.iter().any(|(loc, v)| *loc == "user-agent" && v == "sqlmap/1.0"));
+        assert!(
+            targets
+                .iter()
+                .any(|(loc, v)| *loc == "x-forwarded-for" && v == "1.2.3.4")
+        );
+        assert!(!targets.iter().any(|(_, v)| v == "ignored"));
+    }
+
+    #[test]
+    fn request_targets_decodes_curated_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("referer".to_string(), "%3Cscript%3E".to_string());
+        let ctx = ctx_with_headers(headers);
+        let targets = request_targets(&ctx);
+        assert!(
+            targets
+                .iter()
+                .any(|(loc, v)| *loc == "referer(decoded)" && v == "<script>")
+        );
+    }
 
     #[test]
     fn test_url_decode_recursive_double_encoded() {

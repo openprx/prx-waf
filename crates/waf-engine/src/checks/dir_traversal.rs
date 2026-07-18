@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::RegexSet;
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
-use super::{Check, url_decode};
+use super::{Check, request_targets};
 
 static TRAVERSAL_DESCS: &[&str] = &[
     "directory traversal (../)",
@@ -66,19 +66,13 @@ impl Check for DirTraversalCheck {
             return None;
         }
 
-        // Check both the raw path/query and their decoded forms.
-        let candidates = [
-            ("path", ctx.path.clone()),
-            ("path(decoded)", url_decode(&ctx.path)),
-            ("query", ctx.query.clone()),
-            ("query(decoded)", url_decode(&ctx.query)),
-        ];
-
-        for (location, value) in &candidates {
+        // Scan path / query / cookie / body plus curated headers, in raw and
+        // (recursively) decoded forms — shared with the other content checkers.
+        for (location, value) in request_targets(ctx) {
             if value.is_empty() {
                 continue;
             }
-            let matches = TRAVERSAL_SET.matches(value);
+            let matches = TRAVERSAL_SET.matches(&value);
             if matches.matched_any() {
                 let idx = matches.iter().next().unwrap_or(0);
                 let desc = TRAVERSAL_DESCS.get(idx).copied().unwrap_or("path traversal");
@@ -154,5 +148,23 @@ mod tests {
         let checker = DirTraversalCheck::new();
         let ctx = make_ctx("/api/v1/users", "page=2");
         assert!(checker.check(&ctx).is_none());
+    }
+
+    #[test]
+    fn detects_traversal_in_body() {
+        let checker = DirTraversalCheck::new();
+        let mut ctx = make_ctx("/upload", "");
+        ctx.body_preview = Bytes::from_static(b"file=../../../etc/passwd");
+        // M-5: body is now scanned via request_targets.
+        assert!(checker.check(&ctx).is_some());
+    }
+
+    #[test]
+    fn detects_traversal_in_cookie() {
+        let checker = DirTraversalCheck::new();
+        let mut ctx = make_ctx("/", "");
+        ctx.headers
+            .insert("cookie".to_string(), "sid=..%2f..%2fetc%2fpasswd".to_string());
+        assert!(checker.check(&ctx).is_some());
     }
 }
