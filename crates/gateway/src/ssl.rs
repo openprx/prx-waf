@@ -214,11 +214,20 @@ impl SslManager {
         // Finalize and download certificate
         order.finalize(csr.der()).await?;
 
-        // Wait for certificate to be available
+        // Wait for the certificate to be available (poll up to 60s). Without a
+        // deadline a stalled ACME server could hang this task indefinitely.
+        let download_deadline = tokio::time::Instant::now() + Duration::from_mins(1);
         let cert_chain = loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Some(chain) = order.certificate().await? {
                 break chain;
+            }
+            if tokio::time::Instant::now() > download_deadline {
+                let _ = self
+                    .db
+                    .update_certificate_status(cert_id, "error", Some("ACME certificate download timeout"))
+                    .await;
+                anyhow::bail!("ACME certificate download timed out for domain {domain}");
             }
         };
 
@@ -280,10 +289,9 @@ impl SslManager {
 
     /// Spawn the auto-renewal background task.
     ///
-    /// Checks for certificates due renewal every 24 hours.
-    pub fn spawn_renewal_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+    /// Checks for certificates due for renewal every `interval`.
+    pub fn spawn_renewal_task(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let interval = Duration::from_hours(24);
             loop {
                 tokio::time::sleep(interval).await;
                 if let Err(e) = Arc::clone(&self).renew_due_certificates().await {

@@ -29,6 +29,48 @@ pub struct AppConfig {
     /// Cluster configuration — None means standalone mode (default)
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
+    /// ACME / Let's Encrypt automatic TLS certificate management
+    #[serde(default)]
+    pub acme: AcmeConfig,
+}
+
+/// ACME (Let's Encrypt) automatic certificate configuration.
+///
+/// When `enabled`, the gateway constructs an `SslManager`, spawns the periodic
+/// renewal task, and requests certificates for SSL-enabled hosts that do not
+/// already have an active certificate. HTTP-01 challenges are served by the
+/// proxy at `/.well-known/acme-challenge/{token}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcmeConfig {
+    /// Enable ACME automatic issuance and renewal. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Contact email registered with the ACME account. Required for issuance.
+    #[serde(default)]
+    pub email: String,
+    /// Use the Let's Encrypt staging environment (untrusted certs, relaxed
+    /// rate limits) instead of production. Default: `false` (production).
+    #[serde(default)]
+    pub staging: bool,
+    /// How often the background task checks for certificates due for renewal,
+    /// in seconds. Default: 86400 (24h).
+    #[serde(default = "default_acme_renewal_interval")]
+    pub renewal_check_interval_secs: u64,
+}
+
+const fn default_acme_renewal_interval() -> u64 {
+    86_400
+}
+
+impl Default for AcmeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            email: String::new(),
+            staging: false,
+            renewal_check_interval_secs: default_acme_renewal_interval(),
+        }
+    }
 }
 
 /// Rule source entry from configuration

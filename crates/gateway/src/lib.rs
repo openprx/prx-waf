@@ -12,5 +12,5 @@ pub use http3::alt_svc_header;
 pub use lb::{Backend, LoadBalancer, LoadBalancerRegistry};
 pub use proxy::WafProxy;
 pub use router::HostRouter;
-pub use ssl::SslManager;
+pub use ssl::{ChallengeStore, SslManager};
 pub use tunnel::{TunnelConfig, TunnelConnection, TunnelRegistry, TunnelStatus, generate_token, hash_token};
