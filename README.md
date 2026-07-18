@@ -50,12 +50,23 @@ PRX-WAF is a production-ready Web Application Firewall proxy built on [Pingora](
 git clone https://github.com/openprx/prx-waf
 cd prx-waf
 
-# Edit environment variables in docker-compose.yml (DB password, etc.)
+# Configure secrets in one place: copy the template and fill it in.
+cp .env.example .env
+# At minimum set JWT_SECRET and MASTER_KEY (each >= 32 chars). Generate with:
+#   openssl rand -hex 32
+# docker-compose refuses to start if these required secrets are missing.
+
 docker compose up -d
 
 # Admin UI: http://localhost:9527
-# Default credentials: admin / admin123  (change immediately)
+# Default credentials: admin / <ADMIN_PASSWORD, or the random one printed to the
+# logs on first start>  (change immediately)
 ```
+
+All security-critical settings can be configured via `.env` / environment
+variables — see [`.env.example`](.env.example) for the full, documented list
+(required secrets, reverse-proxy trust, cluster, database). Environment values
+override the matching TOML fields.
 
 ### Manual Build
 

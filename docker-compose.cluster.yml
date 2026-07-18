@@ -78,9 +78,17 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      # ⚠️ Required security secrets — nodes refuse to start without them.
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set to a strong random secret (>= 32 chars); see .env.example}
-      DATABASE_URL: postgresql://prx_waf:prx_waf@postgres:5432/prx_waf
+      MASTER_KEY: ${MASTER_KEY:?MASTER_KEY must be set to a strong random secret (>= 32 chars) for encryption at rest; see .env.example}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://prx_waf:prx_waf@postgres:5432/prx_waf}
       RUST_LOG: ${RUST_LOG:-info}
+      # Cluster overrides — override the [cluster] section of each node's TOML.
+      PRXWAF_CLUSTER_JOIN_TOKEN: ${PRXWAF_CLUSTER_JOIN_TOKEN:-}
+      PRXWAF_CLUSTER_CA_PASSPHRASE: ${PRXWAF_CLUSTER_CA_PASSPHRASE:-}
+      PRXWAF_CLUSTER_REPLICATE_CA_KEY: ${PRXWAF_CLUSTER_REPLICATE_CA_KEY:-}
+      PRXWAF_CLUSTER_MEMBERS: ${PRXWAF_CLUSTER_MEMBERS:-node-a,node-b,node-c}
     volumes:
       - ./configs:/app/configs:ro
       - ./rules:/app/rules:ro
@@ -127,9 +135,17 @@ services:
       node-a:
         condition: service_healthy
     environment:
+      # ⚠️ Required security secrets — nodes refuse to start without them.
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set to a strong random secret (>= 32 chars); see .env.example}
-      DATABASE_URL: postgresql://prx_waf:prx_waf@postgres:5432/prx_waf
+      MASTER_KEY: ${MASTER_KEY:?MASTER_KEY must be set to a strong random secret (>= 32 chars) for encryption at rest; see .env.example}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://prx_waf:prx_waf@postgres:5432/prx_waf}
       RUST_LOG: ${RUST_LOG:-info}
+      # Cluster overrides — override the [cluster] section of each node's TOML.
+      PRXWAF_CLUSTER_JOIN_TOKEN: ${PRXWAF_CLUSTER_JOIN_TOKEN:-}
+      PRXWAF_CLUSTER_CA_PASSPHRASE: ${PRXWAF_CLUSTER_CA_PASSPHRASE:-}
+      PRXWAF_CLUSTER_REPLICATE_CA_KEY: ${PRXWAF_CLUSTER_REPLICATE_CA_KEY:-}
+      PRXWAF_CLUSTER_MEMBERS: ${PRXWAF_CLUSTER_MEMBERS:-node-a,node-b,node-c}
     volumes:
       - ./configs:/app/configs:ro
       - ./rules:/app/rules:ro
@@ -174,9 +190,17 @@ services:
       node-a:
         condition: service_healthy
     environment:
+      # ⚠️ Required security secrets — nodes refuse to start without them.
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set to a strong random secret (>= 32 chars); see .env.example}
-      DATABASE_URL: postgresql://prx_waf:prx_waf@postgres:5432/prx_waf
+      MASTER_KEY: ${MASTER_KEY:?MASTER_KEY must be set to a strong random secret (>= 32 chars) for encryption at rest; see .env.example}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://prx_waf:prx_waf@postgres:5432/prx_waf}
       RUST_LOG: ${RUST_LOG:-info}
+      # Cluster overrides — override the [cluster] section of each node's TOML.
+      PRXWAF_CLUSTER_JOIN_TOKEN: ${PRXWAF_CLUSTER_JOIN_TOKEN:-}
+      PRXWAF_CLUSTER_CA_PASSPHRASE: ${PRXWAF_CLUSTER_CA_PASSPHRASE:-}
+      PRXWAF_CLUSTER_REPLICATE_CA_KEY: ${PRXWAF_CLUSTER_REPLICATE_CA_KEY:-}
+      PRXWAF_CLUSTER_MEMBERS: ${PRXWAF_CLUSTER_MEMBERS:-node-a,node-b,node-c}
     volumes:
       - ./configs:/app/configs:ro
       - ./rules:/app/rules:ro
