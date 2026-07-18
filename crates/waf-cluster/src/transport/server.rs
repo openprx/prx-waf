@@ -16,7 +16,7 @@ use rustls_pki_types::pem::PemObject as _;
 use tracing::{debug, info, warn};
 
 use crate::node::{NodeState, PeerInfo};
-use crate::protocol::{ClusterMessage, ClusterState, ElectionVote, JoinResponse, NodeInfo};
+use crate::protocol::{ApiForwardResponse, ClusterMessage, ClusterState, ElectionVote, JoinResponse, NodeInfo};
 use crate::transport::{frame, identity};
 
 /// QUIC mTLS server for cluster communication.
@@ -353,6 +353,11 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState, auth_id: 
                 term = result.term,
                 "ElectionResult received"
             );
+            // Record the authenticated winner as the current Main so subsequent
+            // rule/config pushes from it are accepted (H-9).
+            if node_state.election.is_valid_term(result.term) {
+                node_state.set_main_node_id(result.elected_id.clone()).await;
+            }
             match node_state.election.process_result(&result) {
                 Ok(new_role) => node_state.transition_to(new_role).await,
                 Err(e) => warn!("process_result error: {e}"),
@@ -360,11 +365,97 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState, auth_id: 
             None
         }
 
-        other => {
-            debug!(
-                msg_type = ?std::mem::discriminant(&other),
-                "Unhandled cluster message"
-            );
+        // ── Data-plane sync ────────────────────────────────────────────────
+        ClusterMessage::RuleSyncRequest(req) => {
+            // Only the authoritative Main serves rules. A non-Main node dropping
+            // the request avoids handing out a stale rule view; the worker will
+            // retry and its response filter (H-9) would reject a non-Main answer
+            // anyway.
+            if node_state.current_role().await != waf_common::config::NodeRole::Main {
+                debug!(%auth_id, "Ignoring RuleSyncRequest: this node is not the Main");
+                return None;
+            }
+            let rules: Vec<waf_engine::Rule> = {
+                let reg = node_state.rule_registry.read();
+                reg.list().into_iter().cloned().collect()
+            };
+            let changelog = node_state.rule_changelog.lock().await;
+            match crate::sync::rules::handle_sync_request(&changelog, &req, &rules) {
+                Ok(response) => Some(ClusterMessage::RuleSyncResponse(response)),
+                Err(e) => {
+                    warn!("Failed to build rule sync response: {e}");
+                    None
+                }
+            }
+        }
+
+        ClusterMessage::RuleSyncResponse(response) => {
+            // A push arriving on the server recv path (full-mesh peer). Applied
+            // only when the sender is the authenticated Main (H-9).
+            crate::sync::apply_incoming_rule_sync(node_state, auth_id, response).await;
+            None
+        }
+
+        ClusterMessage::ConfigSync(sync) => {
+            crate::sync::apply_incoming_config_sync(node_state, auth_id, &sync).await;
+            None
+        }
+
+        ClusterMessage::EventBatch(batch) => {
+            // H-9: a worker may only report events under its own identity.
+            if batch.node_id != auth_id {
+                warn!(
+                    declared = %batch.node_id,
+                    authenticated = %auth_id,
+                    "Dropping EventBatch: node_id does not match peer certificate identity"
+                );
+                return None;
+            }
+            debug!(from = %batch.node_id, count = batch.events.len(), "EventBatch received from worker");
+            None
+        }
+
+        ClusterMessage::ApiForward(fwd) => {
+            // Execute the forwarded write via the attached handler (main side)
+            // and reply on the same stream. Without a handler the node cannot
+            // service writes, so it returns a clear 503.
+            let request_id = fwd.request_id.clone();
+            let response = match node_state.api_forward_handler() {
+                Some(handler) => handler.handle(fwd).await,
+                None => ApiForwardResponse {
+                    request_id,
+                    status: 503,
+                    body: b"cluster API forwarding is not configured on this node".to_vec(),
+                },
+            };
+            Some(ClusterMessage::ApiForwardResponse(response))
+        }
+
+        ClusterMessage::ApiForwardResponse(response) => {
+            node_state.pending_forwards.resolve(response).await;
+            None
+        }
+
+        ClusterMessage::NodeLeave { node_id } => {
+            // H-9: a node may only announce its own departure.
+            if node_id != auth_id {
+                warn!(
+                    declared = %node_id,
+                    authenticated = %auth_id,
+                    "Dropping NodeLeave: node_id does not match peer certificate identity"
+                );
+                return None;
+            }
+            node_state.remove_peer(&node_id).await;
+            None
+        }
+
+        // Datagram-only message; never expected on a reliable stream.
+        ClusterMessage::StatsBatch(_) => None,
+
+        // Client-side responses; never expected inbound on the server path.
+        ClusterMessage::JoinResponse(_) => {
+            debug!(%auth_id, "Ignoring unexpected JoinResponse on server recv path");
             None
         }
     }

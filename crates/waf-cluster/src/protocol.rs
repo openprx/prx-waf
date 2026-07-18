@@ -132,7 +132,7 @@ pub struct RuleChange {
 }
 
 /// Operation type for an incremental rule change
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeOp {
     Upsert,

@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use anyhow::{Context, Result};
+use parking_lot::RwLock;
 use waf_engine::{Rule, RuleRegistry, RuleReloader};
 
 use crate::protocol::{ChangeOp, RuleChange, RuleSyncRequest, RuleSyncResponse, SyncType};
@@ -221,6 +222,51 @@ pub async fn apply_sync_response(
     // the single authoritative version stamped by the main node.
     registry.version = response.version;
     reloader.on_rules_updated(response.version).await
+}
+
+/// Apply a `RuleSyncResponse` to a **shared** registry guarded by an `RwLock`,
+/// then notify the reloader so the data plane picks up the new rules.
+///
+/// This is the worker-side entry point used by the transport dispatch. It keeps
+/// the registry write lock short and **never holds it across an `.await`**:
+///
+/// * `Incremental` — mutates the live registry in place under the write lock.
+/// * `Full` — decompresses and deserialises the snapshot **off-lock** (bounded
+///   by [`MAX_SNAPSHOT_DECOMPRESSED_LEN`], M-18), builds a fresh registry, and
+///   swaps it in atomically under a single write lock. Readers therefore never
+///   observe a half-cleared registry during a full resync.
+///
+/// The authoritative `version` from the response is stamped onto the registry,
+/// and `reloader.on_rules_updated(version)` is awaited **after** the lock is
+/// released.
+pub async fn apply_sync_response_shared(
+    response: RuleSyncResponse,
+    registry: &RwLock<RuleRegistry>,
+    reloader: &dyn RuleReloader,
+) -> Result<()> {
+    let version = response.version;
+    match response.sync_type {
+        SyncType::Incremental => {
+            let mut guard = registry.write();
+            apply_rule_changes(&mut guard, response.changes)?;
+            guard.version = version;
+        }
+        SyncType::Full => {
+            // Build the replacement registry off-lock so decompression and
+            // deserialisation (the expensive, allocation-heavy work) do not
+            // block data-plane readers.
+            let rules = restore_snapshot(&response.snapshot_lz4)?;
+            let mut fresh = RuleRegistry::new();
+            for rule in rules {
+                fresh.insert(rule);
+            }
+            fresh.version = version;
+            fresh.mark_loaded();
+            // Atomic swap: readers see either the old or the new registry.
+            *registry.write() = fresh;
+        }
+    }
+    reloader.on_rules_updated(version).await
 }
 
 // ─── Low-level compression helpers (kept for compatibility) ───────────────────

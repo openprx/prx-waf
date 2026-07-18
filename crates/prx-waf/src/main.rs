@@ -1268,6 +1268,10 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     if let Some(cluster_cfg) = config.cluster.clone()
         && cluster_cfg.enabled
     {
+        // Cluster↔engine wiring: applied rule syncs notify the running WafEngine
+        // (which implements RuleReloader) so the data plane refreshes.
+        let engine_reloader = Arc::clone(&engine);
+        let cluster_reloader: Arc<dyn waf_cluster::RuleReloader> = engine_reloader;
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -1279,6 +1283,7 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
             rt.block_on(async move {
                 match waf_cluster::ClusterNode::new(cluster_cfg) {
                     Ok(node) => {
+                        let node = node.with_rule_reloader(cluster_reloader);
                         if let Err(e) = node.run().await {
                             tracing::error!("Cluster node error: {e}");
                         }

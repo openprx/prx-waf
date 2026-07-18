@@ -235,6 +235,12 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState, auth_id:
                 return;
             }
             if resp.accepted {
+                // Record the authenticated Main identity (validated above) so
+                // rule/config pushes from it are accepted (H-9).
+                node_state
+                    .set_main_node_id(resp.cluster_state.main_node_id.clone())
+                    .await;
+
                 // Store encrypted CA key for failover if the main provided one.
                 if let Some(enc_b64) = resp.encrypted_ca_key_b64 {
                     match base64::engine::general_purpose::STANDARD.decode(&enc_b64) {
@@ -327,10 +333,42 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState, auth_id:
                 );
                 return;
             }
+            // Record the authenticated winner as the current Main (H-9).
+            if node_state.election.is_valid_term(result.term) {
+                node_state.set_main_node_id(result.elected_id.clone()).await;
+            }
             match node_state.election.process_result(&result) {
                 Ok(new_role) => node_state.transition_to(new_role).await,
                 Err(e) => warn!("process_result error: {e}"),
             }
+        }
+
+        // ── Data-plane sync (responses / pushes from the Main) ──────────────
+        ClusterMessage::RuleSyncResponse(response) => {
+            // Reply to our pull, or an unsolicited incremental push. Applied
+            // only when the sender is the authenticated Main (H-9).
+            crate::sync::apply_incoming_rule_sync(node_state, auth_id, response).await;
+        }
+
+        ClusterMessage::ConfigSync(sync) => {
+            crate::sync::apply_incoming_config_sync(node_state, auth_id, &sync).await;
+        }
+
+        ClusterMessage::ApiForwardResponse(response) => {
+            node_state.pending_forwards.resolve(response).await;
+        }
+
+        ClusterMessage::NodeLeave { node_id } => {
+            // H-9: a node may only announce its own departure.
+            if node_id != auth_id {
+                warn!(
+                    declared = %node_id,
+                    authenticated = %auth_id,
+                    "Dropping NodeLeave: node_id does not match peer certificate identity"
+                );
+                return;
+            }
+            node_state.remove_peer(&node_id).await;
         }
 
         other => {

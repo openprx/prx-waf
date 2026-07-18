@@ -11,6 +11,7 @@ pub mod transport;
 pub use cluster_forward::PendingForwards;
 pub use node::{NodeState, PeerInfo, StorageMode};
 pub use protocol::ClusterMessage;
+pub use sync::{ApiForwardHandler, NoopRuleReloader};
 pub use waf_common::config::{ClusterConfig, NodeRole};
 pub use waf_engine::RuleReloader;
 
@@ -34,12 +35,39 @@ use crate::transport::server::ClusterServer;
 /// dedicated tokio runtime (usually a background `std::thread`).
 pub struct ClusterNode {
     config: ClusterConfig,
+    /// Data-plane rule reloader attached by the cluster↔engine wiring. When set,
+    /// applied rule syncs notify the running `WafEngine`.
+    rule_reloader: Option<Arc<dyn RuleReloader>>,
+    /// Handler that executes forwarded API writes on the main node.
+    api_forward_handler: Option<Arc<dyn ApiForwardHandler>>,
 }
 
 impl ClusterNode {
     /// Create a cluster node from configuration.
-    pub const fn new(config: ClusterConfig) -> Result<Self> {
-        Ok(Self { config })
+    pub fn new(config: ClusterConfig) -> Result<Self> {
+        Ok(Self {
+            config,
+            rule_reloader: None,
+            api_forward_handler: None,
+        })
+    }
+
+    /// Attach the data-plane rule reloader (the running `WafEngine`).
+    ///
+    /// Applied rule syncs land in the shared rule registry and then invoke this
+    /// hook so the engine refreshes. Without it, syncs still update the registry
+    /// but the engine is not notified.
+    #[must_use]
+    pub fn with_rule_reloader(mut self, reloader: Arc<dyn RuleReloader>) -> Self {
+        self.rule_reloader = Some(reloader);
+        self
+    }
+
+    /// Attach the handler that executes forwarded API writes on the main node.
+    #[must_use]
+    pub fn with_api_forward_handler(mut self, handler: Arc<dyn ApiForwardHandler>) -> Self {
+        self.api_forward_handler = Some(handler);
+        self
     }
 
     /// Start the cluster node: generate or load certificates, launch QUIC server,
@@ -59,6 +87,14 @@ impl ClusterNode {
         let node_state = Arc::new(
             NodeState::new(self.config.clone(), storage_mode).context("failed to initialise cluster node state")?,
         );
+
+        // ── Data-plane sync hooks (cluster↔engine wiring) ────────────────────
+        if let Some(reloader) = &self.rule_reloader {
+            node_state.attach_rule_reloader(Arc::clone(reloader));
+        }
+        if let Some(handler) = &self.api_forward_handler {
+            node_state.attach_api_forward_handler(Arc::clone(handler));
+        }
 
         // ── Certificate setup ─────────────────────────────────────────────────
 
@@ -191,6 +227,22 @@ impl ClusterNode {
         tokio::spawn(async move {
             run_election_loop(state_election).await;
         });
+
+        // ── Data-plane sync schedulers ───────────────────────────────────────
+        // Worker rule-pull loop: periodically ask the Main for newer rules.
+        {
+            let state_pull = Arc::clone(&node_state);
+            tokio::spawn(async move {
+                crate::sync::run_rule_pull_loop(state_pull, crate::sync::SYNC_INTERVAL_MS).await;
+            });
+        }
+        // Main config-broadcast loop: advertise the current config to peers.
+        {
+            let state_cfg = Arc::clone(&node_state);
+            tokio::spawn(async move {
+                crate::sync::run_config_broadcast_loop(state_cfg, crate::sync::SYNC_INTERVAL_MS).await;
+            });
+        }
 
         // ── QUIC server (blocks) ─────────────────────────────────────────────
 
