@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-use gateway::{HostRouter, TunnelConfig, WafProxy};
+use gateway::{ChallengeStore, HostRouter, SslManager, TunnelConfig, WafProxy};
 use waf_api::{AppState, start_api_server};
 use waf_common::config::{AppConfig, load_config};
 use waf_engine::{
@@ -1151,7 +1151,7 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     // `_shutdown_guards` holds the watch senders that signal background workers
     // to stop.  They are dropped automatically when `run_server` returns (after
     // `server.run_forever()` exits), which sends the shutdown signal.
-    let (engine, router, api_state, _shutdown_guards) = rt.block_on(init_async(config))?;
+    let (engine, router, api_state, acme_challenges, _shutdown_guards) = rt.block_on(init_async(config))?;
 
     // Start the management API in a background thread
     let api_listen = config.api.listen_addr.clone();
@@ -1263,6 +1263,7 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     server.bootstrap();
 
     let mut proxy = WafProxy::new(router, engine);
+    proxy.acme_challenges = acme_challenges;
     proxy.trust_proxy_headers = config.proxy.trust_proxy_headers;
     proxy.trusted_proxies = config
         .proxy
@@ -1277,13 +1278,17 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
         })
         .collect();
 
-    // Warn when XFF trust is enabled but no trusted proxy CIDRs are configured,
-    // meaning XFF headers from ANY source will be honoured (fail-open).
+    // Refuse to start when XFF trust is enabled but no trusted proxy CIDRs are
+    // configured (M-1). Honouring X-Forwarded-For from ANY source lets clients
+    // spoof their IP to bypass IP blocklists and rate limits, so this fail-open
+    // misconfiguration is now a hard startup error rather than a warning.
     if proxy.trust_proxy_headers && proxy.trusted_proxies.is_empty() {
-        tracing::warn!(
-            "trust_proxy_headers is enabled but trusted_proxies is empty — \
-             XFF headers from ANY source will be trusted. \
-             Consider adding trusted proxy CIDRs for production use."
+        anyhow::bail!(
+            "invalid proxy configuration: [proxy].trust_proxy_headers is enabled but \
+             [proxy].trusted_proxies is empty. This would trust X-Forwarded-For headers from \
+             ANY source, allowing clients to spoof their IP and bypass IP blocklists / rate \
+             limits. Configure trusted_proxies with the CIDR ranges of your reverse proxies, \
+             or set trust_proxy_headers = false."
         );
     }
 
@@ -1316,7 +1321,13 @@ struct ShutdownGuards {
 /// Async initialization: database, engine, rules, Phases 5 & 6
 async fn init_async(
     config: &AppConfig,
-) -> anyhow::Result<(Arc<WafEngine>, Arc<HostRouter>, Arc<AppState>, ShutdownGuards)> {
+) -> anyhow::Result<(
+    Arc<WafEngine>,
+    Arc<HostRouter>,
+    Arc<AppState>,
+    Arc<ChallengeStore>,
+    ShutdownGuards,
+)> {
     info!("Connecting to database...");
     let db = Arc::new(Database::connect(&config.storage.database_url, config.storage.max_connections).await?);
 
@@ -1550,5 +1561,76 @@ async fn init_async(
         _community: community_shutdown_guard,
     };
 
-    Ok((engine, router, Arc::new(api_state), guards))
+    // ACME / Let's Encrypt automatic TLS (M-3). Returns the shared challenge
+    // store injected into the proxy so HTTP-01 probes can be answered; an empty
+    // store when ACME is disabled.
+    let acme_challenges = setup_acme(config, Arc::clone(&db), Arc::clone(&router)).await;
+
+    Ok((engine, router, Arc::new(api_state), acme_challenges, guards))
+}
+
+/// Wire up ACME automatic TLS: construct the `SslManager`, spawn the periodic
+/// renewal task, and trigger one-time issuance for SSL hosts without an active
+/// certificate. Returns the challenge store shared with the proxy.
+///
+/// The `SslManager` is constructed here (rather than in `run_server`) because
+/// this is where the `Database` handle and populated `HostRouter` are in scope;
+/// the background tasks are spawned on the caller's multi-threaded runtime,
+/// which outlives `init_async` for the process lifetime.
+async fn setup_acme(config: &AppConfig, db: Arc<Database>, router: Arc<HostRouter>) -> Arc<ChallengeStore> {
+    if !config.acme.enabled {
+        return Arc::new(ChallengeStore::new());
+    }
+
+    if config.acme.email.trim().is_empty() {
+        tracing::warn!("ACME is enabled but [acme].email is empty; certificate issuance will fail");
+    }
+
+    let manager = Arc::new(SslManager::new(
+        Arc::clone(&db),
+        config.acme.email.clone(),
+        config.acme.staging,
+    ));
+    let challenges = Arc::clone(&manager.challenges);
+
+    // Periodic renewal task (interval clamped to a sane minimum).
+    let interval = std::time::Duration::from_secs(config.acme.renewal_check_interval_secs.max(60));
+    let renewal_handle = Arc::clone(&manager).spawn_renewal_task(interval);
+    std::mem::forget(renewal_handle);
+    info!(
+        "ACME auto-renewal task spawned (check interval: {}s, staging: {})",
+        interval.as_secs(),
+        config.acme.staging
+    );
+
+    // One-time issuance for SSL hosts that have no active certificate yet.
+    for host in router.list() {
+        if !host.ssl {
+            continue;
+        }
+        let has_active_cert = match db.list_certificates(Some(&host.code)).await {
+            Ok(certs) => certs.iter().any(|c| c.status == "active" && c.cert_pem.is_some()),
+            Err(e) => {
+                tracing::warn!(domain = %host.host, "ACME: certificate lookup failed: {e}");
+                // Treat a lookup failure as "already provisioned" to avoid
+                // hammering the ACME API when the database is unavailable.
+                true
+            }
+        };
+        if has_active_cert {
+            continue;
+        }
+
+        let mgr = Arc::clone(&manager);
+        let host_code = host.code.clone();
+        let domain = host.host.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mgr.request_certificate(&host_code, &domain).await {
+                // Log once per host; do not retry-spam the ACME endpoint.
+                tracing::error!(domain = %domain, "ACME initial issuance failed: {e}");
+            }
+        });
+    }
+
+    challenges
 }
