@@ -6,8 +6,13 @@ use waf_common::{DetectionResult, Phase, RequestCtx};
 use super::Check;
 
 /// Known search-engine / legitimate crawlers — these are allowed through.
-// SAFETY: All patterns are compile-time string literals. If any pattern fails
-// to compile it is a code bug that must be caught in development, not at runtime.
+///
+/// Unlike `BAD_BOT_SET` below, a compile failure here is *already*
+/// fail-closed as an empty set (Low-1): this set only grants a bypass
+/// (`matched_any()` → allow), so falling back to `RegexSet::empty()` means
+/// "never match" → never grant the allow-list bypass → the request still
+/// falls through to `BAD_BOT_SET` / the rest of the pipeline. No behavior
+/// change needed for this particular set.
 static GOOD_BOT_SET: LazyLock<RegexSet> = LazyLock::new(|| {
     match RegexSet::new([
         r"(?i)\bgooglebot\b",
@@ -55,9 +60,12 @@ static BAD_BOT_DESCS: &[&str] = &[
     "Go standard HTTP client",
 ];
 
-// SAFETY: All patterns are compile-time string literals. If any pattern fails
-// to compile it is a code bug that must be caught in development, not at runtime.
-static BAD_BOT_SET: LazyLock<RegexSet> = LazyLock::new(|| {
+/// Fail-closed compile result (Low-1): see the equivalent comment in
+/// `sql_injection.rs` for the full rationale. `None` means the pattern set
+/// failed to compile; `check()` then treats every request as a match
+/// (fail-closed, i.e. blocked as a bad bot) instead of falling back to
+/// `RegexSet::empty()`, which would match nothing and fail open.
+static BAD_BOT_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
     match RegexSet::new([
         r"(?i)\bscrapy\b",
         r"(?i)\bzgrab\b",
@@ -74,10 +82,13 @@ static BAD_BOT_SET: LazyLock<RegexSet> = LazyLock::new(|| {
         r"(?i)^Ruby$|^Ruby/",
         r"(?i)^Go-http-client/",
     ]) {
-        Ok(set) => set,
+        Ok(set) => Some(set),
         Err(e) => {
-            tracing::error!("BUG: bad bot regex set failed to compile: {e}");
-            RegexSet::empty()
+            tracing::error!(
+                "BUG: bad bot regex set failed to compile: {e} — failing closed \
+                 (this checker will now flag every request as a bad bot until the code is fixed)"
+            );
+            None
         }
     }
 });
@@ -114,8 +125,18 @@ impl Check for BotCheck {
             return None;
         }
 
+        let Some(bad_bot_set) = BAD_BOT_SET.as_ref() else {
+            // Fail-closed: the pattern set failed to compile at startup.
+            return Some(DetectionResult {
+                rule_id: Some("BOT-000".to_string()),
+                rule_name: "Bot".to_string(),
+                phase: Phase::Bot,
+                detail: "fail-closed: bad bot pattern set failed to compile at startup".to_string(),
+            });
+        };
+
         // Block known malicious / scripted UA patterns.
-        let bad_matches = BAD_BOT_SET.matches(ua);
+        let bad_matches = bad_bot_set.matches(ua);
         if bad_matches.matched_any() {
             let idx = bad_matches.iter().next().unwrap_or(0);
             let desc = BAD_BOT_DESCS.get(idx).copied().unwrap_or("malicious bot");

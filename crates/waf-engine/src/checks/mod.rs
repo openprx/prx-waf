@@ -64,15 +64,20 @@ pub(crate) fn url_decode(s: &str) -> String {
 
 /// Iteratively URL-decode until the result stabilises or the iteration cap is reached.
 ///
-/// This catches double/triple-encoded evasion attempts such as:
+/// This catches double/triple/…-encoded evasion attempts such as:
 ///   `%253Cscript%253E` → (pass 1) `%3Cscript%3E` → (pass 2) `<script>`
 ///
-/// `MAX_ITERATIONS` is capped at 3 to cover the most common multi-encoding
-/// depths while preventing pathological inputs from causing excessive work.
+/// `MAX_DECODE_PASSES` bounds how many times the value is re-decoded. This is
+/// a deliberate trade-off: too low and a deeply re-encoded payload slips
+/// through with a residual encoded layer un-inspected; too high (or
+/// unbounded) lets a crafted input force excessive per-request CPU work
+/// (decode-loop `DoS`). 5 passes covers realistic multi-encoding depths while
+/// keeping worst-case per-request work small and constant.
+pub(crate) const MAX_DECODE_PASSES: usize = 5;
+
 pub(crate) fn url_decode_recursive(input: &str) -> String {
-    const MAX_ITERATIONS: usize = 3;
     let mut current = url_decode(input);
-    for _ in 1..MAX_ITERATIONS {
+    for _ in 1..MAX_DECODE_PASSES {
         let next = url_decode(&current);
         if next == current {
             break;
@@ -274,9 +279,17 @@ mod tests {
     }
 
     #[test]
-    fn test_url_decode_recursive_max_iterations() {
-        // Depth-4 encoding exceeds MAX_ITERATIONS=3; the loop stops after 3 passes.
-        // %2525253C: pass1 → %25253C, pass2 → %253C, pass3 → %3C  (stops, result is %3C)
-        assert_eq!(url_decode_recursive("%2525253C"), "%3C");
+    fn test_url_decode_recursive_quadruple_encoded() {
+        // Depth-4 encoding is now within MAX_DECODE_PASSES=5, so it fully resolves.
+        // %2525253C: pass1 → %25253C, pass2 → %253C, pass3 → %3C, pass4 → <
+        assert_eq!(url_decode_recursive("%2525253C"), "<");
+    }
+
+    #[test]
+    fn test_url_decode_recursive_max_passes_exceeded() {
+        // Depth-6 encoding exceeds MAX_DECODE_PASSES=5; the loop stops after 5
+        // passes, leaving one encoded layer (%3C) un-decoded rather than
+        // resolving all the way to `<`.
+        assert_eq!(url_decode_recursive("%25252525253C"), "%3C");
     }
 }

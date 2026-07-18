@@ -127,12 +127,15 @@ impl TunnelRegistry {
     }
 
     /// Look up a tunnel by its token hash (SHA-256 hex of the pre-shared key).
+    ///
+    /// Uses a constant-time comparison (Low: timing side-channel) rather than
+    /// `==`, which can short-circuit on the first differing byte.
     pub async fn find_by_token(&self, token_hash: &str) -> Option<TunnelConfig> {
         self.configs
             .read()
             .await
             .values()
-            .find(|c| c.enabled && c.token_hash == token_hash)
+            .find(|c| c.enabled && constant_time_eq(&c.token_hash, token_hash))
             .cloned()
     }
 
@@ -192,6 +195,24 @@ impl Default for TunnelRegistry {
     }
 }
 
+// ─── Constant-time comparison ─────────────────────────────────────────────────
+
+/// Compare two strings byte-for-byte without short-circuiting on the first
+/// difference, to avoid a timing side-channel when validating a tunnel's
+/// SHA-256 token hash against the stored value.
+///
+/// Written by hand (XOR-fold over every byte) instead of pulling in the
+/// `subtle` crate for a single call site. A length mismatch is reported
+/// immediately — hex-encoded SHA-256 digests are always 64 bytes, so this
+/// leaks nothing an attacker doesn't already know about the hash format.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 // ─── Token hashing helper ─────────────────────────────────────────────────────
 
 /// Compute a SHA-256 hex digest of a pre-shared key.
@@ -208,4 +229,48 @@ pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_matches_equal_strings() {
+        let hash = hash_token("secret-token");
+        assert!(constant_time_eq(&hash, &hash.clone()));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_strings() {
+        let a = hash_token("secret-token-a");
+        let b = hash_token("secret-token-b");
+        assert!(!constant_time_eq(&a, &b));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_lengths() {
+        assert!(!constant_time_eq("abc", "abcd"));
+    }
+
+    #[tokio::test]
+    async fn find_by_token_matches_enabled_config_only() {
+        let registry = TunnelRegistry::new();
+        let token_hash = hash_token("t0k3n");
+        let id = Uuid::new_v4();
+        registry
+            .register(TunnelConfig {
+                id,
+                name: "test".to_string(),
+                token_hash: token_hash.clone(),
+                target_host: "127.0.0.1".to_string(),
+                target_port: 8080,
+                enabled: true,
+            })
+            .await;
+
+        let found = registry.find_by_token(&token_hash).await;
+        assert!(found.is_some_and(|c| c.id == id));
+        assert!(registry.find_by_token("wrong-hash").await.is_none());
+    }
 }

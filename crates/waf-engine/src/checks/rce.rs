@@ -28,9 +28,12 @@ static RCE_DESCS: &[&str] = &[
     "nc/netcat reverse shell",
 ];
 
-// SAFETY: All patterns are compile-time string literals. If any pattern fails
-// to compile it is a code bug that must be caught in development, not at runtime.
-static RCE_SET: LazyLock<RegexSet> = LazyLock::new(|| {
+/// Fail-closed compile result (Low-1): see the equivalent comment in
+/// `sql_injection.rs` for the full rationale. `None` means the pattern set
+/// failed to compile; `check()` then treats every request as a match
+/// (fail-closed) instead of falling back to `RegexSet::empty()`, which would
+/// match nothing and fail open.
+static RCE_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
     match RegexSet::new([
         // Pipe/semicolon followed by known shell commands
         r"(?i)[|;`]\s*(cat|ls|dir|wget|curl|bash|sh|zsh|fish|nc|ncat|nmap|python[23]?|perl|ruby|php|exec|system|passthru|popen|id|whoami|uname)\b",
@@ -65,10 +68,13 @@ static RCE_SET: LazyLock<RegexSet> = LazyLock::new(|| {
         // Netcat reverse shell patterns
         r"(?i)\bnc\b.*-[el]",
     ]) {
-        Ok(set) => set,
+        Ok(set) => Some(set),
         Err(e) => {
-            tracing::error!("BUG: RCE regex set failed to compile: {e}");
-            RegexSet::empty()
+            tracing::error!(
+                "BUG: RCE regex set failed to compile: {e} — failing closed \
+                 (this checker will now flag every request until the code is fixed)"
+            );
+            None
         }
     }
 });
@@ -94,8 +100,18 @@ impl Check for RceCheck {
             return None;
         }
 
+        let Some(set) = RCE_SET.as_ref() else {
+            // Fail-closed: the pattern set failed to compile at startup.
+            return Some(DetectionResult {
+                rule_id: Some("RCE-000".to_string()),
+                rule_name: "RCE".to_string(),
+                phase: Phase::Rce,
+                detail: "fail-closed: RCE pattern set failed to compile at startup".to_string(),
+            });
+        };
+
         for (location, value) in request_targets(ctx) {
-            let matches = RCE_SET.matches(&value);
+            let matches = set.matches(&value);
             if matches.matched_any() {
                 let idx = matches.iter().next().unwrap_or(0);
                 let desc = RCE_DESCS.get(idx).copied().unwrap_or("RCE pattern");
