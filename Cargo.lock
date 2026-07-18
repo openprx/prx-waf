@@ -5134,6 +5134,7 @@ version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "argon2",
  "async-trait",
  "base64",
  "bytes",
@@ -5163,8 +5164,10 @@ version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "argon2",
  "base64",
  "bytes",
+ "rand 0.8.5",
  "serde",
  "sha2",
  "thiserror 2.0.18",
