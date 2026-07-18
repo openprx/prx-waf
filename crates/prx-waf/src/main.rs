@@ -1216,11 +1216,13 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
                         return;
                     }
                 };
+                // Upstream is selected per-host via the router inside the H3
+                // server (same source as Pingora's upstream_peer); no hard-coded
+                // backend here (audit H-7).
                 if let Err(e) = gateway::http3::start_http3_server(
                     addr,
                     cert_pem,
                     key_pem,
-                    "http://127.0.0.1:8080".to_string(),
                     h3_config.upstream_tls_verify,
                     Arc::clone(&h3_engine),
                     Arc::clone(&h3_router),
