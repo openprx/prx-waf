@@ -696,6 +696,25 @@ pub struct ClusterConfig {
     /// Static seed nodes. At least one reachable seed required to join an existing cluster.
     #[serde(default)]
     pub seeds: Vec<String>,
+    /// Join token presented to the main during the join handshake (H-10).
+    ///
+    /// Generated on the main via the cluster admin API and configured on each
+    /// worker. The main validates it against the cluster CA key before accepting
+    /// a `JoinRequest`; an empty or invalid token is rejected.
+    #[serde(default)]
+    pub join_token: String,
+    /// Fixed cluster membership (node ids) used to compute election quorum (M-16).
+    ///
+    /// When non-empty, quorum is derived from this declared size rather than the
+    /// dynamically-shrinking live peer view, preventing partitioned minorities
+    /// from each electing their own Main (split-brain).
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Whether the main replicates its (encrypted) CA private key to workers in
+    /// the `JoinResponse` for failover (H-10). Defaults to `false`: CA key
+    /// material never leaves the main unless explicitly enabled.
+    #[serde(default)]
+    pub replicate_ca_key: bool,
     /// TLS/certificate settings
     #[serde(default)]
     pub crypto: ClusterCryptoConfig,
@@ -725,6 +744,9 @@ impl Default for ClusterConfig {
             role: default_cluster_role(),
             listen_addr: default_cluster_addr(),
             seeds: Vec::new(),
+            join_token: String::new(),
+            members: Vec::new(),
+            replicate_ca_key: false,
             crypto: ClusterCryptoConfig::default(),
             sync: ClusterSyncConfig::default(),
             election: ClusterElectionConfig::default(),

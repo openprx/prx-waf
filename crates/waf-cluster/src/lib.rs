@@ -129,7 +129,7 @@ impl ClusterNode {
 
             // Send JoinRequest as the initial handshake message
             let join_req = ClusterMessage::JoinRequest(crate::protocol::JoinRequest {
-                token: String::new(),
+                token: self.config.join_token.clone(),
                 csr_pem: String::new(),
                 node_info: crate::protocol::NodeInfo {
                     node_id: node_state.node_id.clone(),
