@@ -15,7 +15,7 @@ use crate::checks::{
     SensitiveCheck, SqlInjectionCheck, XssCheck,
 };
 use crate::community::{CommunityChecker, CommunityReporter, RequestInfo};
-use crate::crowdsec::{AppSecClient, AppSecResult, CrowdSecChecker, appsec_to_detection};
+use crate::crowdsec::{AppSecClient, AppSecResult, CrowdSecChecker, FallbackAction, appsec_to_detection};
 use crate::geoip::GeoIpService;
 use crate::rules::engine::{CustomRulesEngine, from_db_rule};
 
@@ -253,7 +253,25 @@ impl WafEngine {
                     let result = appsec_to_detection(message);
                     return Some(self.record_block(ctx, result, true));
                 }
-                AppSecResult::Allow | AppSecResult::Unavailable => {}
+                AppSecResult::Allow => {}
+                // H-4: apply the configured failure_action instead of always
+                // failing open.
+                AppSecResult::Unavailable => match appsec.failure_action() {
+                    FallbackAction::Block => {
+                        let result = crate::crowdsec::appsec::appsec_unavailable_detection();
+                        return Some(self.record_block(ctx, result, false));
+                    }
+                    FallbackAction::Log => {
+                        // Record the outage but let the request continue.
+                        let result = crate::crowdsec::appsec::appsec_unavailable_detection();
+                        let decision = WafDecision {
+                            action: WafAction::LogOnly,
+                            result: Some(result),
+                        };
+                        self.log_security_event(ctx, &decision);
+                    }
+                    FallbackAction::Allow => {}
+                },
             }
         }
 

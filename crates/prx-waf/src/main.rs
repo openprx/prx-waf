@@ -1112,7 +1112,9 @@ fn app_config_to_crowdsec(config: &AppConfig) -> CrowdSecConfig {
         endpoint: endpoint.clone(),
         api_key: config.crowdsec.appsec_key.clone().unwrap_or_default(),
         timeout_ms: config.crowdsec.appsec_timeout_ms,
-        failure_action: FallbackAction::Allow,
+        // H-4: honour the configured CrowdSec fallback_action instead of a
+        // hard-coded fail-open. AppSec reuses the same fallback_action value.
+        failure_action: fallback.clone(),
     });
 
     let pusher = config

@@ -5,7 +5,7 @@ use tracing::{debug, warn};
 
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
-use super::config::AppSecConfig;
+use super::config::{AppSecConfig, FallbackAction};
 use super::models::AppSecResponse;
 
 /// Result of an `AppSec` check
@@ -35,6 +35,14 @@ impl AppSecClient {
             .build()
             .context("failed to build AppSec HTTP client")?;
         Ok(Self { client, config })
+    }
+
+    /// The action to apply when the `AppSec` engine is unavailable.
+    ///
+    /// Read by the WAF engine to fail open (`Allow`), fail closed (`Block`) or
+    /// record-only (`Log`) instead of the previous hard-coded fail-open.
+    pub const fn failure_action(&self) -> &FallbackAction {
+        &self.config.failure_action
     }
 
     /// Check a request against the `CrowdSec` `AppSec` engine.
@@ -104,5 +112,17 @@ pub fn appsec_to_detection(message: String) -> DetectionResult {
         rule_name: "CrowdSec AppSec".to_string(),
         phase: Phase::CrowdSec,
         detail: message,
+    }
+}
+
+/// Build a `DetectionResult` describing an `AppSec` engine outage.
+///
+/// Used when `failure_action` is `Block` (fail closed) or `Log` (record only).
+pub fn appsec_unavailable_detection() -> DetectionResult {
+    DetectionResult {
+        rule_id: Some("crowdsec:appsec-unavailable".to_string()),
+        rule_name: "CrowdSec AppSec Unavailable".to_string(),
+        phase: Phase::CrowdSec,
+        detail: "AppSec engine unavailable; applying configured failure_action".to_string(),
     }
 }
