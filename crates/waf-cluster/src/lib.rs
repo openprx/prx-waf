@@ -47,6 +47,10 @@ impl ClusterNode {
     ///
     /// This function does not return under normal operation.
     pub async fn run(self) -> Result<()> {
+        // M-17: refuse an unworkable crypto topology up front rather than
+        // failing every mTLS handshake at runtime.
+        validate_crypto_topology(&self.config)?;
+
         let listen_addr: SocketAddr = self.config.listen_addr.parse().context("invalid cluster listen_addr")?;
 
         // ── NodeState (resolves node_id before cert generation) ──────────────
@@ -196,6 +200,26 @@ impl ClusterNode {
     }
 }
 
+/// Validate that the configured crypto topology can actually form a cluster (M-17).
+///
+/// With `crypto.auto_generate = true` every node mints its **own** self-signed
+/// CA, so no two nodes share a trust anchor and mTLS to any seed can never
+/// succeed. That combination silently prevents the cluster from ever forming.
+/// We fail fast instead — while still allowing the common single-node bootstrap
+/// (`auto_generate = true`, no seeds) to work out of the box.
+fn validate_crypto_topology(config: &ClusterConfig) -> Result<()> {
+    if config.crypto.auto_generate && !config.seeds.is_empty() {
+        anyhow::bail!(
+            "invalid cluster crypto topology: crypto.auto_generate=true with {} seed(s) configured. \
+             Each auto-generating node creates its own CA, so mTLS to seeds will always fail. \
+             Provision a shared CA + node certs and set auto_generate=false to join an existing \
+             cluster, or leave seeds empty for a single-node bootstrap.",
+            config.seeds.len()
+        );
+    }
+    Ok(())
+}
+
 /// Resolve a seed address string (hostname:port or ip:port) to a `SocketAddr`.
 ///
 /// Returns `None` and logs a warning if resolution fails or yields no addresses.
@@ -209,5 +233,38 @@ async fn resolve_seed_addr(seed_str: &str) -> Option<SocketAddr> {
             warn!(addr = %seed_str, error = %e, "Cannot resolve cluster seed address; skipping");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(auto_generate: bool, seeds: &[&str]) -> ClusterConfig {
+        let mut cfg = ClusterConfig::default();
+        cfg.crypto.auto_generate = auto_generate;
+        cfg.seeds = seeds.iter().map(|s| (*s).to_string()).collect();
+        cfg
+    }
+
+    #[test]
+    fn auto_generate_with_seeds_is_rejected() {
+        let cfg = config(true, &["10.0.0.2:16851"]);
+        assert!(
+            validate_crypto_topology(&cfg).is_err(),
+            "auto_generate + seeds must fail fast"
+        );
+    }
+
+    #[test]
+    fn single_node_auto_generate_is_allowed() {
+        let cfg = config(true, &[]);
+        assert!(validate_crypto_topology(&cfg).is_ok());
+    }
+
+    #[test]
+    fn provisioned_certs_with_seeds_is_allowed() {
+        let cfg = config(false, &["10.0.0.2:16851"]);
+        assert!(validate_crypto_topology(&cfg).is_ok());
     }
 }
