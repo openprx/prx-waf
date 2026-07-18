@@ -52,6 +52,12 @@ pub enum UrlValidationError {
 /// Note on DNS rebinding: this is a best-effort first layer.  For full
 /// protection use [`validate_public_url_with_ips`] to obtain the resolved
 /// addresses and pin the HTTP client via `reqwest::ClientBuilder::resolve_to_addrs`.
+#[cfg_attr(
+    not(test),
+    deprecated(
+        note = "production code must use validate_public_url_with_ips and pin resolved IPs via reqwest resolve_to_addrs to close the DNS-rebinding TOCTOU window; retained for tests only"
+    )
+)]
 pub fn validate_public_url(raw_url: &str) -> Result<Url, UrlValidationError> {
     validate_public_url_with_ips(raw_url).map(|(url, _)| url)
 }

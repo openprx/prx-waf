@@ -1509,7 +1509,7 @@ impl Database {
                 appsec_endpoint, appsec_key_encrypted,
                 update_frequency_secs, fallback_action, created_at, updated_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
-               ON CONFLICT (id) DO UPDATE SET
+               ON CONFLICT ((COALESCE(host_id, '00000000-0000-0000-0000-000000000000'::uuid))) DO UPDATE SET
                  enabled = EXCLUDED.enabled,
                  mode = EXCLUDED.mode,
                  lapi_url = EXCLUDED.lapi_url,
