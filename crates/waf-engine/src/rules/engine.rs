@@ -314,7 +314,9 @@ impl CustomRulesEngine {
     fn field_value(&self, ctx: &RequestCtx, field: &ConditionField) -> Option<String> {
         match field {
             ConditionField::Ip => Some(ctx.client_ip.to_string()),
-            ConditionField::Path => Some(ctx.path.clone()),
+            // M-6: match against the decoded path so encoded evasions such as
+            // `/%61dmin` are normalised to `/admin` before comparison.
+            ConditionField::Path => Some(crate::checks::url_decode(&ctx.path)),
             ConditionField::Query => Some(ctx.query.clone()),
             ConditionField::Method => Some(ctx.method.clone()),
             ConditionField::Host => Some(ctx.host.clone()),
@@ -450,6 +452,33 @@ mod tests {
 
         let ctx2 = make_ctx("/public", "GET", "1.2.3.4");
         assert!(engine.check(&ctx2).is_none());
+    }
+
+    #[test]
+    fn test_path_match_uses_decoded_path() {
+        // M-6: `/%61dmin` decodes to `/admin` and must match a `/admin` rule.
+        let engine = CustomRulesEngine::new();
+        let rule = CustomRule {
+            id: "r_dec".into(),
+            host_code: "test".into(),
+            name: "Block admin (decoded)".into(),
+            priority: 1,
+            enabled: true,
+            condition_op: ConditionOp::And,
+            conditions: vec![Condition {
+                field: ConditionField::Path,
+                operator: Operator::StartsWith,
+                value: ConditionValue::Str("/admin".into()),
+            }],
+            action: RuleAction::Block,
+            action_status: 403,
+            action_msg: None,
+            script: None,
+        };
+        engine.add_rule(rule);
+
+        let ctx = make_ctx("/%61dmin/users", "GET", "1.2.3.4");
+        assert!(engine.check(&ctx).is_some());
     }
 
     #[test]
