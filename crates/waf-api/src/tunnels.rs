@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{Path, Query, State, WebSocketUpgrade},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -162,20 +162,56 @@ pub async fn delete_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<Uu
 
 #[derive(Deserialize)]
 pub struct TunnelConnectQuery {
-    token: String,
+    token: Option<String>,
+}
+
+/// Extract the tunnel pre-shared token from the request.
+///
+/// Priority (mirrors `websocket.rs`'s `extract_ws_token`):
+///   1. `Authorization: Bearer <token>` header (preferred — never logged)
+///   2. `?token=<token>` query parameter (deprecated — may end up in access
+///      logs / proxy logs / browser history)
+fn extract_tunnel_token(headers: &HeaderMap, q: &TunnelConnectQuery) -> Option<String> {
+    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION)
+        && let Ok(s) = auth.to_str()
+        && let Some(token) = s.strip_prefix("Bearer ")
+    {
+        return Some(token.to_string());
+    }
+
+    if let Some(ref token) = q.token {
+        warn!(
+            "Tunnel WebSocket auth via ?token= query parameter is deprecated; use Authorization: Bearer header instead"
+        );
+        return Some(token.clone());
+    }
+
+    None
 }
 
 /// GET /ws/tunnel — WebSocket endpoint for tunnel client connections.
 ///
-/// The client must pass `?token=<plain-text-token>` in the query string.
-/// After the WebSocket handshake the server sends `OK` on success or closes
-/// the connection with a 4401 close code on auth failure.
+/// The client should pass `Authorization: Bearer <plain-text-token>`;
+/// `?token=<plain-text-token>` in the query string is still accepted for
+/// backward compatibility but is deprecated (logs a warning) since it can
+/// leak into access logs. After the WebSocket handshake the server sends
+/// `OK` on success or closes the connection with a 4401 close code on auth
+/// failure.
 pub async fn ws_tunnel(
     State(state): State<Arc<AppState>>,
     Query(q): Query<TunnelConnectQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    let token_hash = hash_token(&q.token);
+) -> axum::response::Response {
+    let Some(token) = extract_tunnel_token(&headers, &q) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "token required — use Authorization header" })),
+        )
+            .into_response();
+    };
+
+    let token_hash = hash_token(&token);
     let registry = state.tunnel_registry.clone();
     let db = state.db.clone();
 
