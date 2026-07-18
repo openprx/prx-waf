@@ -5,6 +5,35 @@ use waf_engine::{Rule, RuleRegistry, RuleReloader};
 
 use crate::protocol::{ChangeOp, RuleChange, RuleSyncRequest, RuleSyncResponse, SyncType};
 
+/// Maximum decompressed snapshot size accepted from a peer (256 MiB, M-18).
+///
+/// lz4 can inflate a tiny payload into an enormous buffer; a malicious peer
+/// could send a "decompression bomb" that exhausts memory. The declared
+/// (uncompressed) size prefix is validated against this cap **before** the
+/// allocation implied by decompression.
+pub const MAX_SNAPSHOT_DECOMPRESSED_LEN: usize = 256 * 1024 * 1024;
+
+/// Decompress an lz4 blob produced with a prepended size, rejecting any blob
+/// whose declared uncompressed size exceeds [`MAX_SNAPSHOT_DECOMPRESSED_LEN`].
+///
+/// `lz4_flex::compress_prepend_size` stores the uncompressed length as a
+/// little-endian `u32` in the first four bytes; we read and bound-check it
+/// before delegating to the decompressor (M-18).
+fn checked_decompress(data: &[u8]) -> Result<Vec<u8>> {
+    let prefix: [u8; 4] = data
+        .get(..4)
+        .context("lz4 snapshot too short: missing uncompressed-size prefix")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("lz4 snapshot has a malformed size prefix"))?;
+    let declared = u32::from_le_bytes(prefix) as usize;
+    if declared > MAX_SNAPSHOT_DECOMPRESSED_LEN {
+        anyhow::bail!(
+            "lz4 snapshot declares {declared} bytes uncompressed, exceeding the {MAX_SNAPSHOT_DECOMPRESSED_LEN}-byte limit; rejecting"
+        );
+    }
+    lz4_flex::decompress_size_prepended(data).map_err(|e| anyhow::anyhow!("lz4 decompress failed: {e}"))
+}
+
 /// Ring-buffer of recent rule changes maintained by the main node.
 ///
 /// Workers send `RuleSyncRequest { current_version }` and receive either an
@@ -105,7 +134,7 @@ pub fn snapshot_rules(rules: &[Rule]) -> Result<Vec<u8>> {
 
 /// Decompress and deserialize a full snapshot produced by [`snapshot_rules`].
 pub fn restore_snapshot(data: &[u8]) -> Result<Vec<Rule>> {
-    let json = lz4_flex::decompress_size_prepended(data).map_err(|e| anyhow::anyhow!("lz4 decompress failed: {e}"))?;
+    let json = checked_decompress(data)?;
     serde_json::from_slice(&json).context("failed to deserialize rules from snapshot")
 }
 
@@ -202,6 +231,44 @@ pub fn compress_snapshot(data: &[u8]) -> Vec<u8> {
 }
 
 /// Decompress an lz4-compressed blob produced by [`compress_snapshot`].
+///
+/// Rejects blobs whose declared uncompressed size exceeds
+/// [`MAX_SNAPSHOT_DECOMPRESSED_LEN`] (M-18).
 pub fn decompress_snapshot(data: &[u8]) -> Result<Vec<u8>> {
-    lz4_flex::decompress_size_prepended(data).map_err(|e| anyhow::anyhow!("lz4 decompress failed: {e}"))
+    checked_decompress(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_within_limit() {
+        let payload = b"the quick brown fox jumps over the lazy dog";
+        let blob = compress_snapshot(payload);
+        assert_eq!(decompress_snapshot(&blob).expect("decompress"), payload);
+    }
+
+    #[test]
+    fn oversized_declared_size_is_rejected_before_decompression() {
+        // Valid lz4 body, but forge the prepended size prefix to 300 MiB so the
+        // bound check trips before any large allocation.
+        let valid = compress_snapshot(b"small payload");
+        let huge = u32::try_from(300usize * 1024 * 1024).expect("fits u32").to_le_bytes();
+        let mut bomb = Vec::with_capacity(valid.len());
+        bomb.extend_from_slice(&huge);
+        if let Some(body) = valid.get(4..) {
+            bomb.extend_from_slice(body);
+        }
+        let err = decompress_snapshot(&bomb).expect_err("bomb must be rejected");
+        assert!(
+            err.to_string().contains("exceeding"),
+            "expected size-limit error: {err}"
+        );
+    }
+
+    #[test]
+    fn short_blob_is_rejected() {
+        assert!(decompress_snapshot(&[0u8; 2]).is_err());
+    }
 }
