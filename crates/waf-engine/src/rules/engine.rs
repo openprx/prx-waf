@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use dashmap::DashMap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -143,6 +144,20 @@ pub struct CustomRule {
     pub action_msg: Option<String>,
     /// Optional Rhai expression that overrides `conditions` when present.
     pub script: Option<String>,
+    /// Regexes precompiled at load time (M-8), one slot per condition index
+    /// (`None` unless that condition uses [`Operator::Regex`]).  Empty when the
+    /// rule was built without precompilation (e.g. in unit tests).
+    pub regex_cache: Vec<Option<Arc<Regex>>>,
+}
+
+/// Outcome of a custom-rule match, carrying the rule's configured action so the
+/// engine can dispatch on it (M-7) rather than always blocking with 403.
+#[derive(Debug, Clone)]
+pub struct CustomRuleMatch {
+    pub result: DetectionResult,
+    pub action: RuleAction,
+    pub action_status: u16,
+    pub action_msg: Option<String>,
 }
 
 // ── Custom rules engine ───────────────────────────────────────────────────────
@@ -204,8 +219,9 @@ impl CustomRulesEngine {
 
     /// Evaluate all rules against the request context.
     ///
-    /// Returns the first matching `DetectionResult`, or `None`.
-    pub fn check(&self, ctx: &RequestCtx) -> Option<DetectionResult> {
+    /// Returns the first matching rule as a [`CustomRuleMatch`] (carrying its
+    /// action), or `None`.
+    pub fn check(&self, ctx: &RequestCtx) -> Option<CustomRuleMatch> {
         let host_code = &ctx.host_config.code;
 
         // Host-specific rules first
@@ -227,23 +243,28 @@ impl CustomRulesEngine {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    fn eval_list(&self, ctx: &RequestCtx, rules: &[CustomRule]) -> Option<DetectionResult> {
+    fn eval_list(&self, ctx: &RequestCtx, rules: &[CustomRule]) -> Option<CustomRuleMatch> {
         for rule in rules {
             if !rule.enabled {
                 continue;
             }
 
             let matched = rule.script.as_ref().map_or_else(
-                || self.eval_conditions(ctx, &rule.conditions, &rule.condition_op),
+                || self.eval_conditions(ctx, rule),
                 |script| self.eval_script(ctx, script),
             );
 
             if matched {
-                return Some(DetectionResult {
-                    rule_id: Some(rule.id.clone()),
-                    rule_name: rule.name.clone(),
-                    phase: Phase::CustomRule,
-                    detail: format!("Custom rule '{}' matched", rule.name),
+                return Some(CustomRuleMatch {
+                    result: DetectionResult {
+                        rule_id: Some(rule.id.clone()),
+                        rule_name: rule.name.clone(),
+                        phase: Phase::CustomRule,
+                        detail: format!("Custom rule '{}' matched", rule.name),
+                    },
+                    action: rule.action.clone(),
+                    action_status: rule.action_status,
+                    action_msg: rule.action_msg.clone(),
                 });
             }
         }
@@ -274,17 +295,21 @@ impl CustomRulesEngine {
             })
     }
 
-    fn eval_conditions(&self, ctx: &RequestCtx, conditions: &[Condition], op: &ConditionOp) -> bool {
-        if conditions.is_empty() {
+    fn eval_conditions(&self, ctx: &RequestCtx, rule: &CustomRule) -> bool {
+        if rule.conditions.is_empty() {
             return false;
         }
-        match op {
-            ConditionOp::And => conditions.iter().all(|c| self.eval_one(ctx, c)),
-            ConditionOp::Or => conditions.iter().any(|c| self.eval_one(ctx, c)),
+        let eval_at = |i: usize, c: &Condition| {
+            let compiled = rule.regex_cache.get(i).and_then(Option::as_ref);
+            self.eval_one(ctx, c, compiled)
+        };
+        match rule.condition_op {
+            ConditionOp::And => rule.conditions.iter().enumerate().all(|(i, c)| eval_at(i, c)),
+            ConditionOp::Or => rule.conditions.iter().enumerate().any(|(i, c)| eval_at(i, c)),
         }
     }
 
-    fn eval_one(&self, ctx: &RequestCtx, cond: &Condition) -> bool {
+    fn eval_one(&self, ctx: &RequestCtx, cond: &Condition, compiled_regex: Option<&Arc<Regex>>) -> bool {
         let fval = self.field_value(ctx, &cond.field);
         let fstr = fval.as_deref().unwrap_or("");
 
@@ -295,7 +320,9 @@ impl CustomRulesEngine {
             (Operator::NotContains, ConditionValue::Str(v)) => !fstr.contains(v.as_str()),
             (Operator::StartsWith, ConditionValue::Str(v)) => fstr.starts_with(v.as_str()),
             (Operator::EndsWith, ConditionValue::Str(v)) => fstr.ends_with(v.as_str()),
-            (Operator::Regex, ConditionValue::Str(v)) => Regex::new(v).ok().is_some_and(|r| r.is_match(fstr)),
+            // M-8: use the precompiled regex; when absent (rule not built via
+            // `from_db_rule`) the condition simply does not match.
+            (Operator::Regex, ConditionValue::Str(_)) => compiled_regex.is_some_and(|r| r.is_match(fstr)),
             (Operator::InList, ConditionValue::List(l)) => l.iter().any(|v| v == fstr),
             (Operator::NotInList, ConditionValue::List(l)) => !l.iter().any(|v| v == fstr),
             (Operator::CidrMatch, ConditionValue::Str(cidr)) => cidr
@@ -347,7 +374,29 @@ impl Default for CustomRulesEngine {
 use waf_storage::models::CustomRule as DbCustomRule;
 
 pub fn from_db_rule(row: &DbCustomRule) -> anyhow::Result<CustomRule> {
-    let conditions: Vec<Condition> = serde_json::from_value(row.conditions.clone()).unwrap_or_default();
+    // M-8: parse conditions strictly. Malformed JSON is a load-time error (the
+    // caller warns and skips the rule) rather than a silent fail-open to an
+    // empty, never-matching condition list.  A null value is a legitimately
+    // empty condition list (e.g. a script-only rule).
+    let conditions: Vec<Condition> = if row.conditions.is_null() {
+        Vec::new()
+    } else {
+        serde_json::from_value(row.conditions.clone())
+            .with_context(|| format!("custom rule {} has invalid conditions JSON", row.id))?
+    };
+
+    // Precompile any regex conditions once, at load time. An invalid pattern is
+    // a load-time error (skip + warn) instead of a per-request silent no-match.
+    let mut regex_cache: Vec<Option<Arc<Regex>>> = Vec::with_capacity(conditions.len());
+    for cond in &conditions {
+        if let (Operator::Regex, ConditionValue::Str(pattern)) = (&cond.operator, &cond.value) {
+            let re = Regex::new(pattern)
+                .with_context(|| format!("custom rule {} has an invalid regex '{pattern}'", row.id))?;
+            regex_cache.push(Some(Arc::new(re)));
+        } else {
+            regex_cache.push(None);
+        }
+    }
 
     Ok(CustomRule {
         id: row.id.to_string(),
@@ -361,6 +410,7 @@ pub fn from_db_rule(row: &DbCustomRule) -> anyhow::Result<CustomRule> {
         action_status: u16::try_from(row.action_status).unwrap_or(403),
         action_msg: row.action_msg.clone(),
         script: row.script.clone(),
+        regex_cache,
     })
 }
 
@@ -415,6 +465,7 @@ mod tests {
             action_status: 403,
             action_msg: None,
             script: None,
+            regex_cache: Vec::new(),
         };
         engine.add_rule(rule);
 
@@ -444,6 +495,7 @@ mod tests {
             action_status: 403,
             action_msg: None,
             script: None,
+            regex_cache: Vec::new(),
         };
         engine.add_rule(rule);
 
@@ -474,6 +526,7 @@ mod tests {
             action_status: 403,
             action_msg: None,
             script: None,
+            regex_cache: Vec::new(),
         };
         engine.add_rule(rule);
 
@@ -496,6 +549,7 @@ mod tests {
             action_status: 403,
             action_msg: None,
             script: Some(r#"method == "DELETE" && path.starts_with("/api")"#.into()),
+            regex_cache: Vec::new(),
         };
         engine.add_rule(rule);
 
@@ -504,5 +558,86 @@ mod tests {
 
         let ctx2 = make_ctx("/api/users/1", "GET", "1.2.3.4");
         assert!(engine.check(&ctx2).is_none());
+    }
+
+    #[test]
+    fn test_match_carries_action_and_status() {
+        // M-7: the match must surface the rule's action + status for dispatch.
+        let engine = CustomRulesEngine::new();
+        engine.add_rule(CustomRule {
+            id: "r_allow".into(),
+            host_code: "test".into(),
+            name: "Allow exception".into(),
+            priority: 1,
+            enabled: true,
+            condition_op: ConditionOp::And,
+            conditions: vec![Condition {
+                field: ConditionField::Path,
+                operator: Operator::StartsWith,
+                value: ConditionValue::Str("/public".into()),
+            }],
+            action: RuleAction::Allow,
+            action_status: 200,
+            action_msg: None,
+            script: None,
+            regex_cache: Vec::new(),
+        });
+
+        let m = engine.check(&make_ctx("/public/x", "GET", "1.2.3.4")).expect("match");
+        assert!(matches!(m.action, RuleAction::Allow));
+        assert_eq!(m.action_status, 200);
+    }
+
+    fn db_rule(conditions: serde_json::Value) -> DbCustomRule {
+        DbCustomRule {
+            id: uuid::Uuid::nil(),
+            host_code: "test".into(),
+            name: "r".into(),
+            description: None,
+            priority: 1,
+            enabled: true,
+            condition_op: "and".into(),
+            conditions,
+            action: "block".into(),
+            action_status: 403,
+            action_msg: None,
+            script: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn from_db_rule_precompiles_regex_and_matches() {
+        // M-8: a valid regex condition compiles at load and matches at runtime.
+        let row = db_rule(serde_json::json!([
+            {"field": "path", "operator": "regex", "value": "^/adm[a-z]+$"}
+        ]));
+        let rule = from_db_rule(&row).expect("valid rule");
+        assert_eq!(rule.regex_cache.len(), 1);
+        assert!(rule.regex_cache.first().is_some_and(Option::is_some));
+
+        let engine = CustomRulesEngine::new();
+        engine.add_rule(rule);
+        assert!(engine.check(&make_ctx("/admin", "GET", "1.2.3.4")).is_some());
+        assert!(engine.check(&make_ctx("/other", "GET", "1.2.3.4")).is_none());
+    }
+
+    #[test]
+    fn from_db_rule_rejects_invalid_regex() {
+        // M-8: an invalid regex is a load-time error (rule skipped + warned),
+        // not a silent fail-open.
+        let row = db_rule(serde_json::json!([
+            {"field": "path", "operator": "regex", "value": "([unclosed"}
+        ]));
+        assert!(from_db_rule(&row).is_err());
+    }
+
+    #[test]
+    fn from_db_rule_rejects_malformed_conditions() {
+        // M-8: malformed conditions JSON must error rather than default to an
+        // empty (never-matching) list.
+        let row = db_rule(serde_json::json!({"not": "an array"}));
+        assert!(from_db_rule(&row).is_err());
     }
 }

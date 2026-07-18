@@ -17,7 +17,7 @@ use crate::checks::{
 use crate::community::{CommunityChecker, CommunityReporter, RequestInfo};
 use crate::crowdsec::{AppSecClient, AppSecResult, CrowdSecChecker, FallbackAction, appsec_to_detection};
 use crate::geoip::GeoIpService;
-use crate::rules::engine::{CustomRulesEngine, from_db_rule};
+use crate::rules::engine::{CustomRulesEngine, RuleAction, from_db_rule};
 
 /// WAF engine configuration
 #[derive(Debug, Clone, Default)]
@@ -216,14 +216,28 @@ impl WafEngine {
     /// Centralises the previously-duplicated `render_block_page` / `log_only`
     /// branching that every detector phase used.
     fn record_block(&self, ctx: &RequestCtx, result: DetectionResult, report_community: bool) -> WafDecision {
+        self.record_block_status(ctx, result, 403, None, report_community)
+    }
+
+    /// Like [`record_block`] but with a caller-supplied status code and optional
+    /// override body (used by custom rules that set `action_status` /
+    /// `action_msg`, M-7).
+    fn record_block_status(
+        &self,
+        ctx: &RequestCtx,
+        result: DetectionResult,
+        status: u16,
+        body_override: Option<String>,
+        report_community: bool,
+    ) -> WafDecision {
         let decision = if ctx.host_config.log_only_mode {
             WafDecision {
                 action: WafAction::LogOnly,
                 result: Some(result),
             }
         } else {
-            let body = render_block_page(ctx, &result.rule_name);
-            WafDecision::block(403, Some(body), result)
+            let body = body_override.unwrap_or_else(|| render_block_page(ctx, &result.rule_name));
+            WafDecision::block(status, Some(body), result)
         };
         self.log_security_event(ctx, &decision);
         if report_community {
@@ -275,9 +289,26 @@ impl WafEngine {
             }
         }
 
-        // ── Phase 12: Custom rules engine ─────────────────────────────────────
-        if let Some(result) = self.custom_rules.check(ctx) {
-            return Some(self.record_block(ctx, result, true));
+        // ── Phase 12: Custom rules engine (dispatch on the rule action, M-7) ──
+        if let Some(m) = self.custom_rules.check(ctx) {
+            match m.action {
+                // Allow acts as an explicit exception: short-circuit and allow.
+                RuleAction::Allow => return Some(WafDecision::allow()),
+                // Log records the hit but lets the request continue the pipeline.
+                RuleAction::Log => {
+                    let decision = WafDecision {
+                        action: WafAction::LogOnly,
+                        result: Some(m.result),
+                    };
+                    self.log_security_event(ctx, &decision);
+                    self.report_community_signal(ctx, &decision);
+                }
+                // Block / Challenge deny using the rule's configured status code
+                // (Challenge has no interactive backend yet, so it denies too).
+                RuleAction::Block | RuleAction::Challenge => {
+                    return Some(self.record_block_status(ctx, m.result, m.action_status, m.action_msg, true));
+                }
+            }
         }
 
         // ── Phase 13: OWASP CRS ────────────────────────────────────────────────
