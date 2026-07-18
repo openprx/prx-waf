@@ -1,24 +1,33 @@
 # Audit policy for prx-waf
 # Advisories ignored here are from upstream transitive dependencies
-# that we cannot directly control.
+# that we cannot directly control. Re-verified against the live tree on 2026-07-18.
+# Next review: 2026-10-01. Kept in sync with deny.toml.
 
 [advisories]
-# RUSTSEC-2023-0071: rsa Marvin Attack via sqlx-mysql
-# sqlx-mysql is an optional dependency of sqlx and is NOT activated in this project
-# (prx-waf only uses postgres feature, default-features = false).
-# It appears in Cargo.lock only as a version record for the optional dep, never compiled.
-# cargo tree -i rsa returns nothing; no fix is available upstream (patched = []).
+# RUSTSEC-2023-0071: rsa 0.9 Marvin timing sidechannel — no fixed release exists (patched = []).
+# CORRECTION (2026-07-18): the earlier note claiming rsa is only a sqlx-mysql version record and
+# "never compiled" was WRONG. The real, compiled path is:
+#     rsa 0.9.10 -> jsonwebtoken 10 (rust_crypto) -> waf-api
+# (sqlx uses postgres only, so sqlx-mysql is indeed not compiled, but that is not the reachable path.)
+# rsa IS linked into waf-api. It is nonetheless not exploitable here: waf-api creates and validates
+# JWTs exclusively with HMAC — EncodingKey/DecodingKey::from_secret => HS256 (crates/waf-api/src/auth.rs).
+# The RSA private-key operations that the Marvin timing attack targets are never invoked.
+#
+# RUSTSEC-2026-0173: proc-macro-error2 2.0.1 unmaintained — build-time proc-macro reached via
+# pingora-cache -> cf-rustracing-jaeger -> local-ip-address -> neli -> getset. Compile-time only,
+# not linked into the runtime binary; pingora 0.8-locked, no replacement until pingora upgrades.
 #
 # RUSTSEC-2024-0437: protobuf 2.28.0 recursive parsing crash — via pingora-core -> prometheus -> protobuf
-# Waiting for Cloudflare/pingora to upgrade prometheus or switch to prost
+# No fixed release for protobuf v2; pingora 0.8 pins prometheus 0.13. Awaiting a safe pingora release.
 #
 # RUSTSEC-2025-0069: daemonize 0.5.0 unmaintained — via pingora-core
-# No alternative available until pingora drops this dependency
+# No alternative available until pingora drops this dependency.
 #
-# RUSTSEC-2024-0388: derivative 2.2.0 unmaintained — via pingora-core
-# No alternative available until pingora drops this dependency
+# RUSTSEC-2024-0388: derivative 2.2.0 unmaintained — via pingora-core (build-time derive macro)
+# No alternative available until pingora drops this dependency.
 ignore = [
     "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0173",
     "RUSTSEC-2024-0437",
     "RUSTSEC-2025-0069",
     "RUSTSEC-2024-0388",
