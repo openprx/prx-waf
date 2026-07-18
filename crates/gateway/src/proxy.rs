@@ -14,6 +14,7 @@ use waf_engine::WafEngine;
 
 use crate::context::{BODY_PREVIEW_LIMIT, GatewayCtx};
 use crate::router::HostRouter;
+use crate::ssl::ChallengeStore;
 
 /// Pingora-based reverse proxy with WAF integration
 pub struct WafProxy {
@@ -26,16 +27,20 @@ pub struct WafProxy {
     /// When non-empty and `trust_proxy_headers` is true, only XFF headers
     /// from connections originating within these ranges are honoured.
     pub trusted_proxies: Vec<ipnet::IpNet>,
+    /// Pending ACME HTTP-01 challenge tokens served at
+    /// `/.well-known/acme-challenge/{token}`. Shared with the `SslManager`
+    /// when ACME is enabled; an empty store otherwise.
+    pub acme_challenges: Arc<ChallengeStore>,
 }
 
 impl WafProxy {
-    #[allow(clippy::missing_const_for_fn)] // Vec::new() is not const in all contexts
     pub fn new(router: Arc<HostRouter>, engine: Arc<WafEngine>) -> Self {
         Self {
             router,
             engine,
             trust_proxy_headers: false,
             trusted_proxies: Vec::new(),
+            acme_challenges: Arc::new(ChallengeStore::new()),
         }
     }
 
@@ -58,11 +63,15 @@ impl WafProxy {
             let peer_trusted =
                 self.trusted_proxies.is_empty() || self.trusted_proxies.iter().any(|net| net.contains(&peer_ip));
 
+            // Take the *right-most* non-empty entry rather than the left-most
+            // one. The left-most value is fully client-controlled and can be
+            // spoofed to bypass IP blocklists / rate limits; the right-most
+            // entry is the address appended by the closest (trusted) proxy.
             if peer_trusted
                 && let Some(xff) = session.get_header("x-forwarded-for")
                 && let Ok(s) = std::str::from_utf8(xff.as_bytes())
-                && let Some(first) = s.split(',').next()
-                && let Ok(ip) = first.trim().parse()
+                && let Some(rightmost) = s.rsplit(',').map(str::trim).find(|seg| !seg.is_empty())
+                && let Ok(ip) = rightmost.parse()
             {
                 return ip;
             }
@@ -153,6 +162,25 @@ impl ProxyHttp for WafProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut GatewayCtx) -> pingora_core::Result<bool> {
+        // ── ACME HTTP-01 challenge (M-4) ──────────────────────────────────────
+        // Answer Let's Encrypt validation probes before any host routing or WAF
+        // inspection. Reads only the raw request path from the session and is
+        // fully decoupled from `ctx.request_ctx`.
+        let challenge_token = {
+            let path = session.req_header().uri.path();
+            path.strip_prefix("/.well-known/acme-challenge/")
+                .map(std::string::ToString::to_string)
+        };
+        if let Some(token) = challenge_token
+            && let Some(key_auth) = self.acme_challenges.get(&token)
+        {
+            let mut response = pingora_http::ResponseHeader::build(200, None)?;
+            response.insert_header("content-type", "text/plain")?;
+            session.write_response_header(Box::new(response), false).await?;
+            session.write_response_body(Some(Bytes::from(key_auth)), true).await?;
+            return Ok(true);
+        }
+
         // ── Health check endpoint (host-independent) ──────────────────────────
         let is_health = {
             let head = session.req_header();
