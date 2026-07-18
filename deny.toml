@@ -11,21 +11,29 @@ feature-depth = 1
 yanked = "deny"
 unmaintained = "all"
 unsound = "workspace"
-# Review all ignores by: 2026-06-01
+# Every ignore below has been re-verified against the live dependency tree on 2026-07-18.
+# Review all ignores by: 2026-10-01
 ignore = [
-    # protobuf 2.28.0 DoS — blocked by pingora 0.8.0 pinning prometheus 0.13 (uses protobuf v2)
-    # pingora main branch already upgraded, waiting for 0.9.x release
-    { id = "RUSTSEC-2024-0437", reason = "protobuf: blocked by pingora 0.8.0, awaiting pingora 0.9.x" },
-    # Unmaintained transitive deps — no replacement available
-    { id = "RUSTSEC-2025-0069", reason = "daemonize: pingora transitive dep" },
-    { id = "RUSTSEC-2024-0388", reason = "derivative: pingora transitive dep" },
-    { id = "RUSTSEC-2024-0436", reason = "paste: pingora transitive dep" },
-    # wasmtime CVEs — blocked by pingora 0.8.0, needs pingora upgrade
-    { id = "RUSTSEC-2024-0438", reason = "wasmtime: Windows device names, blocked by pingora" },
-    { id = "RUSTSEC-2025-0046", reason = "wasmtime: fd_renumber panic, blocked by pingora" },
-    { id = "RUSTSEC-2025-0118", reason = "wasmtime: shared memory unsound, blocked by pingora" },
-    { id = "RUSTSEC-2026-0020", reason = "wasmtime: WASI resource exhaustion, blocked by pingora" },
-    { id = "RUSTSEC-2026-0021", reason = "wasmtime: WASI HTTP fields panic, blocked by pingora" },
+    # protobuf 2.28.0 recursive-parsing stack overflow — path: prometheus 0.13.4 -> protobuf v2,
+    # pulled by pingora-core 0.8.0. protobuf v2 has no fix; pingora 0.8 pins prometheus 0.13.
+    # No safe pingora release yet (main has moved off it, but no 0.9.x published). Verified present.
+    { id = "RUSTSEC-2024-0437", reason = "protobuf v2: transitive via pingora 0.8 -> prometheus 0.13; no fixed release, pingora-locked" },
+    # daemonize 0.5.0 unmaintained — path: pingora-core 0.8.0. Only used by pingora's daemon-mode
+    # process forking; no maintained replacement until pingora drops it. Verified present.
+    { id = "RUSTSEC-2025-0069", reason = "daemonize: unmaintained, pingora 0.8 transitive; no replacement until pingora upgrades" },
+    # derivative 2.2.0 unmaintained — path: pingora-core 0.8.0. Build-time derive macro only,
+    # not part of the shipped runtime. Verified present.
+    { id = "RUSTSEC-2024-0388", reason = "derivative: unmaintained build-time derive macro, pingora 0.8 transitive" },
+    # proc-macro-error2 2.0.1 unmaintained — path: pingora-cache 0.8.0 -> cf-rustracing-jaeger ->
+    # local-ip-address -> neli -> getset -> proc-macro-error2. Build-time proc-macro only, never
+    # linked into the runtime binary; pingora-locked. Verified present.
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: unmaintained build-time proc-macro, pingora 0.8 transitive; not in runtime" },
+    # rsa 0.9.10 Marvin timing sidechannel — NO fixed release exists upstream (patched = []).
+    # Real path: rsa -> jsonwebtoken (rust_crypto) -> waf-api, so the crate IS compiled (the old
+    # "not compiled via sqlx-mysql" claim was wrong). However waf-api signs and verifies JWTs
+    # exclusively with HMAC (EncodingKey/DecodingKey::from_secret => HS256, see crates/waf-api/src/auth.rs).
+    # The RSA private-key operations Marvin targets are never invoked, so it is not exploitable here.
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: compiled via jsonwebtoken but waf-api uses only HMAC/HS256 JWTs; RSA code path unreachable; no fixed version exists" },
 ]
 
 [licenses]
