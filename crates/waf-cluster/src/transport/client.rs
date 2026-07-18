@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use crate::crypto::ca::CLUSTER_SERVER_NAME;
 use crate::node::NodeState;
 use crate::protocol::ClusterMessage;
-use crate::transport::frame;
+use crate::transport::{frame, identity};
 
 /// Minimum reconnect back-off delay (ms).
 const BACKOFF_MIN_MS: u64 = 500;
@@ -109,12 +109,17 @@ impl ClusterClient {
             "Connected to cluster peer"
         );
 
+        // H-9: bind this connection to the node_id proven by the server's mTLS
+        // certificate so inbound messages can be checked against it.
+        let auth_id = identity::authenticated_node_id(&conn)
+            .context("failed to read authenticated identity from cluster peer certificate")?;
+
         let (mut send, mut recv) = conn.open_bi().await.context("failed to open cluster control stream")?;
 
         let state = Arc::clone(node_state);
         tokio::select! {
             r = send_loop(&mut send, msg_rx) => r,
-            r = recv_loop(&mut recv, &state) => r,
+            r = recv_loop(&mut recv, &state, &auth_id) => r,
         }
     }
 
@@ -169,19 +174,30 @@ async fn send_loop(send: &mut quinn::SendStream, msg_rx: &mut mpsc::Receiver<Clu
 }
 
 /// Read inbound messages from the control stream and dispatch them.
-async fn recv_loop(recv: &mut quinn::RecvStream, node_state: &Arc<NodeState>) -> Result<()> {
+async fn recv_loop(recv: &mut quinn::RecvStream, node_state: &Arc<NodeState>, auth_id: &str) -> Result<()> {
     loop {
         let msg: ClusterMessage = frame::read_frame(recv)
             .await
             .context("failed to read cluster frame from peer")?;
-        dispatch_incoming(msg, node_state).await;
+        dispatch_incoming(msg, node_state, auth_id).await;
     }
 }
 
 /// Route an inbound message received from a peer.
-async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
+///
+/// `auth_id` is the identity proven by the peer's mTLS certificate (H-9);
+/// messages whose self-declared identity does not match it are dropped.
+async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState, auth_id: &str) {
     match msg {
         ClusterMessage::Heartbeat(hb) => {
+            if hb.node_id != auth_id {
+                warn!(
+                    declared = %hb.node_id,
+                    authenticated = %auth_id,
+                    "Dropping inbound heartbeat: node_id does not match peer certificate identity"
+                );
+                return;
+            }
             let now_ms = unix_ms();
             {
                 let mut peers = node_state.peers.write().await;
@@ -208,6 +224,16 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
         }
 
         ClusterMessage::JoinResponse(resp) => {
+            // H-9: the responder is the main we dialled; its declared main id
+            // must match the certificate it authenticated with.
+            if resp.accepted && resp.cluster_state.main_node_id != auth_id {
+                warn!(
+                    declared = %resp.cluster_state.main_node_id,
+                    authenticated = %auth_id,
+                    "Dropping JoinResponse: main_node_id does not match peer certificate identity"
+                );
+                return;
+            }
             if resp.accepted {
                 // Store encrypted CA key for failover if the main provided one.
                 if let Some(enc_b64) = resp.encrypted_ca_key_b64 {
@@ -263,6 +289,18 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
 
         ClusterMessage::ElectionVote(vote) => {
             if let Some(voter_id) = vote.voter_id {
+                // H-9 (core): a vote grant may only be attributed to the peer that
+                // actually signed this connection. This blocks a peer from forging
+                // an arbitrary voter_id to single-handedly manufacture a majority.
+                if voter_id != auth_id {
+                    warn!(
+                        declared = %voter_id,
+                        authenticated = %auth_id,
+                        candidate = %vote.candidate_id,
+                        "Dropping vote grant: voter_id does not match peer certificate identity"
+                    );
+                    return;
+                }
                 // This is a vote-grant echo addressed to us as the candidate.
                 if vote.candidate_id == node_state.node_id {
                     let recorded = node_state.election.record_vote_for_me(vote.term, voter_id.clone());
@@ -279,10 +317,21 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState) {
             }
         }
 
-        ClusterMessage::ElectionResult(result) => match node_state.election.process_result(&result) {
-            Ok(new_role) => node_state.transition_to(new_role).await,
-            Err(e) => warn!("process_result error: {e}"),
-        },
+        ClusterMessage::ElectionResult(result) => {
+            // H-9: only the winner itself may announce its own election result.
+            if result.elected_id != auth_id {
+                warn!(
+                    declared = %result.elected_id,
+                    authenticated = %auth_id,
+                    "Dropping ElectionResult: elected_id does not match peer certificate identity"
+                );
+                return;
+            }
+            match node_state.election.process_result(&result) {
+                Ok(new_role) => node_state.transition_to(new_role).await,
+                Err(e) => warn!("process_result error: {e}"),
+            }
+        }
 
         other => {
             debug!(
@@ -300,4 +349,73 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::StorageMode;
+    use crate::protocol::{ElectionVote, Heartbeat};
+    use waf_common::config::{ClusterConfig, NodeRole};
+
+    fn node(id: &str) -> Arc<NodeState> {
+        let cfg = ClusterConfig {
+            node_id: id.to_string(),
+            ..ClusterConfig::default()
+        };
+        Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"))
+    }
+
+    fn vote_grant(candidate: &str, voter: &str, term: u64) -> ClusterMessage {
+        ClusterMessage::ElectionVote(ElectionVote {
+            term,
+            candidate_id: candidate.to_string(),
+            last_log_index: 0,
+            voter_id: Some(voter.to_string()),
+        })
+    }
+
+    #[tokio::test]
+    async fn forged_voter_id_vote_grant_is_dropped() {
+        let c = node("candidate-C");
+        let term = c.election.increment_term_and_vote_for_self();
+        assert_eq!(c.election.vote_count_for_term(term), 1, "self-vote only");
+
+        // Peer authenticated as "peer-P" forges a grant from "ghost-majority".
+        dispatch_incoming(vote_grant("candidate-C", "ghost-majority", term), &c, "peer-P").await;
+        assert_eq!(
+            c.election.vote_count_for_term(term),
+            1,
+            "forged voter_id must not inflate the ballot"
+        );
+
+        // A grant genuinely attributable to the authenticated peer IS counted.
+        dispatch_incoming(vote_grant("candidate-C", "peer-P", term), &c, "peer-P").await;
+        assert_eq!(
+            c.election.vote_count_for_term(term),
+            2,
+            "authenticated voter must be counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_heartbeat_with_mismatched_identity_is_dropped() {
+        let n = node("self");
+        let hb = ClusterMessage::Heartbeat(Heartbeat {
+            sequence: 1,
+            timestamp_ms: 0,
+            node_id: "victim".to_string(),
+            role: NodeRole::Main,
+            uptime_secs: 0,
+            cpu_percent: 0.0,
+            memory_used_bytes: 0,
+            total_requests: 0,
+            blocked_requests: 0,
+            rules_version: 0,
+            config_version: 0,
+        });
+        dispatch_incoming(hb, &n, "peer-P").await;
+        let registered = { n.peers.read().await.iter().any(|p| p.node_id == "victim") };
+        assert!(!registered, "forged inbound heartbeat must not register a peer");
+    }
 }

@@ -108,6 +108,9 @@ parking_lot = "0.12"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 zstd = "0.13"
 
+# X.509 parsing (cluster peer certificate SAN → node identity binding, H-9)
+x509-parser = "0.16"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"

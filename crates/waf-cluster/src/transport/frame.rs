@@ -83,7 +83,10 @@ mod tests {
         let result = read_frame::<serde_json::Value, _>(&mut reader).await;
         assert!(result.is_err(), "oversized frame length must be rejected");
         let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(msg.contains("MAX_FRAME_LEN"), "error should mention the frame limit: {msg}");
+        assert!(
+            msg.contains("MAX_FRAME_LEN"),
+            "error should mention the frame limit: {msg}"
+        );
     }
 
     #[tokio::test]
