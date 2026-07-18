@@ -293,6 +293,14 @@ pub struct HostEntry {
     pub guard_status: Option<bool>,
     pub cert_file: Option<String>,
     pub key_file: Option<String>,
+    /// Optional multi-backend pool. Empty (default) → single
+    /// `remote_host`/`remote_port` backend (backward compatible).
+    #[serde(default)]
+    pub backends: Vec<crate::types::BackendConfig>,
+    /// Load-balancing strategy for the backend pool. Only relevant when
+    /// `backends` is non-empty. Defaults to round-robin.
+    #[serde(default)]
+    pub load_balance_strategy: crate::types::LoadBalanceStrategy,
 }
 
 /// Response caching configuration
