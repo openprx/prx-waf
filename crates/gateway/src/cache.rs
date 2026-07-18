@@ -1,8 +1,9 @@
 //! In-memory LRU response cache backed by `moka`.
 //!
-//! Cache key = `method:host:path?query`
-//! Respects Cache-Control directives: `no-cache`, `no-store`, `private`, `max-age=N`.
-//! Supports stale-while-revalidate via background refresh.
+//! Cache key = `scheme|method|host|port|path?query|ae=<normalised Accept-Encoding>`
+//! (see [`ResponseCache::make_key`]).
+//! Respects Cache-Control directives: `no-cache`, `no-store`, `private`, `max-age=N`,
+//! and never stores a response carrying `Set-Cookie`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,12 +83,30 @@ impl ResponseCache {
     }
 
     /// Build the cache key for a request.
-    pub fn make_key(method: &str, host: &str, path: &str, query: &str) -> String {
-        if query.is_empty() {
-            format!("{method}:{host}:{path}")
-        } else {
-            format!("{method}:{host}:{path}?{query}")
-        }
+    ///
+    /// The key incorporates every request dimension that can change the response
+    /// so that entries can never collide across origins or content negotiation:
+    ///
+    /// * `scheme` (`http`/`https`) + `host` + `port` — a request for
+    ///   `https://a.com:443` must not be served from an `http://a.com:80` entry.
+    /// * `method` — `GET` and `HEAD` are cached under distinct keys.
+    /// * `path` + `query`.
+    /// * the `Accept-Encoding` Vary dimension (normalised) — prevents handing a
+    ///   `br`-encoded body to a client that only advertised `gzip`.
+    ///
+    /// Fields are `|`-separated (a byte that cannot appear in a host, scheme,
+    /// method or normalised encoding token) so the segments are unambiguous.
+    pub fn make_key(
+        scheme: &str,
+        method: &str,
+        host: &str,
+        port: u16,
+        path: &str,
+        query: &str,
+        accept_encoding: &str,
+    ) -> String {
+        let ae = normalize_accept_encoding(accept_encoding);
+        format!("{scheme}|{method}|{host}|{port}|{path}?{query}|ae={ae}")
     }
 
     /// Look up a cached response.  Returns `None` on miss.
@@ -114,8 +133,18 @@ impl ResponseCache {
         body: Bytes,
         cache_control: Option<&str>,
     ) -> bool {
-        // Only cache 2xx responses on GET/HEAD
+        // Only cache 2xx responses.
         if !(200..300).contains(&status) {
+            return false;
+        }
+
+        // Never cache a response that sets a cookie: it is, by definition,
+        // user/session specific and caching it would serve one user's cookie
+        // (and cached body) to everyone else — a cache-poisoning / cross-user
+        // leak. This is a hard safety net independent of the request-side
+        // Authorization/Cookie checks performed by the proxy.
+        if headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("set-cookie")) {
+            debug!(key = %key, "skipping cache: response carries Set-Cookie");
             return false;
         }
 
@@ -147,9 +176,8 @@ impl ResponseCache {
             .inner
             .iter()
             .filter(|(k, _)| {
-                // key format: method:host:path...
-                let parts: Vec<&str> = k.splitn(3, ':').collect();
-                parts.get(1).copied() == Some(host)
+                // key format: scheme|method|host|port|path?query|ae=...
+                k.split('|').nth(2) == Some(host)
             })
             .map(|(k, _)| k.to_string())
             .collect();
@@ -177,6 +205,27 @@ impl ResponseCache {
     /// Approximate entry count.
     pub fn entry_count(&self) -> u64 {
         self.inner.entry_count()
+    }
+}
+
+/// Normalise an `Accept-Encoding` request header into a single canonical token
+/// used as the cache Vary dimension.
+///
+/// The upstream may choose at most one content-coding; by collapsing the header
+/// to the single best coding the client advertised we ensure two requests only
+/// share a cache entry when they would accept the same encoding. Preference
+/// order mirrors what most origins pick: `br` > `gzip` > `deflate` > `identity`.
+fn normalize_accept_encoding(header: &str) -> &'static str {
+    let lower = header.to_ascii_lowercase();
+    let accepts = |tok: &str| lower.split(',').any(|part| part.trim().starts_with(tok));
+    if accepts("br") {
+        "br"
+    } else if accepts("gzip") {
+        "gzip"
+    } else if accepts("deflate") {
+        "deflate"
+    } else {
+        "identity"
     }
 }
 
@@ -213,4 +262,104 @@ fn parse_cache_control(header: Option<&str>) -> CacheDecision {
         }
     }
     CacheDecision::Default
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn make_key_includes_scheme_host_port_and_method() {
+        let http = ResponseCache::make_key("http", "GET", "a.com", 80, "/x", "", "");
+        let https = ResponseCache::make_key("https", "GET", "a.com", 443, "/x", "", "");
+        let head = ResponseCache::make_key("http", "HEAD", "a.com", 80, "/x", "", "");
+        // scheme+port and method are part of the key → no collisions.
+        assert_ne!(http, https);
+        assert_ne!(http, head);
+    }
+
+    #[test]
+    fn make_key_varies_on_accept_encoding() {
+        let gz = ResponseCache::make_key("http", "GET", "a.com", 80, "/x", "", "gzip, deflate");
+        let br = ResponseCache::make_key("http", "GET", "a.com", 80, "/x", "", "br, gzip");
+        let none = ResponseCache::make_key("http", "GET", "a.com", 80, "/x", "", "");
+        // A br-capable client must not share an entry with a gzip-only client.
+        assert_ne!(gz, br);
+        assert_ne!(gz, none);
+        // Clients that both prefer the same coding share the entry.
+        let gz2 = ResponseCache::make_key("http", "GET", "a.com", 80, "/x", "", "gzip");
+        assert_eq!(gz, gz2);
+    }
+
+    #[test]
+    fn normalize_accept_encoding_prefers_br_then_gzip() {
+        assert_eq!(normalize_accept_encoding("gzip, deflate, br"), "br");
+        assert_eq!(normalize_accept_encoding("gzip, deflate"), "gzip");
+        assert_eq!(normalize_accept_encoding("deflate"), "deflate");
+        assert_eq!(normalize_accept_encoding(""), "identity");
+        assert_eq!(normalize_accept_encoding("identity"), "identity");
+    }
+
+    #[tokio::test]
+    async fn does_not_cache_response_with_set_cookie() {
+        let cache = ResponseCache::new(8, 60, 3600);
+        let key = ResponseCache::make_key("http", "GET", "a.com", 80, "/x", "", "");
+        let stored = cache
+            .put(
+                key.clone(),
+                200,
+                vec![("set-cookie".to_string(), "sid=abc".to_string())],
+                Bytes::from_static(b"body"),
+                None,
+            )
+            .await;
+        assert!(!stored, "responses with Set-Cookie must never be cached");
+        assert!(cache.get(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn caches_plain_get_and_serves_hit() {
+        let cache = ResponseCache::new(8, 60, 3600);
+        let key = ResponseCache::make_key("http", "GET", "a.com", 80, "/x", "", "");
+        let stored = cache
+            .put(
+                key.clone(),
+                200,
+                vec![("content-type".to_string(), "text/plain".to_string())],
+                Bytes::from_static(b"hello"),
+                None,
+            )
+            .await;
+        assert!(stored);
+        let hit = cache.get(&key).await.expect("expected a cache hit");
+        assert_eq!(hit.status, 200);
+        assert_eq!(hit.body, Bytes::from_static(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn respects_no_store_cache_control() {
+        let cache = ResponseCache::new(8, 60, 3600);
+        let key = ResponseCache::make_key("http", "GET", "a.com", 80, "/x", "", "");
+        let stored = cache
+            .put(key.clone(), 200, Vec::new(), Bytes::from_static(b"x"), Some("no-store"))
+            .await;
+        assert!(!stored);
+        assert!(cache.get(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn purge_host_removes_only_matching_host() {
+        let cache = ResponseCache::new(8, 60, 3600);
+        let a = ResponseCache::make_key("http", "GET", "a.com", 80, "/x", "", "");
+        let b = ResponseCache::make_key("http", "GET", "b.com", 80, "/x", "", "");
+        cache
+            .put(a.clone(), 200, Vec::new(), Bytes::from_static(b"a"), None)
+            .await;
+        cache
+            .put(b.clone(), 200, Vec::new(), Bytes::from_static(b"b"), None)
+            .await;
+        cache.purge_host("a.com").await;
+        assert!(cache.get(&a).await.is_none(), "a.com entry should be purged");
+        assert!(cache.get(&b).await.is_some(), "b.com entry should remain");
+    }
 }
