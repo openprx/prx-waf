@@ -1136,8 +1136,17 @@ fn app_config_to_crowdsec(config: &AppConfig) -> CrowdSecConfig {
             password: password.clone(),
         });
 
+    // Category ③ (external dependency): CrowdSec stays off for a zero-config
+    // single node — it needs an external LAPI endpoint + bouncer key. Rather
+    // than hard-enabling it (which would be a no-op or error without a LAPI),
+    // treat "an api_key is configured" as intent to enable, so operators only
+    // set the key. With no key the default remains disabled. This derivation is
+    // the single source of truth shared by the runtime and the `crowdsec`
+    // CLI, so both agree. A failed init still fails safe (logged, non-fatal).
+    let enabled = config.crowdsec.enabled || !config.crowdsec.api_key.trim().is_empty();
+
     CrowdSecConfig {
-        enabled: config.crowdsec.enabled,
+        enabled,
         mode,
         lapi_url: config.crowdsec.lapi_url.clone(),
         api_key: config.crowdsec.api_key.clone(),
@@ -1180,8 +1189,15 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
         });
     });
 
+    // Category ③ (external dependency): HTTP/3 needs a TLS cert + key, so it is
+    // off for a zero-config single node. Rather than hard-enabling it (which
+    // would fail without certificates), treat "both cert_pem and key_pem are
+    // configured" as intent to enable — an operator who points HTTP/3 at a
+    // keypair clearly wants it. With no certs it stays disabled.
+    let http3_enabled = config.http3.enabled || (config.http3.cert_pem.is_some() && config.http3.key_pem.is_some());
+
     // Optionally start HTTP/3 listener
-    if config.http3.enabled {
+    if http3_enabled {
         let h3_config = config.http3.clone();
         let h3_engine = Arc::clone(&engine);
         let h3_router = Arc::clone(&router);
@@ -1309,7 +1325,7 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
 
     info!("Proxy listening on {}", config.proxy.listen_addr);
     info!("Management API listening on {}", config.api.listen_addr);
-    if config.http3.enabled {
+    if http3_enabled {
         info!("HTTP/3 (QUIC) listener on {}", config.http3.listen_addr);
     }
     info!("Press Ctrl+C to stop");
