@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use waf_common::{RequestCtx, WafAction, WafDecision};
+use waf_common::{DetectionResult, RequestCtx, WafAction, WafDecision};
 use waf_storage::{
     Database,
     models::{AttackLog, CreateSecurityEvent},
@@ -44,8 +44,18 @@ pub struct WafEngine {
     db: Arc<Database>,
     #[allow(dead_code)]
     config: WafEngineConfig,
-    /// Dynamic checker pipeline (Phase 5-11 detectors).
-    checkers: Vec<Box<dyn Check>>,
+    /// CC / rate-limit checker.
+    ///
+    /// Kept as a dedicated field (not inside a checker vector) so it is invoked
+    /// **exactly once per request** — in the header phase ([`inspect`]) only —
+    /// preventing the double-counting that would otherwise occur when a request
+    /// with a body is inspected again in [`inspect_body`].
+    cc_check: CcCheck,
+    /// Header-phase-only detectors (scanner / bot). Not re-run for body content.
+    header_checkers: Vec<Box<dyn Check>>,
+    /// Content-type detectors (`SQLi` / XSS / RCE / traversal) run in both the
+    /// header phase and the body phase (once `body_preview` is populated).
+    content_checkers: Vec<Box<dyn Check>>,
     owasp: Arc<OWASPCheck>,
     /// GeoIP-based access control check (Phase 17).
     geo_check: Arc<GeoCheck>,
@@ -73,12 +83,14 @@ impl WafEngine {
         let owasp = Arc::new(OWASPCheck::new());
         let geo_check = Arc::new(GeoCheck::new());
 
-        // Build the Phase 5-11 checker pipeline.
-        // CC runs first to shed flood traffic before expensive pattern checks.
-        let checkers: Vec<Box<dyn Check>> = vec![
-            Box::new(CcCheck::new()),
-            Box::new(ScannerCheck::new()),
-            Box::new(BotCheck::new()),
+        // CC is a dedicated field (single counting point — see field docs).
+        let cc_check = CcCheck::new();
+
+        // Header-phase-only detectors.
+        let header_checkers: Vec<Box<dyn Check>> = vec![Box::new(ScannerCheck::new()), Box::new(BotCheck::new())];
+
+        // Content-type detectors — re-used by both the header and body phases.
+        let content_checkers: Vec<Box<dyn Check>> = vec![
             Box::new(SqlInjectionCheck::new()),
             Box::new(XssCheck::new()),
             Box::new(RceCheck::new()),
@@ -92,7 +104,9 @@ impl WafEngine {
             hotlink,
             db,
             config,
-            checkers,
+            cc_check,
+            header_checkers,
+            content_checkers,
             owasp,
             geo_check,
             crowdsec_checker: OnceLock::new(),
@@ -196,11 +210,78 @@ impl WafEngine {
         Ok(())
     }
 
-    /// Run the full WAF inspection pipeline.
+    /// Build a block (or log-only) decision from a detection result and record
+    /// it to the security-event log (and optionally the community reporter).
+    ///
+    /// Centralises the previously-duplicated `render_block_page` / `log_only`
+    /// branching that every detector phase used.
+    fn record_block(&self, ctx: &RequestCtx, result: DetectionResult, report_community: bool) -> WafDecision {
+        let decision = if ctx.host_config.log_only_mode {
+            WafDecision {
+                action: WafAction::LogOnly,
+                result: Some(result),
+            }
+        } else {
+            let body = render_block_page(ctx, &result.rule_name);
+            WafDecision::block(403, Some(body), result)
+        };
+        self.log_security_event(ctx, &decision);
+        if report_community {
+            self.report_community_signal(ctx, &decision);
+        }
+        decision
+    }
+
+    /// Content-type detection sub-pipeline shared by the header and body phases.
+    ///
+    /// Runs `SQLi` / XSS / RCE / traversal, `CrowdSec` `AppSec`, custom rules,
+    /// OWASP CRS and sensitive-data detection.  It deliberately does **not** run
+    /// CC / IP / URL / geo / bouncer / community — those are header-phase-only
+    /// and must be evaluated exactly once per request (see [`inspect`]).
+    async fn inspect_content(&self, ctx: &RequestCtx) -> Option<WafDecision> {
+        // ── Phase 5-9: SQLi / XSS / RCE / traversal ───────────────────────────
+        for checker in &self.content_checkers {
+            if let Some(result) = checker.check(ctx) {
+                return Some(self.record_block(ctx, result, true));
+            }
+        }
+
+        // ── Phase 16b: CrowdSec AppSec — async per-request check ──────────────
+        if let Some(appsec) = self.appsec_client.get() {
+            match appsec.check_request(ctx).await {
+                AppSecResult::Block { message } => {
+                    let result = appsec_to_detection(message);
+                    return Some(self.record_block(ctx, result, true));
+                }
+                AppSecResult::Allow | AppSecResult::Unavailable => {}
+            }
+        }
+
+        // ── Phase 12: Custom rules engine ─────────────────────────────────────
+        if let Some(result) = self.custom_rules.check(ctx) {
+            return Some(self.record_block(ctx, result, true));
+        }
+
+        // ── Phase 13: OWASP CRS ────────────────────────────────────────────────
+        if let Some(result) = self.owasp.check(ctx) {
+            return Some(self.record_block(ctx, result, true));
+        }
+
+        // ── Phase 14: Sensitive data ───────────────────────────────────────────
+        if let Some(result) = self.sensitive.check(ctx) {
+            return Some(self.record_block(ctx, result, true));
+        }
+
+        None
+    }
+
+    /// Run the header-phase WAF inspection pipeline (the full pipeline).
     ///
     /// `ctx` is taken as `&mut` so the engine can enrich it with `GeoIP` data
-    /// before the checker pipeline runs.  Callers should check
-    /// `decision.is_allowed()`.
+    /// before the checker pipeline runs.  This is the **only** place CC / IP /
+    /// URL / geo / bouncer / community checks run, so rate-limit counting and
+    /// community reporting happen exactly once per request.  Callers should
+    /// check `decision.is_allowed()`.
     pub async fn inspect(&self, ctx: &mut RequestCtx) -> WafDecision {
         // Skip WAF if guard is disabled for this host
         if !ctx.host_config.guard_status {
@@ -248,165 +329,69 @@ impl WafEngine {
         if let Some(cs) = self.crowdsec_checker.get()
             && let Some(result) = cs.check(ctx)
         {
-            let rule_name = result.rule_name.clone();
-            let decision = if ctx.host_config.log_only_mode {
-                WafDecision {
-                    action: WafAction::LogOnly,
-                    result: Some(result),
-                }
-            } else {
-                let body = render_block_page(ctx, &rule_name);
-                WafDecision::block(403, Some(body), result)
-            };
-            self.log_security_event(ctx, &decision);
-            self.report_community_signal(ctx, &decision);
-            return decision;
+            return self.record_block(ctx, result, true);
         }
 
         // ── Phase 18: Community blocklist ─────────────────────────────────────
         if let Some(cc) = self.community_checker.get()
             && let Some(result) = cc.check(ctx)
         {
-            let rule_name = result.rule_name.clone();
-            let decision = if ctx.host_config.log_only_mode {
-                WafDecision {
-                    action: WafAction::LogOnly,
-                    result: Some(result),
-                }
-            } else {
-                let body = render_block_page(ctx, &rule_name);
-                WafDecision::block(403, Some(body), result)
-            };
-            self.log_security_event(ctx, &decision);
-            return decision;
+            // Community detections are not reported back to the community feed.
+            return self.record_block(ctx, result, false);
         }
 
         // ── Phase 17: GeoIP access control ────────────────────────────────────
         if let Some(result) = self.geo_check.check(ctx) {
-            let rule_name = result.rule_name.clone();
-            let decision = if ctx.host_config.log_only_mode {
-                WafDecision {
-                    action: WafAction::LogOnly,
-                    result: Some(result),
-                }
-            } else {
-                let body = render_block_page(ctx, &rule_name);
-                WafDecision::block(403, Some(body), result)
-            };
-            self.log_security_event(ctx, &decision);
-            self.report_community_signal(ctx, &decision);
-            return decision;
+            return self.record_block(ctx, result, true);
         }
 
-        // ── Phase 5-11: Attack detection pipeline ─────────────────────────────
-        for checker in &self.checkers {
+        // ── Phase 11: CC / rate limit — single counting point ─────────────────
+        if let Some(result) = self.cc_check.check(ctx) {
+            return self.record_block(ctx, result, true);
+        }
+
+        // ── Phase 8 / 10: scanner + bot (header-only) ─────────────────────────
+        for checker in &self.header_checkers {
             if let Some(result) = checker.check(ctx) {
-                let rule_name = result.rule_name.clone();
-
-                let decision = if ctx.host_config.log_only_mode {
-                    WafDecision {
-                        action: WafAction::LogOnly,
-                        result: Some(result),
-                    }
-                } else {
-                    let body = render_block_page(ctx, &rule_name);
-                    WafDecision::block(403, Some(body), result)
-                };
-
-                self.log_security_event(ctx, &decision);
-                self.report_community_signal(ctx, &decision);
-                return decision;
+                return self.record_block(ctx, result, true);
             }
         }
 
-        // ── Phase 16b: CrowdSec AppSec — async per-request check ──────────────
-        if let Some(appsec) = self.appsec_client.get() {
-            match appsec.check_request(ctx).await {
-                AppSecResult::Block { message } => {
-                    let result = appsec_to_detection(message);
-                    let rule_name = result.rule_name.clone();
-                    let decision = if ctx.host_config.log_only_mode {
-                        WafDecision {
-                            action: WafAction::LogOnly,
-                            result: Some(result),
-                        }
-                    } else {
-                        let body = render_block_page(ctx, &rule_name);
-                        WafDecision::block(403, Some(body), result)
-                    };
-                    self.log_security_event(ctx, &decision);
-                    self.report_community_signal(ctx, &decision);
-                    return decision;
-                }
-                AppSecResult::Allow | AppSecResult::Unavailable => {}
-            }
-        }
-
-        // ── Phase 12: Custom rules engine ─────────────────────────────────────
-        if let Some(result) = self.custom_rules.check(ctx) {
-            let rule_name = result.rule_name.clone();
-            let decision = if ctx.host_config.log_only_mode {
-                WafDecision {
-                    action: WafAction::LogOnly,
-                    result: Some(result),
-                }
-            } else {
-                let body = render_block_page(ctx, &rule_name);
-                WafDecision::block(403, Some(body), result)
-            };
-            self.log_security_event(ctx, &decision);
-            self.report_community_signal(ctx, &decision);
-            return decision;
-        }
-
-        // ── Phase 13: OWASP CRS ────────────────────────────────────────────────
-        if let Some(result) = self.owasp.check(ctx) {
-            let rule_name = result.rule_name.clone();
-            let decision = if ctx.host_config.log_only_mode {
-                WafDecision {
-                    action: WafAction::LogOnly,
-                    result: Some(result),
-                }
-            } else {
-                let body = render_block_page(ctx, &rule_name);
-                WafDecision::block(403, Some(body), result)
-            };
-            self.log_security_event(ctx, &decision);
-            self.report_community_signal(ctx, &decision);
-            return decision;
-        }
-
-        // ── Phase 14: Sensitive data ───────────────────────────────────────────
-        if let Some(result) = self.sensitive.check(ctx) {
-            let rule_name = result.rule_name.clone();
-            let decision = if ctx.host_config.log_only_mode {
-                WafDecision {
-                    action: WafAction::LogOnly,
-                    result: Some(result),
-                }
-            } else {
-                let body = render_block_page(ctx, &rule_name);
-                WafDecision::block(403, Some(body), result)
-            };
-            self.log_security_event(ctx, &decision);
-            self.report_community_signal(ctx, &decision);
+        // ── Phase 5-14: content-type detectors + custom + owasp + sensitive ───
+        if let Some(decision) = self.inspect_content(ctx).await {
             return decision;
         }
 
         // ── Phase 15: Anti-hotlinking ──────────────────────────────────────────
         if let Some(result) = self.hotlink.check(ctx) {
-            let rule_name = result.rule_name.clone();
-            let decision = if ctx.host_config.log_only_mode {
-                WafDecision {
-                    action: WafAction::LogOnly,
-                    result: Some(result),
-                }
-            } else {
-                let body = render_block_page(ctx, &rule_name);
-                WafDecision::block(403, Some(body), result)
-            };
-            self.log_security_event(ctx, &decision);
-            self.report_community_signal(ctx, &decision);
+            return self.record_block(ctx, result, true);
+        }
+
+        WafDecision::allow()
+    }
+
+    /// Run the body-phase WAF inspection.
+    ///
+    /// Only content-type detection runs here (`SQLi` / XSS / RCE / traversal /
+    /// sensitive / custom / OWASP / `AppSec`) against the now-populated
+    /// `body_preview`.  CC / IP / URL / geo / bouncer / community are **not**
+    /// re-run — they were already evaluated (and counted) in [`inspect`] during
+    /// the header phase.
+    pub async fn inspect_body(&self, ctx: &mut RequestCtx) -> WafDecision {
+        // Skip WAF if guard is disabled for this host
+        if !ctx.host_config.guard_status {
+            return WafDecision::allow();
+        }
+
+        // Enrich GeoIP for custom rules that reference geo fields on the body
+        // phase (the header-phase enrichment ran on a separate ctx clone).
+        if let Some(geoip) = self.geoip.get()
+            && ctx.geo.is_none()
+        {
+            ctx.geo = Some(geoip.lookup(ctx.client_ip));
+        }
+
+        if let Some(decision) = self.inspect_content(ctx).await {
             return decision;
         }
 
