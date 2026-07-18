@@ -361,3 +361,99 @@ async fn rule_sync_falls_back_to_full_when_worker_too_far_behind() {
     assert_eq!(registry.rules.len(), 3, "all 3 rules should be in worker registry");
     assert_eq!(registry.version, changelog.current_version());
 }
+
+// ─── End-to-end rule sync over real QUIC mTLS (dispatch path) ───────────────────
+
+/// Full data-plane rule sync across two live QUIC nodes, exercising the wired
+/// transport dispatch (not the sync helpers directly):
+///
+/// 1. Main records a rule (`record_rule_change`) → registry + changelog.
+/// 2. Worker sends a `RuleSyncRequest` over QUIC.
+/// 3. Main's `dispatch_message` answers with a `RuleSyncResponse`.
+/// 4. Worker's `dispatch_incoming` applies it **only after** the authenticated
+///    Main identity is recorded (H-9) — a pull before that is dropped.
+#[tokio::test]
+async fn e2e_rule_sync_applied_only_from_authenticated_main() {
+    install_crypto_provider();
+
+    let server_addr = random_loopback_addr();
+    let client_addr = random_loopback_addr();
+
+    let ca = CertificateAuthority::generate(365).expect("CA generate");
+    let ca_cert_der = ca.cert_der().expect("CA DER");
+    let main_cert = NodeCertificate::generate("e2e-main", &ca, 1).expect("main cert");
+    let worker_cert = NodeCertificate::generate("e2e-worker", &ca, 1).expect("worker cert");
+
+    // ── Main node (role = main) with a rule already recorded ──────────────
+    let mut main_cfg = minimal_config(server_addr);
+    main_cfg.role = "main".to_string();
+    let main_state = make_node_state("e2e-main", main_cfg);
+    main_state
+        .record_rule_change(
+            ChangeOp::Upsert,
+            "sqli-001".to_string(),
+            Some(make_test_rule("sqli-001")),
+        )
+        .await;
+
+    let server = ClusterServer::new(
+        server_addr,
+        ca_cert_der.clone(),
+        main_cert.cert_pem.clone(),
+        main_cert.key_pem.clone(),
+    );
+    let main_srv = Arc::clone(&main_state);
+    tokio::spawn(async move {
+        if let Err(e) = server.serve(main_srv).await {
+            tracing::error!("e2e server error: {e}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // ── Worker node (role = worker), main identity NOT yet known ──────────
+    let worker_state = make_node_state("e2e-worker", minimal_config(client_addr));
+    let (tx, rx) = mpsc::channel::<ClusterMessage>(16);
+    let client = ClusterClient::new(
+        server_addr,
+        "e2e-worker".to_string(),
+        ca_cert_der,
+        worker_cert.cert_pem,
+        worker_cert.key_pem,
+    );
+    let worker_for_task = Arc::clone(&worker_state);
+    tokio::spawn(async move {
+        if let Err(e) = client.run_with_reconnect(worker_for_task, rx).await {
+            tracing::error!("e2e client error: {e}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // ── Pull BEFORE the authenticated main is recorded → must be dropped ──
+    tx.send(ClusterMessage::RuleSyncRequest(RuleSyncRequest { current_version: 0 }))
+        .await
+        .expect("send pull #1");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !worker_state.rule_registry.read().rules.contains_key("sqli-001"),
+        "rule sync must be dropped until the authenticated Main identity is known (H-9)"
+    );
+
+    // ── Record the authenticated main identity (as a real join/election would) ──
+    worker_state.set_main_node_id("e2e-main".to_string()).await;
+
+    // ── Pull again → now applied over the real dispatch path ──────────────
+    tx.send(ClusterMessage::RuleSyncRequest(RuleSyncRequest { current_version: 0 }))
+        .await
+        .expect("send pull #2");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let (rules, version) = {
+        let reg = worker_state.rule_registry.read();
+        (reg.rules.clone(), reg.version)
+    };
+    assert!(
+        rules.contains_key("sqli-001"),
+        "worker must apply the rule pushed by the authenticated Main over QUIC"
+    );
+    assert!(version >= 1, "worker registry version must follow the Main");
+}
