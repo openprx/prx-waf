@@ -78,7 +78,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      JWT_SECRET: ${JWT_SECRET:-cluster-demo-jwt-secret-change-in-production}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set to a strong random secret (>= 32 chars); see .env.example}
       DATABASE_URL: postgresql://prx_waf:prx_waf@postgres:5432/prx_waf
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
@@ -127,7 +127,7 @@ services:
       node-a:
         condition: service_healthy
     environment:
-      JWT_SECRET: ${JWT_SECRET:-cluster-demo-jwt-secret-change-in-production}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set to a strong random secret (>= 32 chars); see .env.example}
       DATABASE_URL: postgresql://prx_waf:prx_waf@postgres:5432/prx_waf
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
@@ -174,7 +174,7 @@ services:
       node-a:
         condition: service_healthy
     environment:
-      JWT_SECRET: ${JWT_SECRET:-cluster-demo-jwt-secret-change-in-production}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set to a strong random secret (>= 32 chars); see .env.example}
       DATABASE_URL: postgresql://prx_waf:prx_waf@postgres:5432/prx_waf
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
