@@ -379,6 +379,9 @@ pub struct AdminUser {
     #[serde(skip_serializing)]
     pub totp_secret: Option<String>,
     pub totp_enabled: bool,
+    /// Highest TOTP step number already consumed (replay protection).
+    #[serde(skip_serializing)]
+    pub totp_last_step: i64,
     pub last_login: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
