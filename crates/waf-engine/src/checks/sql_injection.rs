@@ -21,9 +21,18 @@ static SQLI_DESCS: &[&str] = &[
     "MySQL/MSSQL system table enumeration",
 ];
 
-// SAFETY: All patterns are compile-time string literals. If any pattern fails
-// to compile it is a code bug that must be caught in development, not at runtime.
-static SQLI_SET: LazyLock<RegexSet> = LazyLock::new(|| {
+/// Fail-closed compile result (Low-1): `Some(set)` on success, `None` if the
+/// literal pattern set failed to compile. All patterns above are compile-time
+/// string literals, so `None` should never happen in practice — but if it
+/// ever did, silently falling back to `RegexSet::empty()` would make this
+/// checker match nothing and fail *open* (block none, allow everything). The
+/// constructor for this checker is infallible (`Check::new() -> Self`, wired
+/// into `engine.rs` as `Box<dyn Check>`), so a compile failure cannot be
+/// propagated as a startup error without threading `Result` through the
+/// engine's checker construction — out of scope here. Instead `check()`
+/// below treats a `None` set as an unconditional match, i.e. fail-closed
+/// (block/alert on every request) rather than fail-open.
+static SQLI_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
     match RegexSet::new([
         // UNION … SELECT
         r"(?i)\bunion\b[\s/\*]+select\b",
@@ -50,10 +59,13 @@ static SQLI_SET: LazyLock<RegexSet> = LazyLock::new(|| {
         // MySQL/MSSQL catalog tables
         r"(?i)\b(mysql\.(user|db)|master\.\.(sysdatabases|sysobjects))\b",
     ]) {
-        Ok(set) => set,
+        Ok(set) => Some(set),
         Err(e) => {
-            tracing::error!("BUG: SQL injection regex set failed to compile: {e}");
-            RegexSet::empty()
+            tracing::error!(
+                "BUG: SQL injection regex set failed to compile: {e} — failing closed \
+                 (this checker will now flag every request until the code is fixed)"
+            );
+            None
         }
     }
 });
@@ -79,8 +91,18 @@ impl Check for SqlInjectionCheck {
             return None;
         }
 
+        let Some(set) = SQLI_SET.as_ref() else {
+            // Fail-closed: the pattern set failed to compile at startup.
+            return Some(DetectionResult {
+                rule_id: Some("SQLI-000".to_string()),
+                rule_name: "SQL Injection".to_string(),
+                phase: Phase::SqlInjection,
+                detail: "fail-closed: SQL injection pattern set failed to compile at startup".to_string(),
+            });
+        };
+
         for (location, value) in request_targets(ctx) {
-            let matches = SQLI_SET.matches(&value);
+            let matches = set.matches(&value);
             if matches.matched_any() {
                 let idx = matches.iter().next().unwrap_or(0);
                 let desc = SQLI_DESCS.get(idx).copied().unwrap_or("SQL Injection pattern");

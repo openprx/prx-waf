@@ -44,9 +44,12 @@ static SCANNER_UA_DESCS: &[&str] = &[
     "Scrapy (web scraper)",
 ];
 
-// SAFETY: All patterns are compile-time string literals. If any pattern fails
-// to compile it is a code bug that must be caught in development, not at runtime.
-static SCANNER_UA_SET: LazyLock<RegexSet> = LazyLock::new(|| {
+/// Fail-closed compile result (Low-1): see the equivalent comment in
+/// `sql_injection.rs` for the full rationale. `None` means the pattern set
+/// failed to compile; `check()` then treats every request as a match
+/// (fail-closed) instead of falling back to `RegexSet::empty()`, which would
+/// match nothing and fail open.
+static SCANNER_UA_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
     match RegexSet::new([
         r"(?i)\bsqlmap\b",
         r"(?i)\bnmap\b",
@@ -86,10 +89,13 @@ static SCANNER_UA_SET: LazyLock<RegexSet> = LazyLock::new(|| {
         r"(?i)\bphantomjs\b",
         r"(?i)\bscrapy\b",
     ]) {
-        Ok(set) => set,
+        Ok(set) => Some(set),
         Err(e) => {
-            tracing::error!("BUG: scanner UA regex set failed to compile: {e}");
-            RegexSet::empty()
+            tracing::error!(
+                "BUG: scanner UA regex set failed to compile: {e} — failing closed \
+                 (this checker will now flag every request until the code is fixed)"
+            );
+            None
         }
     }
 });
@@ -117,7 +123,17 @@ impl Check for ScannerCheck {
 
         let ua = ctx.headers.get("user-agent").map_or("", String::as_str);
 
-        let matches = SCANNER_UA_SET.matches(ua);
+        let Some(set) = SCANNER_UA_SET.as_ref() else {
+            // Fail-closed: the pattern set failed to compile at startup.
+            return Some(DetectionResult {
+                rule_id: Some("SCAN-000".to_string()),
+                rule_name: "Scanner".to_string(),
+                phase: Phase::Scanner,
+                detail: "fail-closed: scanner UA pattern set failed to compile at startup".to_string(),
+            });
+        };
+
+        let matches = set.matches(ua);
         if matches.matched_any() {
             let idx = matches.iter().next().unwrap_or(0);
             let desc = SCANNER_UA_DESCS.get(idx).copied().unwrap_or("scanner");

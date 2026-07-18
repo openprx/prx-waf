@@ -16,9 +16,12 @@ static TRAVERSAL_DESCS: &[&str] = &[
     "Windows drive-letter path (C:\\)",
 ];
 
-// SAFETY: All patterns are compile-time string literals. If any pattern fails
-// to compile it is a code bug that must be caught in development, not at runtime.
-static TRAVERSAL_SET: LazyLock<RegexSet> = LazyLock::new(|| {
+/// Fail-closed compile result (Low-1): see the equivalent comment in
+/// `sql_injection.rs` for the full rationale. `None` means the pattern set
+/// failed to compile; `check()` then treats every request as a match
+/// (fail-closed) instead of falling back to `RegexSet::empty()`, which would
+/// match nothing and fail open.
+static TRAVERSAL_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
     match RegexSet::new([
         // Classic ../
         r"(\.\./|\.\.\\)",
@@ -37,10 +40,13 @@ static TRAVERSAL_SET: LazyLock<RegexSet> = LazyLock::new(|| {
         // Windows drive-letter path
         r"(?i)[A-Za-z]:\\",
     ]) {
-        Ok(set) => set,
+        Ok(set) => Some(set),
         Err(e) => {
-            tracing::error!("BUG: directory traversal regex set failed to compile: {e}");
-            RegexSet::empty()
+            tracing::error!(
+                "BUG: directory traversal regex set failed to compile: {e} — failing closed \
+                 (this checker will now flag every request until the code is fixed)"
+            );
+            None
         }
     }
 });
@@ -66,13 +72,23 @@ impl Check for DirTraversalCheck {
             return None;
         }
 
+        let Some(set) = TRAVERSAL_SET.as_ref() else {
+            // Fail-closed: the pattern set failed to compile at startup.
+            return Some(DetectionResult {
+                rule_id: Some("TRAV-000".to_string()),
+                rule_name: "Directory Traversal".to_string(),
+                phase: Phase::DirTraversal,
+                detail: "fail-closed: directory traversal pattern set failed to compile at startup".to_string(),
+            });
+        };
+
         // Scan path / query / cookie / body plus curated headers, in raw and
         // (recursively) decoded forms — shared with the other content checkers.
         for (location, value) in request_targets(ctx) {
             if value.is_empty() {
                 continue;
             }
-            let matches = TRAVERSAL_SET.matches(&value);
+            let matches = set.matches(&value);
             if matches.matched_any() {
                 let idx = matches.iter().next().unwrap_or(0);
                 let desc = TRAVERSAL_DESCS.get(idx).copied().unwrap_or("path traversal");
