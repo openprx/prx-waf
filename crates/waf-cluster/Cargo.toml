@@ -28,6 +28,9 @@ tracing = { workspace = true }
 # Error handling — already in workspace
 anyhow = { workspace = true }
 
+# Async traits — data-plane sync hooks (RuleReloader / ApiForwardHandler)
+async-trait = { workspace = true }
+
 # Crypto — already in workspace
 aes-gcm  = { workspace = true }
 sha2     = { workspace = true }

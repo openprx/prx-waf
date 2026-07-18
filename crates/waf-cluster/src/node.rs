@@ -8,15 +8,25 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use parking_lot::Mutex as ParkingMutex;
+use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
+use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use waf_common::config::{ClusterConfig, NodeRole};
 
+use waf_engine::{Rule, RuleRegistry, RuleReloader};
+
+use crate::cluster_forward::PendingForwards;
 use crate::election::ElectionManager;
 use crate::health::HeartbeatTracker;
-use crate::protocol::ClusterMessage;
+use crate::protocol::{ChangeOp, ClusterMessage, ConfigSync, RuleChange, RuleSyncResponse, SyncType};
+use crate::sync::config::ConfigSyncer;
+use crate::sync::rules::RuleChangelog;
+use crate::sync::{ApiForwardHandler, NoopRuleReloader};
+
+/// Number of recent rule changes the main node retains for incremental sync.
+const RULE_CHANGELOG_CAPACITY: usize = 1_024;
 
 /// Whether this node has a live database connection or must forward writes.
 #[derive(Debug, Clone)]
@@ -59,6 +69,30 @@ pub struct NodeState {
     pub ca_key_pem: ParkingMutex<Option<String>>,
     /// AES-GCM encrypted CA private key stored by worker nodes for failover.
     pub ca_key_encrypted: ParkingMutex<Option<Vec<u8>>>,
+    // ── Data-plane synchronisation ────────────────────────────────────────────
+    /// Shared rule registry that synced rules are applied into (worker side) and
+    /// served from (main side). Behind an `Arc<RwLock>` so a hot-reload swap is
+    /// visible to any data-plane reader holding a clone.
+    pub rule_registry: Arc<ParkingRwLock<RuleRegistry>>,
+    /// Ring buffer of recent rule changes maintained by the main node so workers
+    /// can be answered with an incremental delta instead of a full snapshot.
+    pub rule_changelog: TokioMutex<RuleChangelog>,
+    /// Config version follower (worker) / builder (main).
+    pub config_syncer: TokioMutex<ConfigSyncer>,
+    /// Latest config the main advertises to workers. `None` until set.
+    config_broadcast: ParkingMutex<Option<ConfigSync>>,
+    /// In-flight API write forwards awaiting a response (worker side).
+    pub pending_forwards: PendingForwards,
+    /// Cryptographically authenticated identity of the current cluster Main,
+    /// learned from an accepted `JoinResponse` or an authenticated
+    /// `ElectionResult`. Rule/config pushes are accepted only from this identity
+    /// (H-9). `None` until the node has joined / seen an election result.
+    main_node_id: RwLock<Option<String>>,
+    /// Hook fired after synced rules are applied. Defaults to a no-op; the data
+    /// plane (`WafEngine`) is attached via [`NodeState::attach_rule_reloader`].
+    rule_reloader: ParkingMutex<Arc<dyn RuleReloader>>,
+    /// Executor for forwarded API writes (main side). `None` until attached.
+    api_forward_handler: ParkingMutex<Option<Arc<dyn ApiForwardHandler>>>,
 }
 
 impl NodeState {
@@ -93,6 +127,8 @@ impl NodeState {
 
         info!(node_id = %node_id, role = ?initial_role, "Cluster node initialized");
 
+        let node_id_for_sync = node_id.clone();
+
         Ok(Self {
             node_id,
             role: RwLock::new(initial_role),
@@ -107,6 +143,14 @@ impl NodeState {
             peer_channels: ParkingMutex::new(Vec::new()),
             ca_key_pem: ParkingMutex::new(None),
             ca_key_encrypted: ParkingMutex::new(None),
+            rule_registry: Arc::new(ParkingRwLock::new(RuleRegistry::new())),
+            rule_changelog: TokioMutex::new(RuleChangelog::new(RULE_CHANGELOG_CAPACITY)),
+            config_syncer: TokioMutex::new(ConfigSyncer::new(node_id_for_sync)),
+            config_broadcast: ParkingMutex::new(None),
+            pending_forwards: PendingForwards::new(),
+            main_node_id: RwLock::new(None),
+            rule_reloader: ParkingMutex::new(Arc::new(NoopRuleReloader)),
+            api_forward_handler: ParkingMutex::new(None),
         })
     }
 
@@ -268,6 +312,101 @@ impl NodeState {
         let mut cv = self.config_version.write().await;
         *cv = version;
         version
+    }
+
+    // ── Data-plane synchronisation ────────────────────────────────────────────
+
+    /// Attach the data-plane rule reloader (the running `WafEngine`).
+    ///
+    /// Called by the cluster↔engine wiring in `main.rs`. Until attached, applied
+    /// rule syncs land in [`Self::rule_registry`] with a no-op engine hook.
+    pub fn attach_rule_reloader(&self, reloader: Arc<dyn RuleReloader>) {
+        *self.rule_reloader.lock() = reloader;
+    }
+
+    /// Clone the currently attached rule reloader.
+    pub fn rule_reloader(&self) -> Arc<dyn RuleReloader> {
+        Arc::clone(&self.rule_reloader.lock())
+    }
+
+    /// Attach the handler that executes forwarded API writes on the main node.
+    pub fn attach_api_forward_handler(&self, handler: Arc<dyn ApiForwardHandler>) {
+        *self.api_forward_handler.lock() = Some(handler);
+    }
+
+    /// Clone the currently attached API forward handler, if any.
+    pub fn api_forward_handler(&self) -> Option<Arc<dyn ApiForwardHandler>> {
+        self.api_forward_handler.lock().clone()
+    }
+
+    /// Record the cryptographically authenticated identity of the current Main.
+    ///
+    /// The caller must have already verified this identity against the peer's
+    /// mTLS certificate (H-9) — via an accepted `JoinResponse` whose
+    /// `main_node_id` matched the peer, or an `ElectionResult` whose `elected_id`
+    /// matched the peer.
+    pub async fn set_main_node_id(&self, id: String) {
+        let mut guard = self.main_node_id.write().await;
+        if guard.as_deref() != Some(id.as_str()) {
+            info!(main = %id, "Recorded authenticated cluster Main identity");
+        }
+        *guard = Some(id);
+    }
+
+    /// Returns `true` when `id` is the recorded authenticated Main identity.
+    ///
+    /// Used to gate acceptance of rule/config pushes so a worker only ever
+    /// applies rule state pushed by the real Main (H-9).
+    pub async fn is_current_main(&self, id: &str) -> bool {
+        self.main_node_id.read().await.as_deref() == Some(id)
+    }
+
+    /// Set the config payload the main advertises to workers.
+    pub fn set_config_broadcast(&self, sync: ConfigSync) {
+        *self.config_broadcast.lock() = Some(sync);
+    }
+
+    /// Clone the config payload the main currently advertises, if any.
+    pub fn config_broadcast(&self) -> Option<ConfigSync> {
+        self.config_broadcast.lock().clone()
+    }
+
+    /// Record an authoritative rule change on the main node.
+    ///
+    /// Updates the shared registry, appends the change to the changelog (so
+    /// workers can be answered with an incremental delta), bumps `rules_version`,
+    /// and broadcasts an incremental push to any dialed peers. `rule` is `None`
+    /// for a delete.
+    pub async fn record_rule_change(&self, op: ChangeOp, rule_id: String, rule: Option<Rule>) {
+        {
+            let mut reg = self.rule_registry.write();
+            match op {
+                ChangeOp::Delete => {
+                    reg.remove(&rule_id);
+                }
+                ChangeOp::Upsert => {
+                    if let Some(r) = rule.clone() {
+                        reg.insert(r);
+                    }
+                }
+            }
+        }
+
+        let version = {
+            let mut changelog = self.rule_changelog.lock().await;
+            changelog.record_change(op, rule_id.clone(), rule.as_ref());
+            changelog.current_version()
+        };
+        self.set_rules_version(version).await;
+
+        let rule_json = rule.as_ref().and_then(|r| serde_json::to_value(r).ok());
+        let push = ClusterMessage::RuleSyncResponse(RuleSyncResponse {
+            version,
+            sync_type: SyncType::Incremental,
+            changes: vec![RuleChange { op, rule_id, rule_json }],
+            snapshot_lz4: Vec::new(),
+        });
+        self.broadcast(&push);
     }
 }
 
