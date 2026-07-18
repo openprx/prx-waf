@@ -128,7 +128,42 @@ impl ProxyHttp for WafProxy {
         GatewayCtx::default()
     }
 
-    async fn upstream_peer(&self, session: &mut Session, ctx: &mut GatewayCtx) -> pingora_core::Result<Box<HttpPeer>> {
+    /// Select the upstream peer.
+    ///
+    /// Host routing, site-status checks and WAF header inspection all happen in
+    /// [`request_filter`] (which runs *before* this stage in Pingora's fixed
+    /// phase order).  By the time we get here `ctx.host_config` is guaranteed to
+    /// be populated for any request that was allowed through, so we simply
+    /// rebuild the peer from it.
+    async fn upstream_peer(&self, _session: &mut Session, ctx: &mut GatewayCtx) -> pingora_core::Result<Box<HttpPeer>> {
+        let host_config = ctx.host_config.as_ref().ok_or_else(|| {
+            pingora_core::Error::explain(
+                pingora_core::ErrorType::ConnectProxyFailure,
+                "internal: upstream_peer reached without a resolved host",
+            )
+        })?;
+
+        let upstream_addr = format!("{}:{}", host_config.remote_host, host_config.remote_port);
+        let use_tls = host_config.ssl;
+
+        info!("Proxying {} → {}", host_config.host, upstream_addr);
+
+        let peer = HttpPeer::new(&upstream_addr, use_tls, host_config.remote_host.clone());
+        Ok(Box::new(peer))
+    }
+
+    async fn request_filter(&self, session: &mut Session, ctx: &mut GatewayCtx) -> pingora_core::Result<bool> {
+        // ── Health check endpoint (host-independent) ──────────────────────────
+        let is_health = {
+            let head = session.req_header();
+            head.method.as_str() == "GET" && head.uri.path() == "/health"
+        };
+        if is_health {
+            let _ = session.respond_error(200).await;
+            return Ok(true);
+        }
+
+        // ── Host routing (moved here from upstream_peer, C-1) ─────────────────
         let host_header = session
             .get_header("host")
             .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
@@ -137,62 +172,52 @@ impl ProxyHttp for WafProxy {
 
         debug!("Routing request for host: {}", host_header);
 
-        let host_config = self.router.resolve(&host_header).ok_or_else(|| {
-            pingora_core::Error::explain(
-                pingora_core::ErrorType::ConnectProxyFailure,
-                format!("No route found for host: {host_header}"),
-            )
-        })?;
-
-        // Check if the site is started
-        if !host_config.start_status {
-            return Err(pingora_core::Error::explain(
-                pingora_core::ErrorType::ConnectProxyFailure,
-                "Site is closed",
-            ));
-        }
-
-        let upstream_addr = format!("{}:{}", host_config.remote_host, host_config.remote_port);
-        let use_tls = host_config.ssl;
-
-        ctx.upstream_addr = Some(upstream_addr.clone());
-        ctx.host_config = Some(Arc::clone(&host_config));
-
-        let request_ctx = self.build_request_ctx(session, Arc::clone(&host_config));
-        ctx.request_ctx = Some(request_ctx);
-
-        info!("Proxying {} → {}", host_header, upstream_addr);
-
-        let peer = HttpPeer::new(&upstream_addr, use_tls, host_config.remote_host.clone());
-        Ok(Box::new(peer))
-    }
-
-    async fn request_filter(&self, session: &mut Session, ctx: &mut GatewayCtx) -> pingora_core::Result<bool> {
-        let mut request_ctx = match &ctx.request_ctx {
-            Some(c) => c.clone(),
-            None => return Ok(false),
+        let Some(host_config) = self.router.resolve(&host_header) else {
+            // Unknown host: previously fell through to a pass-through; now we
+            // respond 404 so unrouted traffic is never forwarded / inspected.
+            warn!("No route found for host: {host_header}");
+            let response = pingora_http::ResponseHeader::build(404, None)?;
+            session.write_response_header(Box::new(response), false).await?;
+            session
+                .write_response_body(Some(Bytes::from_static(b"Not Found")), true)
+                .await?;
+            return Ok(true);
         };
 
-        // Handle health check endpoint
-        if request_ctx.path == "/health" && request_ctx.method == "GET" {
-            let _ = session.respond_error(200).await;
+        // Site administratively closed → 503 (previously an opaque proxy error).
+        if !host_config.start_status {
+            warn!("Site closed for host: {host_header}");
+            let response = pingora_http::ResponseHeader::build(503, None)?;
+            session.write_response_header(Box::new(response), false).await?;
+            session
+                .write_response_body(Some(Bytes::from_static(b"Service Unavailable")), true)
+                .await?;
             return Ok(true);
         }
 
-        // Run WAF inspection (ctx is &mut so the engine can enrich it with GeoIP)
+        let upstream_addr = format!("{}:{}", host_config.remote_host, host_config.remote_port);
+        ctx.upstream_addr = Some(upstream_addr);
+        ctx.host_config = Some(Arc::clone(&host_config));
+
+        // ── WAF header-phase inspection ───────────────────────────────────────
+        let mut request_ctx = self.build_request_ctx(session, host_config);
+        let client_ip = request_ctx.client_ip;
+        let path = request_ctx.path.clone();
+        let host = request_ctx.host.clone();
+
+        // ctx is &mut so the engine can enrich it with GeoIP
         let decision = self.engine.inspect(&mut request_ctx).await;
+
+        // Persist the (GeoIP-enriched) request context for the body phase and logging.
+        ctx.request_ctx = Some(request_ctx);
 
         if !decision.is_allowed() {
             match &decision.action {
                 WafAction::Block { status, body } => {
-                    warn!(
-                        "WAF blocked request: ip={} path={} host={}",
-                        request_ctx.client_ip, request_ctx.path, request_ctx.host,
-                    );
+                    warn!("WAF blocked request: ip={client_ip} path={path} host={host}");
                     let status_code = *status;
                     let body_str = body.clone().unwrap_or_else(|| "Access Denied".to_string());
 
-                    // Build a simple HTTP 403 response
                     let response = pingora_http::ResponseHeader::build(status_code, None)?;
                     session.write_response_header(Box::new(response), false).await?;
                     let body_bytes = Bytes::from(body_str);
@@ -238,6 +263,15 @@ impl ProxyHttp for WafProxy {
                 if let Some(slice) = chunk.get(..take) {
                     ctx.body_buf.extend_from_slice(slice);
                 }
+                if take < chunk.len() {
+                    debug!(
+                        "Request body exceeds {BODY_PREVIEW_LIMIT} byte inspection limit; only the first {BODY_PREVIEW_LIMIT} bytes are scanned"
+                    );
+                }
+            } else {
+                debug!(
+                    "Request body exceeds {BODY_PREVIEW_LIMIT} byte inspection limit; only the first {BODY_PREVIEW_LIMIT} bytes are scanned"
+                );
             }
         }
 
@@ -258,8 +292,9 @@ impl ProxyHttp for WafProxy {
 
         request_ctx.body_preview = Bytes::copy_from_slice(&ctx.body_buf);
 
-        // Run WAF inspection with body content
-        let decision = self.engine.inspect(&mut request_ctx).await;
+        // Run body-phase WAF inspection (content detectors only — CC / IP / URL
+        // / geo / bouncer / community already ran once in the header phase).
+        let decision = self.engine.inspect_body(&mut request_ctx).await;
 
         if !decision.is_allowed() {
             match &decision.action {

@@ -106,13 +106,21 @@ impl GeoCheck {
                     }
                 }
                 GeoRuleMode::AllowOnly => {
-                    if !matched && (!geo.country.is_empty() || !geo.iso_code.is_empty()) {
+                    // M-10: fail closed. An IP that is not in the allowlist is
+                    // blocked — including IPs that could not be geolocated at all
+                    // (empty country/iso), which previously slipped through.
+                    if !matched {
+                        let reason = if geo.country.is_empty() && geo.iso_code.is_empty() {
+                            "IP could not be geolocated (fail-closed)"
+                        } else {
+                            "not in allowed list"
+                        };
                         return Some(DetectionResult {
                             rule_id: Some(rule.id.clone()),
                             rule_name: rule.name.clone(),
                             phase: Phase::GeoIp,
                             detail: format!(
-                                "Blocked by geo allowlist '{}': country='{}' iso='{}' not in allowed list",
+                                "Blocked by geo allowlist '{}': country='{}' iso='{}' {reason}",
                                 rule.name, geo.country, geo.iso_code
                             ),
                         });
@@ -149,10 +157,10 @@ impl Check for GeoCheck {
         let Some(geo) = &ctx.geo else {
             return None;
         };
-        // No useful info yet (e.g. private IP not in xdb)
-        if geo.country.is_empty() && geo.iso_code.is_empty() {
-            return None;
-        }
+        // NB: we no longer early-return when country/iso are empty. An
+        // unlocatable IP must still be evaluated so `AllowOnly` rules can fail
+        // closed (M-10). `Block` rules simply do not match an empty geo, so
+        // this does not change blocklist behaviour.
         self.eval_rules(&ctx.host_config.code, geo)
     }
 }
@@ -213,6 +221,46 @@ mod tests {
 
         let ctx2 = make_ctx("US", "United States");
         assert!(check.check(&ctx2).is_none());
+    }
+
+    #[test]
+    fn allow_only_blocks_unlocatable_ip() {
+        // M-10: AllowOnly must fail closed for an IP that cannot be geolocated.
+        let check = GeoCheck::new();
+        check.load_rules(
+            "test",
+            vec![GeoRule {
+                id: "GEO-ALLOW".into(),
+                name: "Allow US only".into(),
+                mode: GeoRuleMode::AllowOnly,
+                iso_codes: ["US".to_string()].into(),
+                countries: HashSet::new(),
+            }],
+        );
+
+        // Allowed country passes.
+        assert!(check.check(&make_ctx("US", "United States")).is_none());
+        // Other country blocked.
+        assert!(check.check(&make_ctx("CN", "China")).is_some());
+        // Unlocatable IP (empty geo) now blocked instead of slipping through.
+        assert!(check.check(&make_ctx("", "")).is_some());
+    }
+
+    #[test]
+    fn block_mode_ignores_unlocatable_ip() {
+        // A Block rule must not fire on an unlocatable IP.
+        let check = GeoCheck::new();
+        check.load_rules(
+            "test",
+            vec![GeoRule {
+                id: "GEO-BLOCK".into(),
+                name: "Block KP".into(),
+                mode: GeoRuleMode::Block,
+                iso_codes: ["KP".to_string()].into(),
+                countries: HashSet::new(),
+            }],
+        );
+        assert!(check.check(&make_ctx("", "")).is_none());
     }
 
     #[test]

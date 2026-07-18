@@ -4,6 +4,7 @@ use tracing::{debug, info};
 use waf_common::{DetectionResult, Phase, RequestCtx, WafAction, WafDecision};
 use waf_storage::Database;
 
+use crate::checks::url_decode;
 use crate::rules::{IpRuleSet, UrlMatchType, UrlRule, UrlRuleSet};
 
 /// In-memory rule store backed by `PostgreSQL`
@@ -236,11 +237,15 @@ pub fn check_ip_blacklist(ctx: &RequestCtx, store: &RuleStore) -> WafDecision {
 }
 
 /// Run Phase 3 WAF check: URL whitelist
-/// If the URL is whitelisted, allow immediately
+/// If the URL is whitelisted, allow immediately.
+///
+/// Matching uses the **decoded** path (M-6) so an encoded request such as
+/// `/%61dmin` is whitelisted consistently with its canonical form `/admin`.
 pub fn check_url_whitelist(ctx: &RequestCtx, store: &RuleStore) -> Option<WafDecision> {
     let host_code = &ctx.host_config.code;
+    let decoded = url_decode(&ctx.path);
 
-    if let Some(rule_id) = store.allow_urls.matches(host_code, &ctx.path) {
+    if let Some(rule_id) = store.allow_urls.matches(host_code, &decoded) {
         debug!("URL {} whitelisted for host {}", ctx.path, host_code);
         return Some(WafDecision {
             action: WafAction::Allow,
@@ -256,11 +261,24 @@ pub fn check_url_whitelist(ctx: &RequestCtx, store: &RuleStore) -> Option<WafDec
     None
 }
 
-/// Run Phase 4 WAF check: URL blacklist
+/// Run Phase 4 WAF check: URL blacklist.
+///
+/// Matching is attempted against both the **raw** and the **decoded** path
+/// (M-6) so encoding tricks such as `/%61dmin` cannot bypass a `/admin`
+/// blacklist rule.
 pub fn check_url_blacklist(ctx: &RequestCtx, store: &RuleStore) -> WafDecision {
     let host_code = &ctx.host_config.code;
 
-    if let Some(rule_id) = store.block_urls.matches(host_code, &ctx.path) {
+    let decoded = url_decode(&ctx.path);
+    let matched = store.block_urls.matches(host_code, &ctx.path).or_else(|| {
+        if decoded == ctx.path {
+            None
+        } else {
+            store.block_urls.matches(host_code, &decoded)
+        }
+    });
+
+    if let Some(rule_id) = matched {
         debug!("URL {} blocked for host {}", ctx.path, host_code);
         return WafDecision::block(
             403,
