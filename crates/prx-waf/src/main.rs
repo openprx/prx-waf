@@ -1102,19 +1102,22 @@ fn app_config_to_crowdsec(config: &AppConfig) -> CrowdSecConfig {
         _ => CrowdSecMode::Bouncer,
     };
 
-    let fallback = match config.crowdsec.fallback_action.as_str() {
+    let parse_fallback = |value: &str| match value {
         "block" => FallbackAction::Block,
         "log" => FallbackAction::Log,
         _ => FallbackAction::Allow,
     };
 
+    let fallback = parse_fallback(config.crowdsec.fallback_action.as_str());
+
     let appsec = config.crowdsec.appsec_endpoint.as_ref().map(|endpoint| AppSecConfig {
         endpoint: endpoint.clone(),
         api_key: config.crowdsec.appsec_key.clone().unwrap_or_default(),
         timeout_ms: config.crowdsec.appsec_timeout_ms,
-        // H-4: honour the configured CrowdSec fallback_action instead of a
-        // hard-coded fail-open. AppSec reuses the same fallback_action value.
-        failure_action: fallback.clone(),
+        // H-4: AppSec has its own dedicated failure_action, configured
+        // independently of the LAPI bouncer's fallback_action. Defaults to
+        // Allow (fail open) for backward compatibility.
+        failure_action: parse_fallback(config.crowdsec.appsec_failure_action.as_str()),
     });
 
     let pusher = config
@@ -1635,4 +1638,48 @@ async fn setup_acme(config: &AppConfig, db: Arc<Database>, router: Arc<HostRoute
     }
 
     challenges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use waf_engine::crowdsec::config::FallbackAction;
+
+    #[test]
+    fn appsec_failure_action_is_independent_of_fallback_action() {
+        // Bouncer fails open, but AppSec is configured to fail closed. The two
+        // must map to their own actions (H-4): AppSec no longer reuses the
+        // top-level fallback_action.
+        let mut config = AppConfig::default();
+        config.crowdsec.fallback_action = "allow".to_string();
+        config.crowdsec.appsec_endpoint = Some("http://127.0.0.1:7422".to_string());
+        config.crowdsec.appsec_failure_action = "block".to_string();
+
+        let cs = app_config_to_crowdsec(&config);
+        assert_eq!(cs.fallback_action, FallbackAction::Allow);
+        let appsec = cs.appsec.expect("appsec config should be present");
+        assert_eq!(
+            appsec.failure_action,
+            FallbackAction::Block,
+            "AppSec failure_action must come from its own field, not fallback_action"
+        );
+    }
+
+    #[test]
+    fn appsec_failure_action_defaults_to_allow() {
+        // Backward compatibility: absent an explicit value, the default
+        // ("allow") preserves the pre-H-4 fail-open behaviour.
+        let mut config = AppConfig::default();
+        config.crowdsec.fallback_action = "block".to_string();
+        config.crowdsec.appsec_endpoint = Some("http://127.0.0.1:7422".to_string());
+        // appsec_failure_action left at its default.
+
+        let cs = app_config_to_crowdsec(&config);
+        let appsec = cs.appsec.expect("appsec config should be present");
+        assert_eq!(
+            appsec.failure_action,
+            FallbackAction::Allow,
+            "default AppSec failure_action must remain Allow regardless of fallback_action"
+        );
+    }
 }

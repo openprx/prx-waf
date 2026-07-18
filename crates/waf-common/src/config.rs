@@ -176,6 +176,11 @@ pub struct CrowdSecConfig {
     pub appsec_key: Option<String>,
     #[serde(default = "default_appsec_timeout")]
     pub appsec_timeout_ms: u64,
+    /// Action when the `AppSec` engine is unavailable. Independent from the
+    /// top-level `fallback_action` (which governs the LAPI bouncer). Defaults
+    /// to "allow" (fail open) for backward compatibility.
+    #[serde(default = "default_appsec_failure_action")]
+    pub appsec_failure_action: String,
     pub pusher_login: Option<String>,
     pub pusher_password: Option<String>,
 }
@@ -195,6 +200,7 @@ impl Default for CrowdSecConfig {
             appsec_endpoint: None,
             appsec_key: None,
             appsec_timeout_ms: default_appsec_timeout(),
+            appsec_failure_action: default_appsec_failure_action(),
             pusher_login: None,
             pusher_password: None,
         }
@@ -205,6 +211,9 @@ const fn default_cs_update_secs() -> u64 {
     10
 }
 fn default_cs_fallback() -> String {
+    "allow".to_string()
+}
+fn default_appsec_failure_action() -> String {
     "allow".to_string()
 }
 const fn default_appsec_timeout() -> u64 {

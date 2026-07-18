@@ -25,8 +25,12 @@ const NONCE_LEN: usize = 12;
 /// New-format header length: magic/version (5) + salt (16) + nonce (12).
 const FIELD_HEADER_LEN: usize = FIELD_MAGIC_V1.len() + SALT_LEN + NONCE_LEN;
 
-/// Minimum passphrase length accepted for encryption at rest (M-12).
-pub const MIN_PASSPHRASE_LEN: usize = 16;
+/// Minimum `MASTER_KEY` length accepted for encryption at rest.
+///
+/// Raised from 16 to 32 characters (BUG-2): the master key protects all
+/// encrypted-at-rest fields, so it warrants a stronger floor than the cluster
+/// CA passphrase (which keeps its own 16-char minimum in `waf-cluster`).
+pub const MASTER_KEY_MIN_LEN: usize = 32;
 
 /// Derive a 32-byte value from an arbitrary master password string via SHA-256.
 ///
@@ -45,17 +49,25 @@ pub fn derive_key(master_password: &str) -> [u8; 32] {
 /// Load master key from `MASTER_KEY` env var.
 ///
 /// Returns an error if the variable is unset or shorter than
-/// [`MIN_PASSPHRASE_LEN`]. Operators **must** set `MASTER_KEY` to a strong
+/// [`MASTER_KEY_MIN_LEN`]. Operators **must** set `MASTER_KEY` to a strong
 /// random value in production.
 pub fn master_key() -> anyhow::Result<[u8; 32]> {
-    match std::env::var("MASTER_KEY") {
-        Ok(s) if s.len() >= MIN_PASSPHRASE_LEN => Ok(derive_key(&s)),
-        Ok(_) => Err(anyhow::anyhow!(
-            "MASTER_KEY is too short: set at least {MIN_PASSPHRASE_LEN} characters for encryption at rest."
+    master_key_from(std::env::var("MASTER_KEY").ok().as_deref())
+}
+
+/// Validate and derive a master key from a raw `MASTER_KEY` value.
+///
+/// Split out from [`master_key`] so the length policy is testable without
+/// mutating process-global environment state.
+fn master_key_from(value: Option<&str>) -> anyhow::Result<[u8; 32]> {
+    match value {
+        Some(s) if s.len() >= MASTER_KEY_MIN_LEN => Ok(derive_key(s)),
+        Some(_) => Err(anyhow::anyhow!(
+            "MASTER_KEY is too short: set at least {MASTER_KEY_MIN_LEN} characters for encryption at rest."
         )),
-        _ => Err(anyhow::anyhow!(
+        None => Err(anyhow::anyhow!(
             "MASTER_KEY environment variable is not set. \
-             Set a strong random value (>= {MIN_PASSPHRASE_LEN} chars) for encryption at rest."
+             Set a strong random value (>= {MASTER_KEY_MIN_LEN} chars) for encryption at rest."
         )),
     }
 }
@@ -188,5 +200,24 @@ mod tests {
         let a = encrypt_field(&key, "same").unwrap();
         let b = encrypt_field(&key, "same").unwrap();
         assert_ne!(a, b, "random salt+nonce must randomise ciphertexts");
+    }
+
+    #[test]
+    fn master_key_enforces_min_length() {
+        assert_eq!(MASTER_KEY_MIN_LEN, 32, "BUG-2: MASTER_KEY floor must be 32");
+
+        let too_short = "a".repeat(MASTER_KEY_MIN_LEN - 1);
+        assert!(
+            master_key_from(Some(&too_short)).is_err(),
+            "a 31-char MASTER_KEY must be rejected"
+        );
+
+        let at_min = "a".repeat(MASTER_KEY_MIN_LEN);
+        assert!(
+            master_key_from(Some(&at_min)).is_ok(),
+            "a 32-char MASTER_KEY must be accepted"
+        );
+
+        assert!(master_key_from(None).is_err(), "an unset MASTER_KEY must be rejected");
     }
 }
