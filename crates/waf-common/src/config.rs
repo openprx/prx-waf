@@ -357,7 +357,12 @@ pub struct SecurityConfig {
     pub admin_ip_allowlist: Vec<String>,
     /// Maximum request body size in bytes (default 10 MB)
     pub max_request_body_bytes: u64,
-    /// API rate limit (requests per second per IP, 0 = disabled)
+    /// Admin-API rate limit (requests per second per IP, 0 = disabled).
+    ///
+    /// Default: 100 req/s per IP (token bucket, burst = 5x = 500). This only
+    /// governs the management API, never proxied traffic, so a generous cap
+    /// leaves normal admin-UI usage untouched while blunting brute-force /
+    /// scripted abuse of the admin surface. Set to 0 to disable.
     pub api_rate_limit_rps: u32,
     /// Allowed CORS origins for admin API (empty = all)
     #[serde(default)]
@@ -369,7 +374,9 @@ impl Default for SecurityConfig {
         Self {
             admin_ip_allowlist: Vec::new(),
             max_request_body_bytes: 10 * 1024 * 1024, // 10 MB
-            api_rate_limit_rps: 0,
+            // Generous per-IP admin-API cap (see field docs). Protects the
+            // management surface without disrupting legitimate admin usage.
+            api_rate_limit_rps: 100,
             cors_origins: Vec::new(),
         }
     }
@@ -412,6 +419,14 @@ impl Default for GeoIpAutoUpdateConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoIpConfig {
     /// Enable `GeoIP` lookups on every request.
+    ///
+    /// Default: `true`. `GeoIP` is a pure-detection feature that degrades
+    /// gracefully — if the xdb database files are missing, `GeoIpService::init`
+    /// fails, the failure is logged with `warn!`, and the pipeline continues
+    /// with `ctx.geo = None` (the geo check then no-ops: it neither blocks nor
+    /// panics). It also has no effect until country/region rules are configured,
+    /// so enabling it by default is safe for a zero-config single-node install.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Path to the ip2region IPv4 xdb file (default: `data/ip2region_v4.xdb`).
     #[serde(default = "default_ipv4_xdb")]
@@ -440,7 +455,9 @@ fn default_geoip_cache_policy() -> String {
 impl Default for GeoIpConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // Enabled by default; degrades gracefully when the xdb files are
+            // absent (see the `enabled` field docs) so it never blocks startup.
+            enabled: true,
             ipv4_xdb_path: default_ipv4_xdb(),
             ipv6_xdb_path: default_ipv6_xdb(),
             cache_policy: default_geoip_cache_policy(),

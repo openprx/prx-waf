@@ -210,6 +210,13 @@ pub struct DefenseConfig {
     pub rce: bool,
     pub sensitive: bool,
     pub dir_traversal: bool,
+    /// Enable the OWASP Core Rule Set check. Default: `true` at paranoia 1.
+    ///
+    /// Low false-positive: paranoia 1 only, and it degrades gracefully — if the
+    /// `rules/owasp-crs/` directory is absent, a minimal embedded rule set is
+    /// used (`OWASPCheck::new` logs a `warn!`); if even that yields no rules the
+    /// check simply iterates an empty set and no-ops. Never blocks legitimate
+    /// traffic on a fresh install.
     pub owasp_set: bool,
     /// CC / rate-limit protection enabled
     #[serde(default = "bool_true")]
@@ -260,7 +267,9 @@ impl Default for DefenseConfig {
             rce: true,
             sensitive: true,
             dir_traversal: true,
-            owasp_set: false,
+            // OWASP CRS on by default (paranoia 1). Safe: embedded fallback
+            // rules + graceful no-op when no rules load (see field docs).
+            owasp_set: true,
             cc: true,
             cc_rps: default_cc_rps(),
             cc_burst: default_cc_burst(),
