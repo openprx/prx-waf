@@ -37,7 +37,7 @@ pub async fn run_decision_sync(
     }
 
     let update_interval = Duration::from_secs(config.update_frequency_secs.max(5));
-    let cleanup_interval = Duration::from_secs(300); // 5 minutes
+    let cleanup_interval = Duration::from_mins(5);
 
     let mut last_cleanup = tokio::time::Instant::now();
 

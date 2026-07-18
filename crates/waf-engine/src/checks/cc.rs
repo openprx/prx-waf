@@ -11,10 +11,10 @@ use super::Check;
 const MAX_ENTRIES: usize = 100_000;
 
 /// Entries idle for longer than this duration are eligible for eviction.
-const ENTRY_TTL: Duration = Duration::from_secs(600); // 10 minutes
+const ENTRY_TTL: Duration = Duration::from_mins(10);
 
 /// How often the background cleanup task runs.
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
+const CLEANUP_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Per-IP token bucket state.
 struct BucketState {

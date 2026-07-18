@@ -14,3 +14,4 @@ __pycache__/
 
 # Root-level tools/ was a duplicate of rules/tools/ — canonical path is rules/tools/
 /tools/
+.claude/worktrees/

@@ -183,7 +183,7 @@ impl DecisionCache {
             return Instant::now() + Duration::from_secs(secs);
         }
         // Default fallback: 4 hours
-        Instant::now() + Duration::from_secs(4 * 3600)
+        Instant::now() + Duration::from_hours(4)
     }
 
     fn insert_decision(&self, decision: &Decision, cached: CachedDecision) {
