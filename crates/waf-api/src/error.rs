@@ -29,13 +29,22 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // 4xx client errors carry a specific, safe message. 5xx errors log the
+        // detail server-side and return only a generic message to the client to
+        // avoid leaking internal/database details.
         let (status, message) = match &self {
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             Self::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
-            Self::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            Self::Storage(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Self::Internal(e) => {
+                tracing::error!(error = %e, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_owned())
+            }
+            Self::Storage(e) => {
+                tracing::error!(error = %e, "storage error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_owned())
+            }
         };
 
         let body = Json(json!({ "error": message }));

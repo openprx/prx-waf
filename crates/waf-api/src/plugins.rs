@@ -16,6 +16,9 @@ use waf_storage::models::CreateWasmPlugin;
 
 use crate::state::AppState;
 
+/// Maximum accepted size for an uploaded WASM plugin binary (16 MiB).
+pub const WASM_UPLOAD_MAX: usize = 16 * 1024 * 1024;
+
 /// GET /api/plugins — list all plugins
 pub async fn list_plugins(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.db.list_wasm_plugins().await {
@@ -40,11 +43,14 @@ pub async fn list_plugins(State(state): State<Arc<AppState>>) -> impl IntoRespon
                 .collect();
             (StatusCode::OK, Json(json!({ "plugins": list }))).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to list plugins");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Internal server error" })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -78,11 +84,30 @@ pub async fn upload_plugin(State(state): State<Arc<AppState>>, mut multipart: Mu
                 author = Some(field.text().await.unwrap_or_default());
             }
             Some("file") => match field.bytes().await {
-                Ok(b) => wasm_bytes = Some(b.to_vec()),
+                Ok(b) => {
+                    if b.len() > WASM_UPLOAD_MAX {
+                        return (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            Json(json!({ "error": "WASM file exceeds 16 MiB limit" })),
+                        )
+                            .into_response();
+                    }
+                    wasm_bytes = Some(b.to_vec());
+                }
                 Err(e) => {
+                    // Body-limit rejections surface here as a 413; other read
+                    // failures are client errors. Distinguish by HTTP status.
+                    let status = e.status();
+                    if status == StatusCode::PAYLOAD_TOO_LARGE {
+                        return (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            Json(json!({ "error": "WASM file exceeds 16 MiB limit" })),
+                        )
+                            .into_response();
+                    }
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": format!("failed to read file: {e}") })),
+                        Json(json!({ "error": "failed to read uploaded file" })),
                     )
                         .into_response();
                 }
@@ -130,9 +155,10 @@ pub async fn upload_plugin(State(state): State<Arc<AppState>>, mut multipart: Mu
     let row = match state.db.create_wasm_plugin(req).await {
         Ok(r) => r,
         Err(e) => {
+            tracing::error!(error = %e, "failed to persist plugin");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
+                Json(json!({ "error": "Internal server error" })),
             )
                 .into_response();
         }
@@ -175,11 +201,14 @@ pub async fn delete_plugin(State(state): State<Arc<AppState>>, Path(id): Path<Uu
     match state.db.delete_wasm_plugin(id).await {
         Ok(true) => (StatusCode::NO_CONTENT).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not found" }))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to delete plugin");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Internal server error" })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -198,10 +227,13 @@ async fn set_plugin_enabled(state: Arc<AppState>, id: Uuid, enabled: bool) -> im
     match state.db.set_wasm_plugin_enabled(id, enabled).await {
         Ok(true) => (StatusCode::OK, Json(json!({ "enabled": enabled }))).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not found" }))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to update plugin state");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Internal server error" })),
+            )
+                .into_response()
+        }
     }
 }
