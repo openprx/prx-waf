@@ -2,6 +2,7 @@ pub mod builtin;
 pub mod engine;
 pub mod formats;
 pub mod hot_reload;
+pub mod ip_feed;
 pub mod manager;
 pub mod registry;
 pub mod sources;
@@ -41,6 +42,32 @@ impl IpRuleSet {
             })
             .collect();
         self.entries.insert(host_code.to_string(), nets);
+    }
+
+    /// Load pre-parsed networks into a bucket, atomically replacing it.
+    ///
+    /// Like [`Self::load`] but takes already-parsed [`IpNet`] values, avoiding a
+    /// re-stringify/re-parse round-trip. Used by the IP-feed adapter, where each
+    /// bucket key is a feed name so a refresh replaces only that source.
+    pub fn load_nets(&self, host_code: &str, nets: Vec<IpNet>) {
+        self.entries.insert(host_code.to_string(), nets);
+    }
+
+    /// Return the first bucket key whose ranges contain `ip`, ignoring host
+    /// scoping.
+    ///
+    /// Whereas [`Self::matches`] is host-scoped (host bucket + global `"*"`),
+    /// this scans **every** bucket and is used for threat-intel feed sets, where
+    /// each bucket is a source name and every entry is globally applicable. The
+    /// returned key is the matching source name, enabling block-reason
+    /// traceability.
+    pub fn match_source(&self, ip: IpAddr) -> Option<String> {
+        for entry in &self.entries {
+            if entry.value().iter().any(|net| net.contains(&ip)) {
+                return Some(entry.key().clone());
+            }
+        }
+        None
     }
 
     /// Check if an IP matches any rule for a given `host_code`
