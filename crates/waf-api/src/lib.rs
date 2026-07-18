@@ -13,6 +13,7 @@ pub mod server;
 pub mod state;
 pub mod static_files;
 pub mod stats;
+pub mod totp;
 pub mod tunnels;
 pub mod websocket;
 

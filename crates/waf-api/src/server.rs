@@ -1,19 +1,20 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::{
     HeaderValue, Method,
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use axum::{
     Router, middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::auth::{login, logout, refresh_token};
+use crate::auth::{login, logout, refresh_token, totp_disable, totp_setup, totp_verify};
 use crate::cache_api::{cache_flush, cache_flush_host, cache_flush_key, cache_stats};
 use crate::cluster::{cluster_status, generate_join_token, get_cluster_node, list_cluster_nodes, remove_cluster_node};
 use crate::crowdsec::{
@@ -29,11 +30,11 @@ use crate::handlers::{
     reload_rules, update_host, upload_certificate, upsert_hotlink_config,
 };
 use crate::health::health_check;
-use crate::middleware::require_auth;
+use crate::middleware::{require_admin, require_auth};
 use crate::notifications::{
     create_notification, delete_notification, list_notifications, notification_log, test_notification,
 };
-use crate::plugins::{delete_plugin, disable_plugin, enable_plugin, list_plugins, upload_plugin};
+use crate::plugins::{WASM_UPLOAD_MAX, delete_plugin, disable_plugin, enable_plugin, list_plugins, upload_plugin};
 use crate::security::{admin_ip_check_middleware, list_audit_log, rate_limit_middleware, security_headers_middleware};
 use crate::state::AppState;
 use crate::static_files::static_handler;
@@ -43,11 +44,16 @@ use crate::websocket::{ws_events, ws_logs};
 
 /// Build the Axum router with all API routes
 pub fn build_router(state: Arc<AppState>) -> Router {
-    // Build CORS layer: use configured origin allowlist when available,
-    // otherwise fall back to permissive mode (backward compatible but insecure).
+    // Build CORS layer. When no origins are configured we do NOT broadcast an
+    // `Access-Control-Allow-Origin` header, so browsers reject cross-origin
+    // requests (secure default). Configure `security.cors_origins` to allow
+    // specific admin front-end origins.
     let cors = if state.cors_origins.is_empty() {
+        warn!(
+            "No CORS origins configured (security.cors_origins is empty); cross-origin admin API \
+             requests will be rejected. Set explicit origins to enable a browser front-end."
+        );
         CorsLayer::new()
-            .allow_origin(Any)
             .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
             .allow_headers([AUTHORIZATION, CONTENT_TYPE])
     } else {
@@ -62,135 +68,128 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             .allow_headers([AUTHORIZATION, CONTENT_TYPE])
     };
 
-    // Public routes (no JWT)
+    // Global request body size limit (protects every route from OOM uploads).
+    let global_body_limit = usize::try_from(state.security_config.max_request_body_bytes).unwrap_or(usize::MAX);
+
+    // Public routes (no JWT). Guarded by the admin IP allowlist so that even the
+    // auth endpoints are only reachable from permitted networks.
     let public_routes = Router::new()
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/refresh", post(refresh_token))
-        .route("/health", get(health_check));
+        .layer(middleware::from_fn_with_state(state.clone(), admin_ip_check_middleware));
 
-    // Protected API routes (JWT required)
-    let protected_routes = Router::new()
-        // Hosts
-        .route("/api/hosts", get(list_hosts).post(create_host))
-        .route(
-            "/api/hosts/{id}",
-            get(get_host).put(update_host).delete(delete_host),
-        )
-        // Allow IPs
-        .route("/api/allow-ips", get(list_allow_ips).post(create_allow_ip))
-        .route("/api/allow-ips/{id}", delete(delete_allow_ip))
-        // Block IPs
-        .route("/api/block-ips", get(list_block_ips).post(create_block_ip))
-        .route("/api/block-ips/{id}", delete(delete_block_ip))
-        // Allow URLs
-        .route(
-            "/api/allow-urls",
-            get(list_allow_urls).post(create_allow_url),
-        )
-        .route("/api/allow-urls/{id}", delete(delete_allow_url))
-        // Block URLs
-        .route(
-            "/api/block-urls",
-            get(list_block_urls).post(create_block_url),
-        )
-        .route("/api/block-urls/{id}", delete(delete_block_url))
-        // Attack logs
+    // Health check — intentionally NOT behind the admin IP allowlist so external
+    // load balancers / orchestrators can probe liveness.
+    let health_route = Router::new().route("/health", get(health_check));
+
+    // ── Read-only routes: any authenticated user (login required, no admin) ──────
+    let readonly_routes = Router::new()
+        .route("/api/hosts", get(list_hosts))
+        .route("/api/hosts/{id}", get(get_host))
+        .route("/api/allow-ips", get(list_allow_ips))
+        .route("/api/block-ips", get(list_block_ips))
+        .route("/api/allow-urls", get(list_allow_urls))
+        .route("/api/block-urls", get(list_block_urls))
         .route("/api/attack-logs", get(list_attack_logs))
-        // Security events
         .route("/api/security-events", get(list_security_events))
-        // System status
         .route("/api/status", get(get_status))
-        // Rule reload
-        .route("/api/reload", post(reload_rules))
-        // Phase 3: Custom rules
-        .route(
-            "/api/custom-rules",
-            get(list_custom_rules).post(create_custom_rule),
-        )
-        .route("/api/custom-rules/{id}", delete(delete_custom_rule))
-        // Phase 3: Sensitive patterns
-        .route(
-            "/api/sensitive-patterns",
-            get(list_sensitive_patterns).post(create_sensitive_pattern),
-        )
-        .route(
-            "/api/sensitive-patterns/{id}",
-            delete(delete_sensitive_pattern),
-        )
-        // Phase 3: Hotlink config
-        .route(
-            "/api/hotlink-config",
-            get(get_hotlink_config).post(upsert_hotlink_config),
-        )
-        // Phase 3: LB backends
-        .route(
-            "/api/lb-backends",
-            get(list_lb_backends).post(create_lb_backend),
-        )
-        .route("/api/lb-backends/{id}", delete(delete_lb_backend))
-        // Phase 3: Certificates
-        .route(
-            "/api/certificates",
-            get(list_certificates).post(upload_certificate),
-        )
-        .route("/api/certificates/{id}", delete(delete_certificate))
-        // Phase 4: Statistics
+        .route("/api/custom-rules", get(list_custom_rules))
+        .route("/api/sensitive-patterns", get(list_sensitive_patterns))
+        .route("/api/hotlink-config", get(get_hotlink_config))
+        .route("/api/lb-backends", get(list_lb_backends))
+        .route("/api/certificates", get(list_certificates))
         .route("/api/stats/overview", get(stats_overview))
         .route("/api/stats/timeseries", get(stats_timeseries))
         .route("/api/stats/geo", get(stats_geo))
-        // Phase 4: Notifications
-        .route(
-            "/api/notifications",
-            get(list_notifications).post(create_notification),
-        )
-        .route("/api/notifications/{id}", delete(delete_notification))
+        .route("/api/notifications", get(list_notifications))
         .route("/api/notifications/log", get(notification_log))
-        .route("/api/notifications/{id}/test", post(test_notification))
-        // Phase 5: WASM Plugins
-        .route("/api/plugins", get(list_plugins).post(upload_plugin))
-        .route("/api/plugins/{id}", delete(delete_plugin))
-        .route("/api/plugins/{id}/enable", post(enable_plugin))
-        .route("/api/plugins/{id}/disable", post(disable_plugin))
-        // Phase 5: Tunnels
-        .route("/api/tunnels", get(list_tunnels).post(create_tunnel))
-        .route("/api/tunnels/{id}", delete(delete_tunnel))
-        // Phase 5: Cache
+        .route("/api/plugins", get(list_plugins))
+        .route("/api/tunnels", get(list_tunnels))
         .route("/api/cache/stats", get(cache_stats))
-        .route("/api/cache", delete(cache_flush))
-        .route("/api/cache/host/{host}", delete(cache_flush_host))
-        .route("/api/cache/key", delete(cache_flush_key))
-        // Phase 5: Audit log
         .route("/api/audit-log", get(list_audit_log))
-        // Phase 7: Cluster
         .route("/api/cluster/status", get(cluster_status))
         .route("/api/cluster/nodes", get(list_cluster_nodes))
         .route("/api/cluster/nodes/{id}", get(get_cluster_node))
-        .route("/api/cluster/token", post(generate_join_token))
-        .route("/api/cluster/nodes/remove", post(remove_cluster_node))
-        // Phase 6: CrowdSec
         .route("/api/crowdsec/status", get(crowdsec_status))
         .route("/api/crowdsec/decisions", get(list_crowdsec_decisions))
-        .route(
-            "/api/crowdsec/decisions/{id}",
-            delete(delete_crowdsec_decision),
-        )
-        .route("/api/crowdsec/test", post(test_crowdsec_connection))
-        .route(
-            "/api/crowdsec/config",
-            get(get_crowdsec_config).put(update_crowdsec_config),
-        )
+        .route("/api/crowdsec/config", get(get_crowdsec_config))
         .route("/api/crowdsec/stats", get(crowdsec_stats))
         .route("/api/crowdsec/events", get(list_crowdsec_events))
+        // Self-service two-factor management — operates on the caller's own
+        // account (identified by the JWT subject), so it only requires login.
+        .route("/api/account/totp/setup", post(totp_setup))
+        .route("/api/account/totp/verify", post(totp_verify))
+        .route("/api/account/totp/disable", post(totp_disable));
+
+    // ── Admin-only routes: all mutations + sensitive operations ─────────────────
+    let admin_routes = Router::new()
+        // Hosts
+        .route("/api/hosts", post(create_host))
+        .route("/api/hosts/{id}", put(update_host).delete(delete_host))
+        // IP / URL lists
+        .route("/api/allow-ips", post(create_allow_ip))
+        .route("/api/allow-ips/{id}", delete(delete_allow_ip))
+        .route("/api/block-ips", post(create_block_ip))
+        .route("/api/block-ips/{id}", delete(delete_block_ip))
+        .route("/api/allow-urls", post(create_allow_url))
+        .route("/api/allow-urls/{id}", delete(delete_allow_url))
+        .route("/api/block-urls", post(create_block_url))
+        .route("/api/block-urls/{id}", delete(delete_block_url))
+        // Rule reload
+        .route("/api/reload", post(reload_rules))
+        // Custom rules
+        .route("/api/custom-rules", post(create_custom_rule))
+        .route("/api/custom-rules/{id}", delete(delete_custom_rule))
+        // Sensitive patterns
+        .route("/api/sensitive-patterns", post(create_sensitive_pattern))
+        .route("/api/sensitive-patterns/{id}", delete(delete_sensitive_pattern))
+        // Hotlink config
+        .route("/api/hotlink-config", post(upsert_hotlink_config))
+        // LB backends
+        .route("/api/lb-backends", post(create_lb_backend))
+        .route("/api/lb-backends/{id}", delete(delete_lb_backend))
+        // Certificates
+        .route("/api/certificates", post(upload_certificate))
+        .route("/api/certificates/{id}", delete(delete_certificate))
+        // Notifications
+        .route("/api/notifications", post(create_notification))
+        .route("/api/notifications/{id}", delete(delete_notification))
+        .route("/api/notifications/{id}/test", post(test_notification))
+        // WASM Plugins — upload route gets a dedicated, larger body limit.
+        .route(
+            "/api/plugins",
+            post(upload_plugin).layer(DefaultBodyLimit::max(WASM_UPLOAD_MAX + 1024 * 1024)),
+        )
+        .route("/api/plugins/{id}", delete(delete_plugin))
+        .route("/api/plugins/{id}/enable", post(enable_plugin))
+        .route("/api/plugins/{id}/disable", post(disable_plugin))
+        // Tunnels
+        .route("/api/tunnels", post(create_tunnel))
+        .route("/api/tunnels/{id}", delete(delete_tunnel))
+        // Cache flush
+        .route("/api/cache", delete(cache_flush))
+        .route("/api/cache/host/{host}", delete(cache_flush_host))
+        .route("/api/cache/key", delete(cache_flush_key))
+        // Cluster management
+        .route("/api/cluster/token", post(generate_join_token))
+        .route("/api/cluster/nodes/remove", post(remove_cluster_node))
+        // CrowdSec management
+        .route("/api/crowdsec/decisions/{id}", delete(delete_crowdsec_decision))
+        .route("/api/crowdsec/test", post(test_crowdsec_connection))
+        .route("/api/crowdsec/config", put(update_crowdsec_config))
+        // Admin gate runs after require_auth (which injects Claims), before handler.
+        .route_layer(middleware::from_fn(require_admin));
+
+    // Protected API routes: merge admin-only and read-only groups, then apply the
+    // shared middleware stack. Execution order for a request is:
+    //   rate_limit → admin_ip → require_auth (injects Claims) → require_admin* → handler
+    // (*require_admin only on admin_routes via the route_layer above).
+    let protected_routes = admin_routes
+        .merge(readonly_routes)
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            admin_ip_check_middleware,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            rate_limit_middleware,
-        ));
+        .layer(middleware::from_fn_with_state(state.clone(), admin_ip_check_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware));
 
     // WebSocket routes — protected by admin IP allowlist and rate limiting.
     // Auth is handled via query param inside each handler.
@@ -209,10 +208,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .merge(public_routes)
+        .merge(health_route)
         .merge(protected_routes)
         .merge(ws_routes)
         .merge(ui_routes)
         .layer(middleware::from_fn(security_headers_middleware))
+        .layer(DefaultBodyLimit::max(global_body_limit))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

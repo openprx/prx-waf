@@ -4722,6 +4722,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d282ade6016312faf3e41e57ebbba0c073e4056dab1232ab1cb624199648f8ed"
 
 [[package]]
+name = "totp-lite"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8e43134db17199f7f721803383ac5854edd0d3d523cc34dba321d6acfbe76c3"
+dependencies = [
+ "digest",
+ "hmac",
+ "sha1",
+ "sha2",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5016,6 +5028,7 @@ dependencies = [
  "base64",
  "chrono",
  "dashmap",
+ "data-encoding",
  "futures-util",
  "gateway",
  "hex",
@@ -5031,6 +5044,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "totp-lite",
  "tower",
  "tower-http",
  "tracing",

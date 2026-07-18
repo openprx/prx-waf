@@ -88,6 +88,9 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
+    /// Optional TOTP code — required only when the account has TOTP enabled.
+    #[serde(default)]
+    pub totp_code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -132,6 +135,24 @@ pub async fn login(
 
     if !verify_password(&req.password, &user.password_hash) {
         return Err(ApiError::Unauthorized("Invalid credentials".into()));
+    }
+
+    // Second factor: enforce TOTP when the account has it enabled.
+    if user.totp_enabled {
+        let secret = user
+            .totp_secret
+            .as_deref()
+            .ok_or_else(|| ApiError::Unauthorized("Two-factor authentication is misconfigured".into()))?;
+        let code = req.totp_code.as_deref().unwrap_or("");
+        let now = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
+        let last_step = u64::try_from(user.totp_last_step).unwrap_or(0);
+        match crate::totp::verify_code(secret, code, now, last_step) {
+            Some(step) => {
+                let step = i64::try_from(step).unwrap_or(i64::MAX);
+                state.db.update_admin_user_totp_last_step(user.id, step).await?;
+            }
+            None => return Err(ApiError::Unauthorized("Invalid two-factor code".into())),
+        }
     }
 
     let access_token =
@@ -256,6 +277,121 @@ pub async fn ensure_default_admin(state: &AppState) -> anyhow::Result<()> {
         tracing::info!("Created default admin user (username=admin)");
     }
     Ok(())
+}
+
+// ─── TOTP (two-factor) self-service ─────────────────────────────────────────────
+
+const TOTP_ISSUER: &str = "prx-waf";
+
+#[derive(Deserialize)]
+pub struct TotpCodeRequest {
+    pub code: String,
+}
+
+/// Resolve the current authenticated user id from the injected [`Claims`].
+fn claims_user_id(claims: &Claims) -> ApiResult<Uuid> {
+    Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("Invalid token subject".into()))
+}
+
+/// POST /api/account/totp/setup — generate a new secret for the current user.
+///
+/// Two-step enablement: this stores a fresh secret with `totp_enabled = false`
+/// so the account is not locked out. Enforcement only begins after the operator
+/// confirms a valid code via [`totp_verify`].
+pub async fn totp_setup(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(claims): axum::Extension<Claims>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user_id = claims_user_id(&claims)?;
+    let secret = crate::totp::generate_secret();
+    state.db.set_admin_user_totp_secret(user_id, Some(&secret)).await?;
+    state.db.set_admin_user_totp_enabled(user_id, false).await?;
+    state.db.update_admin_user_totp_last_step(user_id, 0).await?;
+
+    let uri = crate::totp::provisioning_uri(TOTP_ISSUER, &claims.username, &secret);
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": {
+            "secret": secret,
+            "otpauth_uri": uri,
+            "enabled": false,
+        }
+    })))
+}
+
+/// POST /api/account/totp/verify — confirm a code and enable TOTP.
+pub async fn totp_verify(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(claims): axum::Extension<Claims>,
+    Json(req): Json<TotpCodeRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user_id = claims_user_id(&claims)?;
+    let user = state
+        .db
+        .get_admin_user_by_id(user_id)
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("User not found".into()))?;
+    let secret = user
+        .totp_secret
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("Run TOTP setup before verifying".into()))?;
+
+    let now = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
+    let last_step = u64::try_from(user.totp_last_step).unwrap_or(0);
+    match crate::totp::verify_code(secret, &req.code, now, last_step) {
+        Some(step) => {
+            let step = i64::try_from(step).unwrap_or(i64::MAX);
+            state.db.update_admin_user_totp_last_step(user_id, step).await?;
+            state.db.set_admin_user_totp_enabled(user_id, true).await?;
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "data": { "enabled": true }
+            })))
+        }
+        None => Err(ApiError::Unauthorized("Invalid two-factor code".into())),
+    }
+}
+
+/// POST /api/account/totp/disable — turn off TOTP for the current user.
+///
+/// Requires a valid current code when TOTP is enabled, so a hijacked session
+/// alone cannot silently strip the second factor.
+pub async fn totp_disable(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(claims): axum::Extension<Claims>,
+    Json(req): Json<TotpCodeRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user_id = claims_user_id(&claims)?;
+    let user = state
+        .db
+        .get_admin_user_by_id(user_id)
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("User not found".into()))?;
+
+    if user.totp_enabled {
+        let secret = user
+            .totp_secret
+            .as_deref()
+            .ok_or_else(|| ApiError::Unauthorized("Two-factor authentication is misconfigured".into()))?;
+        let now = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
+        let last_step = u64::try_from(user.totp_last_step).unwrap_or(0);
+        match crate::totp::verify_code(secret, &req.code, now, last_step) {
+            Some(step) => {
+                let step = i64::try_from(step).unwrap_or(i64::MAX);
+                state.db.update_admin_user_totp_last_step(user_id, step).await?;
+            }
+            None => return Err(ApiError::Unauthorized("Invalid two-factor code".into())),
+        }
+    }
+
+    state.db.set_admin_user_totp_enabled(user_id, false).await?;
+    state.db.set_admin_user_totp_secret(user_id, None).await?;
+    state.db.update_admin_user_totp_last_step(user_id, 0).await?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": { "enabled": false }
+    })))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

@@ -811,6 +811,36 @@ impl Database {
             .await?)
     }
 
+    /// Set (or clear with `None`) the TOTP secret for an admin user.
+    pub async fn set_admin_user_totp_secret(&self, id: Uuid, secret: Option<&str>) -> Result<(), StorageError> {
+        sqlx::query("UPDATE admin_users SET totp_secret = $2, updated_at = NOW() WHERE id = $1")
+            .bind(id)
+            .bind(secret)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Enable or disable TOTP enforcement for an admin user.
+    pub async fn set_admin_user_totp_enabled(&self, id: Uuid, enabled: bool) -> Result<(), StorageError> {
+        sqlx::query("UPDATE admin_users SET totp_enabled = $2, updated_at = NOW() WHERE id = $1")
+            .bind(id)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Record the highest TOTP step consumed (replay protection).
+    pub async fn update_admin_user_totp_last_step(&self, id: Uuid, step: i64) -> Result<(), StorageError> {
+        sqlx::query("UPDATE admin_users SET totp_last_step = $2, updated_at = NOW() WHERE id = $1")
+            .bind(id)
+            .bind(step)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // ─── Phase 4: Refresh Tokens ──────────────────────────────────────────────
 
     pub async fn create_refresh_token(

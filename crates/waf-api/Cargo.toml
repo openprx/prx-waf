@@ -27,6 +27,8 @@ rust-embed = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+totp-lite = { workspace = true }
+data-encoding = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
