@@ -9,7 +9,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use gateway::{ChallengeStore, HostRouter, SslManager, TunnelConfig, WafProxy};
 use waf_api::{AppState, start_api_server};
-use waf_common::config::{AppConfig, load_config};
+use waf_common::config::{AppConfig, apply_env_overrides, load_config};
 use waf_engine::{
     CrowdSecClient, CrowdSecConfig, ExportFormat, GeoIpService, RuleManager, WafEngine, WafEngineConfig, XdbUpdater,
     cache_policy_from_str, init_community, init_crowdsec, spawn_auto_updater,
@@ -288,10 +288,16 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     info!("PRX-WAF v{}", env!("CARGO_PKG_VERSION"));
 
-    let config = load_config(&cli.config).unwrap_or_else(|e| {
+    let mut config = load_config(&cli.config).unwrap_or_else(|e| {
         tracing::warn!("Failed to load config from {}: {}. Using defaults.", cli.config, e);
         AppConfig::default()
     });
+
+    // Overlay environment-variable overrides (DATABASE_URL, PRXWAF_*) so
+    // security-critical and deployment-specific settings can be configured in
+    // one place without editing per-node TOML. A malformed override is a hard
+    // startup error rather than a silent wrong default.
+    apply_env_overrides(&mut config)?;
 
     match cli.command {
         Commands::Migrate => {
