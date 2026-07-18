@@ -32,6 +32,48 @@ pub struct AppConfig {
     /// ACME / Let's Encrypt automatic TLS certificate management
     #[serde(default)]
     pub acme: AcmeConfig,
+    /// Threat-intelligence IP feeds (raw IP/CIDR blocklists).
+    ///
+    /// **Empty by default** — no feed is fetched or enabled unless explicitly
+    /// configured. This is deliberate: several sources carry licensing terms
+    /// (e.g. Spamhaus DROP requires attribution and forbids some commercial
+    /// use), so activation is opt-in per operator. See `configs/default.toml`
+    /// for commented, license-annotated examples.
+    #[serde(default)]
+    pub ip_feeds: Vec<IpFeedEntry>,
+}
+
+/// A single threat-intelligence IP-feed source (raw IP/CIDR blocklist).
+///
+/// Mirrors `waf_engine::rules::ip_feed::IpFeedSource`; kept in waf-common so the
+/// TOML loader need not depend on the engine crate. Converted to the engine
+/// type at startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpFeedEntry {
+    /// Unique, human-readable feed name. Doubles as the source tag used for
+    /// per-source replacement, cleanup and block-reason traceability.
+    pub name: String,
+    /// HTTP(S) URL of the raw blocklist.
+    pub url: String,
+    /// Body format: `plain` (one IP/CIDR per line, `#`/`;` comments tolerated)
+    /// or `spamhaus_json` (Spamhaus DROP JSONL with a `cidr` field).
+    #[serde(default = "default_ip_feed_format")]
+    pub format: String,
+    /// Refresh interval in seconds (clamped to a sane minimum at runtime).
+    #[serde(default = "default_ip_feed_interval")]
+    pub update_interval_secs: u64,
+    /// Whether this feed is active. Defaults to `true`: adding the entry is
+    /// itself the opt-in, while the flag lets an operator keep a feed in the
+    /// config but temporarily disable it.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_ip_feed_format() -> String {
+    "plain".to_string()
+}
+const fn default_ip_feed_interval() -> u64 {
+    3600
 }
 
 /// ACME (Let's Encrypt) automatic certificate configuration.
