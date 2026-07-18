@@ -7,6 +7,169 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+Security hardening pass following a full-codebase audit (7 crates, ~27K LOC).
+The headline fix is C-1: the core WAF detection pipeline was not running at
+all for GET/bodyless requests. See "Breaking Changes" below before upgrading
+— four conditions now refuse to start the process.
+
+### Security
+
+#### WAF detection engine
+
+- **(C-1)** Fix WAF inspection never running on GET / bodyless requests: the
+  per-request `request_ctx` was only ever built in `upstream_peer`, which
+  Pingora invokes *after* `request_filter` — so `request_filter` always saw
+  `None` and let every request without a body through with zero checks
+  (SQLi/XSS/RCE/traversal, IP/URL blocklists, rate limiting, GeoIP all
+  bypassed). Detection now runs during `request_filter`; a new
+  `inspect_body` pass handles content-only checks, and empty-body POST/PUT
+  requests are now inspected too (H-6).
+- **(H-7)** Align the HTTP/3 request path with HTTP/1.1: unknown hosts no
+  longer pass through unchecked, backend selection now honours per-host
+  routing instead of a hardcoded loopback target, and request/response
+  headers are no longer silently dropped.
+- **(H-5, M-5)** Scan a curated set of request headers (User-Agent, Referer,
+  X-Forwarded-For, etc.) for SQLi/XSS/RCE, closing a header-injection
+  detection gap; unify directory-traversal detection to also cover
+  body/cookies with recursive decoding.
+- **(H-4)** Apply the configured CrowdSec AppSec `failure_action`
+  (Block/Log/Allow) instead of always treating an unavailable AppSec
+  backend as allow.
+- Fail closed instead of open when a built-in detection `RegexSet` fails to
+  compile, and when GeoIP cannot resolve a client's country while in
+  allow-only mode (M-10).
+- **(M-6)** Normalise the decoded path before matching URL blocklist entries
+  and the custom-rule `Path` field, closing an encoded-path bypass
+  (e.g. `/%61dmin`).
+- **(M-7, M-8)** Honour the custom rule's configured `action`
+  (Allow/Log/Block) instead of always blocking on match; precompile custom
+  rule regexes once at load time instead of per request.
+- **(M-9)** Fix connection-rate-limit counting each request-with-body twice
+  (once at header phase, once at body phase), which had halved the
+  effective rate limit for POST/PUT traffic.
+- **(M-1)** Use the right-most (server-appended) `X-Forwarded-For` entry
+  instead of the client-controlled left-most one.
+- **(M-2)** Reject non-default ports on the bare-host routing fallback,
+  closing a host/port routing ambiguity.
+- **(M-19)** Deprecate the DNS-rebinding-vulnerable bare
+  `validate_public_url` as a regression guard; production SSRF checks
+  (webhooks, remote rule sources) already use the IP-pinned
+  `validate_public_url_with_ips` variant.
+
+#### Admin API
+
+- **(H-2)** Add RBAC: a new `require_admin` middleware gates all
+  write/sensitive routes. A logged-in but non-admin user can no longer
+  delete hosts, issue cluster join tokens, upload WASM plugins, or change
+  CrowdSec configuration.
+- **(H-1)** Enforce JWT secret strength at startup: reject empty, short
+  (<32 chars), known-placeholder, or low-entropy `JWT_SECRET` values.
+- **(H-3)** Implement TOTP two-factor authentication end-to-end: RFC 6238
+  codes verified over a ±1 time-step window with constant-time comparison
+  and replay protection; two-step self-service enable/verify/disable flow
+  so operators cannot lock themselves out.
+- **(M-13)** Tighten CORS: an empty `cors_origins` no longer allows any
+  origin — cross-origin requests are rejected by default.
+- **(M-14)** Stop leaking internal/database error detail to API clients;
+  return a generic message and log details server-side instead.
+- **(M-15)** Enforce a global request body size limit and a 16 MiB cap on
+  WASM plugin uploads.
+- **(L-1)** Guard the login/logout/refresh endpoints with the admin IP
+  allowlist (`/health` remains unguarded for liveness probes).
+- Compare tunnel auth tokens in constant time; prefer the `Authorization`
+  header over the `?token=` query parameter for tunnel WebSocket auth
+  (query-parameter auth is now deprecated).
+
+#### Cluster
+
+- **(H-9)** Bind cluster protocol messages to the authenticated mTLS peer
+  certificate, preventing a peer from forging another node's ID in
+  heartbeats or election votes.
+- **(H-10)** Validate the join token on the main node before accepting a
+  `JoinRequest` (it was previously never checked in production); gate
+  encrypted CA-key replication behind an explicit `replicate_ca_key`
+  opt-in, default off.
+- **(H-8)** Enforce a frame-size cap on the cluster transport to prevent an
+  out-of-memory DoS from an oversized length-prefixed frame.
+- **(M-16)** Use a fixed, configured `members` set for election quorum
+  instead of the live (evictable) peer view, closing a split-brain window
+  during network partitions.
+- **(M-17)** Fail fast at startup when `crypto.auto_generate=true` is
+  combined with a non-empty `seeds` list — that combination can never form
+  a working cluster, since every node would mint its own untrusted CA.
+- **(M-12)** Switch CA-key and encrypted-field-at-rest key derivation from
+  unsalted single-round SHA-256 to Argon2id with a random per-blob salt
+  (legacy blobs remain decryptable for migration); enforce a ≥16-character
+  floor on `MASTER_KEY` and the CA passphrase.
+- **(M-18)** Cap lz4 snapshot decompression at 256 MiB to prevent a
+  decompression-bomb DoS.
+
+#### Storage / SSRF
+
+- **(M-11)** Fix CrowdSec configuration "upsert" silently inserting a new
+  row instead of updating (the `ON CONFLICT` target never matched on the
+  `SERIAL` primary key) — every configuration change had been a no-op, and
+  reads always returned the oldest row.
+- Confirmed production SSRF-guarded call sites (webhook delivery, remote
+  rule fetching) already pin resolved IPs and reject redirects; hardened
+  the bare validator as a regression guard only (see M-19 above).
+
+### ⚠️ Breaking Changes
+
+Startup now **refuses to boot** under any of the following conditions.
+Update your configuration/environment before upgrading:
+
+1. **`JWT_SECRET` is weak** — empty, shorter than 32 characters, or matches
+   a known placeholder value.
+2. **`trust_proxy_headers=true` with an empty `trusted_proxies`** — this
+   previously only logged a warning and trusted `X-Forwarded-For` from any
+   source.
+3. **`cluster.crypto.auto_generate=true` combined with a non-empty
+   `seeds`** — each node would mint its own untrusted CA and the cluster
+   could never actually form; this is now a startup error instead of a
+   silent hang.
+4. **Multi-node clusters now require a configured `join_token`** — a
+   `JoinRequest` without a valid token is rejected by the main node.
+
+Also note:
+
+- `MASTER_KEY` and the cluster CA `ca_passphrase` now require **at least 16
+  characters**.
+- The shipped `docker-compose.yml` / `docker-compose.cluster.yml` no longer
+  ship a default `JWT_SECRET` — you must set one via `.env` (see the new
+  `.env.example`) or the containers will fail to start.
+
+### Added
+
+- Migration `0009_totp_replay.sql` — adds `totp_last_step` for TOTP replay
+  protection.
+- Migration `0010_crowdsec_config_unique.sql` — de-duplicates existing
+  CrowdSec config rows per scope and adds a functional unique index
+  enforcing at most one row per host (or global).
+- ACME auto-TLS wiring: new `AcmeConfig`
+  (enabled/email/staging/renewal_check_interval_secs); `init_async` now
+  constructs the `SslManager`, spawns the certificate-renewal task, and
+  triggers one-time issuance for SSL hosts without an active certificate.
+  The ACME HTTP-01 challenge path is now actually served.
+- TOTP self-service endpoints: `POST /api/account/totp/{setup,verify,disable}`.
+- `ClusterConfig.members`, `ClusterConfig.join_token`,
+  `ClusterConfig.replicate_ca_key` configuration fields.
+- `.env.example` documenting the `JWT_SECRET` requirement.
+
+### Fixed
+
+- CrowdSec configuration updates silently had no effect (M-11, see above).
+- Custom rule `action` (Allow/Log/Block) was ignored — every match was
+  treated as Block regardless of configuration.
+- Connection-count rate limiting double-counted requests that had a body,
+  halving the effective limit for POST/PUT traffic relative to GET.
+- ACME certificate download could hang indefinitely on a slow/unresponsive
+  CA; it now times out after 60s and marks the certificate as errored.
+
+---
+
 ## [0.2.0] — 2026-03-27
 
 ### Security
