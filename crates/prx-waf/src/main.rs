@@ -7,7 +7,10 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-use gateway::{ChallengeStore, HostRouter, SslManager, TunnelConfig, WafProxy};
+use gateway::{
+    ChallengeStore, HostRouter, LoadBalancer, LoadBalancerRegistry, ResponseCache, SslManager, TunnelConfig, WafProxy,
+    spawn_health_checker,
+};
 use waf_api::{AppState, start_api_server};
 use waf_common::config::{AppConfig, apply_env_overrides, load_config};
 use waf_engine::{
@@ -1169,7 +1172,8 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     // `_shutdown_guards` holds the watch senders that signal background workers
     // to stop.  They are dropped automatically when `run_server` returns (after
     // `server.run_forever()` exits), which sends the shutdown signal.
-    let (engine, router, api_state, acme_challenges, _shutdown_guards) = rt.block_on(init_async(config))?;
+    let (engine, router, api_state, acme_challenges, lb_registry, response_cache, _shutdown_guards) =
+        rt.block_on(init_async(config))?;
 
     // Start the management API in a background thread
     let api_listen = config.api.listen_addr.clone();
@@ -1291,6 +1295,8 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
 
     let mut proxy = WafProxy::new(router, engine);
     proxy.acme_challenges = acme_challenges;
+    proxy.lb_registry = lb_registry;
+    proxy.cache = response_cache;
     proxy.trust_proxy_headers = config.proxy.trust_proxy_headers;
     proxy.trusted_proxies = config
         .proxy
@@ -1346,15 +1352,17 @@ struct ShutdownGuards {
 }
 
 /// Async initialization: database, engine, rules, Phases 5 & 6
-async fn init_async(
-    config: &AppConfig,
-) -> anyhow::Result<(
+type InitResult = (
     Arc<WafEngine>,
     Arc<HostRouter>,
     Arc<AppState>,
     Arc<ChallengeStore>,
+    Arc<LoadBalancerRegistry>,
+    Option<Arc<ResponseCache>>,
     ShutdownGuards,
-)> {
+);
+
+async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
     info!("Connecting to database...");
     let db = Arc::new(Database::connect(&config.storage.database_url, config.storage.max_connections).await?);
 
@@ -1436,6 +1444,10 @@ async fn init_async(
             remote_port: entry.remote_port,
             cert_file: entry.cert_file.clone(),
             key_file: entry.key_file.clone(),
+            // Multi-backend load balancing (empty → single-backend, unchanged).
+            is_enable_load_balance: !entry.backends.is_empty(),
+            load_balance_strategy: entry.load_balance_strategy.clone(),
+            backends: entry.backends.clone(),
             ..HostConfig::default()
         });
         router.register(&cfg);
@@ -1443,8 +1455,53 @@ async fn init_async(
 
     info!("Registered {} host routes", router.len());
 
+    // Build a load balancer for every host that declares a multi-backend pool.
+    // Hosts without `backends` are absent from the registry and continue to use
+    // their single `remote_host`/`remote_port` upstream (backward compatible).
+    let lb_registry = Arc::new(LoadBalancerRegistry::new());
+    for host in router.list() {
+        if host.backends.is_empty() {
+            continue;
+        }
+        let lb = Arc::new(LoadBalancer::from_backend_configs(
+            host.load_balance_strategy.clone(),
+            &host.backends,
+        ));
+        // Spawn a background TCP health checker for this pool (every 10s).
+        let handle = spawn_health_checker(Arc::clone(&lb), std::time::Duration::from_secs(10));
+        std::mem::forget(handle);
+        lb_registry.register_arc(&host.code, lb);
+        info!(
+            "Load balancer active for host {} ({} backends, strategy {:?})",
+            host.host,
+            host.backends.len(),
+            host.load_balance_strategy,
+        );
+    }
+
     // Build app state
     let mut api_state = AppState::new(Arc::clone(&db), Arc::clone(&engine), Arc::clone(&router))?;
+
+    // Response cache. Built from config so the proxy and the management API
+    // (cache stats / purge endpoints) share a single instance. When caching is
+    // disabled the proxy receives `None` and behaves exactly as before.
+    let response_cache = if config.cache.enabled {
+        let cache = ResponseCache::new(
+            config.cache.max_size_mb,
+            config.cache.default_ttl_secs,
+            config.cache.max_ttl_secs,
+        );
+        // Share the same cache with the API layer (stats/purge operate on it).
+        api_state.cache = Arc::clone(&cache);
+        info!(
+            "Response cache enabled (max {} MiB, default TTL {}s, max TTL {}s)",
+            config.cache.max_size_mb, config.cache.default_ttl_secs, config.cache.max_ttl_secs,
+        );
+        Some(cache)
+    } else {
+        info!("Response cache disabled");
+        None
+    };
 
     // Apply security configuration
     api_state.cors_origins = config.security.cors_origins.clone();
@@ -1593,7 +1650,15 @@ async fn init_async(
     // store when ACME is disabled.
     let acme_challenges = setup_acme(config, Arc::clone(&db), Arc::clone(&router)).await;
 
-    Ok((engine, router, Arc::new(api_state), acme_challenges, guards))
+    Ok((
+        engine,
+        router,
+        Arc::new(api_state),
+        acme_challenges,
+        lb_registry,
+        response_cache,
+        guards,
+    ))
 }
 
 /// Wire up ACME automatic TLS: construct the `SslManager`, spawn the periodic

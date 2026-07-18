@@ -160,6 +160,35 @@ pub struct HostConfig {
     pub log_only_mode: bool,
     /// Custom HTML block page template; placeholders: `{{req_id}}`, `{{rule_name}}`, `{{client_ip}}`
     pub block_page_template: Option<String>,
+    /// Optional multi-backend pool for load balancing.
+    ///
+    /// When empty (the default), the single `remote_host`/`remote_port` pair is
+    /// used verbatim — this preserves the historical single-backend behaviour
+    /// and keeps existing configs working unchanged. When non-empty, a
+    /// `LoadBalancer` is built for this host and requests are distributed across
+    /// the listed backends according to `load_balance_strategy`.
+    #[serde(default)]
+    pub backends: Vec<BackendConfig>,
+}
+
+/// A single upstream backend in a load-balanced pool.
+///
+/// This is the *serializable* configuration counterpart of the runtime
+/// `gateway::lb::Backend` (which additionally carries health/connection state).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendConfig {
+    /// Upstream host or IP.
+    pub host: String,
+    /// Upstream port.
+    pub port: u16,
+    /// Relative weight for `WeightedRoundRobin` (defaults to 1). Ignored by
+    /// strategies that do not consider weight.
+    #[serde(default = "default_backend_weight")]
+    pub weight: u32,
+}
+
+const fn default_backend_weight() -> u32 {
+    1
 }
 
 impl Default for HostConfig {
@@ -183,6 +212,7 @@ impl Default for HostConfig {
             defense_config: DefenseConfig::default(),
             log_only_mode: false,
             block_page_template: None,
+            backends: Vec::new(),
         }
     }
 }

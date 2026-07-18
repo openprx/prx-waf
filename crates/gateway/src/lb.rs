@@ -18,7 +18,7 @@ use parking_lot::RwLock;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
-use waf_common::LoadBalanceStrategy;
+use waf_common::{BackendConfig, LoadBalanceStrategy};
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
@@ -89,6 +89,20 @@ impl LoadBalancer {
         }
     }
 
+    /// Build a load balancer from a list of serializable [`BackendConfig`]s.
+    ///
+    /// Each backend id is derived from `host:port`. Weights are clamped to a
+    /// minimum of 1 so a mis-configured `weight = 0` never starves a backend
+    /// entirely under weighted round-robin.
+    pub fn from_backend_configs(strategy: LoadBalanceStrategy, configs: &[BackendConfig]) -> Self {
+        let lb = Self::new(strategy);
+        for cfg in configs {
+            let id = format!("{}:{}", cfg.host, cfg.port);
+            lb.add_backend(Backend::new(id, cfg.host.clone(), cfg.port, cfg.weight.max(1)));
+        }
+        lb
+    }
+
     /// Add or update a backend.
     pub fn add_backend(&self, backend: Backend) {
         let mut backends = self.backends.write();
@@ -123,75 +137,80 @@ impl LoadBalancer {
         self.backends.read().clone()
     }
 
-    /// Pick the next backend according to the strategy.
+    /// Pick the next backend address according to the strategy.
     ///
-    /// Returns `None` if there are no healthy backends.
-    #[allow(clippy::indexing_slicing)] // indices are computed via modulo of non-empty len
+    /// Returns `None` if the pool is empty. Prefer [`select_backend`] when the
+    /// caller needs to track the connection lifecycle (Least Connections).
+    ///
+    /// [`select_backend`]: LoadBalancer::select_backend
     pub fn next_backend(&self, client_ip: IpAddr) -> Option<String> {
+        self.select_backend(client_ip).map(|b| b.addr())
+    }
+
+    /// Pick the next backend according to the strategy, returning the full
+    /// [`Backend`] so the caller can `acquire_connection` / `release_connection`
+    /// (required for correct Least-Connections accounting).
+    ///
+    /// Healthy backends are preferred; if none are healthy the whole pool is
+    /// used as a last resort so traffic is not black-holed during an outage.
+    /// Returns `None` only when the pool is completely empty.
+    pub fn select_backend(&self, client_ip: IpAddr) -> Option<Backend> {
         let healthy = self.healthy_backends();
-        if healthy.is_empty() {
-            // Fall back to all backends if none are healthy
-            let all = self.backends.read();
-            if all.is_empty() {
-                return None;
-            }
-            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % all.len();
-            return Some(all[idx].addr());
+        let pool = if healthy.is_empty() {
+            self.all_backends()
+        } else {
+            healthy
+        };
+        if pool.is_empty() {
+            return None;
         }
 
-        match &self.strategy {
-            LoadBalanceStrategy::RoundRobin => Some(self.round_robin(&healthy)),
-            LoadBalanceStrategy::IpHash => Some(Self::ip_hash(client_ip, &healthy)),
-            LoadBalanceStrategy::WeightedRoundRobin => Some(self.weighted_round_robin(&healthy)),
-            LoadBalanceStrategy::LeastConnections => Self::least_connections(&healthy),
-        }
+        let idx = match &self.strategy {
+            LoadBalanceStrategy::RoundRobin => self.round_robin_index(pool.len()),
+            LoadBalanceStrategy::IpHash => Self::ip_hash_index(client_ip, pool.len()),
+            LoadBalanceStrategy::WeightedRoundRobin => self.weighted_round_robin_index(&pool),
+            LoadBalanceStrategy::LeastConnections => Self::least_connections_index(&pool),
+        };
+        pool.get(idx).cloned()
     }
 
-    // ── Strategies ────────────────────────────────────────────────────────────
+    // ── Strategy index selection ───────────────────────────────────────────────
 
-    #[allow(clippy::indexing_slicing)] // idx is computed via modulo of non-empty len
-    fn round_robin(&self, backends: &[Backend]) -> String {
-        let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % backends.len();
-        backends[idx].addr()
+    fn round_robin_index(&self, len: usize) -> usize {
+        self.rr_counter.fetch_add(1, Ordering::Relaxed) % len
     }
 
-    #[allow(clippy::indexing_slicing)] // idx is computed via modulo of non-empty len
     #[allow(clippy::cast_possible_truncation)] // hash truncation is intentional for index selection
-    fn ip_hash(ip: IpAddr, backends: &[Backend]) -> String {
-        let hash = fnv_hash_ip(ip);
-        let idx = (hash as usize) % backends.len();
-        backends[idx].addr()
+    fn ip_hash_index(ip: IpAddr, len: usize) -> usize {
+        (fnv_hash_ip(ip) as usize) % len
     }
 
-    #[allow(clippy::indexing_slicing)] // fallback index 0 only reached when backends is non-empty
     #[allow(clippy::cast_possible_truncation)] // counter truncation to u32 is intentional
-    fn weighted_round_robin(&self, backends: &[Backend]) -> String {
-        // Build a weighted list: each backend appears `weight` times
+    fn weighted_round_robin_index(&self, backends: &[Backend]) -> usize {
         let total_weight: u32 = backends.iter().map(|b| b.weight.max(1)).sum();
         if total_weight == 0 {
-            return self.round_robin(backends);
+            return self.round_robin_index(backends.len());
         }
 
         let counter = self.rr_counter.fetch_add(1, Ordering::Relaxed);
         let pos = (counter as u32) % total_weight;
 
         let mut cumulative = 0u32;
-        for backend in backends {
+        for (idx, backend) in backends.iter().enumerate() {
             cumulative += backend.weight.max(1);
             if pos < cumulative {
-                return backend.addr();
+                return idx;
             }
         }
-
-        // Fallback
-        backends[0].addr()
+        0
     }
 
-    fn least_connections(backends: &[Backend]) -> Option<String> {
+    fn least_connections_index(backends: &[Backend]) -> usize {
         backends
             .iter()
-            .min_by_key(|b| b.active_connections.load(Ordering::Relaxed))
-            .map(Backend::addr)
+            .enumerate()
+            .min_by_key(|(_, b)| b.active_connections.load(Ordering::Relaxed))
+            .map_or(0, |(idx, _)| idx)
     }
 }
 
@@ -232,6 +251,14 @@ impl LoadBalancerRegistry {
 
     pub fn register(&self, host_code: &str, lb: LoadBalancer) {
         self.lbs.insert(host_code.to_string(), Arc::new(lb));
+    }
+
+    /// Register an already-`Arc`-wrapped load balancer.
+    ///
+    /// Lets the caller keep a clone of the same `Arc` (e.g. to hand to a
+    /// background health-check task) while the registry shares ownership.
+    pub fn register_arc(&self, host_code: &str, lb: Arc<LoadBalancer>) {
+        self.lbs.insert(host_code.to_string(), lb);
     }
 
     pub fn remove(&self, host_code: &str) {
@@ -317,6 +344,46 @@ mod tests {
         let backends: std::collections::HashSet<String> = (0..6).map(|_| lb.next_backend(ip).unwrap()).collect();
         // Should hit all 3 backends over 6 requests
         assert_eq!(backends.len(), 3);
+    }
+
+    #[test]
+    fn from_backend_configs_builds_pool_and_round_robins() {
+        let configs = vec![
+            BackendConfig {
+                host: "10.0.0.1".to_string(),
+                port: 8080,
+                weight: 1,
+            },
+            BackendConfig {
+                host: "10.0.0.2".to_string(),
+                port: 8080,
+                weight: 1,
+            },
+        ];
+        let lb = LoadBalancer::from_backend_configs(LoadBalanceStrategy::RoundRobin, &configs);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let seen: std::collections::HashSet<String> = (0..4).map(|_| lb.next_backend(ip).unwrap()).collect();
+        assert_eq!(seen.len(), 2, "round-robin should visit both configured backends");
+    }
+
+    #[test]
+    fn select_backend_tracks_connection_lifecycle() {
+        let lb = make_lb(LoadBalanceStrategy::LeastConnections);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        // Acquire on the first pick; the counter must be visible via the pool
+        // (Backend clones share the same atomic through an Arc).
+        let first = lb.select_backend(ip).expect("a backend");
+        first.acquire_connection();
+        let first_addr = first.addr();
+
+        // With one backend now busy, Least-Connections must avoid it.
+        let second = lb.select_backend(ip).expect("a backend");
+        assert_ne!(second.addr(), first_addr, "should pick a less-loaded backend");
+
+        // Release restores the count so the backend is selectable again.
+        first.release_connection();
+        assert_eq!(first.active_connections.load(Ordering::Relaxed), 0);
     }
 
     #[test]
