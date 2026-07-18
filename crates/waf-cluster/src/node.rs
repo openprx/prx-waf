@@ -83,6 +83,8 @@ impl NodeState {
             config.election.timeout_min_ms,
             config.election.timeout_max_ms,
         ));
+        // M-16: constrain vote eligibility to the declared membership (if any).
+        election.set_members(&config.members);
 
         let heartbeat_tracker = ParkingMutex::new(HeartbeatTracker::new(
             config.election.phi_suspect,
@@ -182,6 +184,20 @@ impl NodeState {
     /// Total number of nodes in the cluster (peers + self).
     pub async fn total_nodes(&self) -> usize {
         self.peers.read().await.len() + 1
+    }
+
+    /// Cluster size used to compute election quorum (M-16).
+    ///
+    /// When a fixed `members` list is configured, quorum is derived from its
+    /// declared size — which does not shrink when peers are evicted — so a
+    /// partitioned minority can never observe a majority. Otherwise this falls
+    /// back to the live view (`total_nodes`).
+    pub async fn quorum_total(&self) -> usize {
+        if self.config.members.is_empty() {
+            self.total_nodes().await
+        } else {
+            self.config.members.len()
+        }
     }
 
     /// Add a peer or update its `last_seen` timestamp if already known.
@@ -378,6 +394,33 @@ mod tests {
         let config = test_config("n1", "main");
         let node = NodeState::new(config, StorageMode::Full).unwrap();
         assert_eq!(node.total_nodes().await, 1);
+    }
+
+    #[tokio::test]
+    async fn quorum_total_uses_declared_members() {
+        let mut config = test_config("n1", "main");
+        config.members = vec!["n1", "n2", "n3", "n4", "n5"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let node = NodeState::new(config, StorageMode::Full).unwrap();
+        // Only one peer is live, but quorum is derived from the declared size.
+        node.add_or_update_peer(test_peer("n2", 1000)).await;
+        assert_eq!(node.total_nodes().await, 2, "live view shrinks to 2");
+        assert_eq!(node.quorum_total().await, 5, "quorum stays at declared size");
+        // A 2-node partition is therefore never a majority of 5.
+        assert!(!ElectionManager::is_majority(
+            node.total_nodes().await,
+            node.quorum_total().await
+        ));
+    }
+
+    #[tokio::test]
+    async fn quorum_total_falls_back_to_live_view_without_members() {
+        let config = test_config("n1", "main");
+        let node = NodeState::new(config, StorageMode::Full).unwrap();
+        node.add_or_update_peer(test_peer("n2", 1000)).await;
+        assert_eq!(node.quorum_total().await, 2);
     }
 
     #[tokio::test]
