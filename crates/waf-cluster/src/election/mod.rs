@@ -51,6 +51,9 @@ pub struct ElectionManager {
     /// Votes received by THIS node when it is a candidate.
     /// Map: term → set of voter node IDs.
     votes_for_me: ParkingMutex<HashMap<u64, HashSet<String>>>,
+    /// Declared cluster membership (M-16). When non-empty, only votes from
+    /// listed node ids are counted toward quorum; empty means "count any peer".
+    members: ParkingRwLock<HashSet<String>>,
 }
 
 impl ElectionManager {
@@ -63,7 +66,25 @@ impl ElectionManager {
             timeout_min_ms,
             timeout_max_ms,
             votes_for_me: ParkingMutex::new(HashMap::new()),
+            members: ParkingRwLock::new(HashSet::new()),
         }
+    }
+
+    /// Declare the fixed cluster membership used for vote eligibility (M-16).
+    ///
+    /// An empty slice clears the membership constraint (any authenticated peer's
+    /// vote counts). Called once at node initialisation from configuration.
+    pub fn set_members(&self, member_ids: &[String]) {
+        let mut members = self.members.write();
+        members.clear();
+        members.extend(member_ids.iter().cloned());
+    }
+
+    /// Returns `true` if `voter_id` is eligible to vote (in the declared
+    /// membership, or membership is unconstrained).
+    fn is_eligible_voter(&self, voter_id: &str) -> bool {
+        let members = self.members.read();
+        members.is_empty() || members.contains(voter_id)
     }
 
     /// Current term (non-blocking, `parking_lot`).
@@ -106,6 +127,15 @@ impl ElectionManager {
     pub fn record_vote_for_me(&self, term: u64, voter_id: String) -> bool {
         // Only count votes for the current term
         if term < *self.term.read() {
+            return false;
+        }
+        // M-16: a voter outside the declared membership does not count toward quorum.
+        if !self.is_eligible_voter(&voter_id) {
+            debug!(
+                node_id = %self.node_id,
+                voter = %voter_id,
+                "Ignoring vote from node outside declared cluster membership"
+            );
             return false;
         }
         self.votes_for_me.lock().entry(term).or_default().insert(voter_id)
@@ -258,16 +288,31 @@ pub async fn run_election_loop(node_state: Arc<crate::node::NodeState>) {
 
         // ── Start election ──────────────────────────────────────────────────
 
-        // Count total known cluster nodes (peers + self).
-        let total_nodes = node_state.total_nodes().await;
+        // M-16: quorum is based on the declared membership size when configured,
+        // otherwise the live peer view (peers + self).
+        let total_nodes = node_state.quorum_total().await;
 
-        // Single-node cluster: win immediately without a vote round.
+        // Single-node cluster: win immediately without a vote round — but only
+        // when this node is genuinely the sole participant. With a declared
+        // membership expecting more nodes, a minority must not self-promote
+        // (split-brain prevention).
         if total_nodes <= 1 {
-            info!(
-                node_id = %node_state.node_id,
-                "Single-node cluster — claiming Main role without election"
-            );
-            node_state.promote_to_main().await;
+            let members = &node_state.config.members;
+            let sole_declared_member =
+                members.is_empty() || (members.len() == 1 && members.contains(&node_state.node_id));
+            if sole_declared_member {
+                info!(
+                    node_id = %node_state.node_id,
+                    "Single-node cluster — claiming Main role without election"
+                );
+                node_state.promote_to_main().await;
+            } else {
+                warn!(
+                    node_id = %node_state.node_id,
+                    "Declared cluster membership does not permit single-node self-promotion; backing off"
+                );
+                node_state.demote_to_worker().await;
+            }
             continue;
         }
 
@@ -359,4 +404,43 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn vote_from_non_member_is_not_counted() {
+        let em = ElectionManager::new("n1".to_string(), 150, 300);
+        em.set_members(&ids(&["n1", "n2", "n3"]));
+        em.increment_term_and_vote_for_self();
+        assert_eq!(em.vote_count_for_term(1), 1, "self vote only");
+        assert!(
+            !em.record_vote_for_me(1, "outsider".to_string()),
+            "vote from a non-member must be rejected"
+        );
+        assert_eq!(em.vote_count_for_term(1), 1, "outsider must not inflate count");
+        assert!(em.record_vote_for_me(1, "n2".to_string()), "member vote counts");
+        assert_eq!(em.vote_count_for_term(1), 2);
+    }
+
+    #[test]
+    fn empty_membership_counts_any_authenticated_voter() {
+        let em = ElectionManager::new("n1".to_string(), 150, 300);
+        em.increment_term_and_vote_for_self();
+        assert!(em.record_vote_for_me(1, "any-peer".to_string()));
+        assert_eq!(em.vote_count_for_term(1), 2);
+    }
+
+    #[test]
+    fn minority_of_declared_members_is_not_majority() {
+        // 5 declared members: a 2-node partition can never reach majority.
+        assert!(!ElectionManager::is_majority(2, 5));
+        assert!(ElectionManager::is_majority(3, 5));
+    }
 }
