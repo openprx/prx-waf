@@ -307,6 +307,22 @@ impl NodeState {
         version
     }
 
+    /// Advance `rules_version` to `version` when it is newer, and return the
+    /// resulting value.
+    ///
+    /// Used on the worker side after it **successfully applies** a rule sync
+    /// pushed by the Main, so the `cluster/status` telemetry reflects the rule
+    /// version actually live in the data plane. Monotonic: a stale or
+    /// out-of-order push carrying an older version leaves the counter untouched,
+    /// so the reported version never regresses.
+    pub async fn advance_rules_version(&self, version: u64) -> u64 {
+        let mut rv = self.rules_version.write().await;
+        if version > *rv {
+            *rv = version;
+        }
+        *rv
+    }
+
     /// Update `config_version` and return it.
     pub async fn set_config_version(&self, version: u64) -> u64 {
         let mut cv = self.config_version.write().await;

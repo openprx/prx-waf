@@ -59,10 +59,19 @@ pub async fn apply_incoming_rule_sync(node_state: &NodeState, auth_id: &str, res
         );
         return;
     }
+    // Capture the authoritative version before `response` is moved into the
+    // applier so we can advance the telemetry counter after a successful apply.
+    let version = response.version;
     let reloader = node_state.rule_reloader();
     if let Err(e) = rules::apply_sync_response_shared(response, &node_state.rule_registry, reloader.as_ref()).await {
         warn!("Failed to apply rule sync from main: {e}");
+        return;
     }
+    // Only now that the rules are live in the data-plane registry do we reflect
+    // the applied version in the `cluster/status` telemetry. Monotonic, so an
+    // out-of-order or stale push never regresses the reported version. This
+    // mirrors how `apply_incoming_config_sync` advances `config_version`.
+    node_state.advance_rules_version(version).await;
 }
 
 /// Apply a config-sync push received from a peer.
@@ -161,6 +170,11 @@ mod tests {
             "a non-Main peer must not be able to push rules into the data plane"
         );
         assert_eq!(version, 0, "registry version must be untouched by a rejected push");
+        assert_eq!(
+            *node.rules_version.read().await,
+            0,
+            "cluster/status telemetry must not advance for a rejected push"
+        );
     }
 
     #[tokio::test]
@@ -185,6 +199,11 @@ mod tests {
         assert!(applied.enabled, "synced rule must be live (enabled)");
         assert_eq!(applied.pattern.as_deref(), Some("evil"));
         assert_eq!(version, 9, "registry version follows the Main's authoritative version");
+        assert_eq!(
+            *node.rules_version.read().await,
+            9,
+            "cluster/status telemetry must report the applied version after a full snapshot"
+        );
 
         // A follow-up incremental upsert from the Main also takes effect.
         let mut r2 = rule("r2");
@@ -194,6 +213,20 @@ mod tests {
         assert!(rules.contains_key("r1"), "existing rule survives an incremental update");
         assert_eq!(rules.get("r2").map(|r| r.action.as_str()), Some("log"));
         assert_eq!(version, 10);
+        assert_eq!(
+            *node.rules_version.read().await,
+            10,
+            "cluster/status telemetry advances with each applied incremental push"
+        );
+
+        // A stale/out-of-order push carrying an older version is still applied to
+        // the registry, but must not regress the monotonic telemetry counter.
+        apply_incoming_rule_sync(&node, "main-A", incremental_upsert(4, &r2)).await;
+        assert_eq!(
+            *node.rules_version.read().await,
+            10,
+            "cluster/status telemetry is monotonic and never regresses"
+        );
     }
 
     #[tokio::test]
