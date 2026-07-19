@@ -42,6 +42,16 @@ pub trait RuleReloader: Send + Sync {
     /// sync operation.  `version` is the authoritative version received from
     /// the main node.
     async fn on_rules_updated(&self, version: u64) -> anyhow::Result<()>;
+
+    /// Called exactly once when this node is promoted Worker→Main.
+    ///
+    /// A freshly-promoted Main is the DB-authoritative rule source, so any rules
+    /// it previously consumed from the old Main (the cluster-synced store) must
+    /// stop matching to avoid double evaluation. The default implementation is a
+    /// no-op; `WafEngine` overrides it to drop its synced store. Idempotent, so a
+    /// spurious call on a node that is already Main (or never synced) is
+    /// harmless.
+    async fn on_promoted_to_main(&self) {}
 }
 
 #[async_trait::async_trait]
@@ -64,5 +74,12 @@ impl RuleReloader for WafEngine {
         } else {
             self.reload_rules().await
         }
+    }
+
+    /// Drop the request-path synced store on Worker→Main promotion so this node
+    /// stops matching rules it consumed from the old Main and relies solely on
+    /// its DB-authoritative stores. No-op on a standalone node that never synced.
+    async fn on_promoted_to_main(&self) {
+        self.clear_synced_rules();
     }
 }

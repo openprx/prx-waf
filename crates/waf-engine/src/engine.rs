@@ -266,6 +266,24 @@ impl WafEngine {
         self.synced.store(Some(Arc::new(store)));
     }
 
+    /// Clear the request-path [`SyncedRuleStore`] (Worker→Main promotion).
+    ///
+    /// When a worker is elected Main it becomes the DB-authoritative source of
+    /// rules, so the rules it previously consumed from the *old* Main must stop
+    /// matching — otherwise the same rules are evaluated twice (once from the DB
+    /// stores, once from the leftover synced store). Atomically publishes `None`
+    /// so the request path falls back to the DB-backed stores on the next
+    /// request.
+    ///
+    /// Idempotent and safe on a standalone node: storing `None` when the store is
+    /// already `None` (never synced) is a no-op. The DB-backed stores are
+    /// bucket-isolated and untouched. The attached registry itself is left in
+    /// place; the worker pull loop stops once this node is Main, so the store is
+    /// not re-populated.
+    pub fn clear_synced_rules(&self) {
+        self.synced.store(None);
+    }
+
     /// Current synced-rule snapshot, if any. Cheap (an `Arc` clone) so it is safe
     /// to call once per request phase.
     fn synced_snapshot(&self) -> Option<Arc<SyncedRuleStore>> {
