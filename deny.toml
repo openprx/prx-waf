@@ -11,7 +11,7 @@ feature-depth = 1
 yanked = "deny"
 unmaintained = "all"
 unsound = "workspace"
-# Every ignore below has been re-verified against the live dependency tree on 2026-07-18.
+# Every ignore below has been re-verified against the live dependency tree on 2026-07-19.
 # Review all ignores by: 2026-10-01
 ignore = [
     # protobuf 2.28.0 recursive-parsing stack overflow — path: prometheus 0.13.4 -> protobuf v2,
@@ -29,11 +29,27 @@ ignore = [
     # linked into the runtime binary; pingora-locked. Verified present.
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: unmaintained build-time proc-macro, pingora 0.8 transitive; not in runtime" },
     # rsa 0.9.10 Marvin timing sidechannel — NO fixed release exists upstream (patched = []).
-    # Real path: rsa -> jsonwebtoken (rust_crypto) -> waf-api, so the crate IS compiled (the old
-    # "not compiled via sqlx-mysql" claim was wrong). However waf-api signs and verifies JWTs
-    # exclusively with HMAC (EncodingKey/DecodingKey::from_secret => HS256, see crates/waf-api/src/auth.rs).
+    # Real path: rsa -> jsonwebtoken (rust_crypto) -> waf-api, so the crate IS compiled. However
+    # waf-api signs and verifies JWTs exclusively with HMAC (EncodingKey/DecodingKey::from_secret
+    # => HS256, Validation::default() locks the algorithm to HS256, see crates/waf-api/src/auth.rs).
     # The RSA private-key operations Marvin targets are never invoked, so it is not exploitable here.
-    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: compiled via jsonwebtoken but waf-api uses only HMAC/HS256 JWTs; RSA code path unreachable; no fixed version exists" },
+    #
+    # Removal paths evaluated & rejected on 2026-07-19 (goal: get rsa out of Cargo.lock entirely):
+    #   1. jsonwebtoken HMAC-only feature trim — IMPOSSIBLE. jsonwebtoken 10.3/10.4 gate all
+    #      RustCrypto algorithms behind one monolithic `rust_crypto` feature that hard-bundles
+    #      rsa together with hmac (features = [ed25519-dalek, hmac, p256, p384, rand, rsa, sha2]);
+    #      there is no HMAC-only sub-feature, so rsa cannot be excluded while keeping HS256.
+    #   2. jsonwebtoken `aws_lc_rs` backend — TECHNICALLY WORKS (rsa leaves the tree, all 13 auth
+    #      unit tests pass with auth.rs unchanged) but REJECTED: it re-adds aws-lc-rs/aws-lc-sys,
+    #      directly reversing commit 1b7e23f which deliberately purged aws-lc-rs so that `ring`
+    #      is the sole crypto provider (dual providers previously panicked rustls at cluster/HTTP3
+    #      startup) and adds a cmake/C-toolchain build burden.
+    #   3. Replace jsonwebtoken with a pure-Rust HMAC lib (jwt crate) or a hand-rolled HS256 —
+    #      REJECTED: rewrites security-critical auth token signing/verification (regression risk
+    #      against the auth red-line) or pulls in an unmaintained crate, to silence an advisory
+    #      that is already unexploitable with no upstream fix.
+    # Conclusion: keeping this documented ignore is the lowest-real-risk option.
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: compiled via jsonwebtoken(rust_crypto) but waf-api uses only HMAC/HS256; RSA code path unreachable; no upstream fix; removal via aws_lc_rs rejected (reverses ring-only commit 1b7e23f), feature-trim impossible (rust_crypto bundles rsa+hmac), lib swap risks auth regression" },
 ]
 
 [licenses]
