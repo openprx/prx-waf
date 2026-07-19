@@ -24,6 +24,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
 ipnet = { workspace = true }
+rustls = { workspace = true }
 
 pingora-core = { workspace = true }
 pingora-proxy = { workspace = true }
