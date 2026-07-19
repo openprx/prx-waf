@@ -11,6 +11,13 @@ use crate::rules::{IpRuleSet, UrlMatchType, UrlRule, UrlRuleSet};
 pub struct RuleStore {
     pub allow_ips: Arc<IpRuleSet>,
     pub block_ips: Arc<IpRuleSet>,
+    /// Threat-intelligence IP blocklist populated by the IP-feed adapter
+    /// (ET Open / Tor / Spamhaus …). Kept separate from `block_ips` because it
+    /// is fed by the background feed sync task rather than the database: the
+    /// database reload path ([`Self::reload_all`]) must not prune it, and each
+    /// bucket is keyed by feed name for per-source replacement and cleanup.
+    /// Every entry is globally applicable (see [`IpRuleSet::match_source`]).
+    pub feed_block_ips: Arc<IpRuleSet>,
     pub allow_urls: Arc<UrlRuleSet>,
     pub block_urls: Arc<UrlRuleSet>,
     db: Arc<Database>,
@@ -21,6 +28,7 @@ impl RuleStore {
         Self {
             allow_ips: Arc::new(IpRuleSet::new()),
             block_ips: Arc::new(IpRuleSet::new()),
+            feed_block_ips: Arc::new(IpRuleSet::new()),
             allow_urls: Arc::new(UrlRuleSet::new()),
             block_urls: Arc::new(UrlRuleSet::new()),
             db,
@@ -229,6 +237,23 @@ pub fn check_ip_blacklist(ctx: &RequestCtx, store: &RuleStore) -> WafDecision {
                 rule_name: "IP Blacklist".to_string(),
                 phase: Phase::IpBlacklist,
                 detail: format!("IP {} matched blacklist", ctx.client_ip),
+            },
+        );
+    }
+
+    // Threat-intelligence IP feeds (global, source-tagged). Checked after the
+    // admin blacklist so an explicit rule's detail wins; the matched feed name
+    // is surfaced for traceability.
+    if let Some(source) = store.feed_block_ips.match_source(ctx.client_ip) {
+        debug!("IP {} blocked by threat feed '{}'", ctx.client_ip, source);
+        return WafDecision::block(
+            403,
+            Some("Access denied.".to_string()),
+            DetectionResult {
+                rule_id: None,
+                rule_name: "IP Blacklist (Threat Feed)".to_string(),
+                phase: Phase::IpBlacklist,
+                detail: format!("IP {} matched threat-intel feed '{source}'", ctx.client_ip),
             },
         );
     }

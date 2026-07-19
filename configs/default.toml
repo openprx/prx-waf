@@ -124,6 +124,47 @@ cors_origins = []
 # flush_interval_secs = 30   # Flush buffer even when batch_size not reached
 # sync_interval_secs = 300   # Blocklist sync interval (default: 5 minutes)
 
+# ── Threat-Intelligence IP Feeds (disabled by default — opt-in) ───────────────
+# Pull raw IP/CIDR blocklists from external open-source intelligence sources and
+# fold matching addresses into the WAF IP blacklist (403). NO feed is fetched
+# unless you uncomment an [[ip_feeds]] block below.
+#
+# ⚠ LICENSING — READ BEFORE ENABLING. These sources are free but carry terms:
+#   • ET Open (Emerging Threats) — BSD-licensed. Free to use.
+#   • Tor exit list              — CC0 / public domain. Free to use.
+#   • Spamhaus DROP              — free BUT requires ATTRIBUTION and FORBIDS
+#                                  some commercial redistribution. Review
+#                                  https://www.spamhaus.org/drop/ terms first.
+# Enabling a feed is your acknowledgement of its license. This is why the
+# default ships with everything commented out.
+#
+# format: "plain"         — one IP/CIDR per line; `#` and `;` comments tolerated
+#         "spamhaus_json" — Spamhaus DROP JSONL (one {"cidr":...} object/line)
+#
+# Emerging Threats Open — compromised / known-bad IPs (BSD license):
+# [[ip_feeds]]
+# name = "et-open-compromised"
+# url = "https://rules.emergingthreats.net/blockrules/compromised-ips.txt"
+# format = "plain"
+# update_interval_secs = 3600
+# enabled = true
+#
+# Tor exit nodes (CC0 / public domain):
+# [[ip_feeds]]
+# name = "tor-exit-nodes"
+# url = "https://check.torproject.org/torbulkexitlist"
+# format = "plain"
+# update_interval_secs = 3600
+# enabled = true
+#
+# Spamhaus DROP (Don't Route Or Peer) — ATTRIBUTION REQUIRED, see terms above:
+# [[ip_feeds]]
+# name = "spamhaus-drop"
+# url = "https://www.spamhaus.org/drop/drop_v4.json"
+# format = "spamhaus_json"
+# update_interval_secs = 86400
+# enabled = true
+
 # ── CrowdSec Integration ──────────────────────────────────────────────────────
 # CrowdSec needs an external LAPI endpoint + bouncer key, so it stays off for a
 # zero-config single node. It auto-enables once `api_key` is set (no need to also

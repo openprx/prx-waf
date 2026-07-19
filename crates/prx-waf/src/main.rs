@@ -14,8 +14,9 @@ use gateway::{
 use waf_api::{AppState, start_api_server};
 use waf_common::config::{AppConfig, apply_env_overrides, load_config};
 use waf_engine::{
-    CrowdSecClient, CrowdSecConfig, ExportFormat, GeoIpService, RuleManager, WafEngine, WafEngineConfig, XdbUpdater,
-    cache_policy_from_str, init_community, init_crowdsec, spawn_auto_updater,
+    CrowdSecClient, CrowdSecConfig, ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource, RuleManager, WafEngine,
+    WafEngineConfig, XdbUpdater, cache_policy_from_str, init_community, init_crowdsec, spawn_auto_updater,
+    spawn_ip_feed_sync,
 };
 use waf_storage::Database;
 
@@ -1409,6 +1410,12 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         }
     }
 
+    // Threat-intelligence IP feeds (opt-in; empty by default). Each enabled
+    // feed becomes a background sync task that fetches its raw CIDR blocklist,
+    // parses it, and folds the results into the WAF IP blacklist. Kept local
+    // to init_async so the wiring lives beside the other background spawns.
+    spawn_ip_feeds(config, &engine);
+
     // Host router
     let router = Arc::new(HostRouter::new());
 
@@ -1664,6 +1671,37 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         response_cache,
         guards,
     ))
+}
+
+/// Spawn background sync tasks for the configured threat-intelligence IP feeds.
+///
+/// No feed is active unless explicitly listed in `[[ip_feeds]]` (opt-in). Each
+/// enabled entry is converted to the engine [`IpFeedSource`] type and handed a
+/// dedicated task that refreshes on its interval; the task handles are detached
+/// (`std::mem::forget`) to live for the process lifetime, matching the other
+/// background spawns in `init_async`.
+fn spawn_ip_feeds(config: &AppConfig, engine: &Arc<WafEngine>) {
+    let feeds: Vec<IpFeedSource> = config
+        .ip_feeds
+        .iter()
+        .filter(|f| f.enabled)
+        .map(|f| IpFeedSource {
+            name: f.name.clone(),
+            url: f.url.clone(),
+            format: IpFeedFormat::parse_str(&f.format),
+            update_interval: std::time::Duration::from_secs(f.update_interval_secs),
+        })
+        .collect();
+
+    if feeds.is_empty() {
+        return;
+    }
+
+    info!("Spawning {} threat-intel IP-feed sync task(s)", feeds.len());
+    let handles = spawn_ip_feed_sync(&engine.store, feeds);
+    for handle in handles {
+        std::mem::forget(handle);
+    }
 }
 
 /// Wire up ACME automatic TLS: construct the `SslManager`, spawn the periodic
