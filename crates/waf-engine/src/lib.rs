@@ -23,6 +23,7 @@ pub use engine::{WafEngine, WafEngineConfig};
 pub use geoip::{GeoIpService, cache_policy_from_str};
 pub use geoip_updater::{UpdateResult, XdbUpdater, spawn_auto_updater};
 pub use plugins::{PluginAction, PluginInfo, PluginManager, WasmPlugin};
+pub use rules::cluster_sync::{self, SyncedRuleStore};
 pub use rules::engine::{CustomRule, CustomRulesEngine};
 pub use rules::formats::{ExportFormat, RuleFormat, ValidationError};
 pub use rules::ip_feed::{IpFeedFormat, IpFeedSource, spawn_ip_feed_sync};
@@ -45,7 +46,23 @@ pub trait RuleReloader: Send + Sync {
 
 #[async_trait::async_trait]
 impl RuleReloader for WafEngine {
+    /// Called by the cluster sync layer after `NodeState.rule_registry` has been
+    /// mutated by a pull from the authenticated Main.
+    ///
+    /// When a cluster registry is attached (worker / DB-less path), rebuild the
+    /// request-path [`SyncedRuleStore`] from the freshly-synced registry so the
+    /// **next request** evaluates the new rules without touching the local
+    /// database. The synced store is bucket-isolated from the DB stores, so this
+    /// never prunes DB-loaded rules and a DB reload never prunes synced rules.
+    ///
+    /// Without an attached registry (standalone node), fall back to the historic
+    /// database reload so single-node behaviour is unchanged.
     async fn on_rules_updated(&self, _version: u64) -> anyhow::Result<()> {
-        self.reload_rules().await
+        if self.has_synced_registry() {
+            self.refresh_synced_rules();
+            Ok(())
+        } else {
+            self.reload_rules().await
+        }
     }
 }

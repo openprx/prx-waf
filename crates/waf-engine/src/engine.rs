@@ -1,4 +1,7 @@
 use std::sync::{Arc, OnceLock};
+
+use arc_swap::ArcSwapOption;
+use parking_lot::RwLock as ParkingRwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -17,7 +20,9 @@ use crate::checks::{
 use crate::community::{CommunityChecker, CommunityReporter, RequestInfo};
 use crate::crowdsec::{AppSecClient, AppSecResult, CrowdSecChecker, FallbackAction, appsec_to_detection};
 use crate::geoip::GeoIpService;
-use crate::rules::engine::{CustomRulesEngine, RuleAction, from_db_rule};
+use crate::rules::cluster_sync::SyncedRuleStore;
+use crate::rules::engine::{CustomRuleMatch, CustomRulesEngine, RuleAction, from_db_rule};
+use crate::rules::registry::RuleRegistry;
 
 /// WAF engine configuration
 #[derive(Debug, Clone, Default)]
@@ -72,6 +77,19 @@ pub struct WafEngine {
     // ── `GeoIP` ────────────────────────────────────────────────────────────────
     /// `GeoIP` lookup service (set once after engine construction via `set_geoip`)
     geoip: OnceLock<Arc<GeoIpService>>,
+    // ── Cluster data-plane sync ─────────────────────────────────────────────────
+    /// Shared cluster rule registry (`NodeState.rule_registry`). Attached once
+    /// via [`Self::attach_synced_registry`] when this node is part of a cluster.
+    /// Its presence is what makes [`crate::RuleReloader::on_rules_updated`] consume
+    /// synced rules instead of reloading from the local database (worker path).
+    synced_registry: OnceLock<Arc<ParkingRwLock<RuleRegistry>>>,
+    /// Request-path snapshot rebuilt from the synced registry on every sync.
+    ///
+    /// Kept **separate** from the database-backed stores so a DB reload never
+    /// prunes synced rules and vice-versa. `None` until the first sync arrives;
+    /// on a standalone (non-cluster) node it stays `None`, so the request path is
+    /// byte-for-byte unchanged.
+    synced: ArcSwapOption<SyncedRuleStore>,
 }
 
 impl WafEngine {
@@ -114,6 +132,8 @@ impl WafEngine {
             community_checker: OnceLock::new(),
             community_reporter: OnceLock::new(),
             geoip: OnceLock::new(),
+            synced_registry: OnceLock::new(),
+            synced: ArcSwapOption::empty(),
         }
     }
 
@@ -210,6 +230,48 @@ impl WafEngine {
         Ok(())
     }
 
+    // ── Cluster data-plane sync (worker consume side) ───────────────────────────
+
+    /// Attach the shared cluster rule registry (`NodeState.rule_registry`).
+    ///
+    /// Called by the cluster↔engine wiring in `main.rs` when this node joins a
+    /// cluster. Once attached, [`crate::RuleReloader::on_rules_updated`] rebuilds
+    /// the request-path [`SyncedRuleStore`] from this registry instead of
+    /// reloading from the local database — the DB-less worker path. Idempotent:
+    /// a second call is ignored.
+    pub fn attach_synced_registry(&self, registry: Arc<ParkingRwLock<RuleRegistry>>) {
+        if self.synced_registry.set(registry).is_err() {
+            warn!("synced registry already attached; ignoring duplicate attach");
+        }
+    }
+
+    /// Returns `true` when a cluster synced registry has been attached.
+    pub fn has_synced_registry(&self) -> bool {
+        self.synced_registry.get().is_some()
+    }
+
+    /// Rebuild the request-path [`SyncedRuleStore`] from the attached registry
+    /// and atomically publish it. No-op when no registry is attached.
+    ///
+    /// The rebuild happens off the request path; readers see either the previous
+    /// snapshot or the new one, never a partially-populated store.
+    pub fn refresh_synced_rules(&self) {
+        let Some(registry) = self.synced_registry.get() else {
+            return;
+        };
+        let store = {
+            let guard = registry.read();
+            SyncedRuleStore::from_registry(&guard)
+        };
+        self.synced.store(Some(Arc::new(store)));
+    }
+
+    /// Current synced-rule snapshot, if any. Cheap (an `Arc` clone) so it is safe
+    /// to call once per request phase.
+    fn synced_snapshot(&self) -> Option<Arc<SyncedRuleStore>> {
+        self.synced.load_full()
+    }
+
     /// Build a block (or log-only) decision from a detection result and record
     /// it to the security-event log (and optionally the community reporter).
     ///
@@ -289,26 +351,23 @@ impl WafEngine {
             }
         }
 
+        // Cluster-synced rules live in a separate, DB-isolated store. Snapshot
+        // it once for this phase; `None` on a standalone node (zero overhead).
+        let synced = self.synced_snapshot();
+
         // ── Phase 12: Custom rules engine (dispatch on the rule action, M-7) ──
-        if let Some(m) = self.custom_rules.check(ctx) {
-            match m.action {
-                // Allow acts as an explicit exception: short-circuit and allow.
-                RuleAction::Allow => return Some(WafDecision::allow()),
-                // Log records the hit but lets the request continue the pipeline.
-                RuleAction::Log => {
-                    let decision = WafDecision {
-                        action: WafAction::LogOnly,
-                        result: Some(m.result),
-                    };
-                    self.log_security_event(ctx, &decision);
-                    self.report_community_signal(ctx, &decision);
-                }
-                // Block / Challenge deny using the rule's configured status code
-                // (Challenge has no interactive backend yet, so it denies too).
-                RuleAction::Block | RuleAction::Challenge => {
-                    return Some(self.record_block_status(ctx, m.result, m.action_status, m.action_msg, true));
-                }
-            }
+        // Database-backed custom rules first, then cluster-synced ones. Both go
+        // through the same dispatch so a synced rule behaves identically.
+        if let Some(m) = self.custom_rules.check(ctx)
+            && let Some(decision) = self.dispatch_custom_match(ctx, m)
+        {
+            return Some(decision);
+        }
+        if let Some(synced) = &synced
+            && let Some(m) = synced.custom_rules.check(ctx)
+            && let Some(decision) = self.dispatch_custom_match(ctx, m)
+        {
+            return Some(decision);
         }
 
         // ── Phase 13: OWASP CRS ────────────────────────────────────────────────
@@ -320,8 +379,41 @@ impl WafEngine {
         if let Some(result) = self.sensitive.check(ctx) {
             return Some(self.record_block(ctx, result, true));
         }
+        if let Some(synced) = &synced
+            && let Some(result) = synced.sensitive.check(ctx)
+        {
+            return Some(self.record_block(ctx, result, true));
+        }
 
         None
+    }
+
+    /// Dispatch a custom-rule match on its configured action (M-7).
+    ///
+    /// Returns `Some(decision)` when the request must short-circuit (allow /
+    /// block / challenge) and `None` when the rule only logged and the pipeline
+    /// should continue. Shared by the database-backed and cluster-synced custom
+    /// rule engines so both behave identically.
+    fn dispatch_custom_match(&self, ctx: &RequestCtx, m: CustomRuleMatch) -> Option<WafDecision> {
+        match m.action {
+            // Allow acts as an explicit exception: short-circuit and allow.
+            RuleAction::Allow => Some(WafDecision::allow()),
+            // Log records the hit but lets the request continue the pipeline.
+            RuleAction::Log => {
+                let decision = WafDecision {
+                    action: WafAction::LogOnly,
+                    result: Some(m.result),
+                };
+                self.log_security_event(ctx, &decision);
+                self.report_community_signal(ctx, &decision);
+                None
+            }
+            // Block / Challenge deny using the rule's configured status code
+            // (Challenge has no interactive backend yet, so it denies too).
+            RuleAction::Block | RuleAction::Challenge => {
+                Some(self.record_block_status(ctx, m.result, m.action_status, m.action_msg, true))
+            }
+        }
     }
 
     /// Run the header-phase WAF inspection pipeline (the full pipeline).
@@ -342,6 +434,11 @@ impl WafEngine {
             ctx.geo = Some(geoip.lookup(ctx.client_ip));
         }
 
+        // Cluster-synced IP/URL rules live in a separate, DB-isolated store.
+        // Snapshot once for this pipeline; `None` on a standalone node.
+        let synced = self.synced_snapshot();
+        let host_code = ctx.host_config.code.clone();
+
         // ── Phase 1: IP Whitelist — allow immediately if matched ──────────────
         let ip_whitelist = check_ip_whitelist(ctx, &self.store);
         if let Some(ref result) = ip_whitelist.result
@@ -351,6 +448,20 @@ impl WafEngine {
             debug!("Request allowed by IP whitelist: {}", ctx.client_ip);
             return ip_whitelist;
         }
+        if let Some(s) = &synced
+            && s.allow_ips.matches(&host_code, ctx.client_ip)
+        {
+            debug!("Request allowed by synced IP whitelist: {}", ctx.client_ip);
+            return WafDecision {
+                action: WafAction::Allow,
+                result: Some(DetectionResult {
+                    rule_id: None,
+                    rule_name: "IP Whitelist (Cluster Sync)".to_string(),
+                    phase: waf_common::Phase::IpWhitelist,
+                    detail: format!("IP {} matched synced whitelist", ctx.client_ip),
+                }),
+            };
+        }
 
         // ── Phase 2: IP Blacklist — block if matched ───────────────────────────
         let ip_blacklist = check_ip_blacklist(ctx, &self.store);
@@ -359,11 +470,43 @@ impl WafEngine {
             self.report_community_signal(ctx, &ip_blacklist);
             return ip_blacklist;
         }
+        if let Some(s) = &synced
+            && s.block_ips.matches(&host_code, ctx.client_ip)
+        {
+            let decision = WafDecision::block(
+                403,
+                Some("Access denied.".to_string()),
+                DetectionResult {
+                    rule_id: None,
+                    rule_name: "IP Blacklist (Cluster Sync)".to_string(),
+                    phase: waf_common::Phase::IpBlacklist,
+                    detail: format!("IP {} matched synced blacklist", ctx.client_ip),
+                },
+            );
+            self.log_attack(ctx, &decision);
+            self.report_community_signal(ctx, &decision);
+            return decision;
+        }
 
         // ── Phase 3: URL Whitelist — allow immediately if matched ──────────────
         if let Some(url_wl) = check_url_whitelist(ctx, &self.store) {
             debug!("Request allowed by URL whitelist: {}", ctx.path);
             return url_wl;
+        }
+        if let Some(s) = &synced {
+            let decoded = crate::checks::url_decode(&ctx.path);
+            if let Some(rule_id) = s.allow_urls.matches(&host_code, &decoded) {
+                debug!("Request allowed by synced URL whitelist: {}", ctx.path);
+                return WafDecision {
+                    action: WafAction::Allow,
+                    result: Some(DetectionResult {
+                        rule_id: Some(rule_id),
+                        rule_name: "URL Whitelist (Cluster Sync)".to_string(),
+                        phase: waf_common::Phase::UrlWhitelist,
+                        detail: format!("Path {} matched synced URL whitelist", ctx.path),
+                    }),
+                };
+            }
         }
 
         // ── Phase 4: URL Blacklist — block if matched ──────────────────────────
@@ -372,6 +515,32 @@ impl WafEngine {
             self.log_attack(ctx, &url_bl);
             self.report_community_signal(ctx, &url_bl);
             return url_bl;
+        }
+        if let Some(s) = &synced {
+            // Match both the raw and decoded path (M-6 evasion parity).
+            let decoded = crate::checks::url_decode(&ctx.path);
+            let matched = s.block_urls.matches(&host_code, &ctx.path).or_else(|| {
+                if decoded == ctx.path {
+                    None
+                } else {
+                    s.block_urls.matches(&host_code, &decoded)
+                }
+            });
+            if let Some(rule_id) = matched {
+                let decision = WafDecision::block(
+                    403,
+                    Some("Access denied.".to_string()),
+                    DetectionResult {
+                        rule_id: Some(rule_id),
+                        rule_name: "URL Blacklist (Cluster Sync)".to_string(),
+                        phase: waf_common::Phase::UrlBlacklist,
+                        detail: format!("Path {} matched synced URL blacklist", ctx.path),
+                    },
+                );
+                self.log_attack(ctx, &decision);
+                self.report_community_signal(ctx, &decision);
+                return decision;
+            }
         }
 
         // ── Phase 16a: CrowdSec Bouncer — fast cache lookup ───────────────────
