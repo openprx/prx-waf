@@ -281,6 +281,19 @@ enum GeoIpCommands {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
+    // Install the process-level rustls CryptoProvider before ANY rustls/QUIC
+    // configuration is constructed (cluster mTLS, HTTP/3, outbound TLS). The
+    // dependency graph pulls in both `ring` and `aws-lc-rs` transitively, so
+    // rustls 0.23 cannot auto-select a provider and would panic at first use
+    // (crypto/mod.rs: "Could not automatically determine the process-level
+    // CryptoProvider"). Pin `ring` explicitly, exactly once, at startup.
+    // `install_default` returns Err only if a provider was already installed;
+    // failing here means the process cannot run TLS safely, so bail loudly
+    // instead of panicking (Iron Rule #1: no expect in production).
+    if rustls::crypto::ring::default_provider().install_default().is_err() {
+        anyhow::bail!("failed to install the ring rustls CryptoProvider: a default provider was already set");
+    }
+
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(

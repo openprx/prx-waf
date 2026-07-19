@@ -69,7 +69,7 @@ base64 = "0.22"
 argon2 = { version = "0.5", features = ["std"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 aes-gcm = "0.10"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "smtp-transport", "builder"] }
 rust-embed = "8"
 mime_guess = "2"
@@ -83,7 +83,7 @@ data-encoding = "2"
 wasmtime = { version = "43.0.0", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "anyhow"] }
 moka = { version = "0.12", features = ["future"] }
 quinn = { version = "0.11", features = ["rustls"] }
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 rustls-pki-types = { version = "1", features = ["std"] }
