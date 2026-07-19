@@ -25,7 +25,7 @@ use waf_cluster::{
     transport::{client::ClusterClient, server::ClusterServer},
 };
 use waf_common::config::{ClusterConfig, NodeRole};
-use waf_engine::{Rule, RuleRegistry};
+use waf_engine::{Rule, RuleRegistry, SyncedRuleStore, cluster_sync};
 
 // ─── Shared test helpers ───────────────────────────────────────────────────────
 
@@ -326,6 +326,76 @@ async fn rule_created_on_main_synced_to_worker() {
     assert!(
         worker_registry.rules.contains_key("xss-001"),
         "non-deleted rule must still be present"
+    );
+}
+
+/// End-to-end **data-plane** proof: a detection rule recorded on the Main is
+/// reconstructed into the worker's request-path store.
+///
+/// This closes the loop the two integration hooks exist for:
+/// 1. Main records a cluster-encoded block-IP rule (`record_rule_change`) — the
+///    same call the API trigger hook makes.
+/// 2. The change travels the sync wire (snapshot → `apply_sync_response`) into a
+///    worker `RuleRegistry`.
+/// 3. The worker rebuilds a [`SyncedRuleStore`] from that registry (Hook #2's
+///    consume side) and the IP now matches on the request path — **no database**.
+#[tokio::test]
+async fn synced_rule_from_main_takes_effect_on_worker_request_path() {
+    // ── Main: record a cluster block-IP rule (as the API hook would) ──────
+    let mut metadata = HashMap::new();
+    metadata.insert("host_code".to_string(), "h1".to_string());
+    let rule_id = format!(
+        "{}:{}",
+        cluster_sync::CAT_BLOCK_IP,
+        "11111111-1111-1111-1111-111111111111"
+    );
+    let block_ip_rule = Rule {
+        id: rule_id.clone(),
+        name: "block 10.0.0.0/8".to_string(),
+        description: None,
+        category: cluster_sync::CAT_BLOCK_IP.to_string(),
+        source: cluster_sync::SOURCE_CLUSTER.to_string(),
+        enabled: true,
+        action: "block".to_string(),
+        severity: None,
+        pattern: Some("10.0.0.0/8".to_string()),
+        tags: vec![],
+        metadata,
+    };
+
+    let main_state = make_node_state("main-dp", minimal_config(random_loopback_addr()));
+    main_state
+        .record_rule_change(ChangeOp::Upsert, rule_id.clone(), Some(block_ip_rule.clone()))
+        .await;
+
+    // ── Wire: build a full snapshot of the Main's rules and ship it ────────
+    let rules: Vec<Rule> = {
+        let reg = main_state.rule_registry.read();
+        reg.rules.values().cloned().collect()
+    };
+    let response = waf_cluster::protocol::RuleSyncResponse {
+        version: 1,
+        sync_type: SyncType::Full,
+        changes: vec![],
+        snapshot_lz4: waf_cluster::sync::rules::snapshot_rules(&rules).expect("snapshot"),
+    };
+
+    // ── Worker: apply the sync, then rebuild the request-path store ───────
+    let mut worker_registry = RuleRegistry::new();
+    apply_sync_response(response, &mut worker_registry, &NoopReloader)
+        .await
+        .expect("apply sync");
+
+    let store = SyncedRuleStore::from_registry(&worker_registry);
+    let blocked: std::net::IpAddr = "10.1.2.3".parse().expect("ip");
+    let allowed: std::net::IpAddr = "192.168.1.1".parse().expect("ip");
+    assert!(
+        store.block_ips.matches("h1", blocked),
+        "synced block-IP rule must match on the worker request path"
+    );
+    assert!(
+        !store.block_ips.matches("h1", allowed),
+        "an unrelated IP must not be blocked"
     );
 }
 

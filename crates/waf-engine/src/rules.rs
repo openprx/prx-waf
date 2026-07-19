@@ -1,4 +1,5 @@
 pub mod builtin;
+pub mod cluster_sync;
 pub mod engine;
 pub mod formats;
 pub mod hot_reload;

@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cache_api;
 pub mod cluster;
+pub mod cluster_sync_hook;
 pub mod crowdsec;
 pub mod error;
 pub mod handlers;

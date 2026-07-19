@@ -141,6 +141,32 @@ impl AppState {
         })
     }
 
+    /// Broadcast a rule upsert to the cluster (Main-only; no-op otherwise).
+    ///
+    /// Called by rule-mutation handlers after a successful DB write so every
+    /// worker's request path picks up the change. `rule` must already carry the
+    /// stable cluster-sync id (see `waf_engine::cluster_sync`).
+    pub async fn cluster_broadcast_upsert(&self, rule: waf_engine::Rule) {
+        crate::cluster_sync_hook::record_if_main(
+            self.cluster_state.as_ref(),
+            waf_cluster::protocol::ChangeOp::Upsert,
+            rule.id.clone(),
+            Some(rule),
+        )
+        .await;
+    }
+
+    /// Broadcast a rule delete to the cluster (Main-only; no-op otherwise).
+    pub async fn cluster_broadcast_delete(&self, kind: waf_engine::cluster_sync::SyncedKind, id: uuid::Uuid) {
+        crate::cluster_sync_hook::record_if_main(
+            self.cluster_state.as_ref(),
+            waf_cluster::protocol::ChangeOp::Delete,
+            waf_engine::cluster_sync::registry_id(kind, id),
+            None,
+        )
+        .await;
+    }
+
     pub fn increment_requests(&self) {
         self.request_counter.fetch_add(1, Ordering::Relaxed);
     }
