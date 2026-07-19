@@ -178,6 +178,10 @@ impl NodeState {
     /// Transitions role to Main and logs. If the node had an encrypted CA key
     /// stored (from a previous `JoinResponse`), it is already available for use.
     pub async fn promote_to_main(&self) {
+        // Only fire the data-plane promotion hook on a genuine Worker→Main
+        // transition, so re-affirming an existing Main leaves the request path
+        // untouched (the clear itself is idempotent, but this avoids needless work).
+        let was_main = *self.role.read().await == NodeRole::Main;
         self.transition_to(NodeRole::Main).await;
         info!(
             node_id = %self.node_id,
@@ -186,6 +190,13 @@ impl NodeState {
         );
         // If we have an encrypted CA key, it can be decrypted now using the
         // cluster passphrase from config (done by the caller when signing certs).
+
+        if !was_main {
+            // This node is now the DB-authoritative rule source. Drop any rules
+            // it previously consumed from the old Main (the synced store) so the
+            // request path stops double-matching them against the DB stores.
+            self.rule_reloader().on_promoted_to_main().await;
+        }
     }
 
     /// Demote this node back to Worker (called when a new election is won by another).
@@ -603,6 +614,72 @@ mod tests {
         // Should not crash or change state
         node.demote_to_worker().await;
         assert_eq!(node.current_role().await, NodeRole::Worker);
+    }
+
+    // ── Worker→Main promotion hook (clears the data-plane synced store) ──────────
+
+    /// Records how many times the data-plane promotion hook fired, so the tests
+    /// can assert it runs exactly once on a genuine Worker→Main transition.
+    struct CountingReloader {
+        promoted: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RuleReloader for CountingReloader {
+        async fn on_rules_updated(&self, _version: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn on_promoted_to_main(&self) {
+            self.promoted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_worker_to_main_fires_hook_once() {
+        let config = test_config("n1", "worker");
+        let node = NodeState::new(config, StorageMode::Full).unwrap();
+        let reloader = Arc::new(CountingReloader {
+            promoted: std::sync::atomic::AtomicUsize::new(0),
+        });
+        node.attach_rule_reloader(Arc::clone(&reloader) as Arc<dyn RuleReloader>);
+
+        assert_eq!(node.current_role().await, NodeRole::Worker);
+        node.promote_to_main().await;
+        assert_eq!(node.current_role().await, NodeRole::Main);
+        assert_eq!(
+            reloader.promoted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a genuine Worker→Main transition must clear the synced store exactly once"
+        );
+
+        // Idempotent: re-affirming an existing Main must not fire the hook again.
+        node.promote_to_main().await;
+        assert_eq!(
+            reloader.promoted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "re-promoting a node that is already Main must not re-clear the synced store"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_when_already_main_does_not_fire_hook() {
+        // A node that boots as Main (single-node / configured Main) has no synced
+        // store to clear; calling promote_to_main must be a no-op for the hook.
+        let config = test_config("n1", "main");
+        let node = NodeState::new(config, StorageMode::Full).unwrap();
+        let reloader = Arc::new(CountingReloader {
+            promoted: std::sync::atomic::AtomicUsize::new(0),
+        });
+        node.attach_rule_reloader(Arc::clone(&reloader) as Arc<dyn RuleReloader>);
+
+        assert_eq!(node.current_role().await, NodeRole::Main);
+        node.promote_to_main().await;
+        assert_eq!(
+            reloader.promoted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no Worker→Main transition occurred, so the hook must not fire"
+        );
     }
 
     // ── Version tracking (2) ─────────────────────────────────────────────────
