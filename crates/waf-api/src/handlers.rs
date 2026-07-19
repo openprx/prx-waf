@@ -176,6 +176,9 @@ pub async fn create_allow_ip(
     let row = state.db.create_allow_ip(req.clone()).await?;
     // Hot-update engine rules
     state.engine.store.allow_ips.insert(&req.host_code, &req.ip_cidr);
+    state
+        .cluster_broadcast_upsert(waf_engine::cluster_sync::allow_ip_to_rule(&row))
+        .await;
     Ok(Json(json!({ "success": true, "data": row })))
 }
 
@@ -188,6 +191,9 @@ pub async fn delete_allow_ip(State(state): State<Arc<AppState>>, Path(id): Path<
     if let Err(e) = state.engine.store.reload_all().await {
         tracing::warn!("Failed to reload allow IPs after delete: {}", e);
     }
+    state
+        .cluster_broadcast_delete(waf_engine::cluster_sync::SyncedKind::AllowIp, id)
+        .await;
     Ok(Json(json!({ "success": true, "data": null })))
 }
 
@@ -208,6 +214,9 @@ pub async fn create_block_ip(
     let row = state.db.create_block_ip(req.clone()).await?;
     // Hot-update engine rules
     state.engine.store.block_ips.insert(&req.host_code, &req.ip_cidr);
+    state
+        .cluster_broadcast_upsert(waf_engine::cluster_sync::block_ip_to_rule(&row))
+        .await;
     Ok(Json(json!({ "success": true, "data": row })))
 }
 
@@ -220,6 +229,9 @@ pub async fn delete_block_ip(State(state): State<Arc<AppState>>, Path(id): Path<
     if let Err(e) = state.engine.store.reload_all().await {
         tracing::warn!("Failed to reload block IPs after delete: {}", e);
     }
+    state
+        .cluster_broadcast_delete(waf_engine::cluster_sync::SyncedKind::BlockIp, id)
+        .await;
     Ok(Json(json!({ "success": true, "data": null })))
 }
 
@@ -238,6 +250,9 @@ pub async fn create_allow_url(
     Json(req): Json<CreateUrlRule>,
 ) -> ApiResult<Json<Value>> {
     let row = state.db.create_allow_url(req.clone()).await?;
+    state
+        .cluster_broadcast_upsert(waf_engine::cluster_sync::allow_url_to_rule(&row))
+        .await;
     Ok(Json(json!({ "success": true, "data": row })))
 }
 
@@ -250,6 +265,9 @@ pub async fn delete_allow_url(State(state): State<Arc<AppState>>, Path(id): Path
     if let Err(e) = state.engine.store.reload_all().await {
         tracing::warn!("Failed to reload allow URLs after delete: {}", e);
     }
+    state
+        .cluster_broadcast_delete(waf_engine::cluster_sync::SyncedKind::AllowUrl, id)
+        .await;
     Ok(Json(json!({ "success": true, "data": null })))
 }
 
@@ -268,6 +286,9 @@ pub async fn create_block_url(
     Json(req): Json<CreateUrlRule>,
 ) -> ApiResult<Json<Value>> {
     let row = state.db.create_block_url(req.clone()).await?;
+    state
+        .cluster_broadcast_upsert(waf_engine::cluster_sync::block_url_to_rule(&row))
+        .await;
     Ok(Json(json!({ "success": true, "data": row })))
 }
 
@@ -280,6 +301,9 @@ pub async fn delete_block_url(State(state): State<Arc<AppState>>, Path(id): Path
     if let Err(e) = state.engine.store.reload_all().await {
         tracing::warn!("Failed to reload block URLs after delete: {}", e);
     }
+    state
+        .cluster_broadcast_delete(waf_engine::cluster_sync::SyncedKind::BlockUrl, id)
+        .await;
     Ok(Json(json!({ "success": true, "data": null })))
 }
 
@@ -369,6 +393,10 @@ pub async fn create_custom_rule(
     if let Ok(rule) = from_db_rule(&row) {
         state.engine.custom_rules.add_rule(rule);
     }
+    // Cluster: broadcast so workers pick up the new rule on their request path.
+    state
+        .cluster_broadcast_upsert(waf_engine::cluster_sync::custom_rule_to_rule(&row))
+        .await;
     Ok(Json(json!({ "success": true, "data": row })))
 }
 
@@ -386,6 +414,9 @@ pub async fn delete_custom_rule(State(state): State<Arc<AppState>>, Path(id): Pa
         .engine
         .custom_rules
         .remove_rule(&rule.host_code, &rule.id.to_string());
+    state
+        .cluster_broadcast_delete(waf_engine::cluster_sync::SyncedKind::Custom, id)
+        .await;
     Ok(Json(json!({ "success": true, "data": null })))
 }
 
@@ -408,6 +439,9 @@ pub async fn create_sensitive_pattern(
     if let Err(e) = state.engine.reload_rules().await {
         tracing::warn!("Failed to reload after pattern add: {}", e);
     }
+    state
+        .cluster_broadcast_upsert(waf_engine::cluster_sync::sensitive_to_rule(&row))
+        .await;
     Ok(Json(json!({ "success": true, "data": row })))
 }
 
@@ -422,6 +456,9 @@ pub async fn delete_sensitive_pattern(
     if let Err(e) = state.engine.reload_rules().await {
         tracing::warn!("Failed to reload after pattern delete: {}", e);
     }
+    state
+        .cluster_broadcast_delete(waf_engine::cluster_sync::SyncedKind::Sensitive, id)
+        .await;
     Ok(Json(json!({ "success": true, "data": null })))
 }
 
