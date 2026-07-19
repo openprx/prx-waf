@@ -40,6 +40,9 @@ pub struct ClusterNode {
     rule_reloader: Option<Arc<dyn RuleReloader>>,
     /// Handler that executes forwarded API writes on the main node.
     api_forward_handler: Option<Arc<dyn ApiForwardHandler>>,
+    /// Externally-constructed node state shared with the API layer / data plane.
+    /// When `None`, [`ClusterNode::run`] builds its own (backward-compatible).
+    node_state: Option<Arc<NodeState>>,
 }
 
 impl ClusterNode {
@@ -49,7 +52,20 @@ impl ClusterNode {
             config,
             rule_reloader: None,
             api_forward_handler: None,
+            node_state: None,
         })
+    }
+
+    /// Attach a pre-built [`NodeState`] to run on.
+    ///
+    /// This lets the caller (`main.rs`) share the same `Arc<NodeState>` with the
+    /// management API (`AppState.cluster_state`) and the data-plane engine (so
+    /// admin writes can broadcast and synced rules can be consumed) instead of
+    /// the node building a private state only it can see.
+    #[must_use]
+    pub fn with_node_state(mut self, node_state: Arc<NodeState>) -> Self {
+        self.node_state = Some(node_state);
+        self
     }
 
     /// Attach the data-plane rule reloader (the running `WafEngine`).
@@ -83,10 +99,15 @@ impl ClusterNode {
 
         // ── NodeState (resolves node_id before cert generation) ──────────────
 
-        let storage_mode = StorageMode::Full;
-        let node_state = Arc::new(
-            NodeState::new(self.config.clone(), storage_mode).context("failed to initialise cluster node state")?,
-        );
+        // Prefer the externally-shared node state (wired into the API + engine by
+        // `main.rs`); otherwise build a private one for backward compatibility.
+        let node_state = match self.node_state.clone() {
+            Some(state) => state,
+            None => Arc::new(
+                NodeState::new(self.config.clone(), StorageMode::Full)
+                    .context("failed to initialise cluster node state")?,
+            ),
+        };
 
         // ── Data-plane sync hooks (cluster↔engine wiring) ────────────────────
         if let Some(reloader) = &self.rule_reloader {
