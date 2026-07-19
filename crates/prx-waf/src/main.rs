@@ -1173,7 +1173,7 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     // `_shutdown_guards` holds the watch senders that signal background workers
     // to stop.  They are dropped automatically when `run_server` returns (after
     // `server.run_forever()` exits), which sends the shutdown signal.
-    let (engine, router, api_state, acme_challenges, lb_registry, response_cache, _shutdown_guards) =
+    let (engine, router, api_state, acme_challenges, lb_registry, response_cache, _shutdown_guards, cluster_node_state) =
         rt.block_on(init_async(config))?;
 
     // Start the management API in a background thread
@@ -1273,6 +1273,9 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
         // (which implements RuleReloader) so the data plane refreshes.
         let engine_reloader = Arc::clone(&engine);
         let cluster_reloader: Arc<dyn waf_cluster::RuleReloader> = engine_reloader;
+        // Run on the SAME node state shared with the API layer + engine (built in
+        // init_async), so both rule-sync hooks operate on one instance.
+        let shared_node_state = cluster_node_state;
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -1284,7 +1287,10 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
             rt.block_on(async move {
                 match waf_cluster::ClusterNode::new(cluster_cfg) {
                     Ok(node) => {
-                        let node = node.with_rule_reloader(cluster_reloader);
+                        let mut node = node.with_rule_reloader(cluster_reloader);
+                        if let Some(state) = shared_node_state {
+                            node = node.with_node_state(state);
+                        }
                         if let Err(e) = node.run().await {
                             tracing::error!("Cluster node error: {e}");
                         }
@@ -1366,6 +1372,7 @@ type InitResult = (
     Arc<LoadBalancerRegistry>,
     Option<Arc<ResponseCache>>,
     ShutdownGuards,
+    Option<Arc<waf_cluster::NodeState>>,
 );
 
 async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
@@ -1662,6 +1669,34 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
     // store when ACME is disabled.
     let acme_challenges = setup_acme(config, Arc::clone(&db), Arc::clone(&router)).await;
 
+    // Phase 7: Cluster node state (shared with the API layer and the data plane).
+    //
+    // Built here — while `api_state` and `engine` are still in scope — so the two
+    // rule-sync hooks can be wired onto the SAME `Arc<NodeState>` the cluster
+    // thread will run:
+    //   * Hook #1 (trigger): `AppState.cluster_state` lets admin rule writes call
+    //     `record_rule_change` (Main-only) to broadcast to workers.
+    //   * Hook #2 (consume): the engine reads synced rules from the shared
+    //     `rule_registry`, so a worker's request path uses them without a DB.
+    // On a standalone node (`[cluster]` absent or disabled) this stays `None`,
+    // leaving both hooks inert and behaviour unchanged.
+    let cluster_node_state = match config.cluster.clone().filter(|c| c.enabled) {
+        Some(cluster_cfg) => match waf_cluster::NodeState::new(cluster_cfg, waf_cluster::StorageMode::Full) {
+            Ok(state) => {
+                let state = Arc::new(state);
+                engine.attach_synced_registry(Arc::clone(&state.rule_registry));
+                api_state.cluster_state = Some(Arc::clone(&state));
+                info!("Cluster node state shared with API layer and data plane");
+                Some(state)
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialise cluster node state: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+
     Ok((
         engine,
         router,
@@ -1670,6 +1705,7 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         lb_registry,
         response_cache,
         guards,
+        cluster_node_state,
     ))
 }
 
