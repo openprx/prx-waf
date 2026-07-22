@@ -10,7 +10,10 @@ pub mod plugins;
 pub mod rules;
 
 pub use checker::RuleStore;
-pub use checks::{AntiHotlinkCheck, GeoCheck, GeoRule, GeoRuleMode, OWASPCheck, SensitiveCheck};
+pub use checks::{
+    AntiHotlinkCheck, ContentSecuritySubsystem, ContentVerdict, GeoCheck, GeoRule, GeoRuleMode, OWASPCheck,
+    SensitiveCheck,
+};
 pub use community::{
     CommunityChecker, CommunityClient, CommunityComponents, CommunityConfig, CommunityReporter, RequestInfo,
     init_community,

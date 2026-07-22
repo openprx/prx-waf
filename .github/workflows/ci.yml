@@ -49,6 +49,39 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features
 
+  # Mandatory gate for the DB-backed content-security engine parity suite.
+  # `cargo test --workspace` (the `test` job) SKIPS these #[ignore]d tests, so
+  # this job is the forcing function that actually runs the 20 engine-entry
+  # parity tests through the real DB-backed `WafEngine`. It must stay green for
+  # any change touching the content-security detection path.
+  db-parity:
+    name: DB Parity (content-security engine gate)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: prx_waf
+          POSTGRES_PASSWORD: prx_waf
+          POSTGRES_DB: prx_waf
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U prx_waf"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run DB-gated content-security engine parity tests
+        env:
+          DATABASE_URL: postgresql://prx_waf:prx_waf@127.0.0.1:15432/prx_waf
+        run: cargo test -p waf-engine --test content_security_engine_parity -- --ignored --nocapture
+
   build:
     name: Build
     needs: lint

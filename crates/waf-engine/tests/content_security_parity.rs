@@ -44,6 +44,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use waf_common::{HostConfig, Phase, RequestCtx};
 use waf_engine::checks::{Check, DirTraversalCheck, RceCheck, SqlInjectionCheck, XssCheck};
+use waf_engine::{ContentSecuritySubsystem, ContentVerdict};
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -403,3 +404,100 @@ fn precedence_clean_request_no_hit() {
 // contract to preserve across G1: id suffix "-000", phase unchanged, and a
 // match (block) rather than a miss (allow) on compile failure.
 // ═════════════════════════════════════════════════════════════════════════════
+
+// ═════════════════════════════════════════════════════════════════════════════
+// G0.1 — REAL production subsystem (`ContentSecuritySubsystem::evaluate`).
+//
+// The precedence tests above run a test-authored `content_checkers()` mirror
+// vector: they pin the *intended* order but would stay green even if the real
+// subsystem drifted. These tests instead drive the actual G1 production type
+// (`ContentSecuritySubsystem`), so a mis-ordered or mis-wired subsystem is
+// caught in the default (no-DB) gate. Same-order first-match-wins + each single
+// hit + clean → None are pinned against the real `evaluate`. The DB-gated
+// sibling additionally pins the full `WafEngine::inspect` entry-point path.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Run the real production subsystem, returning the `LegacyVeto` detection (if any).
+fn subsystem_legacy(c: &RequestCtx) -> Option<waf_common::DetectionResult> {
+    match ContentSecuritySubsystem::new().evaluate(c) {
+        ContentVerdict::LegacyVeto { result } => Some(result),
+        ContentVerdict::None => None,
+    }
+}
+
+#[test]
+fn subsystem_sqli_single_hit() {
+    let r = subsystem_legacy(&with_query(ctx(), "id=1 union select 1,2,3")).expect("SQLi LegacyVeto");
+    assert_eq!(r.phase, Phase::SqlInjection);
+    assert_eq!(r.rule_id.as_deref(), Some("SQLI-001"));
+}
+
+#[test]
+fn subsystem_xss_single_hit() {
+    let r = subsystem_legacy(&with_query(ctx(), "q=<script>alert(1)</script>")).expect("XSS LegacyVeto");
+    assert_eq!(r.phase, Phase::Xss);
+    assert_eq!(r.rule_id.as_deref(), Some("XSS-001"));
+}
+
+#[test]
+fn subsystem_rce_single_hit() {
+    let r = subsystem_legacy(&with_body(ctx(), "cmd=$(id)")).expect("RCE LegacyVeto");
+    assert_eq!(r.phase, Phase::Rce);
+    assert_eq!(r.rule_id.as_deref(), Some("RCE-002"));
+}
+
+#[test]
+fn subsystem_traversal_single_hit() {
+    // Pure traversal payload with no `/etc/passwd` and no shell tokens, so RCE
+    // (which owns `/etc/passwd`, RCE-004) does not win ahead of Traversal in the
+    // ordered subsystem — proving Traversal is reachable as a sole hit.
+    let r = subsystem_legacy(&with_path(ctx(), "/a/../../b")).expect("Traversal LegacyVeto");
+    assert_eq!(r.phase, Phase::DirTraversal);
+    assert_eq!(r.rule_id.as_deref(), Some("TRAV-001"));
+}
+
+#[test]
+fn subsystem_precedence_sqli_wins_over_xss() {
+    // Trips both SQLi (union select) and XSS (<script>). SQLi is first.
+    let r = subsystem_legacy(&with_query(ctx(), "q=<script>union select 1</script>")).expect("multi-hit");
+    assert_eq!(r.phase, Phase::SqlInjection);
+    assert_eq!(r.rule_name, "SQL Injection");
+}
+
+#[test]
+fn subsystem_precedence_xss_wins_over_rce_and_traversal() {
+    // No SQLi; trips XSS (<script>), RCE (/etc/passwd) and Traversal (../, /etc).
+    let r = subsystem_legacy(&with_query(ctx(), "q=<script></script>;cat /etc/passwd ../")).expect("multi-hit");
+    assert_eq!(r.phase, Phase::Xss);
+    assert_eq!(r.rule_name, "XSS");
+}
+
+#[test]
+fn subsystem_precedence_rce_wins_over_traversal() {
+    // No SQLi/XSS; trips RCE (;cat /etc/passwd) and Traversal (../, /etc).
+    let r = subsystem_legacy(&with_query(ctx(), "file=;cat /etc/passwd ../")).expect("multi-hit");
+    assert_eq!(r.phase, Phase::Rce);
+    assert_eq!(r.rule_name, "RCE");
+}
+
+#[test]
+fn subsystem_traversal_alone() {
+    // Pure traversal payload (no /etc, no shell) → Traversal is the only hit.
+    let r = subsystem_legacy(&with_path(ctx(), "/a/../../b")).expect("traversal");
+    assert_eq!(r.phase, Phase::DirTraversal);
+}
+
+#[test]
+fn subsystem_clean_request_is_none() {
+    let c = with_query(with_path(ctx(), "/api/v1/users"), "page=2&sort=asc");
+    assert!(subsystem_legacy(&c).is_none());
+}
+
+#[test]
+fn subsystem_respects_host_toggle() {
+    // Disabling the sqli detector on the host makes the subsystem return None
+    // for a pure SQLi payload (no other legacy detector matches it).
+    let mut c = with_query(ctx(), "id=1 union select 1,2,3");
+    Arc::make_mut(&mut c.host_config).defense_config.sqli = false;
+    assert!(subsystem_legacy(&c).is_none());
+}

@@ -14,8 +14,8 @@ use waf_storage::{
 use crate::block_page::render_block_page;
 use crate::checker::{RuleStore, check_ip_blacklist, check_ip_whitelist, check_url_blacklist, check_url_whitelist};
 use crate::checks::{
-    AntiHotlinkCheck, BotCheck, CcCheck, Check, DirTraversalCheck, GeoCheck, OWASPCheck, RceCheck, ScannerCheck,
-    SensitiveCheck, SqlInjectionCheck, XssCheck,
+    AntiHotlinkCheck, BotCheck, CcCheck, Check, ContentSecuritySubsystem, ContentVerdict, GeoCheck, OWASPCheck,
+    ScannerCheck, SensitiveCheck,
 };
 use crate::community::{CommunityChecker, CommunityReporter, RequestInfo};
 use crate::crowdsec::{AppSecClient, AppSecResult, CrowdSecChecker, FallbackAction, appsec_to_detection};
@@ -58,9 +58,12 @@ pub struct WafEngine {
     cc_check: CcCheck,
     /// Header-phase-only detectors (scanner / bot). Not re-run for body content.
     header_checkers: Vec<Box<dyn Check>>,
-    /// Content-type detectors (`SQLi` / XSS / RCE / traversal) run in both the
-    /// header phase and the body phase (once `body_preview` is populated).
-    content_checkers: Vec<Box<dyn Check>>,
+    /// Content-security subsystem — owns the content-type detectors
+    /// (`SQLi` / XSS / RCE / traversal) as Lane 1 `legacy_veto`. Replaces the
+    /// former `content_checkers` vector; invoked once per content phase (header
+    /// and body) via [`ContentSecuritySubsystem::evaluate`], preserving the
+    /// original same-order first-match-wins short-circuit and side effects.
+    content_security: ContentSecuritySubsystem,
     owasp: Arc<OWASPCheck>,
     /// GeoIP-based access control check (Phase 17).
     geo_check: Arc<GeoCheck>,
@@ -107,13 +110,9 @@ impl WafEngine {
         // Header-phase-only detectors.
         let header_checkers: Vec<Box<dyn Check>> = vec![Box::new(ScannerCheck::new()), Box::new(BotCheck::new())];
 
-        // Content-type detectors — re-used by both the header and body phases.
-        let content_checkers: Vec<Box<dyn Check>> = vec![
-            Box::new(SqlInjectionCheck::new()),
-            Box::new(XssCheck::new()),
-            Box::new(RceCheck::new()),
-            Box::new(DirTraversalCheck::new()),
-        ];
+        // Content-type detectors — owned by the content-security subsystem,
+        // re-used by both the header and body phases (same frozen order).
+        let content_security = ContentSecuritySubsystem::new();
 
         Self {
             store,
@@ -124,7 +123,7 @@ impl WafEngine {
             config,
             cc_check,
             header_checkers,
-            content_checkers,
+            content_security,
             owasp,
             geo_check,
             crowdsec_checker: OnceLock::new(),
@@ -333,11 +332,19 @@ impl WafEngine {
     /// CC / IP / URL / geo / bouncer / community — those are header-phase-only
     /// and must be evaluated exactly once per request (see [`inspect`]).
     async fn inspect_content(&self, ctx: &RequestCtx) -> Option<WafDecision> {
-        // ── Phase 5-9: SQLi / XSS / RCE / traversal ───────────────────────────
-        for checker in &self.content_checkers {
-            if let Some(result) = checker.check(ctx) {
+        // ── Phase 5-9: SQLi / XSS / RCE / traversal (Lane 1 legacy_veto) ──────
+        // Single zero-side-effect subsystem call replaces the former
+        // `content_checkers` loop (control-flow & observable-semantic
+        // equivalent). G1 only produces
+        // `LegacyVeto` / `None`; `LegacyVeto` maps onto the unchanged
+        // `record_block` path (host `log_only_mode` still decides Block vs
+        // LogOnly, security-event log + community report preserved). The Lane 2
+        // `Semantic` branch and its double log-only dispatch are P1.
+        match self.content_security.evaluate(ctx) {
+            ContentVerdict::LegacyVeto { result } => {
                 return Some(self.record_block(ctx, result, true));
             }
+            ContentVerdict::None => {}
         }
 
         // ── Phase 16b: CrowdSec AppSec — async per-request check ──────────────

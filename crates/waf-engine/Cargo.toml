@@ -35,6 +35,10 @@ hex = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+# Test-only: install the process-level rustls `ring` CryptoProvider before the
+# reqwest-backed AppSec / community paths build a client (production does this in
+# `prx-waf` main.rs; reqwest is built with `rustls-no-provider`).
+rustls = { workspace = true }
 
 [lints]
 workspace = true
