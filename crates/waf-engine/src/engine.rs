@@ -14,8 +14,8 @@ use waf_storage::{
 use crate::block_page::render_block_page;
 use crate::checker::{RuleStore, check_ip_blacklist, check_ip_whitelist, check_url_blacklist, check_url_whitelist};
 use crate::checks::{
-    AntiHotlinkCheck, BotCheck, CcCheck, Check, ContentSecuritySubsystem, ContentVerdict, GeoCheck, OWASPCheck,
-    ScannerCheck, SensitiveCheck,
+    AntiHotlinkCheck, BotCheck, CcCheck, Check, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict,
+    GeoCheck, InspectionScope, OWASPCheck, RuntimeContentSecurityConfig, ScannerCheck, SemanticAction, SensitiveCheck,
 };
 use crate::community::{CommunityChecker, CommunityReporter, RequestInfo};
 use crate::crowdsec::{AppSecClient, AppSecResult, CrowdSecChecker, FallbackAction, appsec_to_detection};
@@ -29,6 +29,9 @@ use crate::rules::registry::RuleRegistry;
 pub struct WafEngineConfig {
     /// Whether to log allowed requests that matched whitelist rules
     pub log_whitelist_hits: bool,
+    /// Compiled Lane 2 semantic content-security config. Default = lane off
+    /// (zero-config never activates the semantic lane).
+    pub content_security: RuntimeContentSecurityConfig,
 }
 
 /// Main WAF engine — runs all detection phases.
@@ -111,8 +114,10 @@ impl WafEngine {
         let header_checkers: Vec<Box<dyn Check>> = vec![Box::new(ScannerCheck::new()), Box::new(BotCheck::new())];
 
         // Content-type detectors — owned by the content-security subsystem,
-        // re-used by both the header and body phases (same frozen order).
-        let content_security = ContentSecuritySubsystem::new();
+        // re-used by both the header and body phases (same frozen order). The
+        // Lane 2 semantic config is compiled at startup and threaded in here
+        // (default = lane off).
+        let content_security = ContentSecuritySubsystem::with_config(config.content_security.clone());
 
         Self {
             store,
@@ -331,18 +336,26 @@ impl WafEngine {
     /// OWASP CRS and sensitive-data detection.  It deliberately does **not** run
     /// CC / IP / URL / geo / bouncer / community — those are header-phase-only
     /// and must be evaluated exactly once per request (see [`inspect`]).
-    async fn inspect_content(&self, ctx: &RequestCtx) -> Option<WafDecision> {
+    async fn inspect_content(
+        &self,
+        ctx: &RequestCtx,
+        scope: InspectionScope,
+        state: &mut ContentInspectionState,
+    ) -> Option<WafDecision> {
         // ── Phase 5-9: SQLi / XSS / RCE / traversal (Lane 1 legacy_veto) ──────
-        // Single zero-side-effect subsystem call replaces the former
-        // `content_checkers` loop (control-flow & observable-semantic
-        // equivalent). G1 only produces
-        // `LegacyVeto` / `None`; `LegacyVeto` maps onto the unchanged
-        // `record_block` path (host `log_only_mode` still decides Block vs
-        // LogOnly, security-event log + community report preserved). The Lane 2
-        // `Semantic` branch and its double log-only dispatch are P1.
-        match self.content_security.evaluate(ctx) {
+        // Single zero-side-effect subsystem call. `LegacyVeto` maps onto the
+        // unchanged `record_block` path (host `log_only_mode` still decides
+        // Block vs LogOnly, security-event log + community report preserved) and
+        // short-circuits exactly as before. `Semantic` is the Lane 2 additive
+        // result: in P1a it NEVER blocks and NEVER short-circuits — it records
+        // at most a semantic LogOnly event and falls through to the unchanged
+        // suffix (zero-enforcement guarantee). `None` falls through unchanged.
+        match self.content_security.evaluate_scoped(ctx, scope, state) {
             ContentVerdict::LegacyVeto { result } => {
                 return Some(self.record_block(ctx, result, true));
+            }
+            ContentVerdict::Semantic(verdict) => {
+                self.dispatch_semantic(ctx, verdict);
             }
             ContentVerdict::None => {}
         }
@@ -413,6 +426,46 @@ impl WafEngine {
         None
     }
 
+    /// Dispatch a Lane 2 semantic verdict (plan §3.1 / §13.4).
+    ///
+    /// **P1a is shadow-only at the engine dispatch**: it records at most a
+    /// semantic `LogOnly` security event and **never** blocks and **never**
+    /// short-circuits `inspect_content` — control always falls through to the
+    /// unchanged AppSec/custom/CRS/sensitive suffix, and a Lane 1 legacy veto is
+    /// never downgraded (it took the `LegacyVeto` arm above and returned before
+    /// reaching here). The full enforce path (canary/breaker-gated Block) is
+    /// implemented and unit-tested in
+    /// [`crate::checks::ContentSecuritySubsystem::resolve_action`] but is
+    /// deliberately not connected to the block path until real detectors and
+    /// calibration exist.
+    ///
+    /// In P1a there are no detectors, so `verdict.recommendation` is always
+    /// `None` and this is inert in production — the zero-enforcement guarantee.
+    fn dispatch_semantic(&self, ctx: &RequestCtx, verdict: crate::checks::SemanticVerdict) {
+        if verdict.recommendation != SemanticAction::None
+            && let Some(result) = verdict.primary_result
+        {
+            self.record_semantic_log(ctx, result);
+        }
+        // Observation persistence into `semantic_observations` (migration/model/
+        // repo exist) is wired in a later step; P1a produces no signals to store.
+    }
+
+    /// Record a Lane 2 semantic detection as a forced `LogOnly` security event.
+    ///
+    /// Mirrors the custom-rule Log branch ([`Self::dispatch_custom_match`]) and
+    /// **never** calls `record_block` (which would emit a Block when the host is
+    /// not in log-only mode). Semantic shadow detections are deliberately **not**
+    /// reported to the community feed — unproven semantic signals must not
+    /// pollute the shared blocklist.
+    fn record_semantic_log(&self, ctx: &RequestCtx, result: DetectionResult) {
+        let decision = WafDecision {
+            action: WafAction::LogOnly,
+            result: Some(result),
+        };
+        self.log_security_event(ctx, &decision);
+    }
+
     /// Dispatch a custom-rule match on its configured action (M-7).
     ///
     /// Returns `Some(decision)` when the request must short-circuit (allow /
@@ -449,6 +502,22 @@ impl WafEngine {
     /// community reporting happen exactly once per request.  Callers should
     /// check `decision.is_allowed()`.
     pub async fn inspect(&self, ctx: &mut RequestCtx) -> WafDecision {
+        let mut state = self.new_content_inspection_state();
+        self.inspect_with_state(ctx, &mut state).await
+    }
+
+    /// Create a fresh per-request Lane 2 work-budget state using the engine's
+    /// compiled budget. HTTP/1.1 stores this in `GatewayCtx` (shared across the
+    /// header and body phases); HTTP/3 keeps a local instance (plan §12.3).
+    #[must_use]
+    pub const fn new_content_inspection_state(&self) -> ContentInspectionState {
+        ContentInspectionState::new(self.content_security.config().budget)
+    }
+
+    /// Header-phase inspection sharing a caller-owned Lane 2 budget `state`
+    /// across phases (see [`Self::new_content_inspection_state`]). The public
+    /// [`Self::inspect`] wraps this with a per-call state.
+    pub async fn inspect_with_state(&self, ctx: &mut RequestCtx, state: &mut ContentInspectionState) -> WafDecision {
         // Skip WAF if guard is disabled for this host
         if !ctx.host_config.guard_status {
             return WafDecision::allow();
@@ -601,7 +670,7 @@ impl WafEngine {
         }
 
         // ── Phase 5-14: content-type detectors + custom + owasp + sensitive ───
-        if let Some(decision) = self.inspect_content(ctx).await {
+        if let Some(decision) = self.inspect_content(ctx, InspectionScope::Header, state).await {
             return decision;
         }
 
@@ -621,6 +690,18 @@ impl WafEngine {
     /// re-run — they were already evaluated (and counted) in [`inspect`] during
     /// the header phase.
     pub async fn inspect_body(&self, ctx: &mut RequestCtx) -> WafDecision {
+        let mut state = self.new_content_inspection_state();
+        self.inspect_body_with_state(ctx, &mut state).await
+    }
+
+    /// Body-phase inspection sharing a caller-owned Lane 2 budget `state` with
+    /// the header phase (plan §12.3). The public [`Self::inspect_body`] wraps
+    /// this with a per-call state.
+    pub async fn inspect_body_with_state(
+        &self,
+        ctx: &mut RequestCtx,
+        state: &mut ContentInspectionState,
+    ) -> WafDecision {
         // Skip WAF if guard is disabled for this host
         if !ctx.host_config.guard_status {
             return WafDecision::allow();
@@ -634,7 +715,7 @@ impl WafEngine {
             ctx.geo = Some(geoip.lookup(ctx.client_ip));
         }
 
-        if let Some(decision) = self.inspect_content(ctx).await {
+        if let Some(decision) = self.inspect_content(ctx, InspectionScope::Body, state).await {
             return decision;
         }
 

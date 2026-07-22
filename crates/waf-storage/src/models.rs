@@ -277,6 +277,53 @@ pub struct CreateSecurityEvent {
     pub geo_info: Option<serde_json::Value>,
 }
 
+/// Lane 2 semantic content-security observation (plan v2.2 §13.1).
+///
+/// Stored in the dedicated `semantic_observations` table. `observations` is a
+/// de-identified, versioned JSONB signal array (never the raw payload). P1a
+/// ships the schema/model/repo foundation; the hot-path insert lands with the
+/// P1 detectors.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct SemanticObservation {
+    pub id: Uuid,
+    pub host_code: String,
+    pub client_ip: String,
+    pub req_id: String,
+    pub scope: String,
+    pub request_score: i16,
+    pub recommendation: String,
+    pub degraded: bool,
+    pub exhausted: bool,
+    pub pipeline: String,
+    pub schema_version: i32,
+    pub observations: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Create-request for a [`SemanticObservation`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSemanticObservation {
+    pub host_code: String,
+    pub client_ip: String,
+    pub req_id: String,
+    pub scope: String,
+    pub request_score: i16,
+    pub recommendation: String,
+    pub degraded: bool,
+    pub exhausted: bool,
+    pub pipeline: String,
+    pub schema_version: i32,
+    pub observations: serde_json::Value,
+}
+
+/// Query parameters for listing [`SemanticObservation`] rows.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SemanticObservationQuery {
+    pub host_code: Option<String>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+}
+
 /// Security event query parameters
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SecurityEventQuery {

@@ -12,11 +12,11 @@ use gateway::{
     spawn_health_checker,
 };
 use waf_api::{AppState, start_api_server};
-use waf_common::config::{AppConfig, apply_env_overrides, load_config};
+use waf_common::config::{AppConfig, ConfigError, apply_env_overrides, load_config};
 use waf_engine::{
-    CrowdSecClient, CrowdSecConfig, ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource, RuleManager, WafEngine,
-    WafEngineConfig, XdbUpdater, cache_policy_from_str, init_community, init_crowdsec, spawn_auto_updater,
-    spawn_ip_feed_sync,
+    CrowdSecClient, CrowdSecConfig, ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource, RuleManager,
+    RuntimeContentSecurityConfig, WafEngine, WafEngineConfig, XdbUpdater, cache_policy_from_str, init_community,
+    init_crowdsec, spawn_auto_updater, spawn_ip_feed_sync,
 };
 use waf_storage::Database;
 
@@ -305,10 +305,19 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     info!("PRX-WAF v{}", env!("CARGO_PKG_VERSION"));
 
-    let mut config = load_config(&cli.config).unwrap_or_else(|e| {
-        tracing::warn!("Failed to load config from {}: {}. Using defaults.", cli.config, e);
-        AppConfig::default()
-    });
+    // Distinguish "no config file" (safe to default) from "config exists but is
+    // broken" (must be a hard failure). A parse/validation error is never
+    // silently swallowed into a default config (plan §14.1 / P1a must-fix P1-4).
+    let mut config = match load_config(&cli.config) {
+        Ok(cfg) => cfg,
+        Err(ConfigError::NotFound(path)) => {
+            tracing::warn!("Config file {path} not found; using built-in defaults.");
+            AppConfig::default()
+        }
+        Err(e @ (ConfigError::Parse(_) | ConfigError::Validate(_))) => {
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
 
     // Overlay environment-variable overrides (DATABASE_URL, PRXWAF_*) so
     // security-critical and deployment-specific settings can be configured in
@@ -1395,8 +1404,23 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
     info!("Running database migrations...");
     db.migrate().await?;
 
+    // Compile the (already-validated) Lane 2 semantic config into the immutable
+    // runtime form. `load_config` already ran strict validation; this resolves
+    // detector-id strings and is a hard failure if it somehow fails.
+    let content_security = RuntimeContentSecurityConfig::compile(&config.content_security)
+        .map_err(|e| anyhow::anyhow!("invalid content_security config: {e}"))?;
+    if content_security.enabled {
+        info!("Lane 2 semantic content-security engine enabled (mode: shadow/log-only unless enforced)");
+    }
+
     // WAF engine
-    let engine = Arc::new(WafEngine::new(Arc::clone(&db), WafEngineConfig::default()));
+    let engine = Arc::new(WafEngine::new(
+        Arc::clone(&db),
+        WafEngineConfig {
+            content_security,
+            ..WafEngineConfig::default()
+        },
+    ));
     engine.reload_rules().await?;
 
     // GeoIP service

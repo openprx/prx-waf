@@ -11,8 +11,8 @@ pub mod rules;
 
 pub use checker::RuleStore;
 pub use checks::{
-    AntiHotlinkCheck, ContentSecuritySubsystem, ContentVerdict, GeoCheck, GeoRule, GeoRuleMode, OWASPCheck,
-    SensitiveCheck,
+    AntiHotlinkCheck, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict, GeoCheck, GeoRule, GeoRuleMode,
+    InspectionScope, OWASPCheck, RuntimeContentSecurityConfig, SemanticAction, SemanticVerdict, SensitiveCheck,
 };
 pub use community::{
     CommunityChecker, CommunityClient, CommunityComponents, CommunityConfig, CommunityReporter, RequestInfo,

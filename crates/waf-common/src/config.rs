@@ -41,7 +41,54 @@ pub struct AppConfig {
     /// for commented, license-annotated examples.
     #[serde(default)]
     pub ip_feeds: Vec<IpFeedEntry>,
+    /// Lane 2 semantic content-security engine configuration.
+    ///
+    /// **Off by default** (`enabled = false`, `enforcement_mode = "log_only"`):
+    /// a zero-config install never activates the semantic lane. See
+    /// [`crate::content_security_config::ContentSecurityConfig`].
+    #[serde(default)]
+    pub content_security: crate::content_security_config::ContentSecurityConfig,
 }
+
+impl AppConfig {
+    /// Cross-field semantic validation applied after deserialisation.
+    ///
+    /// Currently this only validates the Lane 2 semantic content-security
+    /// config (plan §6.2 strict loader rule). Returns a human-readable error
+    /// on the first violation.
+    pub fn validate(&self) -> Result<(), String> {
+        self.content_security.validate()
+    }
+}
+
+/// Typed configuration-load error (plan §14.1 / P1a must-fix P1-4).
+///
+/// Lets callers distinguish "no config file" (safe to fall back to defaults)
+/// from "config exists but is broken" (must be a hard startup failure).
+#[derive(Debug)]
+pub enum ConfigError {
+    /// The configuration file does not exist. Callers may fall back to
+    /// [`AppConfig::default`].
+    NotFound(String),
+    /// The file exists but could not be read (I/O error other than not-found)
+    /// or failed to parse as TOML. Fatal.
+    Parse(String),
+    /// The file parsed but failed semantic validation ([`AppConfig::validate`]).
+    /// Fatal.
+    Validate(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(p) => write!(f, "configuration file not found: {p}"),
+            Self::Parse(e) => write!(f, "configuration parse error: {e}"),
+            Self::Validate(e) => write!(f, "configuration validation error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// A single threat-intelligence IP-feed source (raw IP/CIDR blocklist).
 ///
@@ -578,10 +625,26 @@ impl Default for CommunityConfig {
     }
 }
 
-/// Load configuration from a TOML file
-pub fn load_config(path: &str) -> anyhow::Result<AppConfig> {
-    let content = std::fs::read_to_string(path)?;
-    let config: AppConfig = toml::from_str(&content)?;
+/// Load and validate configuration from a TOML file.
+///
+/// Distinguishes three outcomes so the caller can react correctly (plan §14.1):
+///
+/// * [`ConfigError::NotFound`] — the file is absent; the caller may fall back to
+///   [`AppConfig::default`].
+/// * [`ConfigError::Parse`] — the file exists but cannot be read or parsed; this
+///   is a hard failure (do **not** silently fall back to defaults).
+/// * [`ConfigError::Validate`] — the file parsed but failed semantic validation
+///   (e.g. an illegal semantic-lane weight sum); also a hard failure.
+pub fn load_config(path: &str) -> Result<AppConfig, ConfigError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ConfigError::NotFound(path.to_string()));
+        }
+        Err(e) => return Err(ConfigError::Parse(format!("{path}: {e}"))),
+    };
+    let config: AppConfig = toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    config.validate().map_err(ConfigError::Validate)?;
     Ok(config)
 }
 
@@ -988,6 +1051,84 @@ impl Default for ClusterConfig {
             election: ClusterElectionConfig::default(),
             health: ClusterHealthConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod load_config_tests {
+    use super::*;
+
+    /// A missing config file must map to `NotFound` (caller may default).
+    #[test]
+    fn missing_file_is_not_found() {
+        let path = format!(
+            "{}/prx-waf-does-not-exist-{}.toml",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        match load_config(&path) {
+            Err(ConfigError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// A file that parses but fails semantic validation must map to `Validate`
+    /// (a hard failure — never silently defaulted). Plan §14.1.
+    #[test]
+    fn invalid_semantic_config_is_validate_error() {
+        use crate::content_security_config::{ContentSecurityConfig, SemanticAttackConfig};
+        use std::collections::BTreeMap;
+
+        let dir = std::env::temp_dir();
+        let path = format!("{}/prx-waf-invalid-{}.toml", dir.display(), std::process::id());
+
+        // Build a fully-parseable config whose only fault is an enabled SQLi
+        // family with weights summing to 0.8 (not 1.0) — so the failure is
+        // Validate, not Parse.
+        let mut weights = BTreeMap::new();
+        weights.insert("struct_rule".to_string(), 0.5);
+        weights.insert("ast".to_string(), 0.3);
+        let mut attacks = BTreeMap::new();
+        attacks.insert(
+            "sql_injection".to_string(),
+            SemanticAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: Vec::new(),
+            },
+        );
+        let cfg = AppConfig {
+            content_security: ContentSecurityConfig {
+                enabled: true,
+                attacks,
+                ..ContentSecurityConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let toml = toml::to_string(&cfg).expect("serialize invalid config");
+        std::fs::write(&path, toml).expect("write temp config");
+        let result = load_config(&path);
+        let _ = std::fs::remove_file(&path);
+        match result {
+            Err(ConfigError::Validate(msg)) => assert!(msg.contains("sum to 1.0"), "unexpected msg: {msg}"),
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    /// A valid file (a serialized default config) loads cleanly with the
+    /// semantic lane off.
+    #[test]
+    fn valid_config_loads() {
+        let dir = std::env::temp_dir();
+        let path = format!("{}/prx-waf-valid-{}.toml", dir.display(), std::process::id());
+        let toml = toml::to_string(&AppConfig::default()).expect("serialize default");
+        std::fs::write(&path, toml).expect("write temp config");
+        let result = load_config(&path);
+        let _ = std::fs::remove_file(&path);
+        let cfg = result.expect("valid config must load");
+        assert!(!cfg.content_security.enabled, "semantic lane off by default");
     }
 }
 

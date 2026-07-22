@@ -1,0 +1,425 @@
+//! Closed Lane 2 scoring model (plan v2.2 §6).
+//!
+//! The formula is mathematically closed — the request score is provably in
+//! `0..=100` (see [`score`] and the module tests):
+//!
+//! ```text
+//! canonical(scope, field, attack, detector) = argmax over views/wrappers of confidence
+//! group(scope, field, attack)               = Σ_detector weight(attack,detector) · canonical.confidence
+//! request_score                             = max over groups of group score
+//! ```
+//!
+//! With the loader guaranteeing, per enabled attack family, `Σ weight = 1` and
+//! every `confidence ∈ [0,100]`, each group score is a convex combination of the
+//! detectors' confidences and therefore `≤ 100`; the outer `max` keeps it in
+//! range. Detectors that produced no signal contribute `0 ≤ their max`, so the
+//! bound holds for any subset of firing detectors.
+//!
+//! Hard-veto is an explicit per-attack allowlist keyed on the **stable
+//! `rule_key`** (never on `detail`), and blind/synthetic/parse-error provenance
+//! is structurally excluded (plan §6.3).
+
+use std::collections::{HashMap, HashSet};
+
+use waf_common::DetectionResult;
+use waf_common::content_security_config::ContentSecurityConfig;
+
+use super::types::{AttackKind, DetectionSignal, DetectorId, InspectionScope, SemanticAction, SemanticVerdict};
+
+/// Runtime (compiled, immutable) per-attack scoring config.
+#[derive(Debug, Clone)]
+pub struct RuntimeAttackConfig {
+    pub enabled: bool,
+    pub weights: HashMap<DetectorId, f64>,
+    pub log_threshold: u8,
+    pub block_threshold: u8,
+    pub hard_veto_allowlist: HashSet<String>,
+}
+
+/// Runtime (compiled, immutable) scoring config for all attack families.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeScoringConfig {
+    pub attacks: HashMap<AttackKind, RuntimeAttackConfig>,
+}
+
+impl RuntimeScoringConfig {
+    /// Compile the serializable [`ContentSecurityConfig`] into the immutable
+    /// runtime scoring config, resolving detector-id strings and rejecting
+    /// unknown ids. Assumes [`ContentSecurityConfig::validate`] has already run
+    /// (so weight sums / thresholds are known-good); this step only performs the
+    /// string→enum resolution that `waf-common` must not do (plan §6.5).
+    pub fn compile(cfg: &ContentSecurityConfig) -> Result<Self, String> {
+        let mut attacks = HashMap::new();
+        for (family_key, family) in &cfg.attacks {
+            let Some(attack) = AttackKind::from_config_key(family_key) else {
+                return Err(format!("unknown attack family '{family_key}'"));
+            };
+            let mut weights = HashMap::new();
+            for (det_key, w) in &family.weights {
+                let Some(det) = DetectorId::from_config_str(det_key) else {
+                    return Err(format!("attack '{family_key}' references unknown detector '{det_key}'"));
+                };
+                weights.insert(det, *w);
+            }
+            attacks.insert(
+                attack,
+                RuntimeAttackConfig {
+                    enabled: family.enabled,
+                    weights,
+                    log_threshold: family.log_threshold,
+                    block_threshold: family.block_threshold,
+                    hard_veto_allowlist: family.hard_veto_allowlist.iter().cloned().collect(),
+                },
+            );
+        }
+        Ok(Self { attacks })
+    }
+}
+
+/// Clamp a floating score into a `0..=100` byte. Never panics.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn clamp_score_to_u8(x: f64) -> u8 {
+    if !x.is_finite() || x <= 0.0 {
+        0
+    } else if x >= 100.0 {
+        100
+    } else {
+        // 0 < x < 100 and finite: rounding lands in 0..=100, cast is exact.
+        x.round() as u8
+    }
+}
+
+/// A `(scope, field, attack)` accumulation group during scoring.
+struct Group<'a> {
+    score: f64,
+    best: &'a DetectionSignal,
+    best_contrib: f64,
+}
+
+/// Severity ranking so we can pick the strongest group recommendation.
+const fn severity(a: SemanticAction) -> u8 {
+    match a {
+        SemanticAction::None => 0,
+        SemanticAction::Log => 1,
+        SemanticAction::Block => 2,
+    }
+}
+
+/// Compute the closed Lane 2 verdict for a set of signals.
+///
+/// Returns a [`SemanticVerdict`] whose `request_score` is guaranteed to be in
+/// `0..=100`. With `signals` empty (the P1a production reality — no detectors)
+/// the result is always `recommendation = None`, `request_score = 0`,
+/// `primary_result = None`.
+#[must_use]
+pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, degraded: bool) -> SemanticVerdict {
+    // Budget-degraded requests fail open to the legacy verdict (plan §12.4,
+    // codex A-2). Once the per-request budget is exhausted the signal set is
+    // only partial, so Lane 2 must produce **no** recommendation — positive or
+    // negative — and must never overwrite a legacy-only outcome. Signals are
+    // retained for telemetry; `recommendation`/`primary_result` are cleared so
+    // the engine dispatch is inert on a degraded request.
+    if degraded {
+        return SemanticVerdict {
+            recommendation: SemanticAction::None,
+            request_score: 0,
+            primary_result: None,
+            signals: signals.to_vec(),
+            degraded: true,
+        };
+    }
+
+    // 1) Canonical max-aggregation: keep, per (scope, field, attack, detector),
+    //    the highest-confidence signal (arg-max — keep the whole signal so
+    //    detail/provenance survive for the primary-signal / hard-veto audit).
+    let mut canonical: HashMap<(InspectionScope, &str, AttackKind, DetectorId), &'a DetectionSignal> = HashMap::new();
+    for s in signals {
+        let key = (s.scope, s.field.as_ref(), s.attack, s.detector);
+        match canonical.get(&key) {
+            Some(existing) if existing.confidence >= s.confidence => {}
+            _ => {
+                canonical.insert(key, s);
+            }
+        }
+    }
+
+    // 2) Per-(scope, field, attack) weighted sum + arg-max contributor.
+    let mut groups: HashMap<(InspectionScope, &str, AttackKind), Group<'a>> = HashMap::new();
+    let mut hard_veto: Option<&'a DetectionSignal> = None;
+
+    for (&(scope, field, attack, detector), &sig) in &canonical {
+        let Some(ac) = cfg.attacks.get(&attack) else { continue };
+        if !ac.enabled {
+            continue;
+        }
+        let w = ac.weights.get(&detector).copied().unwrap_or(0.0);
+        let contrib = w * f64::from(sig.confidence);
+
+        let g = groups.entry((scope, field, attack)).or_insert(Group {
+            score: 0.0,
+            best: sig,
+            best_contrib: -1.0,
+        });
+        g.score += contrib;
+        if contrib > g.best_contrib {
+            g.best_contrib = contrib;
+            g.best = sig;
+        }
+
+        // Hard-veto — un-forgeable triple gate (plan §6.3, codex A-1):
+        //   1. `provenance.hard_veto_capable()` — structural, derived here from
+        //      the signal's `provenance`; blind/synthetic/parse-error provenance
+        //      can NEVER hard-veto no matter what the detector claims;
+        //   2. on this attack's explicit `rule_key` allowlist.
+        // There is no stored `hard_veto_eligible` bool to forge — eligibility is
+        // recomputed from `provenance` at scoring time.
+        if sig.provenance.hard_veto_capable() && ac.hard_veto_allowlist.contains(sig.rule_key) {
+            hard_veto = Some(sig);
+        }
+    }
+
+    // 3) Request-level roll-up: strongest group recommendation wins.
+    let mut request_score = 0.0f64;
+    let mut recommendation = SemanticAction::None;
+    let mut primary: Option<&'a DetectionSignal> = None;
+
+    for ((_, _, attack), g) in &groups {
+        let Some(ac) = cfg.attacks.get(attack) else { continue };
+        let group_u = clamp_score_to_u8(g.score);
+        let group_rec = if group_u >= ac.block_threshold {
+            SemanticAction::Block
+        } else if group_u >= ac.log_threshold {
+            SemanticAction::Log
+        } else {
+            SemanticAction::None
+        };
+        if g.score > request_score {
+            request_score = g.score;
+        }
+        if severity(group_rec) > severity(recommendation) {
+            recommendation = group_rec;
+            primary = Some(g.best);
+        }
+    }
+
+    // 4) Hard-veto overrides to Block regardless of the aggregate score.
+    if let Some(sig) = hard_veto {
+        recommendation = SemanticAction::Block;
+        primary = Some(sig);
+        request_score = request_score.max(f64::from(sig.confidence));
+    }
+
+    let primary_result = primary.map(|s| DetectionResult {
+        rule_id: Some(s.rule_key.to_string()),
+        rule_name: format!("{} (Semantic)", s.attack.to_phase()),
+        phase: s.attack.to_phase(),
+        detail: s.detail.to_string(),
+    });
+
+    SemanticVerdict {
+        recommendation,
+        request_score: clamp_score_to_u8(request_score),
+        primary_result,
+        signals: signals.to_vec(),
+        degraded,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::*;
+    use crate::checks::content_security::types::Provenance;
+
+    fn sig(
+        attack: AttackKind,
+        detector: DetectorId,
+        field: &'static str,
+        conf: u8,
+        rule_key: &'static str,
+        provenance: Provenance,
+    ) -> DetectionSignal {
+        DetectionSignal {
+            detector,
+            attack,
+            field: Cow::Borrowed(field),
+            scope: InspectionScope::Body,
+            confidence: conf,
+            rule_key,
+            provenance,
+            detail: Cow::Borrowed("test signal"),
+        }
+    }
+
+    fn sqli_cfg(log_t: u8, block_t: u8, allowlist: &[&str]) -> RuntimeScoringConfig {
+        let mut weights = HashMap::new();
+        weights.insert(DetectorId::StructRule, 0.6);
+        weights.insert(DetectorId::Ast, 0.4);
+        let mut attacks = HashMap::new();
+        attacks.insert(
+            AttackKind::SqlInjection,
+            RuntimeAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: log_t,
+                block_threshold: block_t,
+                hard_veto_allowlist: allowlist.iter().map(|s| (*s).to_string()).collect(),
+            },
+        );
+        RuntimeScoringConfig { attacks }
+    }
+
+    #[test]
+    fn empty_signals_score_zero() {
+        let v = score(&[], &RuntimeScoringConfig::default(), false);
+        assert_eq!(v.request_score, 0);
+        assert_eq!(v.recommendation, SemanticAction::None);
+        assert!(v.primary_result.is_none());
+    }
+
+    #[test]
+    fn max_confidence_all_detectors_bounded_by_100() {
+        // Both detectors at max confidence: 0.6*100 + 0.4*100 = 100.
+        let signals = [
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::StructRule,
+                "body",
+                100,
+                "sql.union_null",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::Ast,
+                "body",
+                100,
+                "sql.tautology",
+                Provenance::Raw,
+            ),
+        ];
+        let v = score(&signals, &sqli_cfg(40, 80, &[]), false);
+        assert_eq!(v.request_score, 100, "closed formula caps at 100");
+        assert_eq!(v.recommendation, SemanticAction::Block);
+    }
+
+    #[test]
+    fn duplicate_encoding_does_not_double_count() {
+        // Same detector fires twice on the same field (raw + url-decoded view):
+        // canonical max keeps one, so it cannot exceed its single weighted share.
+        let signals = [
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::StructRule,
+                "body",
+                100,
+                "sql.union_null",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::StructRule,
+                "body",
+                100,
+                "sql.union_null",
+                Provenance::UrlDecoded,
+            ),
+        ];
+        let v = score(&signals, &sqli_cfg(40, 80, &[]), false);
+        // Only StructRule fired → 0.6*100 = 60, not 120.
+        assert_eq!(v.request_score, 60);
+        assert_eq!(v.recommendation, SemanticAction::Log);
+    }
+
+    #[test]
+    fn hard_veto_allowlisted_rulekey_blocks() {
+        let signals = [sig(
+            AttackKind::SqlInjection,
+            DetectorId::StructRule,
+            "body",
+            50,
+            "sql.into_outfile",
+            Provenance::Raw,
+        )];
+        // Score 0.6*50 = 30 < block threshold 80, but allowlisted → Block.
+        let v = score(&signals, &sqli_cfg(40, 80, &["sql.into_outfile"]), false);
+        assert_eq!(v.recommendation, SemanticAction::Block);
+    }
+
+    #[test]
+    fn non_capable_provenance_never_hard_vetoes() {
+        // codex A-1 negative examples: BlindDecoded / SyntheticHpp / ParseError
+        // are structurally excluded from hard-veto. Even with the exact rule_key
+        // on the allowlist and a would-be-eligible signal, none may Block. There
+        // is no longer any `hard_veto_eligible` bool to forge — the scorer
+        // derives capability from `provenance` itself.
+        for prov in [
+            Provenance::BlindDecoded,
+            Provenance::SyntheticHpp,
+            Provenance::ParseError,
+        ] {
+            let signals = [sig(
+                AttackKind::SqlInjection,
+                DetectorId::StructRule,
+                "body",
+                50,
+                "sql.into_outfile",
+                prov,
+            )];
+            let v = score(&signals, &sqli_cfg(40, 80, &["sql.into_outfile"]), false);
+            assert_ne!(
+                v.recommendation,
+                SemanticAction::Block,
+                "provenance {prov:?} must never hard-veto (0.6*50=30 < block 80 → falls back to weighted score)"
+            );
+        }
+    }
+
+    #[test]
+    fn capable_provenance_allowlisted_still_hard_vetoes() {
+        // Positive control: a capable provenance (UrlDecoded) on the allowlist
+        // still hard-vetoes, so the negative test above is not vacuous.
+        for prov in [Provenance::Raw, Provenance::UrlDecoded, Provenance::HtmlEntityDecoded] {
+            let signals = [sig(
+                AttackKind::SqlInjection,
+                DetectorId::StructRule,
+                "body",
+                50,
+                "sql.into_outfile",
+                prov,
+            )];
+            let v = score(&signals, &sqli_cfg(40, 80, &["sql.into_outfile"]), false);
+            assert_eq!(
+                v.recommendation,
+                SemanticAction::Block,
+                "capable provenance {prov:?} on the allowlist must hard-veto"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_family_contributes_nothing() {
+        let mut cfg = sqli_cfg(40, 80, &[]);
+        if let Some(ac) = cfg.attacks.get_mut(&AttackKind::SqlInjection) {
+            ac.enabled = false;
+        }
+        let signals = [sig(
+            AttackKind::SqlInjection,
+            DetectorId::StructRule,
+            "body",
+            100,
+            "sql.union_null",
+            Provenance::Raw,
+        )];
+        let v = score(&signals, &cfg, false);
+        assert_eq!(v.request_score, 0);
+        assert_eq!(v.recommendation, SemanticAction::None);
+    }
+
+    #[test]
+    fn degraded_flag_is_propagated() {
+        let v = score(&[], &RuntimeScoringConfig::default(), true);
+        assert!(v.degraded);
+    }
+}

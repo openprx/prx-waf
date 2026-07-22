@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use waf_common::content_security_config::{ContentSecurityConfig, SemanticBudgetConfig};
 use waf_common::{HostConfig, Phase, RequestCtx, WafAction};
 use waf_engine::crowdsec::{
     AppSecClient, AppSecConfig, CrowdSecChecker, CrowdSecConfig, DecisionCache, FallbackAction,
@@ -35,7 +36,7 @@ use waf_engine::crowdsec::{
 use waf_engine::rules::engine::{
     Condition, ConditionField, ConditionOp, ConditionValue, CustomRule, Operator, RuleAction,
 };
-use waf_engine::{CommunityClient, CommunityReporter, WafEngine, WafEngineConfig};
+use waf_engine::{CommunityClient, CommunityReporter, RuntimeContentSecurityConfig, WafEngine, WafEngineConfig};
 use waf_storage::Database;
 use waf_storage::models::SecurityEventQuery;
 
@@ -664,5 +665,145 @@ async fn side_effect_legacy_block_reaches_community_reporter() {
     assert!(
         captured.contains("SQL Injection"),
         "signal payload must carry the legacy rule name: {captured}"
+    );
+}
+
+// ── P1a: Lane 2 zero-enforcement — never changes the final action ────────────
+
+/// Build an engine with the Lane 2 semantic lane **enabled and in `enforce`
+/// mode with a 100% canary rollout**. P1a ships no production detectors, so even
+/// this most-aggressive configuration must still produce zero signals → score 0
+/// → no semantic action → identical final decisions to a Lane-2-off engine.
+async fn engine_with_semantic_enforce() -> WafEngine {
+    let db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
+    db.migrate().await.expect("migrate");
+    let cfg = ContentSecurityConfig {
+        enabled: true,
+        enforcement_mode: "enforce".to_string(),
+        rollout_bps: 10_000,
+        ..ContentSecurityConfig::default()
+    };
+    let content_security = RuntimeContentSecurityConfig::compile(&cfg).expect("valid semantic config");
+    WafEngine::new(
+        db,
+        WafEngineConfig {
+            content_security,
+            ..WafEngineConfig::default()
+        },
+    )
+}
+
+/// Coarse action discriminant (ignores block-page body text, which may embed a
+/// random req id) plus the detection phase, for decision equality.
+fn action_kind(d: &waf_common::WafDecision) -> (&'static str, Option<Phase>) {
+    let tag = match d.action {
+        WafAction::Allow => "allow",
+        WafAction::Block { .. } => "block",
+        WafAction::LogOnly => "log_only",
+        WafAction::Redirect { .. } => "redirect",
+    };
+    (tag, d.result.as_ref().map(|r| r.phase))
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn lane2_enabled_enforce_never_changes_final_action() {
+    let baseline = engine().await; // Lane 2 off (default)
+    let semantic = engine_with_semantic_enforce().await; // Lane 2 enabled + enforce
+
+    // (query, body) battery: clean + each legacy attack family + a body attack.
+    let cases: &[(&str, &str)] = &[
+        ("q=hello", "just a normal body"),
+        ("id=1 union select 1,2,3", ""),
+        ("q=<script>alert(1)</script>", ""),
+        ("q=;cat /etc/passwd", ""),
+        ("q=../../../../etc/passwd", ""),
+        ("", "id=1 union select username,password from users"),
+    ];
+
+    for (query, body) in cases {
+        // Header phase.
+        let mut a = make_ctx(query, body, false);
+        let mut b = make_ctx(query, body, false);
+        let da = baseline.inspect(&mut a).await;
+        let db = semantic.inspect(&mut b).await;
+        assert_eq!(
+            action_kind(&da),
+            action_kind(&db),
+            "Lane 2 (enforce) changed the header-phase action for query={query:?} body={body:?}"
+        );
+
+        // Body phase.
+        let mut c = make_ctx(query, body, false);
+        let mut d = make_ctx(query, body, false);
+        let dc = baseline.inspect_body(&mut c).await;
+        let dd = semantic.inspect_body(&mut d).await;
+        assert_eq!(
+            action_kind(&dc),
+            action_kind(&dd),
+            "Lane 2 (enforce) changed the body-phase action for query={query:?} body={body:?}"
+        );
+    }
+}
+
+/// Build an enabled-enforce engine whose semantic budget is so tiny the
+/// preprocessor degrades on the very first non-trivial field (a 2-byte per-field
+/// input cap). Used to prove the degraded fail-open contract at the real engine.
+async fn engine_with_semantic_enforce_tiny_budget() -> WafEngine {
+    let db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
+    db.migrate().await.expect("migrate");
+    let cfg = ContentSecurityConfig {
+        enabled: true,
+        enforcement_mode: "enforce".to_string(),
+        rollout_bps: 10_000,
+        budget: SemanticBudgetConfig {
+            max_field_input_bytes: 2,
+            ..SemanticBudgetConfig::default()
+        },
+        ..ContentSecurityConfig::default()
+    };
+    let content_security = RuntimeContentSecurityConfig::compile(&cfg).expect("valid semantic config");
+    WafEngine::new(
+        db,
+        WafEngineConfig {
+            content_security,
+            ..WafEngineConfig::default()
+        },
+    )
+}
+
+/// A semantic budget so tiny the preprocessor degrades on the query field. The
+/// enabled-enforce lane must then FAIL OPEN: it never blocks (no detectors, and
+/// a degraded verdict carries no recommendation) and yields the identical legacy
+/// decision. We drive a caller-owned budget state and assert it was actually
+/// exhausted (`is_degraded`), so this is no longer a vacuous "clean stays clean"
+/// test (codex A-2).
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn lane2_degraded_budget_still_zero_enforcement() {
+    let baseline = engine().await; // Lane 2 off (default)
+    let semantic = engine_with_semantic_enforce_tiny_budget().await; // enforce + tiny budget
+
+    let mut base_ctx = make_ctx("q=hello", "normal", false);
+    let mut ctx = make_ctx("q=hello", "normal", false);
+
+    // Caller-owned state compiled from the engine's (tiny) budget, threaded
+    // through the header phase so we can inspect the degraded flag afterwards.
+    let mut state = semantic.new_content_inspection_state();
+    let d_base = baseline.inspect(&mut base_ctx).await;
+    let d = semantic.inspect_with_state(&mut ctx, &mut state).await;
+
+    assert!(
+        state.is_degraded(),
+        "the 2-byte per-field input cap must exhaust the budget on the query field"
+    );
+    assert_eq!(
+        action_kind(&d_base),
+        action_kind(&d),
+        "a degraded Lane 2 must fail open to the identical legacy decision"
+    );
+    assert!(
+        d.is_allowed(),
+        "clean request must remain allowed under a degraded Lane 2 enforce"
     );
 }

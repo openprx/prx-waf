@@ -421,7 +421,9 @@ fn precedence_clean_request_no_hit() {
 fn subsystem_legacy(c: &RequestCtx) -> Option<waf_common::DetectionResult> {
     match ContentSecuritySubsystem::new().evaluate(c) {
         ContentVerdict::LegacyVeto { result } => Some(result),
-        ContentVerdict::None => None,
+        // `evaluate` is Lane-1-only and never returns `Semantic`; the arm exists
+        // solely for exhaustiveness after the P1a verdict gained the variant.
+        ContentVerdict::Semantic(_) | ContentVerdict::None => None,
     }
 }
 

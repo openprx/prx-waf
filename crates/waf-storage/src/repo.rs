@@ -6,11 +6,12 @@ use crate::error::StorageError;
 use crate::models::{
     AdminUser, AllowIp, AllowUrl, AttackLog, AttackLogQuery, AuditLogEntry, AuditLogQuery, BlockIp, BlockUrl,
     Certificate, CreateAdminUser, CreateCertificate, CreateCrowdSecEvent, CreateCustomRule, CreateHost, CreateIpRule,
-    CreateLbBackend, CreateNotificationConfig, CreateSecurityEvent, CreateSensitivePattern, CreateTunnel,
-    CreateUrlRule, CreateWasmPlugin, CrowdSecConfigRow, CrowdSecEventQuery, CrowdSecEventRow, CustomRule, GeoDistEntry,
-    GeoStats, Host, HotlinkConfig, LbBackend, NotificationConfig, NotificationLog, RefreshToken, SecurityEvent,
-    SecurityEventQuery, SensitivePattern, StatsOverview, TimeSeriesPoint, TopEntry, TunnelRow, UpdateCertificatePem,
-    UpdateHost, UpsertCrowdSecConfig, UpsertHotlinkConfig, WasmPluginRow,
+    CreateLbBackend, CreateNotificationConfig, CreateSecurityEvent, CreateSemanticObservation, CreateSensitivePattern,
+    CreateTunnel, CreateUrlRule, CreateWasmPlugin, CrowdSecConfigRow, CrowdSecEventQuery, CrowdSecEventRow, CustomRule,
+    GeoDistEntry, GeoStats, Host, HotlinkConfig, LbBackend, NotificationConfig, NotificationLog, RefreshToken,
+    SecurityEvent, SecurityEventQuery, SemanticObservation, SemanticObservationQuery, SensitivePattern, StatsOverview,
+    TimeSeriesPoint, TopEntry, TunnelRow, UpdateCertificatePem, UpdateHost, UpsertCrowdSecConfig, UpsertHotlinkConfig,
+    WasmPluginRow,
 };
 
 impl Database {
@@ -413,6 +414,72 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    // ─── Semantic Observations (Lane 2) ──────────────────────────────────────
+
+    /// Insert one Lane 2 semantic observation (plan §13.1). Parameterised
+    /// query; the JSONB `observations` array is de-identified by the caller.
+    pub async fn insert_semantic_observation(&self, req: CreateSemanticObservation) -> Result<(), StorageError> {
+        sqlx::query(
+            r"INSERT INTO semantic_observations
+               (host_code, client_ip, req_id, scope, request_score, recommendation,
+                degraded, exhausted, pipeline, schema_version, observations)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(&req.host_code)
+        .bind(&req.client_ip)
+        .bind(&req.req_id)
+        .bind(&req.scope)
+        .bind(req.request_score)
+        .bind(&req.recommendation)
+        .bind(req.degraded)
+        .bind(req.exhausted)
+        .bind(&req.pipeline)
+        .bind(req.schema_version)
+        .bind(&req.observations)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List semantic observations, most recent first, optionally filtered by
+    /// host and paginated.
+    pub async fn list_semantic_observations(
+        &self,
+        query: SemanticObservationQuery,
+    ) -> Result<Vec<SemanticObservation>, StorageError> {
+        let page = query.page.unwrap_or(1).max(1);
+        let page_size = query.page_size.unwrap_or(50).clamp(1, 500);
+        let offset = (page - 1) * page_size;
+
+        let rows = match query.host_code {
+            Some(host) => {
+                sqlx::query_as::<_, SemanticObservation>(
+                    r"SELECT * FROM semantic_observations
+                       WHERE host_code = $1
+                       ORDER BY created_at DESC
+                       LIMIT $2 OFFSET $3",
+                )
+                .bind(host)
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, SemanticObservation>(
+                    r"SELECT * FROM semantic_observations
+                       ORDER BY created_at DESC
+                       LIMIT $1 OFFSET $2",
+                )
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows)
     }
 
     // ─── Certificates ─────────────────────────────────────────────────────────

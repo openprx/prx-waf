@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use waf_common::{HostConfig, RequestCtx};
+use waf_engine::ContentInspectionState;
 
 use crate::lb::Backend;
 
@@ -28,6 +29,11 @@ pub struct GatewayCtx {
     /// Set to `true` once the body WAF check has been performed so we only
     /// inspect once (on the first chunk that completes the preview or at EOS).
     pub body_inspected: bool,
+    /// Lane 2 semantic work-budget state, shared across the header and body
+    /// phases of this request (plan §12.3 — HTTP/1.1 owns it in `GatewayCtx`;
+    /// HTTP/3 uses a local instance). Initialised from the engine's compiled
+    /// budget in `request_filter`.
+    pub content_inspection: ContentInspectionState,
     // ── Load balancing ─────────────────────────────────────────────────────────
     /// Backend chosen by the load balancer for this request. Held so its active
     /// connection counter can be released in `logging` (Least-Connections

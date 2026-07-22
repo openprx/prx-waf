@@ -322,7 +322,12 @@ where
     };
 
     // ── WAF header-phase inspection ─────────────────────────────────────────
-    let decision = engine.inspect(&mut request_ctx).await;
+    // HTTP/3 has no GatewayCtx, so the Lane 2 budget lives in a local instance
+    // reused across the header and body phases (plan §12.3).
+    let mut content_inspection = engine.new_content_inspection_state();
+    let decision = engine
+        .inspect_with_state(&mut request_ctx, &mut content_inspection)
+        .await;
     if !decision.is_allowed()
         && let Some(handled) = respond_waf_action(&mut stream, &decision.action, &request_ctx).await?
     {
@@ -371,7 +376,9 @@ where
         request_ctx.body_preview = Bytes::copy_from_slice(preview);
         request_ctx.content_length = body_buf.len() as u64;
 
-        let decision = engine.inspect_body(&mut request_ctx).await;
+        let decision = engine
+            .inspect_body_with_state(&mut request_ctx, &mut content_inspection)
+            .await;
         if !decision.is_allowed()
             && let Some(handled) = respond_waf_action(&mut stream, &decision.action, &request_ctx).await?
         {

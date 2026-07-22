@@ -337,8 +337,15 @@ impl ProxyHttp for WafProxy {
         let path = request_ctx.path.clone();
         let host = request_ctx.host.clone();
 
+        // Initialise the Lane 2 budget from the engine's compiled config so the
+        // header and body phases of this request share one budget (plan §12.3).
+        ctx.content_inspection = self.engine.new_content_inspection_state();
+
         // ctx is &mut so the engine can enrich it with GeoIP
-        let decision = self.engine.inspect(&mut request_ctx).await;
+        let decision = self
+            .engine
+            .inspect_with_state(&mut request_ctx, &mut ctx.content_inspection)
+            .await;
 
         // Persist the (GeoIP-enriched) request context for the body phase and logging.
         ctx.request_ctx = Some(request_ctx);
@@ -448,7 +455,11 @@ impl ProxyHttp for WafProxy {
 
         // Run body-phase WAF inspection (content detectors only — CC / IP / URL
         // / geo / bouncer / community already ran once in the header phase).
-        let decision = self.engine.inspect_body(&mut request_ctx).await;
+        // Shares the header phase's Lane 2 budget (plan §12.3).
+        let decision = self
+            .engine
+            .inspect_body_with_state(&mut request_ctx, &mut ctx.content_inspection)
+            .await;
 
         if !decision.is_allowed() {
             match &decision.action {

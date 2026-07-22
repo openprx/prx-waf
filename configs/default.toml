@@ -179,3 +179,45 @@ cors_origins = []
 # update_frequency_secs = 10
 # fallback_action = "allow"          # allow | block | log (LAPI bouncer)
 # appsec_failure_action = "allow"    # allow | block | log (AppSec, independent)
+
+# ── Lane 2 Semantic Content-Security Engine ───────────────────────────────────
+# Additive semantic scoring layer (SQLi/RCE/…) that sits behind the frozen legacy
+# detectors. OFF by default: a zero-config install never activates it. When
+# enabled it defaults to shadow mode ("log_only") — it can, at most, log. P1a
+# ships the scoring/budget/observation/config foundation with NO detectors, so
+# even `enforce` mode produces zero blocks until detectors land.
+#
+# [content_security]
+# enabled = false                     # master switch for the whole lane
+# enforcement_mode = "log_only"       # off | log_only (shadow) | enforce
+# dialect = "generic"                 # global; per-host dialects not claimed in P1
+# hpp = false                         # HTTP-parameter-pollution synthetic views (global off)
+# rollout_bps = 0                     # canary width in basis points (0..10000)
+# rollout_salt = ""                   # stable salt for deterministic canary bucketing
+#
+# [content_security.budget]           # deterministic DoS work caps (conservative)
+# max_fields_per_phase = 64
+# max_views_per_field = 12
+# max_ast_attempts_per_request = 6
+# max_ast_input_bytes_total = 262144
+# max_tokens_per_view = 512
+# max_list_items = 1024
+# max_preprocess_output_bytes_total = 524288
+# max_field_input_bytes = 16384       # per-field input cap, checked before any decode/alloc
+# max_decode_rounds = 3
+#
+# [content_security.breaker]          # anomaly-rate circuit breaker
+# window_secs = 300
+# min_samples = 200
+# anomaly_rate_threshold = 0.05
+# cooldown_secs = 900
+#
+# Per-attack scoring families (enabled ones require weights summing to 1.0):
+# [content_security.attacks.sql_injection]
+# enabled = false                     # no detectors ship in P1a; keep families off
+# log_threshold = 40
+# block_threshold = 80
+# hard_veto_allowlist = []
+# [content_security.attacks.sql_injection.weights]
+# # struct_rule = 0.6
+# # ast = 0.4
