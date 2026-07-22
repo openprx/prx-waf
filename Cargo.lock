@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3330,9 +3330,10 @@ checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "prx-waf"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "gateway",
  "ipnet",
@@ -3340,6 +3341,7 @@ dependencies = [
  "pingora-proxy",
  "regex",
  "rustls",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5151,13 +5153,14 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waf-api"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
  "axum",
  "base64",
+ "bytes",
  "chrono",
  "dashmap",
  "data-encoding",
@@ -5189,7 +5192,7 @@ dependencies = [
 
 [[package]]
 name = "waf-cluster"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5219,7 +5222,7 @@ dependencies = [
 
 [[package]]
 name = "waf-common"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5236,7 +5239,7 @@ dependencies = [
 
 [[package]]
 name = "waf-engine"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5272,7 +5275,7 @@ dependencies = [
 
 [[package]]
 name = "waf-storage"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "serde",

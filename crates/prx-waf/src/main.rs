@@ -1485,22 +1485,10 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
     let hosts = db.list_hosts().await?;
     info!("Loading {} hosts from database", hosts.len());
     for host in &hosts {
-        use waf_common::HostConfig;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let cfg = Arc::new(HostConfig {
-            code: host.code.clone(),
-            host: host.host.clone(),
-            port: host.port as u16,
-            ssl: host.ssl,
-            guard_status: host.guard_status,
-            remote_host: host.remote_host.clone(),
-            remote_port: host.remote_port as u16,
-            remote_ip: host.remote_ip.clone(),
-            cert_file: host.cert_file.clone(),
-            key_file: host.key_file.clone(),
-            start_status: host.start_status,
-            ..HostConfig::default()
-        });
+        // Reuse the same Host -> HostConfig projection the API's create_host /
+        // update_host handlers use, so the startup path can never drift from
+        // the hot path (e.g. silently dropping log_only_mode on restart).
+        let cfg = Arc::new(waf_api::handlers::host_runtime_config(host));
         router.register(&cfg);
     }
 
@@ -1901,6 +1889,157 @@ mod tests {
             appsec.failure_action,
             FallbackAction::Allow,
             "default AppSec failure_action must remain Allow regardless of fallback_action"
+        );
+    }
+
+    // ── startup restart wiring (regression: THIRD log_only_mode projection) ──
+    //
+    // `create_host`/`update_host` already share the `waf_api::handlers::
+    // host_runtime_config` projection (regression-tested in waf-api). This
+    // targets the third, previously-divergent projection: process startup,
+    // which rebuilds the `HostRouter` from `Database::list_hosts` rather than
+    // from a single handler's return value. Before this fix, `init_async`
+    // hand-rolled its own `Host -> HostConfig` mapping that omitted
+    // `log_only_mode`, so a host set to log-only through the admin API would
+    // silently start BLOCKING again after every restart.
+    //
+    // This drives the actual restart sequence: persist a host row (as the
+    // admin API would), reload it with the exact query `init_async` issues,
+    // project it with the same helper the startup loop now calls, register it
+    // into a fresh `HostRouter`, and feed a real `WafEngine` a malicious
+    // request through the resolved config — proving the verdict itself (not
+    // just a field copy) survives a restart.
+    //
+    // DB-gated like the engine/API suites. Run with:
+    //   DATABASE_URL=postgresql://prx_waf:prx_waf@127.0.0.1:15432/prx_waf \
+    //     cargo test -p prx-waf -- --ignored --nocapture
+    use std::collections::HashMap;
+    use uuid::Uuid;
+    use waf_common::{RequestCtx, WafAction};
+    use waf_storage::models::Host;
+
+    fn database_url() -> String {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://prx_waf:prx_waf@127.0.0.1:15432/prx_waf".to_string())
+    }
+
+    /// Persist a host row with a unique hostname so parallel/repeated test
+    /// runs never collide.
+    ///
+    /// This inserts directly rather than going through `Database::create_host`
+    /// because that helper has an unrelated, pre-existing sqlx binding defect
+    /// (out of scope for the `log_only_mode` wiring fixed here): it binds
+    /// `remote_ip: Option<String>` as an explicitly-typed TEXT parameter
+    /// against the `inet` column, which Postgres rejects whenever the value is
+    /// `None` (column "`remote_ip`" is of type inet but expression is of type
+    /// text). Every column this test doesn't care about (`remote_ip`
+    /// included) is left to its schema default via `INSERT ... RETURNING *`.
+    async fn seed_host(db: &Database, log_only_mode: bool) -> Host {
+        let code = Uuid::new_v4().to_string().replace('-', "")[..16].to_string();
+        let host = format!("logonly-restart-{}.test", Uuid::new_v4());
+        sqlx::query_as::<_, Host>(
+            r"INSERT INTO hosts (
+                code, host, port, ssl, guard_status,
+                remote_host, remote_port, start_status, log_only_mode
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING *",
+        )
+        .bind(&code)
+        .bind(&host)
+        .bind(80_i32)
+        .bind(false)
+        .bind(true)
+        .bind("127.0.0.1")
+        .bind(8080_i32)
+        .bind(true)
+        .bind(log_only_mode)
+        .fetch_one(db.pool())
+        .await
+        .expect("seed host row")
+    }
+
+    /// A malicious `SQLi` request bound to the reloaded runtime config. Benign
+    /// User-Agent keeps header-phase scanner/bot detectors from firing ahead
+    /// of the `SQLi` content detector.
+    fn malicious_ctx(host_config: Arc<waf_common::HostConfig>) -> RequestCtx {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "user-agent".to_string(),
+            "Mozilla/5.0 (logonly-restart-wiring)".to_string(),
+        );
+        RequestCtx {
+            req_id: "logonly-restart-wiring".to_string(),
+            client_ip: "198.51.100.10".parse().expect("ip"),
+            client_port: 54321,
+            method: "GET".to_string(),
+            host: host_config.host.clone(),
+            port: host_config.port,
+            path: "/".to_string(),
+            query: "id=1 union select 1,2,3".to_string(),
+            headers,
+            body_preview: bytes::Bytes::new(),
+            content_length: 0,
+            is_tls: false,
+            host_config,
+            geo: None,
+        }
+    }
+
+    /// Seed a host, then reload it exactly the way `init_async` does at
+    /// process startup (`list_hosts` + the shared projection helper +
+    /// `HostRouter::register`), and drive a live `WafEngine` with it.
+    async fn restart_and_inspect(log_only_mode: bool) -> WafAction {
+        let db = Database::connect(&database_url(), 5).await.expect("connect Postgres");
+        db.migrate().await.expect("migrate");
+        let seeded = seed_host(&db, log_only_mode).await;
+
+        // Simulate a process restart: the only source of truth from here on is
+        // what `list_hosts` returns, exactly like `init_async`.
+        let reloaded = db.list_hosts().await.expect("list_hosts");
+        let persisted = reloaded
+            .iter()
+            .find(|h| h.id == seeded.id)
+            .expect("seeded host must survive the reload")
+            .clone();
+
+        let router = HostRouter::new();
+        let cfg = Arc::new(waf_api::handlers::host_runtime_config(&persisted));
+        router.register(&cfg);
+
+        let resolved = router
+            .resolve(&persisted.host)
+            .expect("router must resolve the just-registered host");
+        assert_eq!(
+            resolved.log_only_mode, log_only_mode,
+            "startup projection dropped log_only_mode across restart"
+        );
+
+        let engine_db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
+        let engine = WafEngine::new(engine_db, WafEngineConfig::default());
+        let mut ctx = malicious_ctx(resolved);
+        let decision = engine.inspect(&mut ctx).await;
+
+        let _ = db.delete_host(seeded.id).await;
+        decision.action
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres; run with --ignored"]
+    async fn restart_reload_of_log_only_true_downgrades_to_logonly() {
+        let action = restart_and_inspect(true).await;
+        assert!(
+            matches!(action, WafAction::LogOnly),
+            "log_only_mode=true host reloaded at startup must downgrade the SQLi Block to LogOnly, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres; run with --ignored"]
+    async fn restart_reload_of_log_only_false_blocks() {
+        let action = restart_and_inspect(false).await;
+        assert!(
+            matches!(action, WafAction::Block { status: 403, .. }),
+            "log_only_mode=false host reloaded at startup must still Block the SQLi request, got {action:?}"
         );
     }
 }

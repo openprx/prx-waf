@@ -39,6 +39,7 @@ parking_lot = { workspace = true }
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 base64 = { workspace = true }
+bytes = { workspace = true }
 
 [lints]
 workspace = true

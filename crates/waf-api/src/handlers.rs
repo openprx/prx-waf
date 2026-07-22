@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use waf_storage::models::{
     AttackLogQuery, CreateCertificate, CreateCustomRule, CreateHost, CreateIpRule, CreateLbBackend,
-    CreateSensitivePattern, CreateUrlRule, SecurityEventQuery, UpdateHost, UpsertHotlinkConfig,
+    CreateSensitivePattern, CreateUrlRule, Host, SecurityEventQuery, UpdateHost, UpsertHotlinkConfig,
 };
 
 use waf_common::HostConfig;
@@ -32,6 +32,34 @@ impl<T: Serialize> ApiResponse<T> {
 }
 
 // ─── Hosts ────────────────────────────────────────────────────────────────────
+
+/// Build the runtime [`HostConfig`] the router serves from a persisted [`Host`].
+///
+/// Shared by `create_host` and `update_host` so the field mapping — most
+/// importantly `log_only_mode`, whose omission previously left API-configured
+/// log-only hosts silently blocking — cannot drift between the two paths.
+///
+/// This is a deliberately partial projection: fields the admin API does not yet
+/// surface into the runtime (load-balancing, `defense_json`, `exclude_url_log`,
+/// block page template, backends) keep their `HostConfig::default()` values.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn host_runtime_config(host: &Host) -> HostConfig {
+    HostConfig {
+        code: host.code.clone(),
+        host: host.host.clone(),
+        port: host.port as u16,
+        ssl: host.ssl,
+        guard_status: host.guard_status,
+        remote_host: host.remote_host.clone(),
+        remote_port: host.remote_port as u16,
+        remote_ip: host.remote_ip.clone(),
+        cert_file: host.cert_file.clone(),
+        key_file: host.key_file.clone(),
+        start_status: host.start_status,
+        log_only_mode: host.log_only_mode,
+        ..HostConfig::default()
+    }
+}
 
 pub async fn list_hosts(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
     let hosts = state.db.list_hosts().await?;
@@ -59,21 +87,7 @@ pub async fn create_host(State(state): State<Arc<AppState>>, Json(req): Json<Cre
     let host = state.db.create_host(req).await?;
 
     // Register with router
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let config = Arc::new(HostConfig {
-        code: host.code.clone(),
-        host: host.host.clone(),
-        port: host.port as u16,
-        ssl: host.ssl,
-        guard_status: host.guard_status,
-        remote_host: host.remote_host.clone(),
-        remote_port: host.remote_port as u16,
-        remote_ip: host.remote_ip.clone(),
-        cert_file: host.cert_file.clone(),
-        key_file: host.key_file.clone(),
-        start_status: host.start_status,
-        ..HostConfig::default()
-    });
+    let config = Arc::new(host_runtime_config(&host));
     state.router.register(&config);
 
     Ok(Json(json!({ "success": true, "data": host })))
@@ -112,21 +126,7 @@ pub async fn update_host(
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let old_port = old_host.port as u16;
     state.router.unregister(&old_host.host, old_port);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let config = Arc::new(HostConfig {
-        code: host.code.clone(),
-        host: host.host.clone(),
-        port: host.port as u16,
-        ssl: host.ssl,
-        guard_status: host.guard_status,
-        remote_host: host.remote_host.clone(),
-        remote_port: host.remote_port as u16,
-        remote_ip: host.remote_ip.clone(),
-        cert_file: host.cert_file.clone(),
-        key_file: host.key_file.clone(),
-        start_status: host.start_status,
-        ..HostConfig::default()
-    });
+    let config = Arc::new(host_runtime_config(&host));
     state.router.register(&config);
     Ok(Json(json!({ "success": true, "data": host })))
 }
@@ -576,6 +576,8 @@ pub async fn delete_certificate(State(state): State<Arc<AppState>>, Path(id): Pa
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     /// Replicates the port validation logic used in `create_host` / `update_host`.
     fn is_valid_port(port: i32) -> bool {
         (1..=65535).contains(&port)
@@ -622,5 +624,127 @@ mod tests {
     #[test]
     fn port_validation_i32_max_rejected() {
         assert!(!is_valid_port(i32::MAX));
+    }
+
+    // ── host log_only_mode wiring (regression for the create/update_host bug) ──
+    //
+    // Proves the FULL runtime path, not just a field copy: a persisted `Host`
+    // with `log_only_mode` set is projected by the SAME `host_runtime_config`
+    // helper the handlers use, and the resulting `HostConfig` is fed to a real
+    // `WafEngine`. A malicious SQLi request must Block when the host is NOT in
+    // log-only mode and downgrade to LogOnly when it IS — so the previously
+    // dropped `log_only_mode` field is observably honoured end-to-end.
+    //
+    // DB-gated exactly like the engine parity suite (`WafEngine::new` needs a
+    // live Postgres for the security-event log path). Run with:
+    //
+    //   DATABASE_URL=postgresql://prx_waf:prx_waf@127.0.0.1:15432/prx_waf \
+    //     cargo test -p waf-api -- --ignored --nocapture
+    use super::host_runtime_config;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use chrono::Utc;
+    use uuid::Uuid;
+    use waf_common::{RequestCtx, WafAction};
+    use waf_engine::{WafEngine, WafEngineConfig};
+    use waf_storage::Database;
+    use waf_storage::models::Host;
+
+    fn database_url() -> String {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://prx_waf:prx_waf@127.0.0.1:15432/prx_waf".to_string())
+    }
+
+    /// A persisted host row with the given `log_only_mode`; all other fields are
+    /// benign defaults (guard on, no load-balancing).
+    fn sample_host(log_only_mode: bool) -> Host {
+        Host {
+            id: Uuid::new_v4(),
+            code: "h-logonly".to_string(),
+            host: "example.com".to_string(),
+            port: 80,
+            ssl: false,
+            guard_status: true,
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 8080,
+            remote_ip: None,
+            cert_file: None,
+            key_file: None,
+            remarks: None,
+            start_status: true,
+            exclude_url_log: None,
+            is_enable_load_balance: false,
+            load_balance_stage: 0,
+            defense_json: None,
+            log_only_mode,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// A malicious `SQLi` request bound to the projected runtime config. Benign
+    /// User-Agent keeps the header-phase scanner/bot detectors from firing ahead
+    /// of the `SQLi` content detector.
+    fn malicious_ctx(host: &Host) -> RequestCtx {
+        let host_config = Arc::new(host_runtime_config(host));
+        let mut headers = HashMap::new();
+        headers.insert("user-agent".to_string(), "Mozilla/5.0 (logonly-wiring)".to_string());
+        RequestCtx {
+            req_id: "logonly-wiring".to_string(),
+            client_ip: "198.51.100.9".parse().expect("ip"),
+            client_port: 54321,
+            method: "GET".to_string(),
+            host: "example.com".to_string(),
+            port: 80,
+            path: "/".to_string(),
+            query: "id=1 union select 1,2,3".to_string(),
+            headers,
+            body_preview: Bytes::new(),
+            content_length: 0,
+            is_tls: false,
+            host_config,
+            geo: None,
+        }
+    }
+
+    async fn engine() -> WafEngine {
+        let db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
+        db.migrate().await.expect("migrate");
+        WafEngine::new(db, WafEngineConfig::default())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres; run with --ignored"]
+    async fn host_runtime_config_carries_log_only_false_blocks() {
+        let eng = engine().await;
+        let host = sample_host(false);
+        // Sanity: the projection actually carried the field the bug dropped.
+        assert!(!host_runtime_config(&host).log_only_mode);
+        let mut ctx = malicious_ctx(&host);
+        let decision = eng.inspect(&mut ctx).await;
+        assert!(
+            matches!(decision.action, WafAction::Block { status: 403, .. }),
+            "log_only_mode=false host must Block the SQLi request, got {:?}",
+            decision.action
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres; run with --ignored"]
+    async fn host_runtime_config_carries_log_only_true_downgrades_to_logonly() {
+        let eng = engine().await;
+        let host = sample_host(true);
+        assert!(host_runtime_config(&host).log_only_mode);
+        let mut ctx = malicious_ctx(&host);
+        let decision = eng.inspect(&mut ctx).await;
+        assert!(
+            matches!(decision.action, WafAction::LogOnly),
+            "log_only_mode=true host must downgrade the SQLi Block to LogOnly, got {:?}",
+            decision.action
+        );
+        assert!(decision.is_allowed(), "LogOnly must forward (be allowed)");
+        assert!(decision.result.is_some(), "the SQLi detection must still be recorded");
     }
 }

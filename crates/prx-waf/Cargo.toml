@@ -29,5 +29,9 @@ rustls = { workspace = true }
 pingora-core = { workspace = true }
 pingora-proxy = { workspace = true }
 
+[dev-dependencies]
+bytes = { workspace = true }
+sqlx = { workspace = true }
+
 [lints]
 workspace = true
