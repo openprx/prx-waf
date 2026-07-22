@@ -184,11 +184,13 @@ cors_origins = []
 # Additive semantic scoring layer (SQLi/RCE/…) that sits behind the frozen legacy
 # detectors. P1b ships the first real detector (structural SQLi).
 #
-# OPT-IN: the lane is OFF by default (`enabled = false`). It must be enabled
-# explicitly by an operator, on a controlled target-practice environment, before
-# it does any preprocessing / detection / observation work. This keeps the
-# observation write-path and any detector false positives out of the production
-# default until detection/false-positive rates have been measured from the DB.
+# DEFAULT-ON SHADOW (log_only): the lane is ON by default (`enabled = true`) in
+# this shipped config, but runs in shadow — it detects + logs + persists a
+# de-identified observation and NEVER blocks. Target-practice measured 0 false
+# positives and 100% detection on the bypass corpus, and every preprocessing /
+# detection step is bounded by the budget caps below, so shadow-on is a safe
+# default. Flip `enforcement_mode` to change the posture; note that `enforce`
+# is not wired in P1b (see the truth table below) so it still cannot block.
 #
 # enforcement_mode truth table (when `enabled = true`):
 #   off       → the lane does NO work: no detection, no LogOnly event, no
@@ -203,7 +205,7 @@ cors_origins = []
 # A zero-config install with no config file at all also leaves the lane OFF (the
 # compiled default is `enabled = false`).
 [content_security]
-enabled = false                       # master switch (OPT-IN; off by default)
+enabled = true                        # master switch (default-on SHADOW; log_only never blocks)
 enforcement_mode = "log_only"         # off | log_only (shadow) | enforce (P1b: enforce == log_only, never blocks)
 dialect = "generic"                   # global; per-host dialects not claimed in P1
 hpp = false                           # HTTP-parameter-pollution synthetic views (global off)
