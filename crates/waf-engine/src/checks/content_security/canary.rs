@@ -17,7 +17,7 @@
 //!   Because a fresh breaker starts `Closed`, "restart from `log_only`" is
 //!   **not** provided by the breaker alone — it is provided by an independent
 //!   restart shadow latch in
-//!   [`super::ContentSecuritySubsystem::resolve_action`], which holds
+//!   [`super::ContentSecuritySubsystem::resolve_enforced_action`], which holds
 //!   enforcement to shadow until a health warmup window elapses since process
 //!   start (codex A-4). The anomaly source here ("a block outcome is a sample")
 //!   is a placeholder heuristic pending real-traffic calibration (plan §13.3).

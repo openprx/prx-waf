@@ -1410,7 +1410,25 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
     let content_security = RuntimeContentSecurityConfig::compile(&config.content_security)
         .map_err(|e| anyhow::anyhow!("invalid content_security config: {e}"))?;
     if content_security.enabled {
-        info!("Lane 2 semantic content-security engine enabled (mode: shadow/log-only unless enforced)");
+        match content_security.enforcement_mode {
+            waf_engine::EnforcementMode::Off => {
+                info!(
+                    "Lane 2 semantic content-security engine enabled but enforcement_mode=off — the lane does no work (no detection/log/observation)"
+                );
+            }
+            waf_engine::EnforcementMode::LogOnly => {
+                info!(
+                    "Lane 2 semantic content-security engine enabled in SHADOW mode (log_only): detections are logged + persisted, never blocked"
+                );
+            }
+            waf_engine::EnforcementMode::Enforce => {
+                // P1b does NOT wire the scorer to the block path. `enforce` is
+                // accepted for forward-compatibility but behaves like `log_only`.
+                tracing::warn!(
+                    "Lane 2 enforcement_mode=enforce is configured but NOT yet wired in P1b (shadow only): the lane will LOG + PERSIST but NEVER block. Treating it as log_only."
+                );
+            }
+        }
     }
 
     // WAF engine

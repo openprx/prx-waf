@@ -8,11 +8,13 @@ pub mod geoip;
 pub mod geoip_updater;
 pub mod plugins;
 pub mod rules;
+pub mod semantic_sink;
 
 pub use checker::RuleStore;
 pub use checks::{
-    AntiHotlinkCheck, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict, GeoCheck, GeoRule, GeoRuleMode,
-    InspectionScope, OWASPCheck, RuntimeContentSecurityConfig, SemanticAction, SemanticVerdict, SensitiveCheck,
+    AntiHotlinkCheck, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict, EnforcementMode, GeoCheck,
+    GeoRule, GeoRuleMode, InspectionScope, OWASPCheck, RuntimeContentSecurityConfig, SemanticAction, SemanticVerdict,
+    SensitiveCheck,
 };
 pub use community::{
     CommunityChecker, CommunityClient, CommunityComponents, CommunityConfig, CommunityReporter, RequestInfo,

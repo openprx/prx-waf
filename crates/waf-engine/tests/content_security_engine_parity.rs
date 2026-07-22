@@ -807,3 +807,290 @@ async fn lane2_degraded_budget_still_zero_enforcement() {
         "clean request must remain allowed under a degraded Lane 2 enforce"
     );
 }
+
+// ── P1b: real structural SQLi detector in SHADOW mode ────────────────────────
+
+use base64::Engine as _;
+use waf_storage::models::SemanticObservationQuery;
+
+/// Build an engine with the Lane 2 `SQLi` family enabled in the **default P1b
+/// shadow posture** (`enforcement_mode = log_only`, `struct_rule` weight 1.0,
+/// `into_outfile`/`stacked` on the hard-veto allowlist). Returns the engine + its
+/// DB handle so a test can read back persisted observations.
+async fn engine_with_shadow_sqli() -> (WafEngine, Arc<Database>) {
+    let db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
+    db.migrate().await.expect("migrate");
+    let mut weights = std::collections::BTreeMap::new();
+    weights.insert("struct_rule".to_string(), 1.0);
+    let mut attacks = std::collections::BTreeMap::new();
+    attacks.insert(
+        "sql_injection".to_string(),
+        waf_common::content_security_config::SemanticAttackConfig {
+            enabled: true,
+            weights,
+            log_threshold: 40,
+            block_threshold: 80,
+            // Empty allowlist — no rule is authorised for single-hit Block before
+            // holdout (codex A-3); the shadow guarantee is proven regardless.
+            hard_veto_allowlist: Vec::new(),
+        },
+    );
+    let cfg = ContentSecurityConfig {
+        enabled: true,
+        enforcement_mode: "log_only".to_string(),
+        attacks,
+        ..ContentSecurityConfig::default()
+    };
+    let content_security = RuntimeContentSecurityConfig::compile(&cfg).expect("valid semantic config");
+    let eng = WafEngine::new(
+        Arc::clone(&db),
+        WafEngineConfig {
+            content_security,
+            ..WafEngineConfig::default()
+        },
+    );
+    (eng, db)
+}
+
+/// A base64-wrapped `SQLi` payload the frozen legacy detectors never decode, so it
+/// slips past Lane 1 entirely — but the Lane 2 decode chain (base64 blind decode)
+/// + structural detector catches it. In shadow mode this must still NOT block.
+fn base64_union_payload() -> String {
+    base64::engine::general_purpose::STANDARD.encode("1 union select null,null,null from users")
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn shadow_sqli_encoding_bypass_detected_but_not_blocked() {
+    let baseline = engine().await; // Lane 2 off
+    let (shadow, db) = engine_with_shadow_sqli().await; // Lane 2 SQLi, log_only
+
+    // Body is a pure base64 blob → legacy sees gibberish (no SQL keywords) and
+    // does not block; both engines must reach the identical final action.
+    let payload = base64_union_payload();
+    let mut a = make_ctx("", &payload, false);
+
+    // Unique host_code so we can read back THIS request's observation and prove
+    // detection actually happened (codex A-5: not a vacuous "clean stays clean").
+    let host_code = format!("p1b-bypass-{}", uuid_like());
+    let mut b = make_ctx("", &payload, false);
+    Arc::make_mut(&mut b.host_config).code = host_code.clone();
+
+    let da = baseline.inspect_body(&mut a).await;
+    let db_dec = shadow.inspect_body(&mut b).await;
+
+    assert!(
+        da.is_allowed(),
+        "baseline (Lane 2 off) must allow the base64-wrapped payload — legacy never decodes it: {:?}",
+        da.action
+    );
+    // 1) Final action is identical to the Lane-2-off baseline (shadow never blocks).
+    assert_eq!(
+        action_kind(&da),
+        action_kind(&db_dec),
+        "shadow SQLi detection must NOT change the final action (log_only never blocks)"
+    );
+    // 2) The suffix pipeline ran to completion (request allowed, not short-circuited).
+    assert!(db_dec.is_allowed(), "shadow mode must still allow the request");
+    // 3) Detection was NON-EMPTY: a de-identified observation for this request was
+    //    persisted through the bounded sink — proving the base64 blind decode +
+    //    structural detector actually fired (not a silent no-op).
+    let mut rows = Vec::new();
+    for _ in 0..40 {
+        rows = db
+            .list_semantic_observations(SemanticObservationQuery {
+                host_code: Some(host_code.clone()),
+                page: Some(1),
+                page_size: Some(10),
+            })
+            .await
+            .expect("list observations");
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        rows.len(),
+        1,
+        "detection must persist exactly one observation (non-empty proof)"
+    );
+    let row = rows.first().expect("one row");
+    let arr = row.observations.as_array().expect("observations array");
+    assert!(
+        arr.iter()
+            .any(|s| s.get("provenance").and_then(|v| v.as_str()) == Some("blind_decoded")),
+        "the winning view must be the base64 blind decode: {:?}",
+        row.observations
+    );
+}
+
+/// Build an engine with the Lane 2 `SQLi` family enabled in **enforce** mode.
+/// In P1b the scorer is deliberately not wired to the block path, so `enforce`
+/// must behave exactly like `log_only` at the engine dispatch: detect + persist,
+/// NEVER block (codex A-2 / A-5).
+async fn engine_with_enforce_sqli() -> (WafEngine, Arc<Database>) {
+    let db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
+    db.migrate().await.expect("migrate");
+    let mut weights = std::collections::BTreeMap::new();
+    weights.insert("struct_rule".to_string(), 1.0);
+    let mut attacks = std::collections::BTreeMap::new();
+    attacks.insert(
+        "sql_injection".to_string(),
+        waf_common::content_security_config::SemanticAttackConfig {
+            enabled: true,
+            weights,
+            log_threshold: 40,
+            block_threshold: 80,
+            hard_veto_allowlist: Vec::new(),
+        },
+    );
+    let cfg = ContentSecurityConfig {
+        enabled: true,
+        enforcement_mode: "enforce".to_string(),
+        rollout_bps: 10_000, // 100% canary — the most aggressive posture
+        attacks,
+        ..ContentSecurityConfig::default()
+    };
+    let content_security = RuntimeContentSecurityConfig::compile(&cfg).expect("valid semantic config");
+    let eng = WafEngine::new(
+        Arc::clone(&db),
+        WafEngineConfig {
+            content_security,
+            ..WafEngineConfig::default()
+        },
+    );
+    (eng, db)
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn enforce_mode_still_never_blocks_in_p1b() {
+    let baseline = engine().await; // Lane 2 off
+    let (enforce, _db) = engine_with_enforce_sqli().await; // Lane 2 SQLi, enforce (100% canary)
+
+    // A base64-wrapped union-select payload the legacy lane never decodes. Even in
+    // enforce mode with a 100% canary, P1b must NOT block (scorer not wired to the
+    // block path) — the final action must match the Lane-2-off baseline.
+    let payload = base64_union_payload();
+    let mut a = make_ctx("", &payload, false);
+    let mut b = make_ctx("", &payload, false);
+    let da = baseline.inspect_body(&mut a).await;
+    let db_dec = enforce.inspect_body(&mut b).await;
+
+    assert!(da.is_allowed(), "baseline must allow the base64 payload");
+    assert_eq!(
+        action_kind(&da),
+        action_kind(&db_dec),
+        "enforce mode must NOT change the final action in P1b (scorer not wired to block)"
+    );
+    assert!(
+        db_dec.is_allowed(),
+        "enforce mode in P1b must still allow (shadow only)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn shadow_sqli_persists_observation_roundtrip() {
+    let (shadow, db) = engine_with_shadow_sqli().await;
+
+    // A unique host_code isolates this test's observations from any other rows.
+    let host_code = format!("p1b-obs-{}", uuid_like());
+    let payload = base64_union_payload();
+    let host_config = Arc::new(HostConfig {
+        code: host_code.clone(),
+        host: "example.com".to_string(),
+        guard_status: true,
+        log_only_mode: false,
+        ..HostConfig::default()
+    });
+    let mut headers = HashMap::new();
+    headers.insert("user-agent".to_string(), "Mozilla/5.0 (p1b-obs)".to_string());
+    let mut ctx = RequestCtx {
+        req_id: "p1b-obs".to_string(),
+        client_ip: "198.51.100.9".parse().expect("ip"),
+        client_port: 12345,
+        method: "POST".to_string(),
+        host: "example.com".to_string(),
+        port: 80,
+        path: "/".to_string(),
+        query: String::new(),
+        headers,
+        body_preview: Bytes::from(payload),
+        content_length: 0,
+        is_tls: false,
+        host_config,
+        geo: None,
+    };
+    let decision = shadow.inspect_body(&mut ctx).await;
+    assert!(decision.is_allowed(), "shadow SQLi must not block the observation test");
+
+    // Persistence is fire-and-forget on a spawned task; poll until the row lands.
+    let mut rows = Vec::new();
+    for _ in 0..40 {
+        rows = db
+            .list_semantic_observations(SemanticObservationQuery {
+                host_code: Some(host_code.clone()),
+                page: Some(1),
+                page_size: Some(10),
+            })
+            .await
+            .expect("list observations");
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(rows.len(), 1, "exactly one semantic observation must be persisted");
+    let row = rows.first().expect("one row");
+    assert_eq!(row.scope, "body");
+    assert_eq!(row.pipeline, "semantic");
+    assert_eq!(row.schema_version, 1);
+    assert!(
+        row.request_score >= 40,
+        "union-based hit should score at/above log threshold"
+    );
+    assert!(
+        matches!(row.recommendation.as_str(), "log" | "block"),
+        "recommendation should be log/block (shadow logs it, never enforces): {}",
+        row.recommendation
+    );
+    // De-identified signal breakdown: a base64 blind-decoded SQL structural rule.
+    let arr = row.observations.as_array().expect("observations is a JSON array");
+    assert!(!arr.is_empty(), "at least one signal must be recorded");
+    assert!(
+        arr.iter().any(|s| s
+            .get("rule_key")
+            .and_then(|v| v.as_str())
+            .is_some_and(|k| k.starts_with("sql."))),
+        "a structural SQL rule_key must be present: {:?}",
+        row.observations
+    );
+    assert!(
+        arr.iter()
+            .any(|s| s.get("provenance").and_then(|v| v.as_str()) == Some("blind_decoded")),
+        "the winning view came through base64 blind decode: {:?}",
+        row.observations
+    );
+    // De-identification: only the fixed structural vocabulary (rule_key etc.) is
+    // stored — never the per-signal `detail` text nor raw attacker payload tokens.
+    // NB `rule_key` values like "sql.union_null" legitimately contain "union"; the
+    // check targets payload-specific fragments that only appear in the raw input.
+    let json = row.observations.to_string();
+    assert!(!json.contains("detail"), "detail must not be persisted");
+    assert!(
+        !json.contains("from users"),
+        "raw payload must not be persisted: {json}"
+    );
+    assert!(
+        !json.contains("null,null"),
+        "raw payload column list must not be persisted: {json}"
+    );
+}
+
+/// Small unique-ish suffix for test isolation (avoids a uuid dev-dep here).
+fn uuid_like() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+}

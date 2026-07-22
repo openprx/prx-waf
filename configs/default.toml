@@ -182,42 +182,67 @@ cors_origins = []
 
 # ── Lane 2 Semantic Content-Security Engine ───────────────────────────────────
 # Additive semantic scoring layer (SQLi/RCE/…) that sits behind the frozen legacy
-# detectors. OFF by default: a zero-config install never activates it. When
-# enabled it defaults to shadow mode ("log_only") — it can, at most, log. P1a
-# ships the scoring/budget/observation/config foundation with NO detectors, so
-# even `enforce` mode produces zero blocks until detectors land.
+# detectors. P1b ships the first real detector (structural SQLi).
 #
-# [content_security]
-# enabled = false                     # master switch for the whole lane
-# enforcement_mode = "log_only"       # off | log_only (shadow) | enforce
-# dialect = "generic"                 # global; per-host dialects not claimed in P1
-# hpp = false                         # HTTP-parameter-pollution synthetic views (global off)
-# rollout_bps = 0                     # canary width in basis points (0..10000)
-# rollout_salt = ""                   # stable salt for deterministic canary bucketing
+# OPT-IN: the lane is OFF by default (`enabled = false`). It must be enabled
+# explicitly by an operator, on a controlled target-practice environment, before
+# it does any preprocessing / detection / observation work. This keeps the
+# observation write-path and any detector false positives out of the production
+# default until detection/false-positive rates have been measured from the DB.
 #
-# [content_security.budget]           # deterministic DoS work caps (conservative)
-# max_fields_per_phase = 64
-# max_views_per_field = 12
-# max_ast_attempts_per_request = 6
-# max_ast_input_bytes_total = 262144
-# max_tokens_per_view = 512
-# max_list_items = 1024
-# max_preprocess_output_bytes_total = 524288
-# max_field_input_bytes = 16384       # per-field input cap, checked before any decode/alloc
-# max_decode_rounds = 3
+# enforcement_mode truth table (when `enabled = true`):
+#   off       → the lane does NO work: no detection, no LogOnly event, no
+#               `semantic_observations` row. Equivalent to `enabled = false`.
+#   log_only  → SHADOW: detect + log a LogOnly security event + persist a
+#               de-identified observation. NEVER a Block.
+#   enforce   → NOT WIRED in P1b. The block path is deliberately not connected to
+#               the scorer yet, so `enforce` behaves EXACTLY like `log_only`
+#               (detect + log + persist, never Block) and startup logs a WARN.
+#               Setting `enforce` today does NOT make the lane block traffic.
 #
-# [content_security.breaker]          # anomaly-rate circuit breaker
-# window_secs = 300
-# min_samples = 200
-# anomaly_rate_threshold = 0.05
-# cooldown_secs = 900
+# A zero-config install with no config file at all also leaves the lane OFF (the
+# compiled default is `enabled = false`).
+[content_security]
+enabled = false                       # master switch (OPT-IN; off by default)
+enforcement_mode = "log_only"         # off | log_only (shadow) | enforce (P1b: enforce == log_only, never blocks)
+dialect = "generic"                   # global; per-host dialects not claimed in P1
+hpp = false                           # HTTP-parameter-pollution synthetic views (global off)
+rollout_bps = 0                       # canary width in basis points (0..10000)
+rollout_salt = ""                     # stable salt for deterministic canary bucketing
+
+[content_security.budget]             # deterministic DoS work caps (conservative)
+max_fields_per_phase = 64
+max_views_per_field = 12
+max_ast_attempts_per_request = 6
+max_ast_input_bytes_total = 262144
+max_tokens_per_view = 512
+max_list_items = 1024
+max_preprocess_output_bytes_total = 524288
+max_field_input_bytes = 16384         # per-field input cap, checked before any decode/alloc
+max_decode_rounds = 3
+
+[content_security.breaker]            # anomaly-rate circuit breaker
+window_secs = 300
+min_samples = 200
+anomaly_rate_threshold = 0.05
+cooldown_secs = 900
+
+# Per-attack scoring families (enabled ones require weights summing to 1.0).
+# SQLi is defined with the single structural detector. The family only runs when
+# the lane above is `enabled = true`.
 #
-# Per-attack scoring families (enabled ones require weights summing to 1.0):
-# [content_security.attacks.sql_injection]
-# enabled = false                     # no detectors ship in P1a; keep families off
-# log_threshold = 40
-# block_threshold = 80
-# hard_veto_allowlist = []
-# [content_security.attacks.sql_injection.weights]
-# # struct_rule = 0.6
-# # ast = 0.4
+# hard_veto_allowlist is EMPTY: no rule is authorised for single-hit Block before
+# holdout calibration (plan v2.2 "先标定、后授权"). Even if a rule were listed, in
+# the P1b shadow posture it can only be logged, never enforced.
+#
+# The structural detector ships high-noise rules (stacked / chr / hex /
+# information_schema) DISABLED by default (plan v2.2). Only the lower-FP rules
+# (into_outfile / dangerous_fn / union_select / union_null / version_comment) run
+# by default; the rest await holdout data before being turned on.
+[content_security.attacks.sql_injection]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.sql_injection.weights]
+struct_rule = 1.0                     # only the structural detector ships in P1b (ast is P2)

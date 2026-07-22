@@ -32,6 +32,7 @@ libinjectionrs = "0.1"
 ed25519-dalek = { workspace = true }
 zstd = { workspace = true }
 hex = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

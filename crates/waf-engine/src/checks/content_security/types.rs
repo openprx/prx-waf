@@ -144,6 +144,12 @@ pub enum Provenance {
     JsonDecoded,
     /// base64 / hex blind decode — never hard-veto.
     BlindDecoded,
+    /// SQL-comment-stripped synthetic view (inline `/**/` / `--` / `#` /
+    /// `/*!…*/` removed) — never hard-veto. Comment removal can synthesise a
+    /// token stream a given backend would not parse identically (dialect
+    /// dependent), so a match on this view is scored but can never single-signal
+    /// Block (plan §6.3 spirit for synthetic transforms).
+    CommentStripped,
     /// HPP synthetic concatenation — never hard-veto.
     SyntheticHpp,
     /// Parser-differential weak signal — never hard-veto.
@@ -160,6 +166,7 @@ impl Provenance {
             Self::HtmlEntityDecoded => "html_entity_decoded",
             Self::JsonDecoded => "json_decoded",
             Self::BlindDecoded => "blind_decoded",
+            Self::CommentStripped => "comment_stripped",
             Self::SyntheticHpp => "synthetic_hpp",
             Self::ParseError => "parse_error",
         }
@@ -170,7 +177,10 @@ impl Provenance {
     /// allowlist). Blind/synthetic/parse-error provenance is never eligible.
     #[must_use]
     pub const fn hard_veto_capable(self) -> bool {
-        !matches!(self, Self::BlindDecoded | Self::SyntheticHpp | Self::ParseError)
+        !matches!(
+            self,
+            Self::BlindDecoded | Self::CommentStripped | Self::SyntheticHpp | Self::ParseError
+        )
     }
 }
 

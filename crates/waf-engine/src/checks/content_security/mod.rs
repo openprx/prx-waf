@@ -15,20 +15,24 @@
 //! phase-limited [`preprocess::semantic_preprocessor`] → detectors → the closed
 //! [`scoring::score`] model, returning [`ContentVerdict::Semantic`].
 //!
-//! **P1a ships zero production detectors** ([`Self::detectors`] is empty), so
-//! Lane 2 always yields an empty signal set → `request_score == 0` →
-//! `recommendation == None`. Even with `enforcement_mode = enforce` the lane
-//! cannot produce a block: this is the provable zero-enforcement property (task
-//! P1a). The scoring / budget / config foundation is implemented and unit-tested
-//! via a test-only mock detector; the budget admission + degraded fail-open are
-//! enforced end-to-end. Two pieces are deliberately built but **not yet wired to
-//! the engine block path** (scaffold until real detectors + calibration exist):
-//! [`Self::resolve_action`] (canary/breaker-gated enforcement, with a restart
-//! shadow latch) and the `semantic_observations` persistence.
+//! **P1b registers the first production detector**
+//! ([`detectors::StructuralSqlDetector`], `SQLi` family). It only contributes to
+//! scoring when the `SQLi` family is enabled + weighted, and the lane as a whole
+//! is still **shadow-only**: the default `enforcement_mode = log_only` means a
+//! match is at most a `LogOnly` security event + a persisted observation,
+//! **never** a Block. The engine-facing [`Self::resolve_action`] caps `enforce`
+//! at `Log` in P1b (enforce is EXACTLY `log_only`). The block-capable
+//! canary/breaker/warmup machinery lives in the isolated **next-stage**
+//! [`Self::resolve_enforced_action`], which is implemented and unit-tested but
+//! **deliberately not wired to the engine block path** (nor reachable from P1b
+//! production config) until holdout calibration exists — so the action-level
+//! shadow guarantee holds: enabling the `SQLi` detector cannot change the final
+//! action versus a Lane-2-off engine (codex A-2).
 
 pub mod budget;
 pub mod canary;
 pub mod config;
+pub mod detectors;
 pub mod preprocess;
 pub mod scoring;
 pub mod types;
@@ -44,6 +48,7 @@ use crate::checks::{Check, DirTraversalCheck, RceCheck, SqlInjectionCheck, XssCh
 pub use budget::{Budget, ContentInspectionState};
 pub use canary::{BreakerState, CircuitBreaker, canary_bucket, in_canary};
 pub use config::{Dialect, EnforcementMode, RuntimeContentSecurityConfig};
+pub use detectors::StructuralSqlDetector;
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
 pub use types::{
@@ -82,8 +87,8 @@ pub struct ContentSecuritySubsystem {
     legacy_checkers: Vec<Box<dyn Check>>,
     /// Compiled, immutable Lane 2 config (default = lane off).
     config: RuntimeContentSecurityConfig,
-    /// Lane 2 semantic detectors. **Empty in P1a** (no detectors) — the loop
-    /// over it always yields zero signals, guaranteeing zero enforcement.
+    /// Lane 2 semantic detectors. In P1b this holds the production
+    /// [`detectors::StructuralSqlDetector`]; tests may push additional mocks.
     detectors: Vec<Box<dyn SemanticDetector>>,
     /// Runtime anomaly-rate breaker state (never persisted; restart resets it).
     breaker: Mutex<CircuitBreaker>,
@@ -116,10 +121,16 @@ impl ContentSecuritySubsystem {
         ];
         let now = Instant::now();
         let breaker = Mutex::new(CircuitBreaker::new(config.breaker, now));
+        // Production Lane 2 detectors (P1b): the structural SQLi detector. It only
+        // contributes to scoring when the SQLi family is enabled + weighted in the
+        // compiled config; with the lane off (`config.enabled == false`)
+        // `evaluate_scoped` short-circuits before any detector runs, so the
+        // zero-config install still does zero Lane 2 work.
+        let detectors: Vec<Box<dyn SemanticDetector>> = vec![Box::new(detectors::StructuralSqlDetector::new())];
         Self {
             legacy_checkers,
             config,
-            detectors: Vec::new(),
+            detectors,
             breaker,
             created_at: now,
         }
@@ -171,7 +182,14 @@ impl ContentSecuritySubsystem {
         }
 
         // ── Lane 2: additive semantic scoring (off by default) ───────────────
-        if !self.config.enabled {
+        // The lane runs only when it is enabled AND the enforcement mode is not
+        // `off`. `off` means "produce no action at all" (codex A-2): no
+        // preprocessing, no detection, no LogOnly event and no observation — it
+        // is behaviourally identical to `enabled = false`. `log_only` and
+        // `enforce` both run the lane; in P1b `enforce` is not wired to the block
+        // path, so it behaves like `log_only` (detect + log + persist, never
+        // Block) and the startup logs a WARN.
+        if !self.config.enabled || self.config.enforcement_mode == EnforcementMode::Off {
             return ContentVerdict::None;
         }
 
@@ -205,20 +223,51 @@ impl ContentSecuritySubsystem {
         now.duration_since(self.created_at) >= self.config.breaker.window
     }
 
-    /// Resolve a Lane 2 recommendation into the effective action, applying the
-    /// restart shadow latch, the enforcement mode, canary bucketing, the circuit
-    /// breaker and the host `log_only_mode` downgrade (plan §13.3 / §13.4 double
-    /// log-only table). `now` is injected for deterministic testing.
+    /// Resolve a Lane 2 recommendation into the **P1b effective action** — the
+    /// engine-facing resolver (codex A-2).
     ///
-    /// Guarantees Lane 2 can **never** Block in `off`/`log_only` mode, within the
-    /// post-restart warmup window, when the request is outside the canary, when
-    /// the breaker is open, or when the host is in log-only mode. In P1a `rec` is
-    /// always `None` (no detectors) and this is **not** wired to the engine block
-    /// path, so it always returns `None`/at-most-`Log` in production — the
-    /// zero-enforcement guarantee (codex A-4: latch added, resolver still
-    /// deliberately not connected to the engine this round).
+    /// This is the single resolver that P1b production config can reach, and it
+    /// can **never** Block: `off` produces `None`, and both `log_only` **and**
+    /// `enforce` cap the effective action at `Log`. `enforce` is therefore
+    /// EXACTLY `log_only` in P1b — matching the config docs / startup WARN — so a
+    /// future engine wiring of *this* method cannot silently break the
+    /// shadow-not-block red line.
+    ///
+    /// The block-capable canary/breaker/warmup machinery lives in the
+    /// deliberately isolated, **not-yet-wired** [`Self::resolve_enforced_action`]
+    /// (a next-stage API that P1b production config does not select and the engine
+    /// does not call); it stays unit-tested so the plumbing is proven, but it is
+    /// no longer reachable as "the resolver".
     #[must_use]
-    pub fn resolve_action(
+    pub fn resolve_action(&self, rec: SemanticAction) -> SemanticAction {
+        match self.config.enforcement_mode {
+            // `off` produces no action at all.
+            EnforcementMode::Off => SemanticAction::None,
+            // Shadow: `log_only` AND `enforce` both cap at Log in P1b — enforce is
+            // exactly log_only (never Block). A `None` recommendation stays `None`.
+            EnforcementMode::LogOnly | EnforcementMode::Enforce => {
+                if rec == SemanticAction::None {
+                    SemanticAction::None
+                } else {
+                    SemanticAction::Log
+                }
+            }
+        }
+    }
+
+    /// **Next-stage** enforcement resolver — the block-capable path (plan §13.3 /
+    /// §13.4 double log-only table). It applies the restart shadow latch, canary
+    /// bucketing, the circuit breaker and the host `log_only_mode` downgrade.
+    /// `now` is injected for deterministic testing.
+    ///
+    /// **Deliberately NOT wired in P1b (codex A-2):** the engine dispatch never
+    /// calls this, and P1b production config cannot reach it — the engine-facing
+    /// [`Self::resolve_action`] is the only resolver on the P1b path and it caps
+    /// `enforce` at `Log`. This method retains the full machinery (and its unit
+    /// tests) so a future stage can enable enforcement once holdout calibration
+    /// authorises it, but it must not be connected to the block path until then.
+    #[must_use]
+    pub fn resolve_enforced_action(
         &self,
         rec: SemanticAction,
         host_code: &str,
@@ -364,9 +413,10 @@ mod tests {
     }
 
     #[test]
-    fn enabled_lane_without_detectors_scores_zero() {
-        // Lane enabled + enforce, but zero production detectors → Semantic with
-        // score 0 and recommendation None: the zero-enforcement property.
+    fn enabled_lane_benign_input_scores_zero() {
+        // Lane enabled + enforce, production StructuralSqlDetector registered, but
+        // a benign body → no signal → Semantic with score 0 and recommendation
+        // None. The detector never fires on clean traffic.
         let sub = ContentSecuritySubsystem::with_config(enabled_enforce_cfg());
         let mut st = ContentInspectionState::default();
         match sub.evaluate_scoped(&ctx(), InspectionScope::Body, &mut st) {
@@ -380,10 +430,10 @@ mod tests {
     }
 
     #[test]
-    fn mock_detector_in_enforce_can_block_but_log_only_mode_downgrades() {
-        // With a test detector we verify the *machinery* would block in enforce,
-        // and that host log_only_mode downgrades it — proving the plumbing works
-        // while production (no detectors) stays inert.
+    fn next_stage_enforced_resolver_can_block_but_host_log_only_downgrades() {
+        // The block-capable NEXT-STAGE resolver (`resolve_enforced_action`, NOT
+        // wired in P1b) would block in enforce, and host log_only_mode downgrades
+        // it — proving the plumbing works while the P1b engine path stays inert.
         let mut sub = ContentSecuritySubsystem::with_config(enabled_enforce_cfg());
         sub.detectors.push(Box::new(MockSqliDetector { confidence: 100 }));
         let mut st = ContentInspectionState::default();
@@ -395,22 +445,35 @@ mod tests {
         // Past the restart warmup window (breaker.window default = 300s):
         // host log_only=false → Block; host log_only=true → downgraded to Log.
         let warm = sub.created_at + Duration::from_secs(301);
-        assert_eq!(sub.resolve_action(rec, "h", "k", false, warm), SemanticAction::Block);
-        assert_eq!(sub.resolve_action(rec, "h", "k", true, warm), SemanticAction::Log);
+        assert_eq!(
+            sub.resolve_enforced_action(rec, "h", "k", false, warm),
+            SemanticAction::Block
+        );
+        assert_eq!(
+            sub.resolve_enforced_action(rec, "h", "k", true, warm),
+            SemanticAction::Log
+        );
+        // But the P1b engine-facing resolver caps enforce at Log regardless.
+        assert_eq!(
+            sub.resolve_action(rec),
+            SemanticAction::Log,
+            "the P1b resolver never blocks, even in enforce mode"
+        );
     }
 
     #[test]
-    fn enforce_is_shadow_latched_until_warmup_window() {
-        // codex A-4: even in enforce + 100% canary + Closed breaker, a would-be
-        // Block is held to shadow Log until the health warmup window elapses since
-        // subsystem start — a restart cannot resume blocking immediately.
+    fn next_stage_enforced_resolver_is_shadow_latched_until_warmup_window() {
+        // codex A-4: even in enforce + 100% canary + Closed breaker, the
+        // NEXT-STAGE resolver holds a would-be Block to shadow Log until the health
+        // warmup window elapses since subsystem start — a restart cannot resume
+        // blocking immediately.
         let mut sub = ContentSecuritySubsystem::with_config(enabled_enforce_cfg());
         sub.detectors.push(Box::new(MockSqliDetector { confidence: 100 }));
 
         // Inside the warmup window → shadow Log.
         let cold = sub.created_at + Duration::from_secs(1);
         assert_eq!(
-            sub.resolve_action(SemanticAction::Block, "h", "k", false, cold),
+            sub.resolve_enforced_action(SemanticAction::Block, "h", "k", false, cold),
             SemanticAction::Log,
             "within the restart warmup window enforcement stays shadow"
         );
@@ -418,7 +481,7 @@ mod tests {
         // After the warmup window (breaker.window default 300s) → Block allowed.
         let warm = sub.created_at + Duration::from_secs(301);
         assert_eq!(
-            sub.resolve_action(SemanticAction::Block, "h", "k", false, warm),
+            sub.resolve_enforced_action(SemanticAction::Block, "h", "k", false, warm),
             SemanticAction::Block,
             "after the warmup window enforcement is permitted"
         );
@@ -557,9 +620,155 @@ mod tests {
         let mut sub = ContentSecuritySubsystem::with_config(rt);
         sub.detectors.push(Box::new(MockSqliDetector { confidence: 100 }));
         assert_eq!(
-            sub.resolve_action(SemanticAction::Block, "h", "k", false, sub.created_at),
+            sub.resolve_action(SemanticAction::Block),
             SemanticAction::Log,
             "shadow mode never blocks"
+        );
+    }
+
+    /// Enabled config with the `SQLi` family weighted on `struct_rule`, in the
+    /// default P1b **shadow** posture (`enforcement_mode = log_only`).
+    fn sqli_log_only_rt() -> RuntimeContentSecurityConfig {
+        let cfg = ContentSecurityConfig {
+            enforcement_mode: "log_only".to_string(),
+            ..enabled_enforce_source()
+        };
+        RuntimeContentSecurityConfig::compile(&cfg).expect("valid")
+    }
+
+    #[test]
+    fn real_sqli_detector_fires_but_shadow_never_blocks() {
+        // The production StructuralSqlDetector fires on a real `into outfile`
+        // payload (confidence 95 ≥ block threshold 80) so the scorer's
+        // recommendation is EXACTLY `Block` — the request genuinely crosses the
+        // block bar, not merely the log bar (codex A-5). Yet with the default P1b
+        // `log_only` mode the resolver downgrades the effective action to `Log`,
+        // proving the shadow-not-block guarantee is a real downgrade, not an
+        // artefact of a sub-threshold score. Lane 1 would veto this raw payload
+        // first inside `evaluate_scoped`, so we drive the Lane 2 detector →
+        // scoring → shadow-resolve pipeline directly to isolate it.
+        let sub = ContentSecuritySubsystem::with_config(sqli_log_only_rt());
+        let det = StructuralSqlDetector::new();
+        let req = ctx();
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let view = View {
+            location: Cow::Borrowed("body"),
+            round: 0,
+            text: Cow::Borrowed("1 union select 1 into outfile '/tmp/x'"),
+            lower_trunc: "1 union select 1 into outfile '/tmp/x'".to_string(),
+            provenance: Provenance::Raw,
+        };
+        let mut st = ContentInspectionState::default();
+        let finding = det
+            .detect(&view, &pctx, &mut st)
+            .expect("the real SQLi detector must fire on into-outfile");
+        assert_eq!(finding.rule_key, "sql.into_outfile", "the strongest rule (95) wins");
+        let signal = view.to_signal(det.id(), InspectionScope::Body, finding);
+
+        let verdict = score(std::slice::from_ref(&signal), &sub.config().scoring, false);
+        // Non-empty detection evidence + the recommendation is EXACTLY Block.
+        assert!(!verdict.signals.is_empty(), "detection evidence must be recorded");
+        assert_eq!(
+            verdict.recommendation,
+            SemanticAction::Block,
+            "confidence 95 (weight 1.0) must reach the block threshold (80)"
+        );
+        // In log_only mode the P1b resolver downgrades the genuine Block to Log.
+        assert_eq!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Log,
+            "shadow (log_only) must downgrade a genuine Block to Log (real downgrade, not sub-threshold)"
+        );
+    }
+
+    // ── A-2: enforcement_mode three-state dispatch truth table ────────────────
+
+    /// Build an enabled runtime config in the given enforcement mode with the
+    /// mock-firing `SQLi` family weighted on `struct_rule`.
+    fn enabled_rt_with_mode(mode: &str) -> RuntimeContentSecurityConfig {
+        let cfg = ContentSecurityConfig {
+            enforcement_mode: mode.to_string(),
+            ..enabled_enforce_source()
+        };
+        RuntimeContentSecurityConfig::compile(&cfg).expect("valid")
+    }
+
+    #[test]
+    fn mode_off_produces_no_semantic_verdict_even_with_firing_detector() {
+        // enabled=true but enforcement_mode=off → the lane does NO work: no
+        // preprocessing, no detection, no verdict. `evaluate_scoped` returns None
+        // exactly like a disabled lane, so nothing is ever logged or persisted.
+        let mut sub = ContentSecuritySubsystem::with_config(enabled_rt_with_mode("off"));
+        sub.detectors.push(Box::new(MockSqliDetector { confidence: 100 }));
+        let mut st = ContentInspectionState::default();
+        let v = sub.evaluate_scoped(&ctx(), InspectionScope::Body, &mut st);
+        assert!(
+            matches!(v, ContentVerdict::None),
+            "off mode must produce no Semantic verdict (no action at all), got {v:?}"
+        );
+    }
+
+    #[test]
+    fn mode_log_only_and_enforce_both_run_the_lane() {
+        // log_only and enforce both RUN the lane (produce a Semantic verdict with
+        // signals). The difference between them is only in `resolve_action`, and
+        // in P1b even enforce is shadow at the engine dispatch (never blocks).
+        for mode in ["log_only", "enforce"] {
+            let mut sub = ContentSecuritySubsystem::with_config(enabled_rt_with_mode(mode));
+            sub.detectors.push(Box::new(MockSqliDetector { confidence: 100 }));
+            let mut st = ContentInspectionState::default();
+            match sub.evaluate_scoped(&ctx(), InspectionScope::Body, &mut st) {
+                ContentVerdict::Semantic(v) => {
+                    assert!(!v.signals.is_empty(), "{mode}: the lane must run and produce signals");
+                    assert_eq!(
+                        v.recommendation,
+                        SemanticAction::Block,
+                        "{mode}: mock conf 100 → Block rec"
+                    );
+                }
+                other => panic!("{mode}: expected Semantic, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_action_effective_action_truth_table_off_log_enforce() {
+        // codex A-2: the P1b engine-facing resolver's EFFECTIVE action per mode.
+        // off → None, log_only → Log, enforce → Log (enforce is EXACTLY log_only
+        // in P1b — never Block). A `None` recommendation always stays `None`.
+        let off = ContentSecuritySubsystem::with_config(enabled_rt_with_mode("off"));
+        assert_eq!(
+            off.resolve_action(SemanticAction::Block),
+            SemanticAction::None,
+            "off → None (no action at all)"
+        );
+        assert_eq!(off.resolve_action(SemanticAction::None), SemanticAction::None);
+
+        let log_only = ContentSecuritySubsystem::with_config(enabled_rt_with_mode("log_only"));
+        assert_eq!(
+            log_only.resolve_action(SemanticAction::Block),
+            SemanticAction::Log,
+            "log_only → Log (a Block recommendation is capped at Log)"
+        );
+        assert_eq!(
+            log_only.resolve_action(SemanticAction::None),
+            SemanticAction::None,
+            "log_only: a None recommendation stays None"
+        );
+
+        let enforce = ContentSecuritySubsystem::with_config(enabled_rt_with_mode("enforce"));
+        assert_eq!(
+            enforce.resolve_action(SemanticAction::Block),
+            SemanticAction::Log,
+            "enforce → Log in P1b (EXACTLY log_only, never Block)"
+        );
+        assert_eq!(
+            enforce.resolve_action(SemanticAction::None),
+            SemanticAction::None,
+            "enforce: a None recommendation stays None"
         );
     }
 

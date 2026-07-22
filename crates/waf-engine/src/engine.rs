@@ -8,7 +8,7 @@ use uuid::Uuid;
 use waf_common::{DetectionResult, RequestCtx, WafAction, WafDecision};
 use waf_storage::{
     Database,
-    models::{AttackLog, CreateSecurityEvent},
+    models::{AttackLog, CreateSecurityEvent, CreateSemanticObservation},
 };
 
 use crate::block_page::render_block_page;
@@ -23,6 +23,9 @@ use crate::geoip::GeoIpService;
 use crate::rules::cluster_sync::SyncedRuleStore;
 use crate::rules::engine::{CustomRuleMatch, CustomRulesEngine, RuleAction, from_db_rule};
 use crate::rules::registry::RuleRegistry;
+use crate::semantic_sink::{
+    EVENT_CHANNEL_CAPACITY, OBSERVATION_CHANNEL_CAPACITY, SemanticObservationSink, spawn_worker_if_runtime,
+};
 
 /// WAF engine configuration
 #[derive(Debug, Clone, Default)]
@@ -96,6 +99,11 @@ pub struct WafEngine {
     /// on a standalone (non-cluster) node it stays `None`, so the request path is
     /// byte-for-byte unchanged.
     synced: ArcSwapOption<SyncedRuleStore>,
+    /// Bounded, back-pressured sink for Lane 2 semantic observations (codex A-1).
+    /// The hot path only `try_send`s here; a single background worker (started in
+    /// [`Self::new`] when a runtime is present) drains and batch-inserts. When the
+    /// lane is off this is never fed, so it stays idle.
+    semantic_sink: Arc<SemanticObservationSink>,
 }
 
 impl WafEngine {
@@ -119,6 +127,16 @@ impl WafEngine {
         // (default = lane off).
         let content_security = ContentSecuritySubsystem::with_config(config.content_security.clone());
 
+        // Bounded observation sink (codex A-1). Start its single drain worker on
+        // the current runtime; when constructed outside a runtime (never on the
+        // async server path) no worker starts and observations are dropped+counted
+        // rather than panicking.
+        let semantic_sink = Arc::new(SemanticObservationSink::new(
+            OBSERVATION_CHANNEL_CAPACITY,
+            EVENT_CHANNEL_CAPACITY,
+        ));
+        let _ = spawn_worker_if_runtime(&semantic_sink, Arc::clone(&db));
+
         Self {
             store,
             custom_rules,
@@ -138,6 +156,7 @@ impl WafEngine {
             geoip: OnceLock::new(),
             synced_registry: OnceLock::new(),
             synced: ArcSwapOption::empty(),
+            semantic_sink,
         }
     }
 
@@ -355,7 +374,7 @@ impl WafEngine {
                 return Some(self.record_block(ctx, result, true));
             }
             ContentVerdict::Semantic(verdict) => {
-                self.dispatch_semantic(ctx, verdict);
+                self.dispatch_semantic(ctx, scope, verdict);
             }
             ContentVerdict::None => {}
         }
@@ -433,37 +452,129 @@ impl WafEngine {
     /// short-circuits `inspect_content` — control always falls through to the
     /// unchanged AppSec/custom/CRS/sensitive suffix, and a Lane 1 legacy veto is
     /// never downgraded (it took the `LegacyVeto` arm above and returned before
-    /// reaching here). The full enforce path (canary/breaker-gated Block) is
-    /// implemented and unit-tested in
-    /// [`crate::checks::ContentSecuritySubsystem::resolve_action`] but is
+    /// reaching here). The block-capable enforce path (canary/breaker-gated Block)
+    /// is implemented and unit-tested in the isolated next-stage
+    /// [`crate::checks::ContentSecuritySubsystem::resolve_enforced_action`] but is
     /// deliberately not connected to the block path until real detectors and
-    /// calibration exist.
+    /// calibration exist; the P1b engine-facing
+    /// [`crate::checks::ContentSecuritySubsystem::resolve_action`] caps `enforce`
+    /// at `Log`.
     ///
-    /// In P1a there are no detectors, so `verdict.recommendation` is always
-    /// `None` and this is inert in production — the zero-enforcement guarantee.
-    fn dispatch_semantic(&self, ctx: &RequestCtx, verdict: crate::checks::SemanticVerdict) {
+    /// In P1b the `SQLi` structural detector can produce signals, but the default
+    /// `log_only` posture keeps this to **record + persist** — never a Block and
+    /// never a short-circuit (no resolver is wired to the block path here, and the
+    /// next-stage block-capable resolver is not reachable from P1b config). This
+    /// is the action-level shadow guarantee.
+    fn dispatch_semantic(&self, ctx: &RequestCtx, scope: InspectionScope, verdict: crate::checks::SemanticVerdict) {
+        // Shadow persistence (plan §13.1): whenever the semantic lane produced any
+        // signal — even sub-threshold or on a degraded (fail-open) request —
+        // persist de-identified detection evidence so real-attack target practice
+        // can read detection / false-positive rates from the DB. Persist + LogOnly
+        // ONLY; this path can never Block.
+        if !verdict.signals.is_empty() {
+            self.persist_semantic_observation(ctx, scope, &verdict);
+        }
         if verdict.recommendation != SemanticAction::None
             && let Some(result) = verdict.primary_result
         {
             self.record_semantic_log(ctx, result);
         }
-        // Observation persistence into `semantic_observations` (migration/model/
-        // repo exist) is wired in a later step; P1a produces no signals to store.
+    }
+
+    /// Persist a Lane 2 semantic observation into `semantic_observations`
+    /// (plan §13.1). The `observations` JSONB is **de-identified**: it carries
+    /// only the structural signal breakdown (detector / attack / field / scope /
+    /// confidence / `rule_key` / provenance) and **never** the raw payload or the
+    /// per-signal `detail` text. Enqueued on a **bounded** MPSC sink drained by a
+    /// single background worker (codex A-1): the hot path only `try_send`s, and a
+    /// flood is dropped + counted rather than spawning unbounded tasks / inserts.
+    fn persist_semantic_observation(
+        &self,
+        ctx: &RequestCtx,
+        scope: InspectionScope,
+        verdict: &crate::checks::SemanticVerdict,
+    ) {
+        let observations = serde_json::Value::Array(
+            verdict
+                .signals
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "detector": s.detector.as_config_str(),
+                        "attack": s.attack.as_config_key(),
+                        "field": s.field.as_ref(),
+                        "scope": s.scope.as_str(),
+                        "confidence": s.confidence,
+                        "rule_key": s.rule_key,
+                        "provenance": s.provenance.as_str(),
+                    })
+                })
+                .collect(),
+        );
+        let recommendation = match verdict.recommendation {
+            SemanticAction::Block => "block",
+            SemanticAction::Log => "log",
+            SemanticAction::None => "none",
+        };
+        let obs = CreateSemanticObservation {
+            host_code: ctx.host_config.code.clone(),
+            client_ip: ctx.client_ip.to_string(),
+            req_id: ctx.req_id.clone(),
+            scope: scope.as_str().to_string(),
+            request_score: i16::from(verdict.request_score),
+            recommendation: recommendation.to_string(),
+            degraded: verdict.degraded,
+            // P1b: budget exhaustion is the sole degradation source, so
+            // `exhausted` mirrors `degraded`; the schema keeps them distinct for
+            // future non-budget degradations.
+            exhausted: verdict.degraded,
+            pipeline: "semantic".to_string(),
+            schema_version: 1,
+            observations,
+        };
+        // Bounded, back-pressured enqueue (codex A-1). Never awaits, never spawns
+        // per-observation; a full channel drops + counts rather than growing
+        // unbounded tasks / DB pressure under flood.
+        self.semantic_sink.try_persist(obs);
     }
 
     /// Record a Lane 2 semantic detection as a forced `LogOnly` security event.
     ///
-    /// Mirrors the custom-rule Log branch ([`Self::dispatch_custom_match`]) and
-    /// **never** calls `record_block` (which would emit a Block when the host is
+    /// **Never** calls `record_block` (which would emit a Block when the host is
     /// not in log-only mode). Semantic shadow detections are deliberately **not**
     /// reported to the community feed — unproven semantic signals must not
     /// pollute the shared blocklist.
+    ///
+    /// Enqueued on the **bounded** semantic sink (codex A-1): unlike the legacy /
+    /// custom `log_security_event` path (which spawns one fire-and-forget task per
+    /// event and is unchanged), the opt-in shadow lane must not let attacker
+    /// traffic fan out unbounded Tokio tasks / `security_events` inserts. The hot
+    /// path only `try_send`s; a full channel drops + counts (a separate metric
+    /// from the observation channel). This deliberately does not go through
+    /// [`Self::log_security_event`] so the legacy/custom logging behaviour stays
+    /// byte-for-byte unchanged.
     fn record_semantic_log(&self, ctx: &RequestCtx, result: DetectionResult) {
-        let decision = WafDecision {
-            action: WafAction::LogOnly,
-            result: Some(result),
+        let event = CreateSecurityEvent {
+            host_code: ctx.host_config.code.clone(),
+            client_ip: ctx.client_ip.to_string(),
+            method: ctx.method.clone(),
+            path: ctx.path.clone(),
+            rule_id: result.rule_id,
+            rule_name: result.rule_name,
+            // Shadow semantic detections are always LogOnly.
+            action: "log_only".to_string(),
+            detail: Some(result.detail),
+            geo_info: ctx.geo.as_ref().map(|g| {
+                serde_json::json!({
+                    "country": g.country,
+                    "province": g.province,
+                    "city": g.city,
+                    "isp": g.isp,
+                    "iso_code": g.iso_code,
+                })
+            }),
         };
-        self.log_security_event(ctx, &decision);
+        self.semantic_sink.try_persist_event(event);
     }
 
     /// Dispatch a custom-rule match on its configured action (M-7).
