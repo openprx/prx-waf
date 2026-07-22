@@ -248,3 +248,33 @@ block_threshold = 80
 hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
 [content_security.attacks.sql_injection.weights]
 struct_rule = 1.0                     # only the structural detector ships in P1b (ast is P2)
+
+# RCE (shell command injection) — P1c structural detector. Runs on the Lane-2
+# decode/normalise views (base64/hex/entity/comment-strip + SHELL de-obfuscation)
+# that the frozen Lane 1 RceCheck's URL-decode-only path cannot see. Default-on
+# rules are context-narrowed (reverse-shell fingerprints, `$(cmd)` substitution,
+# `sh -c` exec flag, pipe-to-shell, fetch+arg, sensitive-file read); the high-noise
+# rules (bare separator + common command, backtick-wraps-anything) ship DISABLED
+# and await holdout calibration.
+[content_security.attacks.rce]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.rce.weights]
+rce = 1.0                             # self-authored shell-injection detector
+
+# Traversal T1 (encoded path traversal) — P1c structural detector. T0 is the
+# frozen Lane 1 DirTraversalCheck (raw `../`, `%2e%2e`, overlong, sensitive abs
+# paths). This additive T1 re-catches those structures on the Lane-2-only decode
+# views (a traversal wrapped in base64, or split by quotes so `/etc/passwd` never
+# appears raw). Default-on: encoded / overlong / sensitive-absolute (almost never
+# legitimate); the plain-`../` rule ships DISABLED (relative imports are too noisy)
+# and awaits holdout calibration.
+[content_security.attacks.traversal]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.traversal.weights]
+traversal = 1.0                       # segment-aware traversal detector

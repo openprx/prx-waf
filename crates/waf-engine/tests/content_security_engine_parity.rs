@@ -1094,3 +1094,175 @@ fn uuid_like() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos())
 }
+
+// ── P1c: real RCE + Traversal detectors in SHADOW mode (codex A-2/A-3/A-4) ────
+
+/// Build an engine with the Lane 2 `rce` AND `traversal` families enabled in the
+/// default P1c shadow posture (`enforcement_mode = log_only`). Returns the engine
+/// + its DB handle so a test can read back persisted observations.
+async fn engine_with_shadow_rce_traversal() -> (WafEngine, Arc<Database>) {
+    let db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
+    db.migrate().await.expect("migrate");
+    let family = |detector: &str| {
+        let mut weights = std::collections::BTreeMap::new();
+        weights.insert(detector.to_string(), 1.0);
+        waf_common::content_security_config::SemanticAttackConfig {
+            enabled: true,
+            weights,
+            log_threshold: 40,
+            block_threshold: 80,
+            hard_veto_allowlist: Vec::new(),
+        }
+    };
+    let mut attacks = std::collections::BTreeMap::new();
+    attacks.insert("rce".to_string(), family("rce"));
+    attacks.insert("traversal".to_string(), family("traversal"));
+    let cfg = ContentSecurityConfig {
+        enabled: true,
+        enforcement_mode: "log_only".to_string(),
+        attacks,
+        ..ContentSecurityConfig::default()
+    };
+    let content_security = RuntimeContentSecurityConfig::compile(&cfg).expect("valid semantic config");
+    let eng = WafEngine::new(
+        Arc::clone(&db),
+        WafEngineConfig {
+            content_security,
+            ..WafEngineConfig::default()
+        },
+    );
+    (eng, db)
+}
+
+/// Poll `semantic_observations` for `host_code` until a row lands (fire-and-forget
+/// persistence), returning the rows (possibly empty after the retry budget).
+async fn wait_for_observation(db: &Database, host_code: &str) -> Vec<waf_storage::models::SemanticObservation> {
+    let mut rows = Vec::new();
+    for _ in 0..40 {
+        rows = db
+            .list_semantic_observations(SemanticObservationQuery {
+                host_code: Some(host_code.to_string()),
+                page: Some(1),
+                page_size: Some(10),
+            })
+            .await
+            .expect("list observations");
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    rows
+}
+
+/// Assert a persisted observation exists for `host_code` carrying a signal of the
+/// expected `attack` on a `blind_decoded` view — the proof that the Lane-2 decode
+/// chain (base64 / shell normalise) actually fired.
+fn assert_blind_signal(row: &waf_storage::models::SemanticObservation, attack: &str) {
+    let arr = row.observations.as_array().expect("observations array");
+    assert!(
+        arr.iter().any(|s| {
+            s.get("attack").and_then(|v| v.as_str()) == Some(attack)
+                && s.get("provenance").and_then(|v| v.as_str()) == Some("blind_decoded")
+        }),
+        "a {attack} signal on a blind_decoded view must be present: {:?}",
+        row.observations
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn shadow_rce_base64_bypass_detected_but_not_blocked() {
+    // codex A-2 acceptance (RCE): base64("bash -c id") — a pure blob the frozen
+    // Lane 1 (and CRS) never decode — is detected by the Lane-2 base64 blind gate
+    // + RCE detector, yet in shadow it must NOT block; the suffix runs to allow.
+    let baseline = engine().await; // Lane 2 off
+    let (shadow, db) = engine_with_shadow_rce_traversal().await;
+    let payload = base64::engine::general_purpose::STANDARD.encode("bash -c id");
+
+    let mut a = make_ctx("", &payload, false);
+    let host_code = format!("p1c-rce-{}", uuid_like());
+    let mut b = make_ctx("", &payload, false);
+    Arc::make_mut(&mut b.host_config).code = host_code.clone();
+
+    let da = baseline.inspect_body(&mut a).await;
+    let db_dec = shadow.inspect_body(&mut b).await;
+    assert!(
+        da.is_allowed(),
+        "baseline must allow the base64 RCE blob: {:?}",
+        da.action
+    );
+    assert_eq!(
+        action_kind(&da),
+        action_kind(&db_dec),
+        "shadow RCE detection must not change the final action"
+    );
+    assert!(db_dec.is_allowed(), "shadow RCE must still allow (suffix continues)");
+
+    let rows = wait_for_observation(&db, &host_code).await;
+    assert_eq!(rows.len(), 1, "detection must persist exactly one observation");
+    assert_blind_signal(rows.first().expect("row"), "rce");
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn shadow_traversal_base64_bypass_detected_but_not_blocked() {
+    // codex A-2 acceptance (Traversal): base64("../../../etc/passwd") — invisible
+    // to Lane 1 — is detected by the base64 blind gate + Traversal T1 detector,
+    // yet shadow keeps it advisory (no block, suffix continues).
+    let baseline = engine().await;
+    let (shadow, db) = engine_with_shadow_rce_traversal().await;
+    let payload = base64::engine::general_purpose::STANDARD.encode("../../../etc/passwd");
+
+    let mut a = make_ctx("", &payload, false);
+    let host_code = format!("p1c-trav-{}", uuid_like());
+    let mut b = make_ctx("", &payload, false);
+    Arc::make_mut(&mut b.host_config).code = host_code.clone();
+
+    let da = baseline.inspect_body(&mut a).await;
+    let db_dec = shadow.inspect_body(&mut b).await;
+    assert!(
+        da.is_allowed(),
+        "baseline must allow the base64 traversal blob: {:?}",
+        da.action
+    );
+    assert_eq!(
+        action_kind(&da),
+        action_kind(&db_dec),
+        "shadow must not change the action"
+    );
+    assert!(db_dec.is_allowed(), "shadow traversal must still allow");
+
+    let rows = wait_for_observation(&db, &host_code).await;
+    assert_eq!(rows.len(), 1, "detection must persist exactly one observation");
+    assert_blind_signal(rows.first().expect("row"), "traversal");
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn shadow_rce_shell_normalised_bypass_detected_but_not_blocked() {
+    // codex A-3 acceptance: a quote/`$IFS`-split `python3 -c id`. Lane 1's
+    // URL-decode-only path never reveals it; the shell-normalise gate (now built
+    // from the default-on RCE rules) surfaces a BlindDecoded view and the detector
+    // fires. OWASP/sensitive suffix is disabled on the host to isolate the Lane-2
+    // increment (its $IFS command-injection rules would otherwise mask the test);
+    // the request must stay allowed and persist an RCE blind observation.
+    let (shadow, db) = engine_with_shadow_rce_traversal().await;
+    let host_code = format!("p1c-shell-{}", uuid_like());
+    let mut b = make_ctx("", "cmd=pyth''on3$IFS-c$IFSid", false);
+    {
+        let hc = Arc::make_mut(&mut b.host_config);
+        hc.code = host_code.clone();
+        hc.defense_config.owasp_set = false;
+        hc.defense_config.sensitive = false;
+    }
+    let d = shadow.inspect_body(&mut b).await;
+    assert!(
+        d.is_allowed(),
+        "shell-normalised RCE must stay allowed in shadow (suffix disabled): {:?}",
+        d.action
+    );
+    let rows = wait_for_observation(&db, &host_code).await;
+    assert_eq!(rows.len(), 1, "detection must persist exactly one observation");
+    assert_blind_signal(rows.first().expect("row"), "rce");
+}

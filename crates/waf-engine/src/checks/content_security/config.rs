@@ -139,6 +139,35 @@ mod tests {
     }
 
     #[test]
+    fn shipped_default_toml_compiles_all_families() {
+        use super::super::types::AttackKind;
+
+        // Regression: the shipped `configs/default.toml` must load, validate and
+        // compile through the runtime — proving every family's detector-id
+        // (`struct_rule` / `rce` / `traversal`) resolves and the weight sums are
+        // accepted. Guards against config drift breaking startup.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/default.toml");
+        let app = waf_common::config::load_config(path).expect("shipped default.toml must load + validate");
+        let rt = RuntimeContentSecurityConfig::compile(&app.content_security)
+            .expect("shipped default.toml content_security must compile");
+        assert!(rt.enabled, "shipped lane is enabled (shadow)");
+        assert_eq!(
+            rt.enforcement_mode,
+            EnforcementMode::LogOnly,
+            "shipped posture is log_only"
+        );
+        // All three P1c-era families present and enabled.
+        for fam in [AttackKind::SqlInjection, AttackKind::Rce, AttackKind::Traversal] {
+            let ac = rt.scoring.attacks.get(&fam).expect("family present");
+            assert!(ac.enabled, "{fam:?} enabled");
+            assert!(
+                ac.hard_veto_allowlist.is_empty(),
+                "{fam:?} hard-veto allowlist must be empty pre-holdout"
+            );
+        }
+    }
+
+    #[test]
     fn compile_rejects_unknown_detector() {
         let mut weights = BTreeMap::new();
         weights.insert("nonexistent".to_string(), 1.0);

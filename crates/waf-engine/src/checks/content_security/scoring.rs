@@ -18,7 +18,18 @@
 //! Hard-veto is an explicit per-attack allowlist keyed on the **stable
 //! `rule_key`** (never on `detail`), and blind/synthetic/parse-error provenance
 //! is structurally excluded (plan §6.3).
+//!
+//! **Primary/`request_score` contract (codex A-1).** `request_score` is the max
+//! group score and is computed independently of the primary family. The
+//! `primary_result` is chosen by a *total, `HashMap`-order-independent*
+//! comparator: highest recommendation severity, then highest group score, then a
+//! stable structural tie-break on `(attack, scope, field, rule_key)`. Because
+//! `(scope, field, attack)` is the group key, that tuple is unique per group, so
+//! two families firing on the same field at the same score always resolve to the
+//! same primary — the security-event attack type is deterministic across
+//! processes (never seeded by `HashMap` iteration order).
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
 use waf_common::DetectionResult;
@@ -105,6 +116,41 @@ const fn severity(a: SemanticAction) -> u8 {
     }
 }
 
+/// Stable ordinal for [`AttackKind`], used only as a deterministic tie-break in
+/// the request roll-up (codex A-1). The numeric value is arbitrary but fixed, so
+/// two families that reach the same severity and score always resolve to the
+/// same primary regardless of `HashMap` iteration order.
+const fn attack_ord(a: AttackKind) -> u8 {
+    match a {
+        AttackKind::SqlInjection => 0,
+        AttackKind::Rce => 1,
+        AttackKind::Xss => 2,
+        AttackKind::Traversal => 3,
+    }
+}
+
+/// Stable ordinal for [`InspectionScope`] — the second component of the roll-up
+/// tie-break (codex A-1).
+const fn scope_ord(s: InspectionScope) -> u8 {
+    match s {
+        InspectionScope::Header => 0,
+        InspectionScope::Body => 1,
+    }
+}
+
+/// Fully-ordered comparison key that makes the request roll-up winner
+/// deterministic (codex A-1). Sorted so the **greatest** key wins:
+///   1. recommendation `severity` (Block > Log);
+///   2. clamped `group_score`;
+///   3. a stable structural tie-break on `(attack, scope, field, rule_key)` where
+///      the lexicographically *smallest* tuple wins (wrapped in [`Reverse`] so
+///      "greatest key" still selects it).
+///
+/// `(scope, field, attack)` is the group key, so the tie-break tuple is unique
+/// per group and the order is a strict total order — no two candidate groups can
+/// ever compare equal, so the winner never depends on iteration order.
+type WinnerKey<'a> = (u8, u8, Reverse<(u8, u8, &'a str, &'a str)>);
+
 /// Compute the closed Lane 2 verdict for a set of signals.
 ///
 /// Returns a [`SemanticVerdict`] whose `request_score` is guaranteed to be in
@@ -145,7 +191,11 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
 
     // 2) Per-(scope, field, attack) weighted sum + arg-max contributor.
     let mut groups: HashMap<(InspectionScope, &str, AttackKind), Group<'a>> = HashMap::new();
-    let mut hard_veto: Option<&'a DetectionSignal> = None;
+    // Hard-veto candidate is chosen deterministically (codex A-1): the highest
+    // confidence wins, then the same stable structural tie-break as the roll-up,
+    // so a multi-hit allowlisted request never records a `HashMap`-order-dependent
+    // primary. Keyed by `(confidence, Reverse(stable-key))` — greatest wins.
+    let mut hard_veto: Option<(WinnerKey<'a>, &'a DetectionSignal)> = None;
 
     for (&(scope, field, attack, detector), &sig) in &canonical {
         let Some(ac) = cfg.attacks.get(&attack) else { continue };
@@ -174,18 +224,36 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
         // There is no stored `hard_veto_eligible` bool to forge — eligibility is
         // recomputed from `provenance` at scoring time.
         if sig.provenance.hard_veto_capable() && ac.hard_veto_allowlist.contains(sig.rule_key) {
-            hard_veto = Some(sig);
+            let hv_key: WinnerKey<'a> = (
+                sig.confidence,
+                0,
+                Reverse((attack_ord(attack), scope_ord(scope), field, sig.rule_key)),
+            );
+            if hard_veto.as_ref().is_none_or(|(k, _)| hv_key > *k) {
+                hard_veto = Some((hv_key, sig));
+            }
         }
     }
 
-    // 3) Request-level roll-up: strongest group recommendation wins.
+    // 3) Request-level roll-up (codex A-1): the winner is chosen by a total,
+    //    `HashMap`-order-independent comparator ([`WinnerKey`]) so the primary
+    //    signal is deterministic across processes. `request_score` is the max
+    //    group score (the closed-formula request magnitude) and is computed
+    //    independently of which family becomes primary; the two are related by
+    //    the written contract "`request_score = max_g group_score`; `primary` is
+    //    the highest-severity, then highest-scoring, then stable-key group that
+    //    reached at least its Log threshold".
     let mut request_score = 0.0f64;
     let mut recommendation = SemanticAction::None;
     let mut primary: Option<&'a DetectionSignal> = None;
+    let mut best_key: Option<WinnerKey<'a>> = None;
 
-    for ((_, _, attack), g) in &groups {
-        let Some(ac) = cfg.attacks.get(attack) else { continue };
+    for (&(scope, field, attack), g) in &groups {
+        let Some(ac) = cfg.attacks.get(&attack) else { continue };
         let group_u = clamp_score_to_u8(g.score);
+        if g.score > request_score {
+            request_score = g.score;
+        }
         let group_rec = if group_u >= ac.block_threshold {
             SemanticAction::Block
         } else if group_u >= ac.log_threshold {
@@ -193,17 +261,25 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
         } else {
             SemanticAction::None
         };
-        if g.score > request_score {
-            request_score = g.score;
+        // A group below its Log threshold never becomes the primary (matches the
+        // "no family crossed its log threshold → primary_result is None" contract).
+        if group_rec == SemanticAction::None {
+            continue;
         }
-        if severity(group_rec) > severity(recommendation) {
+        let key: WinnerKey<'a> = (
+            severity(group_rec),
+            group_u,
+            Reverse((attack_ord(attack), scope_ord(scope), field, g.best.rule_key)),
+        );
+        if best_key.is_none_or(|b| key > b) {
+            best_key = Some(key);
             recommendation = group_rec;
             primary = Some(g.best);
         }
     }
 
     // 4) Hard-veto overrides to Block regardless of the aggregate score.
-    if let Some(sig) = hard_veto {
+    if let Some((_, sig)) = hard_veto {
         recommendation = SemanticAction::Block;
         primary = Some(sig);
         request_score = request_score.max(f64::from(sig.confidence));
@@ -421,5 +497,123 @@ mod tests {
     fn degraded_flag_is_propagated() {
         let v = score(&[], &RuntimeScoringConfig::default(), true);
         assert!(v.degraded);
+    }
+
+    /// A three-family scoring config (`SQLi` / RCE / Traversal), each a single
+    /// detector at weight 1.0, block threshold 80 — mirrors the shipped families.
+    fn three_family_cfg() -> RuntimeScoringConfig {
+        let mut attacks = HashMap::new();
+        for (attack, det) in [
+            (AttackKind::SqlInjection, DetectorId::StructRule),
+            (AttackKind::Rce, DetectorId::Rce),
+            (AttackKind::Traversal, DetectorId::Traversal),
+        ] {
+            let mut weights = HashMap::new();
+            weights.insert(det, 1.0);
+            attacks.insert(
+                attack,
+                RuntimeAttackConfig {
+                    enabled: true,
+                    weights,
+                    log_threshold: 40,
+                    block_threshold: 80,
+                    hard_veto_allowlist: HashSet::new(),
+                },
+            );
+        }
+        RuntimeScoringConfig { attacks }
+    }
+
+    #[test]
+    fn primary_is_deterministic_across_runs_equal_severity_and_score() {
+        // codex A-1: three families fire on the SAME field with the SAME confidence
+        // (all Block, all group score 90). The old code left the primary to
+        // `HashMap` iteration order; the deterministic comparator must always pick
+        // the same family — the stable structural tie-break selects the smallest
+        // `attack_ord`, i.e. SQLi. Run many times (each `score` call builds fresh
+        // randomly-seeded HashMaps) and assert the primary never drifts.
+        let signals = [
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::StructRule,
+                "body",
+                90,
+                "sql.into_outfile",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Rce,
+                DetectorId::Rce,
+                "body",
+                90,
+                "rce.reverse_shell",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Traversal,
+                DetectorId::Traversal,
+                "body",
+                90,
+                "traversal.overlong",
+                Provenance::Raw,
+            ),
+        ];
+        let cfg = three_family_cfg();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let v = score(&signals, &cfg, false);
+            assert_eq!(v.recommendation, SemanticAction::Block);
+            assert_eq!(v.request_score, 90, "request score is the max group score");
+            let rule = v.primary_result.expect("a Block must carry a primary").rule_id;
+            seen.insert(rule);
+        }
+        assert_eq!(
+            seen,
+            std::collections::HashSet::from([Some("sql.into_outfile".to_string())]),
+            "primary must be the deterministic tie-break winner (SQLi), never HashMap-order-dependent: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn primary_is_the_highest_scoring_family_regardless_of_order() {
+        // codex A-1 (the exact reported failure): SQLi 95 / RCE 92 / Traversal 68,
+        // all Block. `request_score` is 95 and the primary must ALWAYS be the
+        // highest-scoring family (SQLi), never flipping to RCE across runs.
+        let signals = [
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::StructRule,
+                "body",
+                95,
+                "sql.into_outfile",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Rce,
+                DetectorId::Rce,
+                "body",
+                92,
+                "rce.reverse_shell",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Traversal,
+                DetectorId::Traversal,
+                "body",
+                68,
+                "traversal.sensitive_abs",
+                Provenance::Raw,
+            ),
+        ];
+        let cfg = three_family_cfg();
+        for _ in 0..200 {
+            let v = score(&signals, &cfg, false);
+            assert_eq!(v.request_score, 95);
+            assert_eq!(
+                v.primary_result.as_ref().and_then(|r| r.rule_id.as_deref()),
+                Some("sql.into_outfile"),
+                "the highest-scoring group must always be primary"
+            );
+        }
     }
 }
