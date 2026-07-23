@@ -690,6 +690,59 @@ fn shell_normalize(s: &str) -> Option<String> {
         .then_some(out)
 }
 
+/// Percent-decode `%XX` escapes while **preserving a literal `+`** — unlike
+/// [`crate::checks::url_decode`], which converts `+` → space per the
+/// `application/x-www-form-urlencoded` rule.
+///
+/// This exists only to feed the blind base64/hex decoders a `+`-intact view.
+/// A base64 token's `+` is a data character (alphabet value 62), not a space, so
+/// the form-urlencoded conversion corrupts a base64 payload before it can be
+/// decoded (decode-chain FN): the round-based `url_decode` in
+/// [`semantic_preprocessor`] converts a **bare** `+` in round 1 and a
+/// `%2B`-restored `+` in the next round, so by the time the transform frontier
+/// (which runs on the fully URL-decoded text) reaches the blind decoders the `+`
+/// has become a token-splitting space. Decoding `%XX` (so a `%2B`-encoded `+` is
+/// restored) while leaving `+` intact yields the character a base64 token needs.
+/// ASCII-only, never panics.
+#[allow(clippy::indexing_slicing)] // bounds checked by loop guard: i < len, i+2 < len
+fn percent_decode_keep_plus(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = char::from(bytes[i + 1]).to_digit(16);
+            let lo = char::from(bytes[i + 2]).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                #[allow(clippy::cast_possible_truncation)]
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Iterated [`percent_decode_keep_plus`], stopping at a fixed point or after
+/// `max_rounds` passes, so a `%252B`-style multi-encoded `+` is unwrapped to the
+/// same depth as the main URL-decode round loop (bounded, never panics).
+fn percent_decode_keep_plus_rounds(s: &str, max_rounds: u8) -> String {
+    let mut current = s.to_string();
+    let mut rounds = 0u8;
+    while rounds < max_rounds {
+        let next = percent_decode_keep_plus(&current);
+        if next == current {
+            break;
+        }
+        current = next;
+        rounds = rounds.saturating_add(1);
+    }
+    current
+}
+
 /// Maximum transform-composition depth (codex A-4): depth 1 = a single transform
 /// of the URL-decoded base, depth 2 = a transform of a depth-1 output. Deeper
 /// chains are not explored (and are bounded anyway by the per-field view cap).
@@ -849,6 +902,12 @@ pub fn semantic_preprocessor<'a>(
             provenance: Provenance::Raw,
         });
 
+        // Capture the raw field text BEFORE the URL-decode loop consumes it: the
+        // `+`-preserving transform seed below needs a form-of the field where a
+        // base64 token's `+` has not yet been converted to a space (decode-chain
+        // FN, see below).
+        let raw_for_plus_seed: String = raw.as_ref().to_string();
+
         // Bounded URL-decode rounds. Each distinct round is a fresh view so a
         // "malicious middle round, benign final round" evasion cannot hide.
         // `views_for_field` starts at 1 (the raw view) and is compared against
@@ -903,7 +962,21 @@ pub fn semantic_preprocessor<'a>(
         // `push_extra_view` and capped by the per-field view count — so this is a
         // deterministic upper bound, not per-decoder-attempt accounting.
         let decoded_base = current.as_ref().to_string();
-        let mut frontier: Vec<(String, bool, u8)> = vec![(decoded_base, false, 1)];
+        let mut frontier: Vec<(String, bool, u8)> = vec![(decoded_base.clone(), false, 1)];
+        // Decode-chain FN (`+` corruption): the URL-decode rounds above convert a
+        // base64 token's `+` (bare, or restored from `%2B` on a later round) into a
+        // token-splitting space, so `decoded_base` can no longer surface a base64
+        // XSS/SQLi/RCE payload that carried a literal `+`. Seed the transform
+        // frontier ADDITIONALLY with a `+`-preserving decode of the raw field so
+        // the blind base64/hex decoders get an intact `+`. This is purely additive
+        // — the space-decoded views above are unchanged, scoring keeps only the
+        // per-detector max so a duplicate view can never inflate a score, and the
+        // seed is added only when it actually differs and still holds a `+`, so no
+        // other encoding path does extra work or regresses.
+        let plus_seed = percent_decode_keep_plus_rounds(&raw_for_plus_seed, max_rounds);
+        if plus_seed.contains('+') && plus_seed != decoded_base {
+            frontier.push((plus_seed, false, 1));
+        }
         while let Some((text, tainted, depth)) = frontier.pop() {
             if views_for_field >= max_views || depth > MAX_TRANSFORM_DEPTH {
                 continue;
@@ -1143,6 +1216,106 @@ mod tests {
             strip_sql_comments("a/**/-b", CommentJoin::Space).as_deref(),
             Some("a -b")
         );
+    }
+
+    #[test]
+    fn base64_with_bare_plus_survives_url_decode_corruption() {
+        // Decode-chain FN: a base64 payload whose STANDARD encoding contains a bare
+        // `+` was corrupted by the url-decode `+`→space rule (the token split before
+        // the blind decoder ran on the fully url-decoded text). The `+`-preserving
+        // transform seed must now surface the FULL decoded payload.
+        let payload = "<script>alert(1)</script>~~~";
+        let enc = STANDARD.encode(payload);
+        assert!(enc.contains('+'), "fixture must exercise a bare '+': {enc}");
+        let body = format!("data={enc}");
+        let views = body_views(body.as_bytes());
+        assert!(
+            views
+                .iter()
+                .any(|v| v.provenance == Provenance::BlindDecoded && v.text.contains("<script>")),
+            "bare-'+' base64 XSS must fully blind-decode: {:?}",
+            views
+                .iter()
+                .map(|v| (v.provenance, v.text.as_ref()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn base64_with_pct2b_plus_survives_multi_round_url_decode() {
+        // The `%2B`-encoded variant: round 1 restores `+`, a later round would
+        // convert it to a space. The `+`-preserving seed decodes `%2B` → `+` and
+        // keeps it, so the full payload still surfaces.
+        let payload = "<script>alert(1)</script>~~~";
+        let enc = STANDARD.encode(payload).replace('+', "%2B");
+        let body = format!("data={enc}");
+        let views = body_views(body.as_bytes());
+        assert!(
+            views
+                .iter()
+                .any(|v| v.provenance == Provenance::BlindDecoded && v.text.contains("<script>")),
+            "%2B-encoded base64 XSS must fully blind-decode: {:?}",
+            views
+                .iter()
+                .map(|v| (v.provenance, v.text.as_ref()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn base64_sqli_with_bare_plus_still_decodes() {
+        // Cross-family: the same decode-chain fix must recover a base64 SQLi payload
+        // carrying a bare `+` (the bug affected all blind decoding, not just XSS).
+        for plaintext in [
+            "1 union select null,null-- +sqlmap",
+            "1; select load_file('/etc/passwd')++",
+        ] {
+            let enc = STANDARD.encode(plaintext);
+            if !enc.contains('+') {
+                continue;
+            }
+            let body = format!("id={enc}");
+            let views = body_views(body.as_bytes());
+            assert!(
+                views.iter().any(|v| v.provenance == Provenance::BlindDecoded
+                    && (v.text.contains("union") || v.text.contains("load_file"))),
+                "bare-'+' base64 SQLi must blind-decode ({plaintext:?} → {enc}): {:?}",
+                views
+                    .iter()
+                    .map(|v| (v.provenance, v.text.as_ref()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn benign_field_with_plus_produces_no_spurious_view() {
+        // Anti-FP for the `+`-preserving seed: an ordinary field carrying `+`
+        // characters (form data, math, names) must not synthesise a blind-decoded
+        // view — the structural gate rejects non-attack decoded bytes.
+        for benign in ["a=1+2+3+4", "name=jean+luc+picard", "q=c+++programming+guide"] {
+            let views = body_views(benign.as_bytes());
+            assert!(
+                !views.iter().any(|v| v.provenance == Provenance::BlindDecoded),
+                "benign '+'-bearing field must not blind-decode: {benign:?} → {:?}",
+                views
+                    .iter()
+                    .map(|v| (v.provenance, v.text.as_ref()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn percent_decode_keep_plus_preserves_plus_and_decodes_escapes() {
+        // Unit-level: `+` is preserved, `%2B` becomes `+`, other escapes decode.
+        assert_eq!(percent_decode_keep_plus("a+b"), "a+b");
+        assert_eq!(percent_decode_keep_plus("a%2Bb"), "a+b");
+        assert_eq!(percent_decode_keep_plus("%3Cscript%3E"), "<script>");
+        // Iterated: `%252B` → `%2B` → `+`.
+        assert_eq!(percent_decode_keep_plus_rounds("a%252Bb", 3), "a+b");
+        // Contrast with url_decode, which turns `+` into a space.
+        assert_eq!(crate::checks::url_decode("a+b"), "a b");
     }
 
     #[test]

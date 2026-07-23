@@ -90,14 +90,27 @@ fn looks_like_markup(s: &str) -> bool {
     false
 }
 
-/// Does the input contain a literal `<body`, `<frameset`, or `<html` start-tag
-/// (case-insensitive, name terminated by a tag delimiter)? html5ever's
-/// body-context *fragment* parse silently drops the event-handler attributes of a
-/// second `<body>`/`<frameset>` (a browser reflecting the payload merges them onto
-/// the live document element and executes them — a genuine XSS). A full *document*
-/// parse recovers them, so this gates a second, budget-charged reparse (FN-1). The
-/// `<body-panel>` custom element must not match, hence the delimiter check.
-fn hosts_document_level_element(s: &str) -> bool {
+/// Byte offset of the **first** literal `<body`, `<frameset`, or `<html`
+/// start-tag (case-insensitive, name terminated by a tag delimiter), or `None`.
+/// html5ever's body-context *fragment* parse silently drops the event-handler
+/// attributes of a second `<body>`/`<frameset>` (a browser reflecting the payload
+/// merges them onto the live document element and executes them — a genuine XSS).
+/// A full *document* parse recovers them, so this gates a second, budget-charged
+/// reparse (FN-1).
+///
+/// The offset (not just a bool) matters for a second false-negative source
+/// (FN-2): the WHATWG **frameset-ok** flag is set to "not ok" by any preceding
+/// non-whitespace content, after which a `<frameset onload=…>` / `<frameset
+/// onpageshow=…>` start-tag is *dropped* even by a full document parse — so
+/// `x<frameset onload=…>` or `<p>hi</p><frameset onpageshow=…>` would silently
+/// miss. Reparsing the **suffix from this offset** (dropping the prefix that
+/// zeroed frameset-ok) restores a fresh frameset-ok, recovering the handler as a
+/// genuinely-parsed attribute — no text-level attribute scan, so the anti-FP
+/// property is preserved. The suffix is a superset of what a whole-document
+/// reparse could recover (leading non-host content only ever *hurts*), so this is
+/// strictly-higher recall with no regression. The `<body-panel>` custom element
+/// must not match, hence the delimiter check.
+fn first_document_level_host(s: &str) -> Option<usize> {
     const HOSTS: &[&[u8]] = &[b"body", b"frameset", b"html"];
     let bytes = s.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
@@ -113,11 +126,11 @@ fn hosts_document_level_element(s: &str) -> bool {
                 && let Some(&after) = rest.get(host.len())
                 && matches!(after, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | b'/' | b'>')
             {
-                return true;
+                return Some(i);
             }
         }
     }
-    false
+    None
 }
 
 /// URL attributes whose value is resolved as a navigation / fetch target and can
@@ -559,17 +572,21 @@ impl SemanticDetector for XssDomDetector {
         let mut js_contexts: Vec<String> = Vec::new();
         let html = Html::parse_fragment(text);
         let mut best = Self::scan_fragment(&html, self.include_weak, check_template, &mut js_contexts);
-        // FN-1: the body-context fragment parse drops `<body>`/`<frameset>`
-        // start-tag event handlers (asymmetric with `<html>`, which it keeps).
-        // When one of those hosts is present, a full document parse — which merges
-        // the start-tag attributes onto the document element — recovers them. It
-        // takes its own parse-budget attempt/bytes so it never bypasses the cap;
-        // if the budget is spent the recovery is simply skipped (fail-open).
-        if hosts_document_level_element(text)
+        // FN-1/FN-2: the body-context fragment parse drops `<body>`/`<frameset>`
+        // start-tag event handlers (asymmetric with `<html>`, which it keeps), and
+        // a full document parse still drops a `<frameset on*=>` once the WHATWG
+        // frameset-ok flag has been zeroed by preceding non-whitespace content. A
+        // document parse of the **suffix from the first host tag-open** merges the
+        // host start-tag attributes onto the document element AND starts with a
+        // fresh frameset-ok, recovering both. It takes its own parse-budget
+        // attempt/bytes so it never bypasses the cap; if the budget is spent the
+        // recovery is simply skipped (fail-open).
+        if let Some(host_idx) = first_document_level_host(text)
+            && let Some(doc_input) = text.get(host_idx..)
             && state.try_take_html_parse_attempt()
-            && state.try_take_html_parse_input_bytes(text.len())
+            && state.try_take_html_parse_input_bytes(doc_input.len())
             && let Some(cand) = Self::scan_fragment(
-                &Html::parse_document(text),
+                &Html::parse_document(doc_input),
                 self.include_weak,
                 check_template,
                 &mut js_contexts,
@@ -871,6 +888,47 @@ mod tests {
                 .rule_key,
             "xss.event_handler"
         );
+    }
+
+    #[test]
+    fn frameset_handler_after_frameset_ok_zeroing_prefix_fires() {
+        // FN-2: preceding non-whitespace content zeroes the WHATWG frameset-ok
+        // flag, so a full document parse of the whole input DROPS the following
+        // `<frameset on*=>` start tag — a browser reflecting the payload into a
+        // fresh context still executes it. Reparsing the suffix from the first host
+        // tag-open restores a fresh frameset-ok and recovers the handler.
+        for payload in [
+            "x<frameset onload=alert(1)>",
+            "x<frameset onpageshow=alert(1)>",
+            "<p>hi</p><frameset onload=alert(1)>",
+            "<p>text</p><frameset onpageshow=alert(1)>",
+            "lorem ipsum<frameset onunload=alert(1)>",
+            "x<body onload=alert(1)>",
+            "<div>content</div><body onpageshow=alert(1)>",
+        ] {
+            let f = fire(payload).unwrap_or_else(|| panic!("must fire (frameset-ok reset): {payload:?}"));
+            assert_eq!(f.rule_key, "xss.event_handler", "payload {payload:?}");
+            assert_eq!(f.attack, AttackKind::Xss);
+        }
+    }
+
+    #[test]
+    fn frameset_word_in_prose_stays_clean() {
+        // Anti-FP for FN-2: the word "frameset"/"body" in prose (no `<frameset`
+        // start tag) and a real `<frameset>`/`<body>` with no handler must both
+        // stay clean — the suffix reparse only fires on a genuinely-parsed handler
+        // attribute, never a text-node lookalike.
+        for benign in [
+            "<p>the frameset onload attribute is documented here</p>",
+            "see the <body> element and its onload=true option in the manual",
+            "<p>intro</p><frameset cols=\"50%,50%\"><frame src=a></frameset>",
+            "text before<frameset rows=\"*\">",
+        ] {
+            assert!(
+                fire(benign).is_none(),
+                "frameset/body prose or handler-free markup must be clean: {benign:?}"
+            );
+        }
     }
 
     #[test]
