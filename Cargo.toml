@@ -116,6 +116,15 @@ zstd = "0.13"
 # X.509 parsing (cluster peer certificate SAN → node identity binding, H-9)
 x509-parser = "0.16"
 
+# Lane 2 (semantic) structured-body field extraction (Lane B). All forbid unsafe
+# in their own code; each parser/walk is depth-bounded by our own guards.
+#   quick-xml >= 0.41 fixes RUSTSEC-2026-0194 + RUSTSEC-2026-0195 (two DoS advisories).
+quick-xml = "0.41"
+async-graphql-parser = "7.2"
+async-graphql-value = "7.2"
+multer = "3.1"
+pollster = "1"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"

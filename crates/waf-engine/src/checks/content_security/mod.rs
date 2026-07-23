@@ -38,6 +38,7 @@ pub mod config;
 pub mod detectors;
 pub mod preprocess;
 pub mod scoring;
+mod struct_extract;
 pub mod types;
 pub mod xss_dom;
 pub mod xss_js;
@@ -919,6 +920,66 @@ mod tests {
             sub.resolve_action(verdict.recommendation),
             SemanticAction::Log,
             "shadow (log_only) downgrades a genuine Traversal Block to Log"
+        );
+    }
+
+    #[test]
+    fn laneb_json_unicode_escaped_sqli_fires_only_via_field_extraction() {
+        // Lane B acceptance (k3 probe): a SQLi tautology whose quotes are JSON
+        // `'`-escaped. The whole-body view carries the LITERAL `'`, so the
+        // AST SQLi detector never sees a tautology on it (score 0, the bypass). With
+        // structured extraction the JSON leaf is unescaped to `1' OR '1'='1` and the
+        // production `AstSqlDetector` fires — driven through the REAL
+        // `evaluate_scoped` (preprocess → extraction → detector → score). Shadow
+        // keeps it advisory.
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("sql_injection", "ast"));
+        // The body carries the LITERAL six-byte `'` sequences (JSON escape for
+        // an apostrophe); only JSON parsing turns them into the `'` quotes that form
+        // the tautology, so the whole-body view never sees a quote-breakout.
+        let escaped = b"{\"q\":\"1\\u0027 OR \\u00271\\u0027=\\u00271\"}";
+
+        // Control: the escaped leaf as a NON-structured (form-encoded) body, so no
+        // extraction runs. The whole-body view carries the literal `'`, the
+        // AST detector never sees a quote-breakout, and no SQLi signal is produced —
+        // this is the bypass the extraction closes.
+        let mut plain = ctx();
+        plain.body_preview = Bytes::from_static(b"q=1\\u0027 OR \\u00271\\u0027=\\u00271");
+        plain.content_length = plain.body_preview.len() as u64;
+        let mut st0 = ContentInspectionState::default();
+        let plain_sqli = match sub.evaluate_scoped(&plain, InspectionScope::Body, &mut st0) {
+            ContentVerdict::Semantic(v) => v.signals.iter().any(|s| s.attack == AttackKind::SqlInjection),
+            other => panic!("Lane 1 must stay clean → Semantic, got {other:?}"),
+        };
+        assert!(
+            !plain_sqli,
+            "without extraction the escaped tautology must NOT fire (the bypass)"
+        );
+
+        // With `application/json`, extraction unescapes the leaf and the detector fires.
+        let mut req = ctx();
+        req.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        req.body_preview = Bytes::copy_from_slice(&escaped[..]);
+        req.content_length = req.body_preview.len() as u64;
+        let mut st = ContentInspectionState::default();
+        let verdict = match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => v,
+            other => panic!("Lane 1 must stay clean → Semantic, got {other:?}"),
+        };
+        let sig = verdict
+            .signals
+            .iter()
+            .find(|s| s.attack == AttackKind::SqlInjection)
+            .expect("the extracted JSON leaf must produce a SQLi signal");
+        assert_eq!(*sig.field, *"body.json", "the signal came from the extracted JSON leaf");
+        assert!(
+            sig.rule_key.starts_with("ast."),
+            "a real AST SQLi rule_key: {}",
+            sig.rule_key
+        );
+        assert!(
+            verdict.request_score > 0,
+            "the extracted leaf must raise the score above 0"
         );
     }
 

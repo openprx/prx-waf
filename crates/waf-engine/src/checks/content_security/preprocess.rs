@@ -785,29 +785,50 @@ enum FieldSource<'a> {
     Text(Cow<'static, str>, &'a str),
     /// Raw request body bytes — materialised to text only after admission.
     Body(&'a [u8]),
+    /// A structured leaf extracted from the body (JSON / XML / GraphQL / multipart,
+    /// Lane B). Both the label and the value are **owned** because the structured
+    /// parsers unescape a leaf into a fresh string (a JSON `'`, an XML
+    /// `'`, a GraphQL string escape) that cannot borrow the raw body. This
+    /// field source is strictly additive: the whole-body [`Self::Body`] view is
+    /// still produced, so extraction only widens the field set — no existing view
+    /// changes (plan: shadow, behaviour-preserving).
+    Extracted(Cow<'static, str>, String),
 }
 
 impl FieldSource<'_> {
-    /// Byte length for the per-field input admission cap. Cheap for both variants
-    /// (no UTF-8 conversion): a borrowed `&str` is already valid UTF-8 so its
-    /// `.len()` is its byte length, and the body reports its raw byte length.
+    /// Byte length for the per-field input admission cap. Cheap for all variants
+    /// (no UTF-8 conversion): a borrowed `&str` / owned `String` is already valid
+    /// UTF-8 so its `.len()` is its byte length, and the body reports its raw byte
+    /// length.
     const fn input_len(&self) -> usize {
         match self {
             Self::Text(_, s) => s.len(),
+            Self::Extracted(_, s) => s.len(),
             Self::Body(bytes) => bytes.len(),
         }
     }
 }
 
 /// Collect the field sources for a scope. Header scope yields path / query /
-/// cookie / curated headers; body scope yields the body only — header-phase
-/// fields are not re-scanned in the body phase (plan §3.5, Lane 2
-/// phase-limiting; this constraint is Lane-2-only and never touches Lane 1).
+/// cookie / curated headers; body scope yields the whole body **plus** the
+/// structured leaves extracted from it (Lane B) — header-phase fields are not
+/// re-scanned in the body phase (plan §3.5, Lane 2 phase-limiting; this constraint
+/// is Lane-2-only and never touches Lane 1).
 ///
-/// Nothing is decoded or converted here: header values borrow from `req`
-/// (zero-copy) and the body stays as raw bytes so the per-field input cap runs
-/// before any allocation.
-fn collect_field_sources<'a>(scope: InspectionScope, req: &'a RequestCtx) -> Vec<FieldSource<'a>> {
+/// Header values and the raw body are captured without decode/conversion (the
+/// per-field input cap runs before any allocation). The body scope additionally
+/// runs [`super::struct_extract::extract_body_fields`], which parses a
+/// JSON/XML/GraphQL/multipart body and returns owned leaf `(label, value)` pairs;
+/// this is **additive** — the whole-body [`FieldSource::Body`] is still emitted, so
+/// no existing view changes, and each extracted leaf is metered by the same
+/// per-field budget in [`semantic_preprocessor`]. `max_extracted` bounds the
+/// pre-collection so a wide body cannot allocate an unbounded leaf vector before
+/// the field budget is consulted.
+fn collect_field_sources<'a>(
+    scope: InspectionScope,
+    req: &'a RequestCtx,
+    max_extracted: usize,
+) -> Vec<FieldSource<'a>> {
     let mut fields: Vec<FieldSource<'a>> = Vec::new();
     match scope {
         InspectionScope::Header => {
@@ -832,7 +853,17 @@ fn collect_field_sources<'a>(scope: InspectionScope, req: &'a RequestCtx) -> Vec
         }
         InspectionScope::Body => {
             if !req.body_preview.is_empty() {
+                // The whole-body view is preserved unchanged (behaviour-shadow).
                 fields.push(FieldSource::Body(&req.body_preview));
+                // Lane B: additionally surface structured leaves so a payload
+                // buried in a deep JSON leaf / XML sibling / GraphQL argument /
+                // multipart part reaches the detectors as its own field.
+                let content_type = req.headers.get("content-type").map(String::as_str);
+                for (label, value) in
+                    super::struct_extract::extract_body_fields(&req.body_preview, content_type, max_extracted)
+                {
+                    fields.push(FieldSource::Extracted(label, value));
+                }
             }
         }
     }
@@ -863,7 +894,10 @@ pub fn semantic_preprocessor<'a>(
 
     let mut views: Vec<View<'a>> = Vec::new();
 
-    for source in collect_field_sources(scope, req) {
+    // Bound structured-leaf pre-collection by the same per-phase field budget — a
+    // leaf beyond it could never be admitted by `try_take_field` anyway.
+    let max_extracted = state.budget().max_fields_per_phase as usize;
+    for source in collect_field_sources(scope, req, max_extracted) {
         if !state.try_take_field() {
             break;
         }
@@ -883,6 +917,7 @@ pub fn semantic_preprocessor<'a>(
         let (location, raw): (Cow<'static, str>, Cow<'a, str>) = match source {
             FieldSource::Text(loc, s) => (loc, Cow::Borrowed(s)),
             FieldSource::Body(bytes) => (Cow::Borrowed("body"), String::from_utf8_lossy(bytes)),
+            FieldSource::Extracted(loc, s) => (loc, Cow::Owned(s)),
         };
 
         // Round 0: raw view. Meter both the retained input bytes and the
@@ -1069,6 +1104,79 @@ mod tests {
         let views = semantic_preprocessor(InspectionScope::Body, &req, &mut st);
         assert!(views.iter().all(|v| *v.location == *"body"));
         assert!(!views.is_empty());
+    }
+
+    fn req_with_body_ct(body: &[u8], content_type: &str) -> RequestCtx {
+        let mut req = req_with("/a", "q=1", body);
+        req.headers.insert("content-type".to_string(), content_type.to_string());
+        req
+    }
+
+    #[test]
+    fn structured_body_extracts_leaves_and_preserves_whole_body_view() {
+        // Lane B integration: a JSON body with a deep SQLi leaf that the k3 probe
+        // showed bypasses the whole-body field. The extracted leaf must reach the
+        // pipeline as its own `body.json` field/view, AND the original whole-body
+        // view must still be produced unchanged (behaviour-shadow).
+        let body = br#"{"a":{"b":{"c":{"d":"1 UNION SELECT password FROM users"}}}}"#;
+        let req = req_with_body_ct(body, "application/json");
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Body, &req, &mut st);
+        // The whole-body view is preserved (shadow guarantee).
+        assert!(
+            views.iter().any(|v| *v.location == *"body" && v.round == 0),
+            "the whole-body view must still be produced: {:?}",
+            views.iter().map(|v| v.location.as_ref()).collect::<Vec<_>>()
+        );
+        // The deep leaf now surfaces as its own field the detectors can inspect.
+        assert!(
+            views
+                .iter()
+                .any(|v| *v.location == *"body.json" && v.text.contains("UNION SELECT")),
+            "the deep JSON leaf must surface as a body.json view: {:?}",
+            views
+                .iter()
+                .map(|v| (v.location.as_ref(), v.text.as_ref()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn structured_extraction_shares_the_field_budget() {
+        // Extracted leaves are metered by the same per-phase field budget: with a
+        // budget of one field, only the whole-body field is admitted and the
+        // request is marked degraded — extraction can never exceed the budget.
+        let body = br#"{"a":"x","b":"y","c":"z"}"#;
+        let req = req_with_body_ct(body, "application/json");
+        let budget = Budget {
+            max_fields_per_phase: 1,
+            ..Budget::default()
+        };
+        let mut st = ContentInspectionState::new(budget);
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Body, &req, &mut st);
+        assert!(
+            views.iter().all(|v| *v.location == *"body"),
+            "only the whole-body field fits the 1-field budget: {:?}",
+            views.iter().map(|v| v.location.as_ref()).collect::<Vec<_>>()
+        );
+        assert!(st.is_degraded(), "exceeding the field budget must degrade the request");
+    }
+
+    #[test]
+    fn non_structured_body_produces_no_extracted_views() {
+        // A form-urlencoded body (the shape of the existing Lane 2 body tests) must
+        // yield no extracted views — zero behaviour change for existing traffic.
+        let req = req_with_body_ct(b"name=alice&role=admin", "application/x-www-form-urlencoded");
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Body, &req, &mut st);
+        assert!(
+            views.iter().all(|v| *v.location == *"body"),
+            "non-structured body must not synthesise extracted views: {:?}",
+            views.iter().map(|v| v.location.as_ref()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

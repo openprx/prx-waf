@@ -243,6 +243,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-graphql-parser"
+version = "7.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e64ef70f77a1c689111e52076da1cd18f91834bcb847de0a9171f83624b07fbf"
+dependencies = [
+ "async-graphql-value",
+ "pest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "async-graphql-value"
+version = "7.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e3ef112905abea9dea592fc868a6873b10ebd3f983e83308f995d6284e9ba41"
+dependencies = [
+ "bytes",
+ "indexmap 2.13.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "async-lock"
 version = "3.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -514,6 +538,9 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cached"
@@ -3528,6 +3555,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "pollster"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc6355899e1c9462875b6757c79f3caa011a1fdae12bbb1a2e72dd1f234f8336"
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3704,6 +3737,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -5699,6 +5741,8 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "arc-swap",
+ "async-graphql-parser",
+ "async-graphql-value",
  "async-trait",
  "base64",
  "brush-parser",
@@ -5706,12 +5750,16 @@ dependencies = [
  "chrono",
  "dashmap",
  "ed25519-dalek",
+ "futures-util",
  "hex",
  "ip2region",
  "ipnet",
  "libinjectionrs",
+ "multer",
  "notify",
  "parking_lot",
+ "pollster",
+ "quick-xml",
  "rand 0.8.5",
  "regex",
  "reqwest",

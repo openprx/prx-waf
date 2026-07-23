@@ -42,6 +42,19 @@ sqlparser = { version = "0.62", default-features = false }
 # fragment parser + ego-tree walk. No C toolchain; our code is zero-unsafe.
 scraper = { workspace = true }
 brush-parser = "0.4.0"
+# Lane B structured-body field extraction (Lane 2 preprocess). quick-xml pinned
+# >= 0.41 (RUSTSEC-2026-0194/0195 DoS fixes); all forbid unsafe in their own code.
+# Depth-bounded parse + iterative depth-capped walk keep them stack-safe (Lane A
+# P0 precedent).
+quick-xml = { workspace = true }
+async-graphql-parser = { workspace = true }
+async-graphql-value = { workspace = true }
+multer = { workspace = true }
+pollster = { workspace = true }
+# One-shot in-memory Stream for `multer` (multipart body already buffered in
+# `body_preview`); the future handed to `pollster::block_on` is pure-memory ready
+# and never awaits real I/O, so it cannot park a tokio worker.
+futures-util = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
