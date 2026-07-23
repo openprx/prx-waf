@@ -133,6 +133,131 @@ fn first_document_level_host(s: &str) -> Option<usize> {
     None
 }
 
+/// Text-only elements (rawtext / RCDATA / script-data) whose textual content is
+/// **not** parsed as markup by the HTML tokenizer. A `<body`/`<frameset`/`<html`
+/// tag-open sitting inside one of these is inert text — a browser never turns it
+/// into a live element — so the FN-2 frameset-ok suffix reparse (which strips the
+/// wrapper) must not resurrect it. `noscript` is included because a browser
+/// reflecting a payload runs with scripting enabled, where `<noscript>` content is
+/// rawtext.
+const RAWTEXT_ELEMENTS: &[&[u8]] = &[
+    b"script",
+    b"style",
+    b"textarea",
+    b"title",
+    b"xmp",
+    b"iframe",
+    b"noembed",
+    b"noframes",
+    b"noscript",
+];
+
+/// First byte offset (`>= from`) at which `needle` occurs in `haystack`, or
+/// `None`. `needle` must be non-empty (all call sites pass constants).
+fn find_from(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    let start = from.min(haystack.len());
+    haystack
+        .get(start..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| start + p)
+}
+
+/// First byte offset (`>= from`) of a `</name` end-tag-open (case-insensitive,
+/// name terminated by a tag delimiter) in `haystack`, or `None`.
+fn find_closing_tag(haystack: &[u8], from: usize, name: &[u8]) -> Option<usize> {
+    let mut i = from;
+    while let Some(&b) = haystack.get(i) {
+        if b == b'<'
+            && haystack.get(i + 1) == Some(&b'/')
+            && haystack
+                .get(i + 2..i + 2 + name.len())
+                .is_some_and(|h| h.eq_ignore_ascii_case(name))
+            && haystack
+                .get(i + 2 + name.len())
+                .is_none_or(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | b'>' | b'/'))
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Is the tag-open at byte offset `host_idx` genuinely at HTML **data** (document)
+/// level in the full input — i.e. NOT inside a comment (`<!-- … -->`) nor inside
+/// the text content of a [`RAWTEXT_ELEMENTS`] element? Only then is the FN-2
+/// frameset-ok **suffix reparse** legitimate. Reparsing the suffix from `host_idx`
+/// as a document strips whatever wrapped the host, so a host the browser would
+/// only ever see as inert comment / rawtext text must be left alone — otherwise a
+/// lazy, never-executed `<!-- <body onload> -->` or
+/// `<textarea><body onload></textarea>` would be "revived" into a false
+/// event-handler hit (the P1 regression this guards).
+///
+/// It scans only the discarded prefix `[0, host_idx)`, tracking the tokenizer's
+/// coarse state (data / comment / rawtext). Conservative by construction: any
+/// unterminated comment or rawtext element covering the offset returns `false`
+/// (skip the reparse). A comment / rawtext element that *closes* before the host
+/// leaves the host at data level → `true`, so the legitimate frameset-ok recovery
+/// (`x<frameset onload=…>`, `<p>hi</p><frameset onpageshow=…>`) is preserved.
+fn host_offset_at_data_level(s: &str, host_idx: usize) -> bool {
+    let bytes = s.as_bytes();
+    let limit = host_idx.min(bytes.len());
+    let mut i = 0usize;
+    while i < limit {
+        if bytes.get(i) != Some(&b'<') {
+            i += 1;
+            continue;
+        }
+        let after_lt = i + 1;
+        // Comment `<!-- … -->`: if it does not close before `host_idx`, the host is
+        // commented out (inert) → not data level.
+        if bytes.get(after_lt..).is_some_and(|r| r.starts_with(b"!--")) {
+            let Some(end) = find_from(bytes, after_lt + 3, b"-->") else {
+                return false;
+            };
+            let after = end + 3;
+            if after > limit {
+                return false;
+            }
+            i = after;
+            continue;
+        }
+        // Start tag of a rawtext / RCDATA element: its content up to the matching
+        // close tag is text, so a host inside it is inert.
+        let mut rawtext: Option<&[u8]> = None;
+        for &name in RAWTEXT_ELEMENTS {
+            if bytes
+                .get(after_lt..after_lt + name.len())
+                .is_some_and(|h| h.eq_ignore_ascii_case(name))
+                && bytes
+                    .get(after_lt + name.len())
+                    .is_none_or(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | b'>' | b'/'))
+            {
+                rawtext = Some(name);
+                break;
+            }
+        }
+        if let Some(name) = rawtext {
+            // The start tag must close with `>` before its text content begins.
+            let Some(gt) = find_from(bytes, after_lt + name.len(), b">") else {
+                return false;
+            };
+            match find_closing_tag(bytes, gt + 1, name) {
+                // Rawtext closes before the host → keep scanning after it as data.
+                Some(close) if close <= limit => {
+                    i = close;
+                    continue;
+                }
+                // Never closed, or closes only after the host → host is inside it.
+                _ => return false,
+            }
+        }
+        i += 1;
+    }
+    true
+}
+
 /// URL attributes whose value is resolved as a navigation / fetch target and can
 /// therefore carry a dangerous scheme. `xlink:href` reduces to the local name
 /// `href` after parsing, so it is covered.
@@ -581,7 +706,15 @@ impl SemanticDetector for XssDomDetector {
         // fresh frameset-ok, recovering both. It takes its own parse-budget
         // attempt/bytes so it never bypasses the cap; if the budget is spent the
         // recovery is simply skipped (fail-open).
+        //
+        // The suffix reparse strips whatever wrapped the host tag-open, so it must
+        // only run when the host is genuinely at document/data level in the full
+        // input. `host_offset_at_data_level` rejects a host that is commented out
+        // or buried in rawtext / RCDATA (`<textarea>`/`<title>`/`<style>`/`<xmp>`/
+        // `<noscript>`) content — inert markup a browser never executes — so a lazy
+        // `<!-- <body onload> -->` is not "revived" into a false handler hit.
         if let Some(host_idx) = first_document_level_host(text)
+            && host_offset_at_data_level(text, host_idx)
             && let Some(doc_input) = text.get(host_idx..)
             && state.try_take_html_parse_attempt()
             && state.try_take_html_parse_input_bytes(doc_input.len())
@@ -927,6 +1060,57 @@ mod tests {
             assert!(
                 fire(benign).is_none(),
                 "frameset/body prose or handler-free markup must be clean: {benign:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frameset_suffix_reparse_ignores_wrapped_lazy_content() {
+        // Regression (P1): the FN-2 frameset-ok **suffix reparse** parses the raw
+        // suffix from the first `<body`/`<frameset`/`<html` tag-open as a document,
+        // which strips whatever *wrapped* that tag-open. A host sitting inside an
+        // HTML comment or the text content of a rawtext / RCDATA element
+        // (`<textarea>`/`<title>`/`<style>`/`<xmp>`/`<noscript>`) is **inert** — a
+        // browser never turns it into a live element — so the reparse must NOT
+        // "revive" it into a false `xss.event_handler` hit. Each of these is clean
+        // in a real browser; the WAF must agree.
+        for benign in [
+            "<!-- <body onload=alert(1)> -->",
+            "<!-- <frameset onpageshow=alert(1)> -->",
+            "<textarea><body onload=alert(1)></textarea>",
+            "<title><frameset onload=alert(1)></title>",
+            "<xmp><body onload=alert(1)></xmp>",
+            "<noscript><body onload=alert(1)></noscript>",
+            "<style><frameset onload=alert(1)></style>",
+        ] {
+            assert!(
+                fire(benign).is_none(),
+                "commented / rawtext-wrapped host is inert, must stay clean: {benign:?}"
+            );
+        }
+        // Control: the SAME hosts UNWRAPPED (genuinely at document level) still
+        // fire — proving the guard rejects only the wrapping, not the recovery.
+        for payload in ["<body onload=alert(1)>", "x<frameset onpageshow=alert(1)>"] {
+            assert_eq!(
+                fire(payload)
+                    .unwrap_or_else(|| panic!("unwrapped host must still fire: {payload:?}"))
+                    .rule_key,
+                "xss.event_handler",
+                "payload {payload:?}"
+            );
+        }
+        // A comment / rawtext element that CLOSES before the host leaves the host
+        // genuinely at data level — it must still fire.
+        for payload in [
+            "<!-- note --><frameset onload=alert(1)>",
+            "<style>.a{}</style><body onpageshow=alert(1)>",
+        ] {
+            assert_eq!(
+                fire(payload)
+                    .unwrap_or_else(|| panic!("host after a closed wrapper must fire: {payload:?}"))
+                    .rule_key,
+                "xss.event_handler",
+                "payload {payload:?}"
             );
         }
     }
