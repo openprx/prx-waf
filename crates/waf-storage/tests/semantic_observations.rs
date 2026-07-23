@@ -141,3 +141,73 @@ async fn check_constraints_reject_illegal_rows() {
         .await
         .expect("a valid row must still insert");
 }
+
+/// Retention/TTL (migration `0012`): `prune_semantic_observations` deletes rows
+/// older than the window and keeps recent ones, and rejects a non-positive
+/// window instead of wiping the table.
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn prune_removes_old_rows_and_keeps_recent() {
+    let db = Database::connect(&database_url(), 5).await.expect("connect Postgres");
+    db.migrate().await.expect("migrate (incl. 0012 retention)");
+
+    // A non-positive window must never delete anything — it is rejected up front.
+    assert!(
+        db.prune_semantic_observations(0).await.is_err(),
+        "retention_days 0 must be rejected"
+    );
+    assert!(
+        db.prune_semantic_observations(-5).await.is_err(),
+        "negative retention_days must be rejected"
+    );
+
+    let host = format!("p1a-ttl-{}", uuid::Uuid::new_v4());
+    let signals = serde_json::json!([{ "detector": "struct_rule" }]);
+    let mk = |req_id: &str| CreateSemanticObservation {
+        host_code: host.clone(),
+        client_ip: "203.0.113.60".to_string(),
+        req_id: req_id.to_string(),
+        scope: "body".to_string(),
+        request_score: 40,
+        recommendation: "log".to_string(),
+        degraded: false,
+        exhausted: false,
+        pipeline: "semantic".to_string(),
+        schema_version: 1,
+        observations: signals.clone(),
+    };
+
+    // A recent row (created_at defaults to now()) and an old row backdated 30
+    // days directly on the pool so the prune boundary can be observed.
+    db.insert_semantic_observation(mk("recent"))
+        .await
+        .expect("insert recent");
+    db.insert_semantic_observation(mk("old")).await.expect("insert old");
+    sqlx::query(
+        "UPDATE semantic_observations SET created_at = now() - INTERVAL '30 days' WHERE host_code = $1 AND req_id = $2",
+    )
+    .bind(&host)
+    .bind("old")
+    .execute(db.pool())
+    .await
+    .expect("backdate the old row");
+
+    // Prune everything older than 7 days: the 30-day row goes, the recent stays.
+    let deleted = db
+        .prune_semantic_observations(7)
+        .await
+        .expect("prune older than 7 days");
+    assert!(deleted >= 1, "at least our backdated row must be pruned");
+
+    let rows = db
+        .list_semantic_observations(SemanticObservationQuery {
+            host_code: Some(host.clone()),
+            page: Some(1),
+            page_size: Some(10),
+        })
+        .await
+        .expect("list after prune");
+    assert_eq!(rows.len(), 1, "only the recent row survives");
+    let survivor = rows.first().expect("one surviving row");
+    assert_eq!(survivor.req_id, "recent", "the surviving row is the recent one");
+}

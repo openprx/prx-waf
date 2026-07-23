@@ -515,6 +515,33 @@ impl Database {
         Ok(rows)
     }
 
+    /// Prune Lane 2 semantic observations older than `retention_days` — the
+    /// retention / TTL enforcement for the shadow telemetry table (plan §13.1).
+    ///
+    /// The cutoff is computed in Rust (`now() - retention_days`) and bound as a
+    /// single `$1` parameter, so the `DELETE` is fully parameterised — no
+    /// `INTERVAL` string interpolation. Returns the number of rows deleted.
+    ///
+    /// `retention_days` must be positive: a zero or negative window would delete
+    /// every row, so it is rejected as invalid input rather than silently wiping
+    /// the table. An out-of-range day count (would overflow the timestamp
+    /// arithmetic) is likewise rejected instead of panicking.
+    pub async fn prune_semantic_observations(&self, retention_days: i64) -> Result<u64, StorageError> {
+        if retention_days <= 0 {
+            return Err(StorageError::InvalidInput(format!(
+                "retention_days must be positive, got {retention_days}"
+            )));
+        }
+        let delta = chrono::TimeDelta::try_days(retention_days)
+            .ok_or_else(|| StorageError::InvalidInput(format!("retention_days {retention_days} is out of range")))?;
+        let cutoff = chrono::Utc::now() - delta;
+        let result = sqlx::query("DELETE FROM semantic_observations WHERE created_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     // ─── Certificates ─────────────────────────────────────────────────────────
 
     pub async fn list_certificates(&self, host_code: Option<&str>) -> Result<Vec<Certificate>, StorageError> {
