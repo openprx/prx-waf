@@ -301,8 +301,12 @@ enabled = true
 log_threshold = 40
 block_threshold = 80
 hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+# Two-detector corroboration (T1-A): a Block needs BOTH the structural regex and
+# the true shell-AST detector (0.5·c_struct + 0.5·c_ast), so no single detector
+# recommends Block. Still shadow (log_only) — never enforced pre-holdout.
 [content_security.attacks.rce.weights]
-rce = 1.0                             # self-authored shell-injection detector
+rce = 0.5                             # self-authored structural shell-injection detector
+rce_ast = 0.5                         # brush-parser true shell-AST detector (T1-A)
 
 # Traversal T1 (encoded path traversal) — P1c structural detector. T0 is the
 # frozen Lane 1 DirTraversalCheck (raw `../`, `%2e%2e`, overlong, sensitive abs

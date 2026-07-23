@@ -117,6 +117,13 @@ pub enum DetectorId {
     Ast,
     /// Self-authored shell lexer for command injection (P1+).
     Rce,
+    /// `brush-parser` true shell-AST layer for command injection (T1-A) — the
+    /// **second** detector in the `Rce` family (alongside [`Self::Rce`]), parsing
+    /// the decoded view into a real shell syntax tree and firing on dangerous
+    /// structures (interpreter exec-flag, pipe-to-interpreter, here-doc→interpreter,
+    /// `/dev/tcp` redirect, process/command substitution) for the 0.5/0.5
+    /// corroboration that gates a Block recommendation.
+    RceAst,
     /// Segment-aware traversal detector (T1).
     Traversal,
     /// HTML5 DOM semantic XSS detector (P-XSS-1).
@@ -136,6 +143,7 @@ impl DetectorId {
             Self::StructRule => "struct_rule",
             Self::Ast => "ast",
             Self::Rce => "rce",
+            Self::RceAst => "rce_ast",
             Self::Traversal => "traversal",
             Self::XssDom => "xss_dom",
             Self::XssJs => "xss_js",
@@ -150,6 +158,7 @@ impl DetectorId {
             "struct_rule" => Some(Self::StructRule),
             "ast" => Some(Self::Ast),
             "rce" => Some(Self::Rce),
+            "rce_ast" => Some(Self::RceAst),
             "traversal" => Some(Self::Traversal),
             "xss_dom" => Some(Self::XssDom),
             "xss_js" => Some(Self::XssJs),

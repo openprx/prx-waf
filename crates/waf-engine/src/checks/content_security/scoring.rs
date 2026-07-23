@@ -155,9 +155,10 @@ const fn detector_ord(d: DetectorId) -> u8 {
         DetectorId::StructRule => 0,
         DetectorId::Ast => 1,
         DetectorId::Rce => 2,
-        DetectorId::Traversal => 3,
-        DetectorId::XssDom => 4,
-        DetectorId::XssJs => 5,
+        DetectorId::RceAst => 3,
+        DetectorId::Traversal => 4,
+        DetectorId::XssDom => 5,
+        DetectorId::XssJs => 6,
     }
 }
 

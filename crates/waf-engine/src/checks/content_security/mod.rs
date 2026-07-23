@@ -53,7 +53,9 @@ use crate::checks::{Check, DirTraversalCheck, RceCheck, SqlInjectionCheck, XssCh
 pub use budget::{Budget, ContentInspectionState};
 pub use canary::{BreakerState, CircuitBreaker, canary_bucket, in_canary};
 pub use config::{Dialect, EnforcementMode, RuntimeContentSecurityConfig};
-pub use detectors::{AstSqlDetector, RceStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector};
+pub use detectors::{
+    AstSqlDetector, RceAstDetector, RceStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector,
+};
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
 pub use types::{
@@ -146,6 +148,7 @@ impl ContentSecuritySubsystem {
             Box::new(detectors::StructuralSqlDetector::new()),
             Box::new(detectors::AstSqlDetector::new()),
             Box::new(detectors::RceStructuralDetector::new()),
+            Box::new(detectors::RceAstDetector::new()),
             Box::new(detectors::TraversalStructuralDetector::new()),
             Box::new(xss_dom::XssDomDetector::new()),
             Box::new(xss_js::XssJsTokenDetector::new()),
