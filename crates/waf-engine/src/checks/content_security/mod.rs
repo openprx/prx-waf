@@ -48,7 +48,7 @@ use crate::checks::{Check, DirTraversalCheck, RceCheck, SqlInjectionCheck, XssCh
 pub use budget::{Budget, ContentInspectionState};
 pub use canary::{BreakerState, CircuitBreaker, canary_bucket, in_canary};
 pub use config::{Dialect, EnforcementMode, RuntimeContentSecurityConfig};
-pub use detectors::{RceStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector};
+pub use detectors::{AstSqlDetector, RceStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector};
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
 pub use types::{
@@ -87,8 +87,8 @@ pub struct ContentSecuritySubsystem {
     legacy_checkers: Vec<Box<dyn Check>>,
     /// Compiled, immutable Lane 2 config (default = lane off).
     config: RuntimeContentSecurityConfig,
-    /// Lane 2 semantic detectors. In P1b this holds the production
-    /// [`detectors::StructuralSqlDetector`]; tests may push additional mocks.
+    /// Lane 2 semantic detectors: the structural + AST `SQLi` detectors and the
+    /// RCE / Traversal detectors; tests may push additional mocks.
     detectors: Vec<Box<dyn SemanticDetector>>,
     /// Runtime anomaly-rate breaker state (never persisted; restart resets it).
     breaker: Mutex<CircuitBreaker>,
@@ -121,14 +121,17 @@ impl ContentSecuritySubsystem {
         ];
         let now = Instant::now();
         let breaker = Mutex::new(CircuitBreaker::new(config.breaker, now));
-        // Production Lane 2 detectors: the structural SQLi detector (P1b) plus the
-        // RCE (shell command injection) and Traversal T1 (encoded path traversal)
-        // detectors (P1c). Each only contributes to scoring when ITS attack family
-        // is enabled + weighted in the compiled config; with the lane off
+        // Production Lane 2 detectors: the structural SQLi detector (P1b) and the
+        // sqlparser AST SQLi detector (P2, the second `SqlInjection`-family
+        // detector), plus the RCE (shell command injection) and Traversal T1
+        // (encoded path traversal) detectors (P1c). Each only contributes to
+        // scoring when ITS attack family is enabled + weighted (the AST detector on
+        // the `ast` weight); with the lane off
         // (`config.enabled == false`) `evaluate_scoped` short-circuits before any
         // detector runs, so the zero-config install still does zero Lane 2 work.
         let detectors: Vec<Box<dyn SemanticDetector>> = vec![
             Box::new(detectors::StructuralSqlDetector::new()),
+            Box::new(detectors::AstSqlDetector::new()),
             Box::new(detectors::RceStructuralDetector::new()),
             Box::new(detectors::TraversalStructuralDetector::new()),
         ];
@@ -920,6 +923,175 @@ mod tests {
             sub.resolve_action(verdict.recommendation),
             SemanticAction::Log,
             "shadow keeps the fully double-encoded traversal advisory (not blocked)"
+        );
+    }
+
+    // ── P2: AST SQLi detector fires but shadow never blocks ───────────────────
+
+    /// Enabled `log_only` (shadow) config for the `SqlInjection` family with BOTH
+    /// detectors weighted 0.5 / 0.5 (the shipped default.toml posture).
+    fn sqli_two_detector_log_only_rt() -> RuntimeContentSecurityConfig {
+        let mut weights = BTreeMap::new();
+        weights.insert("struct_rule".to_string(), 0.5);
+        weights.insert("ast".to_string(), 0.5);
+        let mut attacks = BTreeMap::new();
+        attacks.insert(
+            "sql_injection".to_string(),
+            SemanticAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: Vec::new(),
+            },
+        );
+        let cfg = ContentSecurityConfig {
+            enabled: true,
+            enforcement_mode: "log_only".to_string(),
+            attacks,
+            ..ContentSecurityConfig::default()
+        };
+        RuntimeContentSecurityConfig::compile(&cfg).expect("valid")
+    }
+
+    #[test]
+    fn real_ast_sqli_detector_fires_but_shadow_never_blocks() {
+        // The production AstSqlDetector fires on a quote-breakout tautology
+        // (`1' or '1'='1`). Lane 1's libinjection would veto this raw payload first,
+        // so — like the sibling structural/RCE/traversal shadow tests — we drive the
+        // Lane 2 detector → scoring → shadow-resolve pipeline directly. With ast
+        // weight 0.5, a single detector reaches only Log; the point here is that the
+        // AST detector genuinely fires and shadow never blocks.
+        let sub = ContentSecuritySubsystem::with_config(sqli_two_detector_log_only_rt());
+        let det = AstSqlDetector::new();
+        let req = ctx();
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let view = View {
+            location: Cow::Borrowed("body"),
+            round: 0,
+            text: Cow::Borrowed("1' or '1'='1"),
+            lower_trunc: "1' or '1'='1".to_string(),
+            provenance: Provenance::Raw,
+        };
+        let mut st = ContentInspectionState::default();
+        let finding = det
+            .detect(&view, &pctx, &mut st)
+            .expect("the AST detector must fire on the quote-breakout tautology");
+        assert_eq!(finding.rule_key, "ast.tautology");
+        assert_eq!(finding.attack, AttackKind::SqlInjection);
+        let signal = view.to_signal(det.id(), InspectionScope::Body, finding);
+        let verdict = score(std::slice::from_ref(&signal), &sub.config().scoring, false);
+        assert!(!verdict.signals.is_empty(), "detection evidence must be recorded");
+        // 0.5 · 80 = 40 ≥ log threshold (40) → Log recommendation; shadow keeps it.
+        assert_eq!(verdict.recommendation, SemanticAction::Log);
+        assert_eq!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Log,
+            "shadow (log_only) never blocks an AST SQLi detection"
+        );
+    }
+
+    #[test]
+    fn ast_and_structural_corroborate_to_block_recommendation_still_shadow() {
+        // Both SQLi detectors fire on the same field: `1 and sleep(5)` →
+        // structural sql.dangerous_fn (85) AND ast.dangerous_fn (85). With 0.5 / 0.5
+        // the group score is 0.5·85 + 0.5·85 = 85 ≥ block (80): corroboration by
+        // BOTH detectors is what crosses the Block bar (neither alone can — 0.5·85 =
+        // 42.5 is only Log) — yet shadow still downgrades the effective action to
+        // Log. The primary is the deterministic within-group winner (struct_rule).
+        let sub = ContentSecuritySubsystem::with_config(sqli_two_detector_log_only_rt());
+        let req = ctx();
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let payload = "1 and sleep(5)";
+        let view = View {
+            location: Cow::Borrowed("body"),
+            round: 0,
+            text: Cow::Borrowed(payload),
+            lower_trunc: payload.to_string(),
+            provenance: Provenance::Raw,
+        };
+        let mut st = ContentInspectionState::default();
+        let struct_sig = {
+            let f = StructuralSqlDetector::new()
+                .detect(&view, &pctx, &mut st)
+                .expect("structural dangerous_fn fires");
+            assert_eq!(f.rule_key, "sql.dangerous_fn");
+            view.to_signal(DetectorId::StructRule, InspectionScope::Body, f)
+        };
+        let ast_sig = {
+            let f = AstSqlDetector::new()
+                .detect(&view, &pctx, &mut st)
+                .expect("ast dangerous_fn fires");
+            assert_eq!(f.rule_key, "ast.dangerous_fn");
+            view.to_signal(DetectorId::Ast, InspectionScope::Body, f)
+        };
+        // Single detector alone is only Log (42.5 < block 80).
+        let struct_only = score(std::slice::from_ref(&struct_sig), &sub.config().scoring, false);
+        assert_eq!(
+            struct_only.recommendation,
+            SemanticAction::Log,
+            "one detector alone is only Log"
+        );
+        // Corroboration crosses the block bar.
+        let verdict = score(&[struct_sig, ast_sig], &sub.config().scoring, false);
+        assert_eq!(verdict.request_score, 85, "0.5·85 + 0.5·85 = 85");
+        assert_eq!(
+            verdict.recommendation,
+            SemanticAction::Block,
+            "corroboration by both detectors crosses the block threshold"
+        );
+        assert_eq!(
+            verdict.primary_result.as_ref().and_then(|r| r.rule_id.as_deref()),
+            Some("sql.dangerous_fn"),
+            "within-group primary is the deterministic tie-break winner (struct_rule)"
+        );
+        assert_eq!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Log,
+            "shadow (log_only) downgrades the corroborated Block to Log"
+        );
+    }
+
+    #[test]
+    fn lane1_clean_base64_sqli_fires_ast_through_production_pipeline() {
+        // A base64-wrapped `1 union select …` — invisible to Lane 1 (never decodes
+        // base64) — surfaces an AST SQLi signal on a BlindDecoded view through the
+        // real `evaluate_scoped` pipeline, and shadow keeps it advisory. Proves the
+        // encoding-bypass → decode-chain → AST path, and that a BlindDecoded AST
+        // signal is (correctly) never hard-veto-capable.
+        use base64::Engine as _;
+        let sub = ContentSecuritySubsystem::with_config(sqli_two_detector_log_only_rt());
+        let payload = base64::engine::general_purpose::STANDARD.encode("1 union select null,null,null from users");
+        let mut req = ctx();
+        req.body_preview = Bytes::from(format!("q={payload}"));
+        req.content_length = req.body_preview.len() as u64;
+        let mut st = ContentInspectionState::default();
+        let verdict = match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => v,
+            other => panic!("Lane 1 must stay clean → Semantic, got {other:?}"),
+        };
+        let ast_sig = verdict
+            .signals
+            .iter()
+            .find(|s| s.detector == DetectorId::Ast && s.attack == AttackKind::SqlInjection)
+            .expect("the base64 blind decode must surface an AST SQLi signal");
+        assert_eq!(
+            ast_sig.provenance,
+            Provenance::BlindDecoded,
+            "the AST signal came through base64 blind decode (never hard-veto)"
+        );
+        assert_eq!(ast_sig.rule_key, "ast.union");
+        // Shadow: whatever the recommendation, the effective action is never Block.
+        assert_ne!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Block,
+            "shadow (log_only) never blocks the base64-wrapped AST SQLi"
         );
     }
 

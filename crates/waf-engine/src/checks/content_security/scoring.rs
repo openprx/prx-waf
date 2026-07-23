@@ -138,6 +138,37 @@ const fn scope_ord(s: InspectionScope) -> u8 {
     }
 }
 
+/// Stable ordinal for [`DetectorId`], the tie-break used when two detectors in the
+/// **same** group contribute equally (codex P1c §3.1). P2 puts a second detector
+/// (`ast`) in the `SqlInjection` family, so `struct_rule` and `ast` can now fire on
+/// one field with an identical weighted contribution; without this the group's
+/// representative signal (`Group::best` → `primary_result`) would depend on
+/// `HashMap` iteration order. The numeric value is arbitrary but fixed.
+const fn detector_ord(d: DetectorId) -> u8 {
+    match d {
+        DetectorId::StructRule => 0,
+        DetectorId::Ast => 1,
+        DetectorId::Rce => 2,
+        DetectorId::Traversal => 3,
+    }
+}
+
+/// Whether a candidate detector signal should replace the group's current best,
+/// under a **total, `HashMap`-order-independent** order (codex P1c §3.1): higher
+/// weighted contribution wins; on an equal contribution the smaller
+/// `(detector_ord, rule_key)` wins. Equal contributions are compared bit-for-bit
+/// (`total_cmp`): two detectors with the same weight and confidence produce an
+/// identical `f64`, so the stable structural key is what breaks the tie.
+fn group_best_is_better(new_contrib: f64, new: &DetectionSignal, cur_contrib: f64, cur: &DetectionSignal) -> bool {
+    match new_contrib.total_cmp(&cur_contrib) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            (detector_ord(new.detector), new.rule_key) < (detector_ord(cur.detector), cur.rule_key)
+        }
+    }
+}
+
 /// Fully-ordered comparison key that makes the request roll-up winner
 /// deterministic (codex A-1). Sorted so the **greatest** key wins:
 ///   1. recommendation `severity` (Block > Log);
@@ -211,7 +242,11 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
             best_contrib: -1.0,
         });
         g.score += contrib;
-        if contrib > g.best_contrib {
+        // Deterministic within-group representative (codex P1c §3.1): higher
+        // contribution wins, equal contribution breaks on `(detector_ord,
+        // rule_key)` — never on `HashMap` iteration order. The `-1.0` seed makes
+        // the first admitted signal always win over the placeholder.
+        if group_best_is_better(contrib, sig, g.best_contrib, g.best) {
             g.best_contrib = contrib;
             g.best = sig;
         }
@@ -408,6 +443,58 @@ mod tests {
         assert_eq!(v.recommendation, SemanticAction::Log);
     }
 
+    fn shipped_sqli_cfg(log_t: u8) -> RuntimeScoringConfig {
+        // Mirror the SHIPPED weights (struct/ast 0.5 each) — sqli_cfg above uses
+        // 0.6/0.4, which does not reproduce the single-hit shadow-coverage question.
+        let mut weights = HashMap::new();
+        weights.insert(DetectorId::StructRule, 0.5);
+        weights.insert(DetectorId::Ast, 0.5);
+        let mut attacks = HashMap::new();
+        attacks.insert(
+            AttackKind::SqlInjection,
+            RuntimeAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: log_t,
+                block_threshold: 80,
+                hard_veto_allowlist: std::collections::HashSet::new(),
+            },
+        );
+        RuntimeScoringConfig { attacks }
+    }
+
+    #[test]
+    fn single_structural_hit_stays_observable_at_shipped_threshold() {
+        // Shadow-coverage regression: with struct/ast weights 0.5, a single
+        // structural detector firing alone scores 0.5 × conf. The lowest-confidence
+        // default-on rule is version_comment (conf 70 → 35). At log_threshold 40 it
+        // scored below the bar (35 < 40) and produced NO shadow observation — the
+        // calibration data the shadow phase exists to collect. log_threshold 30
+        // keeps it (and union_select 72→36, union_null 78→39) observable.
+        let hit = [sig(
+            AttackKind::SqlInjection,
+            DetectorId::StructRule,
+            "body",
+            70,
+            "sql.version_comment",
+            Provenance::Raw,
+        )];
+        let v = score(&hit, &shipped_sqli_cfg(30), false);
+        assert_eq!(v.request_score, 35, "0.5 × 70 = 35");
+        assert_eq!(
+            v.recommendation,
+            SemanticAction::Log,
+            "single default-on structural hit must stay observable in shadow"
+        );
+        // Regression witness: the same hit under the old threshold 40 was silent.
+        let v_old = score(&hit, &shipped_sqli_cfg(40), false);
+        assert_eq!(
+            v_old.recommendation,
+            SemanticAction::None,
+            "at log_threshold 40 the single hit produced no observation (the regression this fixes)"
+        );
+    }
+
     #[test]
     fn hard_veto_allowlisted_rulekey_blocks() {
         let signals = [sig(
@@ -571,6 +658,56 @@ mod tests {
             seen,
             std::collections::HashSet::from([Some("sql.into_outfile".to_string())]),
             "primary must be the deterministic tie-break winner (SQLi), never HashMap-order-dependent: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn within_group_best_is_deterministic_for_equal_contribution() {
+        // codex P1c §3.1 / P2: TWO detectors (`struct_rule` + `ast`) fire on the
+        // SAME (scope, field, attack) group with EQUAL weighted contribution
+        // (0.5·80 == 0.5·80). Group score is 0.5·80 + 0.5·80 = 80 (Block), and the
+        // group's representative signal (`Group::best` → `primary_result`) must be
+        // the deterministic tie-break winner (smaller detector_ord → `struct_rule`),
+        // never `HashMap`-order-dependent. Run many freshly-seeded times.
+        let signals = [
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::StructRule,
+                "body",
+                80,
+                "sql.union_null",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::Ast,
+                "body",
+                80,
+                "ast.union",
+                Provenance::Raw,
+            ),
+        ];
+        let cfg = sqli_cfg(40, 80, &[]); // struct_rule 0.6 / ast 0.4 → unequal; override to 0.5/0.5
+        let cfg = {
+            let mut c = cfg;
+            if let Some(ac) = c.attacks.get_mut(&AttackKind::SqlInjection) {
+                ac.weights.insert(DetectorId::StructRule, 0.5);
+                ac.weights.insert(DetectorId::Ast, 0.5);
+            }
+            c
+        };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..300 {
+            let v = score(&signals, &cfg, false);
+            assert_eq!(v.request_score, 80, "0.5·80 + 0.5·80 = 80");
+            assert_eq!(v.recommendation, SemanticAction::Block, "80 ≥ block threshold 80");
+            let rule = v.primary_result.expect("Block carries a primary").rule_id;
+            seen.insert(rule);
+        }
+        assert_eq!(
+            seen,
+            std::collections::HashSet::from([Some("sql.union_null".to_string())]),
+            "equal-contribution group best must be the deterministic (detector_ord) winner: {seen:?}"
         );
     }
 

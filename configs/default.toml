@@ -243,11 +243,23 @@ cooldown_secs = 900
 # by default; the rest await holdout data before being turned on.
 [content_security.attacks.sql_injection]
 enabled = true
-log_threshold = 40
+log_threshold = 30
 block_threshold = 80
 hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+# Two detectors, equal contribution (Σ = 1.0). A single detector firing alone
+# scores 0.5 × its confidence; the lowest-confidence default-on structural rule is
+# version_comment (conf 70 → 35), so log_threshold = 30 keeps EVERY single
+# default-on detector hit observable in shadow (35 ≥ 30, and the higher-confidence
+# rules well above). log_threshold = 40 used to silence single hits below conf 80
+# (union_select 72 → 36, union_null 78 → 39, version_comment 70 → 35 all < 40),
+# dropping their shadow observations — the calibration data the shadow phase exists
+# to collect. A Block recommendation still requires BOTH the structural regex
+# detector AND the sqlparser AST detector to corroborate on the same field
+# (0.5·c_struct + 0.5·c_ast ≥ 80), so no single detector can recommend Block. Still
+# shadow (log_only) regardless of score.
 [content_security.attacks.sql_injection.weights]
-struct_rule = 1.0                     # only the structural detector ships in P1b (ast is P2)
+struct_rule = 0.5                     # OpenRASP-style structural / regex detector (P1b)
+ast = 0.5                             # sqlparser-rs true-AST detector (P2)
 
 # RCE (shell command injection) — P1c structural detector. Runs on the Lane-2
 # decode/normalise views (base64/hex/entity/comment-strip + SHELL de-obfuscation)

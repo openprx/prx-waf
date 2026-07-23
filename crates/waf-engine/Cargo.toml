@@ -33,6 +33,11 @@ ed25519-dalek = { workspace = true }
 zstd = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
+# AST SQLi detector (Lane 2, P2). `default-features = false` drops the
+# `recursive-protection` feature and its `psm` dependency (C build + unsafe),
+# keeping the supply chain zero-C/zero-unsafe; stack safety is enforced by our own
+# explicit pre-parse nesting-depth guard (see `detectors::AstSqlDetector`).
+sqlparser = { version = "0.62", default-features = false }
 
 [dev-dependencies]
 rand = { workspace = true }

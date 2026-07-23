@@ -14,7 +14,12 @@
 //! **Shadow only in P1b**: the `SQLi` family ships with `enforcement_mode =
 //! log_only`, so a match is at most logged + persisted, never a Block.
 
+use std::borrow::Cow;
+
 use regex::Regex;
+use sqlparser::ast::{BinaryOperator, Expr, ObjectName, ObjectNamePart, SetExpr, Statement};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
 use tracing::error;
 
 use super::budget::ContentInspectionState;
@@ -533,6 +538,465 @@ impl SemanticDetector for TraversalStructuralDetector {
     ) -> Option<DetectionFinding> {
         let rule = best_match(&self.rules, view.lower_trunc.as_str())?;
         Some(finding_for(rule, AttackKind::Traversal, "Traversal"))
+    }
+}
+
+// ── AST SQLi detector (sqlparser-rs true parse, plan §11, P2) ─────────────────
+
+/// Maximum bracket / prefix-operator nesting depth we will hand to `sqlparser`.
+///
+/// **Primary stack-safety guard (P2 recursive-protection decision).** We build
+/// `sqlparser` with `default-features = false`, which drops the
+/// `recursive-protection` feature and its `psm` dependency (a C build + `unsafe`) —
+/// keeping the supply chain zero-C / zero-unsafe (iron rule). Without that feature
+/// the parser has **no** stack guard: its `with_recursion_limit` is a no-op, and
+/// its recursive descent overflows a 2 MiB worker-thread stack once nesting grows
+/// large enough. The per-frame stack cost differs by construct, so the overflow
+/// floor does too — measured (2 MiB stack) at, release / debug builds:
+/// `case`/`not` ≈ 240 / 18, `(((…)))` ≈ 329 / 60, unary `- -` ≈ 376 / 60. The
+/// smallest floor is `case`/`not` at ~18 frames in a debug build. `12` sits below
+/// even that, so [`ast_structural_depth_ok`] — which counts **every** recursion
+/// driver reachable in `GenericDialect` (brackets, `case`, `not`, `interval`, and
+/// the unary prefixes `+ - ~ !`) — never admits an input the parser could recurse
+/// near an overflow on. A rejected input simply yields no AST signal (fail-open —
+/// the structural detector still runs). `+`/`-` were the P2 gap: they drive unary
+/// recursion but were not counted, so a `1 or 1 < - - … 1` chain slipped past the
+/// old scan and could abort the worker; they are counted now, and
+/// [`AST_MAX_INPUT_BYTES`] is a second, independent cap in case any driver is ever
+/// missed again.
+const MAX_AST_NESTING: usize = 12;
+
+/// Belt-and-suspenders stack-safety cap: the maximum input byte length handed to
+/// the AST path, independent of the per-driver [`MAX_AST_NESTING`] scan.
+///
+/// Each parser recursion consumes at least one token, and every token is at least
+/// one byte, so the recursion depth of any parse is **at most the input byte
+/// length** — the densest driver (`(`, `~`) costs exactly one frame per byte. An
+/// input capped at `256` bytes can therefore drive at most ~256 value frames plus
+/// the fixed `select * from t where c = …` wrapper (a small constant), staying
+/// below the lowest measured one-frame-per-byte overflow floor (`(((…)))` at ~329
+/// release frames) with margin. This holds **regardless** of which operators the
+/// cheap scan above happens to enumerate, so even a future `sqlparser` prefix
+/// entry the scan does not know about cannot overflow the stack through this path.
+/// A longer input is declined for AST (fail-open — the structural detector still
+/// runs). Real injection structures the AST layer targets are far shorter than
+/// this cap.
+const AST_MAX_INPUT_BYTES: usize = 256;
+
+/// Recursion limit handed to `sqlparser` as defence-in-depth. It is a no-op in
+/// the current `recursive-protection`-off build (the real guard is
+/// [`ast_structural_depth_ok`]); it is set above [`MAX_AST_NESTING`] so it can
+/// never spuriously reject an input the depth guard already admitted, while still
+/// catching a runaway should a future `sqlparser` version begin enforcing it.
+const AST_RECURSION_LIMIT: usize = 20;
+
+/// SQL functions whose presence in a value context is a time-based / blind /
+/// exfiltration primitive (mirrors the structural `sql.dangerous_fn` set). A
+/// benign scalar value never contains one of these calls.
+const AST_DANGEROUS_FNS: &[&str] = &[
+    "sleep",
+    "pg_sleep",
+    "benchmark",
+    "load_file",
+    "updatexml",
+    "extractvalue",
+    "xp_cmdshell",
+];
+
+/// Cheap pre-filter: only spend an AST parse attempt when the input plausibly
+/// carries SQL structure. A benign scalar (number / word / UUID / prose) matches
+/// nothing here, so the overwhelming majority of traffic skips the parser (and the
+/// AST budget) entirely — clean traffic never even reaches [`ContentInspectionState::try_take_ast_attempt`].
+///
+/// Liberal by design on the safe side: a benign value that slips through simply
+/// fails to parse or yields no injection AST (the classifier, not this gate, is
+/// the correctness boundary). Bare `or` / `and` (common English) only qualify when
+/// a comparison operator is also present, so prose like `active or inactive` never
+/// spends a parse attempt.
+fn ast_prefilter(s: &str) -> bool {
+    // Strong keyword tokens (word-bounded) — rarely appear in benign values.
+    const STRONG_KW: &[&str] = &[
+        "union",
+        "select",
+        "sleep",
+        "benchmark",
+        "load_file",
+        "updatexml",
+        "extractvalue",
+        "xp_cmdshell",
+        "waitfor",
+        "insert",
+        "update",
+        "delete",
+        "drop",
+        "exec",
+    ];
+    const BOOL_KW: &[&str] = &["or", "and"];
+    // Punctuation-level injection markers.
+    if s.contains('\'') || s.contains(';') || s.contains("--") || s.contains("/*") || s.contains('#') {
+        return true;
+    }
+    let mut has_bool = false;
+    for tok in s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if STRONG_KW.contains(&tok) {
+            return true;
+        }
+        if BOOL_KW.contains(&tok) {
+            has_bool = true;
+        }
+    }
+    // `or` / `and` count only alongside a comparison operator (a real boolean
+    // injection: `1 or 1=1`), never on their own (`cats and dogs`).
+    has_bool && (s.contains('=') || s.contains('<') || s.contains('>'))
+}
+
+/// Over-approximation of `sqlparser`'s recursion depth, used purely as a
+/// stack-overflow guard (see [`MAX_AST_NESTING`]). The estimated recursion depth is
+/// `max bracket nesting + total paren-less keyword/prefix recursion drivers`:
+///
+/// * bracket nesting (`(` / `[`) drives paren / function / subquery / `exists`
+///   recursion (all of which descend through a bracket);
+/// * the paren-less prefix operators `not`, `case`, `interval`, and the unary signs
+///   `+ - ~ !` nest **without** brackets — and their *total* count upper-bounds any
+///   consecutive run or nesting depth.
+///
+/// The unary `+`/`-` signs were the P2 gap (they drive `parse_prefix` recursion but
+/// were previously uncounted, so a space-separated `- - … ` chain estimated depth
+/// `0` and could overflow the stack); they are counted here now. Because the count
+/// over-approximates it rejects strictly more than necessary — always the safe
+/// (fail-open) direction. This scan is the primary guard; [`AST_MAX_INPUT_BYTES`]
+/// is a byte-length backstop applied first, so a driver this scan might not know
+/// about still cannot overflow the stack.
+fn ast_structural_depth_ok(s: &str) -> bool {
+    // Backstop: bound recursion by input length regardless of the driver scan
+    // below (depth <= tokens <= bytes).
+    if s.len() > AST_MAX_INPUT_BYTES {
+        return false;
+    }
+
+    let mut bracket: usize = 0;
+    let mut max_bracket: usize = 0;
+    let mut prefixish: usize = 0;
+    let mut word_start: Option<usize> = None;
+
+    let close_word = |word_start: &mut Option<usize>, end: usize, prefixish: &mut usize| {
+        if let Some(start) = word_start.take() {
+            let word = s.get(start..end).unwrap_or_default();
+            if word == "not" || word == "case" || word == "interval" {
+                *prefixish += 1;
+            }
+        }
+    };
+
+    for (idx, c) in s.char_indices() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            if word_start.is_none() {
+                word_start = Some(idx);
+            }
+            continue;
+        }
+        close_word(&mut word_start, idx, &mut prefixish);
+        match c {
+            '(' | '[' => {
+                bracket += 1;
+                max_bracket = max_bracket.max(bracket);
+            }
+            ')' | ']' => bracket = bracket.saturating_sub(1),
+            // Unary prefixes that drive `sqlparser::parse_prefix` recursion. `+`/`-`
+            // are the P2 fix; `~`/`!` were already counted.
+            '~' | '!' | '+' | '-' => prefixish += 1,
+            _ => {}
+        }
+        if max_bracket.saturating_add(prefixish) > MAX_AST_NESTING {
+            return false;
+        }
+    }
+    close_word(&mut word_start, s.len(), &mut prefixish);
+    max_bracket.saturating_add(prefixish) <= MAX_AST_NESTING
+}
+
+/// Spend one AST attempt (subject to the per-request budget) parsing `sql` and
+/// classifying it. Returns `None` when the budget is exhausted, the parse fails,
+/// or the parse is an ordinary single-value query.
+fn ast_attempt(sql: &str, state: &mut ContentInspectionState) -> Option<(&'static str, u8)> {
+    if !state.try_take_ast_attempt() {
+        return None;
+    }
+    let stmts = parse_wrapped(sql)?;
+    classify_statements(&stmts)
+}
+
+/// Parse a wrapped statement string, returning the statements on a full,
+/// consume-to-EOF parse. `parse_statements` (unlike `parse_expr`) never silently
+/// truncates — trailing tokens are a parse error — so pitfall ① ("`parse_expr`
+/// stops at the first unparseable token and reports the prefix as clean") cannot
+/// mislead us: we never infer *clean* from a partial parse. A parse error yields
+/// `None` (no signal — a parse failure is not, on its own, evidence of injection).
+fn parse_wrapped(sql: &str) -> Option<Vec<Statement>> {
+    Parser::new(&GenericDialect {})
+        .with_recursion_limit(AST_RECURSION_LIMIT)
+        .try_with_sql(sql)
+        .ok()?
+        .parse_statements()
+        .ok()
+}
+
+/// Whether a binary operator is an arithmetic comparison (the shape of a SQL
+/// tautology `1=1` / `'a'<>'b'`). Boolean `And`/`Or` and `Like` are intentionally
+/// excluded — a tautology is a comparison **between two constants**.
+const fn is_comparison_op(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::Spaceship
+    )
+}
+
+/// Whether an expression is a literal constant (a number / string / boolean /
+/// null), unwrapping parentheses and unary sign. Used to decide a tautology:
+/// a comparison **between two literals** (`1=1`, `'a'='a'`) is always-true/false
+/// and never appears in a legitimate `col = <value>` — the value alone is one
+/// literal, never a `literal <cmp> literal` sub-expression.
+fn is_literal_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Value(_) => true,
+        Expr::Nested(inner) => is_literal_expr(inner),
+        Expr::UnaryOp { expr, .. } => is_literal_expr(expr),
+        _ => false,
+    }
+}
+
+/// Whether an [`ObjectName`]'s final identifier names a dangerous SQL function.
+fn is_dangerous_fn(name: &ObjectName) -> bool {
+    name.0
+        .last()
+        .and_then(|part| match part {
+            ObjectNamePart::Identifier(id) => Some(id.value.as_str()),
+            ObjectNamePart::Function(_) => None,
+        })
+        .is_some_and(|n| AST_DANGEROUS_FNS.contains(&n.to_ascii_lowercase().as_str()))
+}
+
+/// Injection structures discovered while walking a `WHERE` expression.
+#[derive(Default)]
+struct AstFlags {
+    dangerous_fn: bool,
+    tautology: bool,
+    subquery: bool,
+}
+
+/// Recursively collect injection structures from a `WHERE` expression. Depth is
+/// bounded (the AST itself is already depth-limited by [`ast_structural_depth_ok`];
+/// this guard is belt-and-braces so the walker can never recurse unbounded).
+fn walk_where(e: &Expr, depth: usize, flags: &mut AstFlags) {
+    if depth > 64 {
+        return;
+    }
+    let d = depth + 1;
+    match e {
+        Expr::BinaryOp { left, op, right } => {
+            if is_comparison_op(op) && is_literal_expr(left) && is_literal_expr(right) {
+                flags.tautology = true;
+            }
+            walk_where(left, d, flags);
+            walk_where(right, d, flags);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => walk_where(expr, d, flags),
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            walk_where(expr, d, flags);
+            walk_where(pattern, d, flags);
+        }
+        Expr::Between { expr, low, high, .. } => {
+            walk_where(expr, d, flags);
+            walk_where(low, d, flags);
+            walk_where(high, d, flags);
+        }
+        Expr::InList { expr, list, .. } => {
+            walk_where(expr, d, flags);
+            for item in list {
+                walk_where(item, d, flags);
+            }
+        }
+        Expr::Function(func) => {
+            if is_dangerous_fn(&func.name) {
+                flags.dangerous_fn = true;
+            }
+        }
+        Expr::Subquery(_) | Expr::Exists { .. } => flags.subquery = true,
+        Expr::InSubquery { expr, .. } => {
+            flags.subquery = true;
+            walk_where(expr, d, flags);
+        }
+        _ => {}
+    }
+}
+
+/// Classify a parsed statement list into an injection `(rule_key, confidence)`,
+/// or `None` when it is an ordinary single-value query.
+///
+/// The input was wrapped as `select * from t where c = <input>` (pitfall ②:
+/// UNION / stacked statements are invisible at the expression level, so we parse
+/// at the **statement** level). A benign scalar produces exactly one statement
+/// whose body is a `Select` with a `c = <literal>` `WHERE` and nothing else; every
+/// branch below fires only on structure the *input* grafted in, which a single
+/// value can never contribute.
+fn classify_statements(stmts: &[Statement]) -> Option<(&'static str, u8)> {
+    // Stacked query: the wrapper is one statement — more than one means the input
+    // injected a statement separator.
+    if stmts.len() > 1 {
+        return Some(("ast.stacked", 90));
+    }
+    let Some(Statement::Query(query)) = stmts.first() else {
+        return None;
+    };
+    classify_set_expr(&query.body, 0)
+}
+
+/// Classify a query body (recursing through a parenthesised sub-body).
+fn classify_set_expr(body: &SetExpr, depth: usize) -> Option<(&'static str, u8)> {
+    if depth > 64 {
+        return None;
+    }
+    match body {
+        // UNION / EXCEPT / INTERSECT grafted onto `c = <input>` — a value can
+        // never introduce a set operation.
+        SetExpr::SetOperation { .. } => Some(("ast.union", 85)),
+        SetExpr::Select(select) => {
+            let mut flags = AstFlags::default();
+            if let Some(expr) = &select.selection {
+                walk_where(expr, 0, &mut flags);
+            }
+            // Highest-confidence structure wins.
+            if flags.dangerous_fn {
+                Some(("ast.dangerous_fn", 85))
+            } else if flags.tautology {
+                Some(("ast.tautology", 80))
+            } else if flags.subquery {
+                Some(("ast.subquery", 78))
+            } else {
+                None
+            }
+        }
+        SetExpr::Query(inner) => classify_set_expr(&inner.body, depth + 1),
+        _ => None,
+    }
+}
+
+/// `sqlparser`-rs true-AST `SQLi` detector (plan §11, P2).
+///
+/// The **second** detector in the `SqlInjection` family (alongside
+/// [`StructuralSqlDetector`]); it parses each normalised view with `sqlparser` and
+/// fires on parse-acceptability of an injection structure (UNION / stacked /
+/// tautology / dangerous-function / subquery), returning a context-free
+/// [`DetectionFinding`].
+///
+/// The three measured `sqlparser` pitfalls are handled structurally:
+/// * **① silent `parse_expr` truncation** — we never use `parse_expr`; every parse
+///   goes through [`parse_wrapped`] (`parse_statements`), which consumes to EOF or
+///   errors, so a partial prefix parse can never be mistaken for a clean value.
+/// * **② UNION / stacked invisible at expression level** — the input is wrapped in
+///   a `select * from t where c = <input>` **statement** so set operations and
+///   statement separators surface ([`classify_statements`]).
+/// * **③ comments vanish in the AST** — comment obfuscation is caught at the char
+///   layer: the preprocessor already emits a `CommentStripped` view (so the
+///   detector re-runs on the de-commented form), and any injection whose source
+///   view still carried a comment marker is labelled `ast.comment_obfusc`.
+///
+/// **Known, intentional fail-safe blind spots (not vulnerabilities).** This
+/// detector deliberately under-detects a few shapes to hold false positives down;
+/// they are covered by the structural (`StructuralSqlDetector`) and frozen Lane 1
+/// (libinjection) detectors, and are recorded here so callers never assume the AST
+/// layer alone is complete:
+/// * **bare-truthy `OR`** (`' OR 1`, `OR true`, `OR 'x'`) — the tautology rule is
+///   narrowed to `literal <cmp> literal`, so a bare truthy literal with no
+///   comparison operator does not fire on the AST path (narrowing suppresses the
+///   large FP surface of "any `OR <value>`").
+/// * **bracket/quote-breakout `UNION`** (`1) union select …`, `1') union select …`)
+///   — the numeric and single-quote wrappers both fail to parse the broken-out
+///   context, so no AST set-operation surfaces.
+/// * **`ORDER BY` / projection-position / `INTO OUTFILE` injection** — these
+///   positions are not reachable from the value-context wrapper under
+///   `GenericDialect`, so the AST does not model them.
+pub struct AstSqlDetector {
+    _private: (),
+}
+
+impl AstSqlDetector {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl Default for AstSqlDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SemanticDetector for AstSqlDetector {
+    fn id(&self) -> DetectorId {
+        DetectorId::Ast
+    }
+
+    fn detect(
+        &self,
+        view: &View<'_>,
+        _ctx: &PreprocessCtx<'_>,
+        state: &mut ContentInspectionState,
+    ) -> Option<DetectionFinding> {
+        let s = view.lower_trunc.as_str();
+        if s.is_empty() {
+            return None;
+        }
+        // Cheap gate — clean traffic exits here without touching the AST budget.
+        if !ast_prefilter(s) {
+            return None;
+        }
+        // Stack-safety: decline deeply-nested input before it reaches the parser.
+        if !ast_structural_depth_ok(s) {
+            return None;
+        }
+        // DoS byte budget (per-request total across all views).
+        if !state.try_take_ast_input_bytes(s.len()) {
+            return None;
+        }
+
+        let has_comment = s.contains("--") || s.contains("/*") || s.contains('#');
+
+        // Numeric / bareword context — catches UNION, stacked, `1 or 1=1`,
+        // `1 and sleep(5)`, subqueries. On a miss, fall back (only when the input
+        // carries a quote) to the single-quote breakout context — pitfall ①:
+        // `1' or '1'='1` breaks out of a quoted value, and the quoted wrapper
+        // reveals the tautology the numeric wrapper cannot parse.
+        let (structural_key, confidence) =
+            ast_attempt(&format!("select * from t where c = {s}"), state).or_else(|| {
+                if s.contains('\'') {
+                    ast_attempt(&format!("select * from t where c = '{s}'"), state)
+                } else {
+                    None
+                }
+            })?;
+        // Pitfall ③: a confirmed injection whose source view still carried a comment
+        // marker is comment-obfuscated (the AST alone cannot see the comment).
+        let rule_key = if has_comment {
+            "ast.comment_obfusc"
+        } else {
+            structural_key
+        };
+        Some(DetectionFinding {
+            attack: AttackKind::SqlInjection,
+            confidence,
+            rule_key,
+            detail: Cow::Owned(format!(
+                "ast sqli structure '{rule_key}' matched (confidence {confidence})"
+            )),
+        })
     }
 }
 
@@ -1164,5 +1628,280 @@ mod tests {
                 .rule_key,
             "traversal.sensitive_abs_ops"
         );
+    }
+
+    // ── AST SQLi detector (P2) ────────────────────────────────────────────────
+
+    fn ast_fire(text: &str) -> Option<DetectionFinding> {
+        run(&AstSqlDetector::new(), text)
+    }
+
+    #[test]
+    fn ast_union_fires_statement_level() {
+        // Pitfall ②: a UNION is invisible at the expression level; the statement
+        // wrapper surfaces it as a set operation.
+        let f = ast_fire("1 union select null,null,null from users").expect("union must fire");
+        assert_eq!(f.rule_key, "ast.union");
+        assert_eq!(f.attack, AttackKind::SqlInjection);
+        assert_eq!(f.confidence, 85);
+        assert!(
+            ast_fire("1 union all select 1,2").is_some(),
+            "union all is still a set op"
+        );
+    }
+
+    #[test]
+    fn ast_stacked_fires_statement_level() {
+        // Pitfall ②: a stacked statement is only visible once parsed at the
+        // statement level (`stmts.len() > 1`).
+        let f = ast_fire("1;drop table x").expect("stacked must fire");
+        assert_eq!(f.rule_key, "ast.stacked");
+        assert_eq!(f.confidence, 90);
+        assert_eq!(
+            ast_fire("1;update users set admin=1")
+                .expect("stacked update must fire")
+                .rule_key,
+            "ast.stacked"
+        );
+    }
+
+    #[test]
+    fn ast_tautology_quote_breakout_fires_with_eof_consumed() {
+        // Pitfall ①: `1' or '1'='1` — a numeric wrapper leaves a dangling quote
+        // (parse error, no false "clean"); the single-quote breakout wrapper parses
+        // it fully (consume-to-EOF via `parse_statements`) and reveals the OR +
+        // constant-comparison tautology.
+        let f = ast_fire("1' or '1'='1").expect("quote-breakout tautology must fire");
+        assert_eq!(f.rule_key, "ast.tautology");
+        assert_eq!(f.confidence, 80);
+        // Numeric tautology too.
+        assert_eq!(
+            ast_fire("1 or 1=1").expect("numeric tautology").rule_key,
+            "ast.tautology"
+        );
+    }
+
+    #[test]
+    fn ast_comment_obfuscated_injection_is_labelled() {
+        // Pitfall ③: comments vanish in the AST — the tokenizer strips `/**/`, so
+        // `1/**/or/**/1=1` still parses to the OR tautology, and because the source
+        // carried a comment marker it is labelled `ast.comment_obfusc` at the char
+        // layer.
+        let f = ast_fire("1/**/or/**/1=1").expect("comment-obfuscated tautology must fire");
+        assert_eq!(f.rule_key, "ast.comment_obfusc");
+    }
+
+    #[test]
+    fn ast_dangerous_fn_fires() {
+        let f = ast_fire("1 and sleep(5)").expect("time-based blind must fire");
+        assert_eq!(f.rule_key, "ast.dangerous_fn");
+        assert_eq!(f.confidence, 85);
+        assert_eq!(
+            ast_fire("1 and extractvalue(1,concat(0x7e,version()))")
+                .expect("extractvalue must fire")
+                .rule_key,
+            "ast.dangerous_fn"
+        );
+    }
+
+    #[test]
+    fn ast_subquery_fires() {
+        let f = ast_fire("1 = (select password from users limit 1)").expect("subquery must fire");
+        assert_eq!(f.rule_key, "ast.subquery");
+        assert_eq!(f.confidence, 78);
+    }
+
+    #[test]
+    fn ast_clean_traffic_does_not_fire() {
+        // The high-FP surface: benign scalars, prose with `or`/`and`, JSON, UUIDs,
+        // versions, identifiers, and "looks-like-a-column" values must NOT fire.
+        for clean in [
+            "42",
+            "alice",
+            "laptop",
+            "price",
+            "true",
+            "null",
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "version=1.2.3",
+            "the quick brown fox jumps over the lazy dog",
+            "cats and dogs and birds",
+            "active or inactive",
+            "true or false",
+            "red and blue",
+            "please select an option from the menu",
+            "reunion committee",
+            "q=laptop&sort=price&order=asc&page=2",
+            r#"{"name":"alice","role":"admin","age":30}"#,
+            "SELECT_ALL=1&reunion=family",
+            "i love my cat and my dog",
+            "search for shoes and socks",
+            "status = active",
+            "order by relevance please",
+            "drops of rain and sunshine",
+            "a normal sentence, nothing to see here",
+            "user@example.com",
+            "2026-07-23T00:00:00Z",
+        ] {
+            assert!(
+                ast_fire(clean).is_none(),
+                "clean AST negative fired: {clean:?} -> {:?}",
+                ast_fire(clean)
+            );
+        }
+    }
+
+    #[test]
+    fn ast_prefilter_skips_non_sql() {
+        // The prefilter (cheap gate) must reject benign scalars so no AST budget is
+        // spent, and admit the injection shapes.
+        assert!(!ast_prefilter("42"));
+        assert!(!ast_prefilter("alice"));
+        assert!(!ast_prefilter("cats and dogs")); // `and` without a comparison
+        assert!(!ast_prefilter("active or inactive"));
+        assert!(ast_prefilter("1 or 1=1")); // `or` + comparison
+        assert!(ast_prefilter("1 union select 1"));
+        assert!(ast_prefilter("1;drop table x"));
+        assert!(ast_prefilter("1' or '1'='1"));
+        assert!(ast_prefilter("1/**/or/**/1=1"));
+    }
+
+    #[test]
+    fn ast_deep_nesting_is_declined_without_stack_overflow() {
+        // Stack-safety guard (recursive-protection OFF): pathological nesting is
+        // rejected by the depth pre-scan BEFORE the parser runs, so it can never
+        // overflow the stack. Each of these would abort the process if parsed.
+        let parens = format!("{}1{}", "(".repeat(5000), ")".repeat(5000));
+        let nots = format!("1 or {}1", "not ".repeat(5000));
+        let cases = format!("{}1{}", "case when 1 then ".repeat(5000), " end".repeat(5000));
+        // The P2 gap: space-separated unary `-`/`+` chains. `sqlparser` parses each
+        // sign with a recursive `parse_prefix`, so a `1 or 1 < - - … 1` chain of a
+        // few hundred signs overflows the worker stack — but the old depth scan
+        // counted `(`/`~`/`!`/not/case only and estimated depth 0 for this input,
+        // admitting it to the parser. 600 signs is well past the measured overflow
+        // floor (release ~376, debug ~60), so on the pre-fix code this input aborts
+        // the process (EXIT 134); the fix must decline it here instead.
+        let unary_minus = format!("1 or 1 < {}1", "- ".repeat(600));
+        let unary_plus = format!("1 or 1 < {}1", "+ ".repeat(600));
+        let tildes = format!("1 or 1 < {}1", "~".repeat(600));
+        let bangs = format!("1 or 1 < {}1", "!".repeat(600));
+        // Mixed drivers must also be declined (their counts sum in the estimate).
+        let mixed = format!("1 or {}1", "not - ~ case when 1 then ".repeat(200));
+        for deep in [
+            &parens,
+            &nots,
+            &cases,
+            &unary_minus,
+            &unary_plus,
+            &tildes,
+            &bangs,
+            &mixed,
+        ] {
+            assert!(
+                !ast_structural_depth_ok(deep),
+                "deep input must be declined: depth guard"
+            );
+            // And end-to-end: detect returns None (no signal, no parse, no panic).
+            assert!(
+                ast_fire(deep).is_none(),
+                "deep input must not fire (declined pre-parse)"
+            );
+        }
+        // A realistically-nested but shallow subquery is still admitted + detected.
+        assert!(ast_structural_depth_ok("1 = (select 1)"));
+    }
+
+    #[test]
+    fn ast_depth_guard_counts_every_recursion_driver() {
+        // Isolate the driver *scan* from the byte-length backstop: every input here
+        // is short (well under AST_MAX_INPUT_BYTES), so a decline can only come from
+        // the per-driver count. A run of 13 of any single recursion driver exceeds
+        // MAX_AST_NESTING (12) and must be declined. Pre-fix, the unary `+`/`-` rows
+        // asserted `false` but the scan returned `true` (they were uncounted) — this
+        // test fails on the old code without aborting.
+        let n = 13;
+        let cases = [
+            ("paren", format!("1 < {}1{}", "(".repeat(n), ")".repeat(n))),
+            ("tilde", format!("1 < {}1", "~".repeat(n))),
+            ("bang", format!("1 < {}1", "!".repeat(n))),
+            ("minus", format!("1 < {}1", "- ".repeat(n))),
+            ("plus", format!("1 < {}1", "+ ".repeat(n))),
+            ("not", format!("1 or {}1", "not ".repeat(n))),
+            ("interval", format!("1 < {}1", "interval ".repeat(n))),
+        ];
+        for (kind, s) in &cases {
+            assert!(
+                s.len() <= AST_MAX_INPUT_BYTES,
+                "{kind} probe must exercise the scan, not the byte cap"
+            );
+            assert!(
+                !ast_structural_depth_ok(s),
+                "{kind} chain (>{MAX_AST_NESTING}) must be declined by the driver scan"
+            );
+        }
+        // A short run of the same drivers (<= cap) is still admitted.
+        assert!(ast_structural_depth_ok("1 < - - - 1"));
+        assert!(ast_structural_depth_ok("1 or not not 1=1"));
+    }
+
+    #[test]
+    fn ast_over_length_input_declined_by_byte_backstop() {
+        // The byte backstop declines any input longer than AST_MAX_INPUT_BYTES even
+        // when its per-driver depth is trivial, so a missed future driver cannot
+        // overflow through a long input. `1 or 1=1 ` + padding parses trivially but
+        // is over the cap.
+        let long = format!("1 or 1=1 {}", "a".repeat(AST_MAX_INPUT_BYTES));
+        assert!(long.len() > AST_MAX_INPUT_BYTES);
+        assert!(!ast_structural_depth_ok(&long), "over-length input must be declined");
+        assert!(ast_fire(&long).is_none(), "over-length input must not fire");
+        // Exactly at the cap with trivial depth is still admitted.
+        let at_cap = format!("1 or 1=1{}", " ".repeat(AST_MAX_INPUT_BYTES - "1 or 1=1".len()));
+        assert_eq!(at_cap.len(), AST_MAX_INPUT_BYTES);
+        assert!(ast_structural_depth_ok(&at_cap));
+    }
+
+    #[test]
+    fn ast_parse_error_is_fail_safe_not_a_hit() {
+        // Garbage / broken SQL that does not parse to an injection structure must
+        // not be reported as an attack (a parse failure is not, by itself,
+        // evidence) — and must never panic.
+        for weird in [
+            "select from where",
+            "union union union",
+            "' or or or",
+            "'''",
+            "; ; ;",
+            "/*/*/*",
+            "select select select",
+        ] {
+            assert!(
+                ast_fire(weird).is_none(),
+                "malformed SQL must not be reported as an AST injection: {weird:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ast_budget_exhaustion_stops_parsing() {
+        // Once the AST-attempt budget is spent, further parses are skipped (degraded)
+        // — the detector must not exceed `max_ast_attempts_per_request`.
+        use crate::checks::content_security::budget::Budget;
+        let det = AstSqlDetector::new();
+        let req = throwaway_req();
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let mut st = ContentInspectionState::new(Budget {
+            max_ast_attempts_per_request: 1,
+            ..Budget::default()
+        });
+        // First injection spends the single numeric attempt and hits — budget now 0,
+        // not yet degraded (the attempt was within budget).
+        assert!(det.detect(&view("1 union select 1"), &pctx, &mut st).is_some());
+        assert!(!st.is_degraded());
+        // The next injection cannot take an attempt → no parse, no signal, degraded.
+        assert!(det.detect(&view("1;drop table y"), &pctx, &mut st).is_none());
+        assert!(st.is_degraded());
     }
 }
