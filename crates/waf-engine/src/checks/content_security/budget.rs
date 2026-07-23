@@ -83,6 +83,20 @@ pub struct ContentInspectionState {
     /// Telemetry: number of Lane 2 evaluations performed on this request
     /// (per-phase). Used for the observation/pipeline counters (plan §3.4).
     semantic_evaluations: u32,
+    /// Per-view scratch channel for the two-detector XSS corroboration (P-XSS-2).
+    ///
+    /// The XSS DOM detector — which already HTML-parses each view exactly once —
+    /// stashes the JS **execution contexts** it extracted from that single parse
+    /// (event-handler attribute values + `javascript:` / `vbscript:` URL script
+    /// bodies) here; the lightweight [`super::xss_js::XssJsTokenDetector`],
+    /// registered immediately after it, drains them and classifies dangerous JS
+    /// tokens. The token detector therefore never parses HTML itself — no second
+    /// parse, no extra parse budget — and it inspects only genuinely-parsed
+    /// attributes (never a text node), so `element.onerror = eval(x)` prose or
+    /// `<textarea>`/`<template>` inert content never reaches it. The DOM detector
+    /// overwrites this on every view it inspects (with the extracted values, or an
+    /// empty vec), so a previous view's contexts can never leak forward.
+    xss_js_contexts: Vec<String>,
 }
 
 impl Default for ContentInspectionState {
@@ -104,6 +118,7 @@ impl ContentInspectionState {
             preprocess_output_bytes_used: 0,
             degraded: false,
             semantic_evaluations: 0,
+            xss_js_contexts: Vec::new(),
         }
     }
 
@@ -134,6 +149,22 @@ impl ContentInspectionState {
     #[must_use]
     pub const fn semantic_evaluations(&self) -> u32 {
         self.semantic_evaluations
+    }
+
+    /// Stash the JS execution contexts the XSS DOM detector extracted from the
+    /// **current view** (P-XSS-2). Called by the DOM detector on every view it
+    /// inspects — with the extracted event-handler / `javascript:`-URL bodies, or
+    /// an empty vec — so the token detector, which drains this immediately after,
+    /// can never read a previous view's contexts.
+    pub fn stash_xss_js_contexts(&mut self, contexts: Vec<String>) {
+        self.xss_js_contexts = contexts;
+    }
+
+    /// Drain the stashed XSS JS contexts, leaving the channel empty (P-XSS-2).
+    /// The token detector classifies dangerous JS tokens inside them.
+    #[must_use]
+    pub fn take_xss_js_contexts(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.xss_js_contexts)
     }
 
     /// Try to admit one more field in the current phase. Returns `false` (and

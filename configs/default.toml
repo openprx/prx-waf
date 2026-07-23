@@ -293,21 +293,51 @@ hard_veto_allowlist = []              # empty until holdout-calibrated (no singl
 [content_security.attacks.traversal.weights]
 traversal = 1.0                       # segment-aware traversal detector
 
-# XSS DOM (P-XSS-1) — HTML5-parser semantic detector. Upgrades XSS from the
-# frozen Lane 1 regex (kept, additive) to a WHATWG fragment parse: it fires only
-# on structures that REALLY parse into executable content — a `<script>` element,
-# an `on*=` handler on a genuinely-parsed element, a dangerous URL scheme
-# (`javascript:` / `data:text/html` / `vbscript:`) on a real URL attribute, or
-# `<svg onload>` / `<iframe srcdoc>` / `<object>`/`<embed>` / `<base href>`. Text
-# that merely contains the string `onclick=` or `<script` (bug comments, config
-# docs, Markdown, CSV, URL paths) parses to NO such element and stays clean —
-# that is the false-positive win over the Lane 1 regex. Runs on every decode view
+# XSS (P-XSS-1/2) — two-detector HTML5-semantic family. The DOM detector
+# (`xss_dom`, P-XSS-1) upgrades XSS from the frozen Lane 1 regex (kept, additive)
+# to a WHATWG fragment parse: it fires only on structures that REALLY parse into
+# executable content — a `<script>` element, an `on*=` handler on a genuinely-
+# parsed element, a dangerous URL scheme (`javascript:` / `data:text/html` /
+# `vbscript:`) on a real URL attribute, or `<svg onload>` / `<iframe srcdoc>`.
+# Text that merely contains `onclick=` or `<script` (bug comments, docs, CSV, URL
+# paths) parses to NO such element and stays clean — the false-positive win over
+# the Lane 1 regex. The JS-token detector (`xss_js`, P-XSS-2) is the second
+# detector: from that SAME single parse it classifies only ATTACK-SPECIFIC JS
+# tokens inside the parsed event-handler values and `javascript:` URL bodies —
+# credential/storage theft (document.cookie/document.domain/localStorage), dynamic
+# code execution (eval/execScript/import) and obfuscation decode
+# (atob/String.fromCharCode/unescape). It deliberately does NOT fire on the plain
+# JS a legitimate inline handler routinely carries (a bare fetch/XMLHttpRequest,
+# setTimeout, location navigation, .src= assignment, innerHTML write): those are
+# evidence of "this is JS", not of an attack. Narrowing to attack-specific verbs
+# is what keeps xss_js independent of xss_dom — a real handler trips the DOM
+# structure but not the token detector. Runs on every decode view
 # (base64/hex/entity), so encoded XSS surfaces too; blind-decoded hits are never
-# hard-veto-capable. Still shadow (log_only) — never blocks.
+# hard-veto-capable.
+#
+# Two detectors, equal contribution (Σ = 1.0), mirroring SQLi. A single detector
+# firing alone scores 0.5 × its confidence; the lowest default-on construct is
+# `xss.data_html_url` (conf 82 → 41) and every other default-on DOM/JS construct
+# is higher (event_handler 85 → 42.5, js_sink 85 → 42.5, iframe_srcdoc 85 → 42.5,
+# svg_onload 88 → 44, js_exfil 88 → 44, script_tag 90 → 45), so log_threshold = 40
+# keeps EVERY single default-on hit observable in shadow. Corroboration raises the
+# BLOCK bar: reaching 0.5·c_dom + 0.5·c_js ≥ 80 needs the DOM structure AND a JS
+# token on the same field, so no single detector can recommend Block —
+# e.g. `<img onerror=eval(document.cookie)>`. NOTE this is a higher Block bar, NOT
+# an independent-evidence guarantee for the mainstream XSS surface: a real inline
+# handler contains real JS, so DOM-structure and JS-value are correlated there —
+# the discrimination comes from xss_js only counting attack-specific actions
+# (above), not from the two signals being independent. A legitimate
+# `onclick="fetch('/api')"` therefore trips xss_dom alone (Log), not corroboration.
+# The Block bar still needs holdout calibration on real traffic before it can gate
+# enforcement; everything here is shadow (log_only) and never blocks. The noisy
+# `xss.object_embed` / `xss.base_href` DOM constructs ship DEFAULT-OFF (fire-drill
+# FP-4: legitimate media/PDF embeds and SPA `<base href>` hit them 3/3).
 [content_security.attacks.xss]
 enabled = true
 log_threshold = 40
 block_threshold = 80
 hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
 [content_security.attacks.xss.weights]
-xss_dom = 1.0                         # HTML5 DOM semantic detector (P-XSS-1)
+xss_dom = 0.5                         # HTML5 DOM semantic detector (P-XSS-1)
+xss_js = 0.5                          # lightweight JS-token detector (P-XSS-2)

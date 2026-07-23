@@ -105,6 +105,11 @@ pub enum DetectorId {
     Traversal,
     /// HTML5 DOM semantic XSS detector (P-XSS-1).
     XssDom,
+    /// Lightweight JS-token XSS detector (P-XSS-2) — the second `Xss`-family
+    /// detector, classifying dangerous JS tokens inside the event-handler /
+    /// `javascript:`-URL contexts the DOM detector extracts, for the 0.5/0.5
+    /// corroboration that gates a Block recommendation.
+    XssJs,
 }
 
 impl DetectorId {
@@ -117,6 +122,7 @@ impl DetectorId {
             Self::Rce => "rce",
             Self::Traversal => "traversal",
             Self::XssDom => "xss_dom",
+            Self::XssJs => "xss_js",
         }
     }
 
@@ -130,6 +136,7 @@ impl DetectorId {
             "rce" => Some(Self::Rce),
             "traversal" => Some(Self::Traversal),
             "xss_dom" => Some(Self::XssDom),
+            "xss_js" => Some(Self::XssJs),
             _ => None,
         }
     }

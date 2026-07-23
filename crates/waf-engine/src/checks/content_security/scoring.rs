@@ -140,10 +140,11 @@ const fn scope_ord(s: InspectionScope) -> u8 {
 
 /// Stable ordinal for [`DetectorId`], the tie-break used when two detectors in the
 /// **same** group contribute equally (codex P1c §3.1). P2 puts a second detector
-/// (`ast`) in the `SqlInjection` family, so `struct_rule` and `ast` can now fire on
-/// one field with an identical weighted contribution; without this the group's
-/// representative signal (`Group::best` → `primary_result`) would depend on
-/// `HashMap` iteration order. The numeric value is arbitrary but fixed.
+/// (`ast`) in the `SqlInjection` family and P-XSS-2 a second (`xss_js`) in the
+/// `Xss` family, so two detectors can fire on one field with an identical weighted
+/// contribution; without this the group's representative signal (`Group::best` →
+/// `primary_result`) would depend on `HashMap` iteration order. The numeric value
+/// is arbitrary but fixed.
 const fn detector_ord(d: DetectorId) -> u8 {
     match d {
         DetectorId::StructRule => 0,
@@ -151,6 +152,7 @@ const fn detector_ord(d: DetectorId) -> u8 {
         DetectorId::Rce => 2,
         DetectorId::Traversal => 3,
         DetectorId::XssDom => 4,
+        DetectorId::XssJs => 5,
     }
 }
 
@@ -494,6 +496,128 @@ mod tests {
             SemanticAction::None,
             "at log_threshold 40 the single hit produced no observation (the regression this fixes)"
         );
+    }
+
+    fn shipped_xss_cfg(log_t: u8) -> RuntimeScoringConfig {
+        // Mirror the SHIPPED xss weights (xss_dom/xss_js 0.5 each, P-XSS-2).
+        let mut weights = HashMap::new();
+        weights.insert(DetectorId::XssDom, 0.5);
+        weights.insert(DetectorId::XssJs, 0.5);
+        let mut attacks = HashMap::new();
+        attacks.insert(
+            AttackKind::Xss,
+            RuntimeAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: log_t,
+                block_threshold: 80,
+                hard_veto_allowlist: std::collections::HashSet::new(),
+            },
+        );
+        RuntimeScoringConfig { attacks }
+    }
+
+    #[test]
+    fn xss_two_detector_corroboration_single_log_both_block() {
+        // P-XSS-2 (mirrors the SQLi corroboration): a lone XSS detector on a field
+        // scores 0.5 × conf → Log; the DOM structure AND the JS token together on
+        // the SAME field reach the Block threshold. Shadow still downgrades, but the
+        // recommendation itself is the corroboration signal under test.
+        let dom_only = [sig(
+            AttackKind::Xss,
+            DetectorId::XssDom,
+            "body",
+            85,
+            "xss.event_handler",
+            Provenance::Raw,
+        )];
+        let v = score(&dom_only, &shipped_xss_cfg(40), false);
+        assert_eq!(v.request_score, 43, "0.5 × 85 = 42.5 → 43");
+        assert_eq!(
+            v.recommendation,
+            SemanticAction::Log,
+            "a lone DOM structural hit stays at Log (no corroboration)"
+        );
+
+        let js_only = [sig(
+            AttackKind::Xss,
+            DetectorId::XssJs,
+            "body",
+            85,
+            "xss.js_sink",
+            Provenance::Raw,
+        )];
+        let v = score(&js_only, &shipped_xss_cfg(40), false);
+        assert_eq!(
+            v.recommendation,
+            SemanticAction::Log,
+            "a lone JS-token hit stays at Log (no corroboration)"
+        );
+
+        // Both detectors on the same field → 0.5·85 + 0.5·85 = 85 ≥ 80 → Block.
+        let corroborated = [
+            sig(
+                AttackKind::Xss,
+                DetectorId::XssDom,
+                "body",
+                85,
+                "xss.event_handler",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Xss,
+                DetectorId::XssJs,
+                "body",
+                85,
+                "xss.js_sink",
+                Provenance::Raw,
+            ),
+        ];
+        let v = score(&corroborated, &shipped_xss_cfg(40), false);
+        assert_eq!(v.request_score, 85, "0.5·85 + 0.5·85 = 85");
+        assert_eq!(
+            v.recommendation,
+            SemanticAction::Block,
+            "DOM structure + JS token corroborate → Block recommendation"
+        );
+        // Deterministic within-group representative: equal contribution breaks on
+        // detector_ord (XssDom = 4 < XssJs = 5), so the DOM structural signal is the
+        // group's primary.
+        assert_eq!(
+            v.primary_result.and_then(|r| r.rule_id).as_deref(),
+            Some("xss.event_handler"),
+            "equal-contribution tie-break picks the smaller detector_ord (xss_dom)"
+        );
+    }
+
+    #[test]
+    fn single_xss_default_on_construct_stays_observable_at_log_40() {
+        // Threshold audit (P-XSS-2): every default-on construct's lone 0.5 × conf
+        // must stay ≥ the shipped log_threshold (40) so shadow still observes it.
+        // The lowest default-on construct is `xss.data_html_url` (conf 82 → 41).
+        for (conf, rule, det) in [
+            (82u8, "xss.data_html_url", DetectorId::XssDom),
+            (85, "xss.event_handler", DetectorId::XssDom),
+            (85, "xss.js_url", DetectorId::XssDom),
+            (85, "xss.iframe_srcdoc", DetectorId::XssDom),
+            (88, "xss.svg_onload", DetectorId::XssDom),
+            (90, "xss.script_tag", DetectorId::XssDom),
+            (85, "xss.js_sink", DetectorId::XssJs),
+            (88, "xss.js_exfil", DetectorId::XssJs),
+        ] {
+            let hit = [sig(AttackKind::Xss, det, "body", conf, rule, Provenance::Raw)];
+            let v = score(&hit, &shipped_xss_cfg(40), false);
+            assert_eq!(
+                v.recommendation,
+                SemanticAction::Log,
+                "single default-on {rule} (0.5 × {conf}) must stay observable at log 40, got score {}",
+                v.request_score
+            );
+            assert!(
+                v.request_score < 80,
+                "and must be below Block (single detector never blocks)"
+            );
+        }
     }
 
     #[test]

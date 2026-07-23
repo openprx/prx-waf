@@ -19,9 +19,23 @@
 //!   exactly what a browser's URL parser strips, so an internal space keeps
 //!   `java script:` inert) on a real URL attribute (`href` / `src` / `action` /
 //!   `formaction`);
-//! * `<iframe srcdoc>`, `<object>`/`<embed>`, `<base href>`;
+//! * `<iframe srcdoc>` (and, default-off since P-XSS-2, `<object>`/`<embed>` /
+//!   `<base href>` — see [`scan_element`]);
 //! * a `<body>` / `<frameset>` / `<html>` start-tag event handler, recovered by a
 //!   budgeted document reparse the body-context fragment parse would drop (FN-1).
+//!
+//! **P-XSS-2.** Alongside the strongest structural construct, the same single
+//! parse also extracts the JS **execution contexts** (event-handler attribute
+//! values + `javascript:`/`vbscript:` URL script bodies) and stashes them in
+//! [`ContentInspectionState`] for the second `Xss`-family detector
+//! ([`super::xss_js::XssJsTokenDetector`]) — so a Block recommendation needs both
+//! the DOM structure AND a dangerous JS token (0.5/0.5 corroboration), while a
+//! lone structural hit stays at Log. `<template>` content is skipped (FP-5,
+//! inert) and the noisy `<object>`/`<embed>`/`<base href>` constructs are
+//! default-off (FP-4). Rawtext elements (`<textarea>`/`<title>`/`<style>`/
+//! `<script>` content) need no special handling — html5ever already parses their
+//! body as text, so no dangerous element or attribute is ever produced there
+//! (the fire-drill's `<textarea>` probe was clean by construction).
 //!
 //! Like the other detectors it returns a **context-free** [`DetectionFinding`];
 //! the pipeline ([`View::to_signal`](super::preprocess::View::to_signal)) stamps
@@ -287,26 +301,68 @@ fn keep_stronger(best: &mut Option<(&'static str, u8)>, cand: (&'static str, u8)
     }
 }
 
-/// Scan one parsed element for the strongest dangerous construct it introduces.
+/// Extract the JS script body of a `javascript:` / `vbscript:` URL value — the
+/// text after the scheme, with tab/CR/LF stripped and leading control/space
+/// trimmed exactly as [`dangerous_scheme`] normalises it, but with the original
+/// **case preserved** (a JS token like `String.fromCharCode` / `atob` is
+/// case-significant). Returns `None` for a non-JS scheme (e.g. `data:text/html`,
+/// whose body is HTML, not JS). The token detector ([`super::xss_js`])
+/// classifies dangerous tokens inside the returned body.
+fn js_url_body(value: &str) -> Option<String> {
+    let mut norm = String::with_capacity(value.len());
+    for c in value.chars() {
+        if c == '\t' || c == '\n' || c == '\r' {
+            continue;
+        }
+        norm.push(c);
+    }
+    let trimmed = norm.trim_start_matches(|c: char| c == ' ' || c.is_control());
+    let lower = trimmed.to_ascii_lowercase();
+    for scheme in ["javascript:", "vbscript:"] {
+        if lower.starts_with(scheme) {
+            // `scheme` is ASCII, so its byte length is the same in `trimmed`.
+            return trimmed.get(scheme.len()..).map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Scan one parsed element for the strongest dangerous construct it introduces,
+/// and (P-XSS-2) collect the JS **execution contexts** it exposes — event-handler
+/// attribute values and `javascript:` / `vbscript:` URL script bodies — into
+/// `js_contexts` for the token detector to corroborate.
 ///
 /// Every branch fires only on a **real parsed element / attribute** — the whole
 /// point of the DOM upgrade. Event handlers are matched against the
 /// [`EVENT_HANDLERS`] allowlist (not a bare `on` prefix); the URL-scheme branches
 /// run only on the curated [`URL_ATTRS`] set.
-fn scan_element(el: &Element) -> Option<(&'static str, u8)> {
+///
+/// `include_weak` gates the P-XSS-2 default-off constructs: `<object>`/`<embed>`
+/// and `<base href>` fired unconditionally at confidence 80 in P-XSS-1, but the
+/// fire-drill showed legitimate PDF/media embeds and SPA `<base href="/app/">`
+/// hit them 3/3 (`report/prx-waf-pxss-fire-drill-2026-07-23.md` §4.3). Per the
+/// "default-on 只留低误报" discipline they now ship **default-off** (only under the
+/// test/future all-constructs set), leaving corroboration to demote any residual
+/// hit — they carry no JS sink, so the token detector never corroborates them and
+/// a lone structural hit stays at Log.
+fn scan_element(el: &Element, include_weak: bool, js_contexts: &mut Vec<String>) -> Option<(&'static str, u8)> {
     let name = el.name(); // html5ever lowercases HTML local names
     let mut best: Option<(&'static str, u8)> = None;
 
     match name {
         "script" => keep_stronger(&mut best, ("xss.script_tag", 90)),
-        "object" | "embed" => keep_stronger(&mut best, ("xss.object_embed", 80)),
-        "base" if el.attr("href").is_some() => keep_stronger(&mut best, ("xss.base_href", 80)),
+        // FP-4 (P-XSS-2): default-off — legitimate media/PDF embeds and SPA
+        // `<base href>` hit these unconditionally.
+        "object" | "embed" if include_weak => keep_stronger(&mut best, ("xss.object_embed", 80)),
+        "base" if include_weak && el.attr("href").is_some() => keep_stronger(&mut best, ("xss.base_href", 80)),
         "iframe" if el.attr("srcdoc").is_some() => keep_stronger(&mut best, ("xss.iframe_srcdoc", 85)),
         _ => {}
     }
 
     for (attr, value) in el.attrs() {
         if is_event_handler(attr) {
+            // P-XSS-2: the handler's VALUE is a JS execution context.
+            js_contexts.push(value.to_string());
             if name == "svg" && attr == "onload" {
                 keep_stronger(&mut best, ("xss.svg_onload", 88));
             } else {
@@ -316,6 +372,11 @@ fn scan_element(el: &Element) -> Option<(&'static str, u8)> {
         if URL_ATTRS.contains(&attr)
             && let Some(cand) = dangerous_scheme(value)
         {
+            // P-XSS-2: a `javascript:` / `vbscript:` URL's script body is a JS
+            // execution context (a `data:text/html` URL is HTML, not JS → `None`).
+            if let Some(body) = js_url_body(value) {
+                js_contexts.push(body);
+            }
             keep_stronger(&mut best, cand);
         }
     }
@@ -391,20 +452,59 @@ impl XssDomDetector {
         Self { include_weak: true }
     }
 
-    /// Walk a parsed fragment and return the strongest default-on construct.
-    fn scan_fragment(html: &Html) -> Option<(&'static str, u8)> {
+    /// Walk a parsed fragment and return the strongest default-on construct,
+    /// collecting the JS execution contexts (P-XSS-2) into `js_contexts`.
+    ///
+    /// `check_template` (set only when the input actually contains a `<template`
+    /// tag) turns on the FP-5 ancestor check: `<template>` **content** is inert —
+    /// it is cloned into a document fragment and never parsed/executed in place —
+    /// so a `<script>` / `on*=` inside a template must NOT fire (fire-drill §4.9).
+    /// The ancestor walk is O(depth) per node, so it is gated behind the cheap
+    /// `check_template` flag to keep the common (no-template) walk O(n).
+    fn scan_fragment(
+        html: &Html,
+        include_weak: bool,
+        check_template: bool,
+        js_contexts: &mut Vec<String>,
+    ) -> Option<(&'static str, u8)> {
         let mut best: Option<(&'static str, u8)> = None;
-        // Arena-order value iteration — non-recursive, so a deeply-nested tree is
+        // Arena-order node iteration — non-recursive, so a deeply-nested tree is
         // walked (and later dropped) in O(n) without stack growth.
-        for node in html.tree.values() {
-            if let Some(el) = node.as_element()
-                && let Some(cand) = scan_element(el)
+        for node in html.tree.nodes() {
+            let Some(el) = node.value().as_element() else {
+                continue;
+            };
+            // FP-5: skip anything inside a `<template>` (inert template content).
+            if check_template
+                && node
+                    .ancestors()
+                    .any(|a| a.value().as_element().is_some_and(|e| e.name() == "template"))
             {
+                continue;
+            }
+            if let Some(cand) = scan_element(el, include_weak, js_contexts) {
                 keep_stronger(&mut best, cand);
             }
         }
         best
     }
+}
+
+/// Does the input contain a literal `<template` start-tag (case-insensitive)? A
+/// cheap over-approximate gate that turns on the FP-5 template-content ancestor
+/// check in [`XssDomDetector::scan_fragment`] only when a template is actually
+/// present, keeping the hot no-template path O(n).
+fn contains_template_tag(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'<'
+            && let Some(head) = bytes.get(i + 1..i + 9)
+            && head.eq_ignore_ascii_case(b"template")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl Default for XssDomDetector {
@@ -427,6 +527,10 @@ impl SemanticDetector for XssDomDetector {
         // Parse the REAL view text, not `lower_trunc` (which collapses whitespace
         // and truncates tokens — that would mangle the HTML).
         let text = view.text.as_ref();
+        // P-XSS-2: reset the corroboration channel for THIS view up front, before
+        // any early return, so a previous view's JS contexts can never leak to the
+        // token detector (which drains this immediately after us).
+        state.stash_xss_js_contexts(Vec::new());
         // Cheap gate: no tag-open → no element → clean. Skips the parser + budget.
         if !looks_like_markup(text) {
             return None;
@@ -446,8 +550,15 @@ impl SemanticDetector for XssDomDetector {
             return None;
         }
 
+        let check_template = contains_template_tag(text);
+        // P-XSS-2: JS execution contexts extracted during the parse walk, stashed
+        // for the token detector to corroborate (event-handler values + js-url
+        // script bodies). Collected even when no construct fires so the token
+        // detector can still classify (a benign handler value simply carries no
+        // dangerous token).
+        let mut js_contexts: Vec<String> = Vec::new();
         let html = Html::parse_fragment(text);
-        let mut best = Self::scan_fragment(&html);
+        let mut best = Self::scan_fragment(&html, self.include_weak, check_template, &mut js_contexts);
         // FN-1: the body-context fragment parse drops `<body>`/`<frameset>`
         // start-tag event handlers (asymmetric with `<html>`, which it keeps).
         // When one of those hosts is present, a full document parse — which merges
@@ -457,10 +568,19 @@ impl SemanticDetector for XssDomDetector {
         if hosts_document_level_element(text)
             && state.try_take_html_parse_attempt()
             && state.try_take_html_parse_input_bytes(text.len())
-            && let Some(cand) = Self::scan_fragment(&Html::parse_document(text))
+            && let Some(cand) = Self::scan_fragment(
+                &Html::parse_document(text),
+                self.include_weak,
+                check_template,
+                &mut js_contexts,
+            )
         {
             keep_stronger(&mut best, cand);
         }
+        // Hand the extracted JS contexts to the token detector (P-XSS-2). Done
+        // before the weak-signal fallback: `dangling_open_tag` is text-level and
+        // exposes no parsed attribute, so it contributes no JS context.
+        state.stash_xss_js_contexts(js_contexts);
         if best.is_none() && self.include_weak {
             best = dangling_open_tag(text);
         }
@@ -605,20 +725,66 @@ mod tests {
     }
 
     #[test]
-    fn object_embed_and_base_href_fire() {
+    fn object_embed_and_base_href_are_default_off_but_fire_with_all_constructs() {
+        // FP-4 (P-XSS-2): legitimate media/PDF embeds and SPA `<base href>` hit
+        // these 3/3 in the fire-drill, so they ship DEFAULT-OFF and stay clean on
+        // the production set…
+        for benign in [
+            "<object data=evil.swf></object>",
+            "<embed src=evil.swf>",
+            "<base href=\"http://evil.example/\">",
+        ] {
+            assert!(
+                fire(benign).is_none(),
+                "object/embed/base_href must be default-off (FP-4): {benign:?}"
+            );
+        }
+        // …but still fire under the test/future all-constructs set.
         assert_eq!(
-            fire("<object data=evil.swf></object>").expect("object fires").rule_key,
+            run(
+                &XssDomDetector::with_all_constructs(),
+                "<object data=evil.swf></object>"
+            )
+            .expect("object fires with all constructs")
+            .rule_key,
             "xss.object_embed"
         );
         assert_eq!(
-            fire("<embed src=evil.swf>").expect("embed fires").rule_key,
-            "xss.object_embed"
-        );
-        assert_eq!(
-            fire("<base href=\"http://evil.example/\">")
-                .expect("base href fires")
+            run(&XssDomDetector::with_all_constructs(), "<embed src=evil.swf>")
+                .expect("embed fires with all constructs")
                 .rule_key,
+            "xss.object_embed"
+        );
+        assert_eq!(
+            run(
+                &XssDomDetector::with_all_constructs(),
+                "<base href=\"http://evil.example/\">"
+            )
+            .expect("base href fires with all constructs")
+            .rule_key,
             "xss.base_href"
+        );
+    }
+
+    #[test]
+    fn template_inert_content_is_clean() {
+        // FP-5 (P-XSS-2): `<template>` content is cloned into a document fragment
+        // and never parsed/executed in place, so a `<script>` / `on*=` inside a
+        // template must NOT fire (fire-drill §4.9). The same construct OUTSIDE a
+        // template still fires (control), proving it is the template gate, not the
+        // pre-filter, doing the work.
+        for inert in [
+            "<template><script>alert(1)</script></template>",
+            "<template><img src=x onerror=alert(1)></template>",
+            "<template><svg onload=alert(1)></template>",
+            "<div><template><a href=\"javascript:alert(1)\">x</a></template></div>",
+        ] {
+            assert!(fire(inert).is_none(), "template content is inert: {inert:?}");
+        }
+        // Control: the SAME script, not wrapped in a template, still fires.
+        assert_eq!(
+            fire("<script>alert(1)</script>").expect("bare script fires").rule_key,
+            "xss.script_tag"
         );
     }
 

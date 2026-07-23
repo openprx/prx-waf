@@ -37,6 +37,7 @@ pub mod preprocess;
 pub mod scoring;
 pub mod types;
 pub mod xss_dom;
+pub mod xss_js;
 
 use std::time::Instant;
 
@@ -57,6 +58,7 @@ pub use types::{
     SemanticVerdict,
 };
 pub use xss_dom::XssDomDetector;
+pub use xss_js::XssJsTokenDetector;
 
 /// Outcome of a content-security evaluation, carrying the verdict's source so
 /// the engine can dispatch it correctly (plan §3.2).
@@ -90,8 +92,8 @@ pub struct ContentSecuritySubsystem {
     /// Compiled, immutable Lane 2 config (default = lane off).
     config: RuntimeContentSecurityConfig,
     /// Lane 2 semantic detectors: the structural + AST `SQLi` detectors, the
-    /// RCE / Traversal detectors and the XSS DOM detector; tests may push
-    /// additional mocks.
+    /// RCE / Traversal detectors and the XSS DOM + JS-token detectors (P-XSS-2,
+    /// 0.5/0.5 corroboration); tests may push additional mocks.
     detectors: Vec<Box<dyn SemanticDetector>>,
     /// Runtime anomaly-rate breaker state (never persisted; restart resets it).
     breaker: Mutex<CircuitBreaker>,
@@ -132,12 +134,18 @@ impl ContentSecuritySubsystem {
         // the `ast` weight); with the lane off
         // (`config.enabled == false`) `evaluate_scoped` short-circuits before any
         // detector runs, so the zero-config install still does zero Lane 2 work.
+        // NOTE (P-XSS-2): the XSS token detector MUST be registered immediately
+        // after the XSS DOM detector — the DOM detector's single HTML parse stashes
+        // the JS execution contexts that the token detector drains for the 0.5/0.5
+        // corroboration (see `xss_dom` / `xss_js`). The DOM detector overwrites the
+        // stash on every view, so no earlier view can leak forward.
         let detectors: Vec<Box<dyn SemanticDetector>> = vec![
             Box::new(detectors::StructuralSqlDetector::new()),
             Box::new(detectors::AstSqlDetector::new()),
             Box::new(detectors::RceStructuralDetector::new()),
             Box::new(detectors::TraversalStructuralDetector::new()),
             Box::new(xss_dom::XssDomDetector::new()),
+            Box::new(xss_js::XssJsTokenDetector::new()),
         ];
         Self {
             legacy_checkers,
@@ -1220,6 +1228,117 @@ mod tests {
             sub.resolve_action(verdict.recommendation),
             SemanticAction::Block,
             "shadow (log_only) never blocks the base64-wrapped body onload"
+        );
+    }
+
+    /// Build an enabled `log_only` runtime config for the shipped two-detector XSS
+    /// family (`xss_dom`/`xss_js` weighted 0.5/0.5, P-XSS-2).
+    fn xss_corroboration_rt() -> RuntimeContentSecurityConfig {
+        let mut weights = BTreeMap::new();
+        weights.insert("xss_dom".to_string(), 0.5);
+        weights.insert("xss_js".to_string(), 0.5);
+        let mut attacks = BTreeMap::new();
+        attacks.insert(
+            "xss".to_string(),
+            SemanticAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: Vec::new(),
+            },
+        );
+        let cfg = ContentSecurityConfig {
+            enabled: true,
+            enforcement_mode: "log_only".to_string(),
+            attacks,
+            ..ContentSecurityConfig::default()
+        };
+        RuntimeContentSecurityConfig::compile(&cfg).expect("valid")
+    }
+
+    #[test]
+    fn xss_dom_js_corroboration_blocks_but_shadow_downgrades() {
+        // P-XSS-2 end-to-end: a base64-wrapped `<svg onload=eval(document.cookie)>` —
+        // invisible to Lane 1 — surfaces BOTH XSS signals on the same BlindDecoded view
+        // via the real pipeline: `xss_dom` (svg_onload structure) + `xss_js`
+        // (`document.cookie` exfil — a genuine credential-theft action, not merely
+        // "this is JS"). Their 0.5/0.5 sum reaches the Block threshold, yet shadow
+        // (log_only) downgrades the effective action to Log.
+        use base64::Engine as _;
+        let sub = ContentSecuritySubsystem::with_config(xss_corroboration_rt());
+        // STANDARD base64 of `<svg onload=eval(document.cookie)>` has no `+`/`/` (a `+`
+        // would url-decode to a space and corrupt the token before the blind decoder).
+        let payload = base64::engine::general_purpose::STANDARD.encode("<svg onload=eval(document.cookie)>");
+        let mut req = ctx();
+        req.body_preview = Bytes::from(format!("q={payload}"));
+        req.content_length = req.body_preview.len() as u64;
+        let mut st = ContentInspectionState::default();
+        let verdict = match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => v,
+            other => panic!("Lane 1 must stay clean → Semantic, got {other:?}"),
+        };
+        // Both detectors corroborate on the same field.
+        let dom = verdict
+            .signals
+            .iter()
+            .find(|s| s.detector == DetectorId::XssDom && s.attack == AttackKind::Xss)
+            .expect("xss_dom must fire (svg onload structure)");
+        let js = verdict
+            .signals
+            .iter()
+            .find(|s| s.detector == DetectorId::XssJs && s.attack == AttackKind::Xss)
+            .expect("xss_js must corroborate (eval sink in the handler value)");
+        assert_eq!(dom.rule_key, "xss.svg_onload");
+        assert_eq!(js.rule_key, "xss.js_exfil");
+        assert_eq!(dom.field, js.field, "both signals land on the SAME field");
+        assert_eq!(
+            verdict.recommendation,
+            SemanticAction::Block,
+            "0.5·88 + 0.5·88 = 88 ≥ block threshold 80 → Block recommendation"
+        );
+        // Shadow-not-block red line: a corroborated Block is still downgraded to Log.
+        assert_eq!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Log,
+            "shadow (log_only) downgrades even a corroborated XSS Block to Log"
+        );
+    }
+
+    #[test]
+    fn xss_single_detector_only_logs_through_pipeline() {
+        // A base64-wrapped `<svg onload=setTimeout(f,9)>` — a REAL handler running
+        // genuine JS, but a *benign* timer, not an attack-specific action. Under the
+        // old wide token table `setTimeout` fired `xss_js` and corroborated this legit
+        // handler to Block; after the narrowing `xss_js` stays silent, so only `xss_dom`
+        // (structure) fires. Its lone 0.5 × 88 = 44 stays at Log, never Block —
+        // corroboration is reserved for genuinely attack-specific JS.
+        use base64::Engine as _;
+        let sub = ContentSecuritySubsystem::with_config(xss_corroboration_rt());
+        let payload = base64::engine::general_purpose::STANDARD.encode("<svg onload=setTimeout(f,9)>");
+        let mut req = ctx();
+        req.body_preview = Bytes::from(format!("q={payload}"));
+        req.content_length = req.body_preview.len() as u64;
+        let mut st = ContentInspectionState::default();
+        let verdict = match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => v,
+            other => panic!("Lane 1 must stay clean → Semantic, got {other:?}"),
+        };
+        assert!(
+            verdict
+                .signals
+                .iter()
+                .any(|s| s.detector == DetectorId::XssDom && s.attack == AttackKind::Xss),
+            "xss_dom fires on the svg onload structure"
+        );
+        assert!(
+            !verdict.signals.iter().any(|s| s.detector == DetectorId::XssJs),
+            "xss_js must NOT fire — `setTimeout` is a benign timer, not an attack-specific token"
+        );
+        assert_eq!(
+            verdict.recommendation,
+            SemanticAction::Log,
+            "a lone structural hit (0.5 × 88 = 44) stays at Log, never Block"
         );
     }
 
