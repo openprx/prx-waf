@@ -15,19 +15,22 @@
 //! phase-limited [`preprocess::semantic_preprocessor`] → detectors → the closed
 //! [`scoring::score`] model, returning [`ContentVerdict::Semantic`].
 //!
-//! **P1b registers the first production detector**
-//! ([`detectors::StructuralSqlDetector`], `SQLi` family). It only contributes to
-//! scoring when the `SQLi` family is enabled + weighted, and the lane as a whole
-//! is still **shadow-only**: the default `enforcement_mode = log_only` means a
-//! match is at most a `LogOnly` security event + a persisted observation,
-//! **never** a Block. The engine-facing [`Self::resolve_action`] caps `enforce`
-//! at `Log` in P1b (enforce is EXACTLY `log_only`). The block-capable
-//! canary/breaker/warmup machinery lives in the isolated **next-stage**
-//! [`Self::resolve_enforced_action`], which is implemented and unit-tested but
-//! **deliberately not wired to the engine block path** (nor reachable from P1b
-//! production config) until holdout calibration exists — so the action-level
-//! shadow guarantee holds: enabling the `SQLi` detector cannot change the final
-//! action versus a Lane-2-off engine (codex A-2).
+//! The five attack families ship enabled but **shadow-only** by default: the
+//! shipped `enforcement_mode = log_only` (and the empty per-family
+//! `enforcement_overrides`) means a match is at most a `LogOnly` security event +
+//! a persisted observation, **never** a Block.
+//!
+//! **E0 wires the block-capable enforce path.** The engine dispatch now calls the
+//! block-capable [`Self::resolve_enforced_action`] (not the P1b log-cap
+//! [`Self::resolve_action`], which is retained for its shadow tests). That
+//! resolver only returns `Block` when the effective per-family mode is `enforce`
+//! AND all four shadow guardrails pass (restart warmup latch → canary bucket →
+//! circuit breaker → host `log_only_mode`) AND the A2 blind guard holds (a
+//! blind/synthetic-only Block is downgraded to shadow `Log`). With the shipped
+//! `log_only` posture it can only ever return `Log`/`None`, so enabling a detector
+//! still cannot change the final action versus a Lane-2-off engine — the
+//! zero-behaviour-change guarantee. `enforce` is opt-in per the global
+//! `enforcement_mode` or a per-family `enforcement_overrides` entry.
 
 pub mod budget;
 pub mod canary;
@@ -243,21 +246,15 @@ impl ContentSecuritySubsystem {
         now.duration_since(self.created_at) >= self.config.breaker.window
     }
 
-    /// Resolve a Lane 2 recommendation into the **P1b effective action** — the
-    /// engine-facing resolver (codex A-2).
+    /// The P1b log-capping resolver — a `Block`-incapable projection kept for its
+    /// shadow unit tests (it maps `off` → `None`, and both `log_only` **and**
+    /// `enforce` → `Log`).
     ///
-    /// This is the single resolver that P1b production config can reach, and it
-    /// can **never** Block: `off` produces `None`, and both `log_only` **and**
-    /// `enforce` cap the effective action at `Log`. `enforce` is therefore
-    /// EXACTLY `log_only` in P1b — matching the config docs / startup WARN — so a
-    /// future engine wiring of *this* method cannot silently break the
-    /// shadow-not-block red line.
-    ///
-    /// The block-capable canary/breaker/warmup machinery lives in the
-    /// deliberately isolated, **not-yet-wired** [`Self::resolve_enforced_action`]
-    /// (a next-stage API that P1b production config does not select and the engine
-    /// does not call); it stays unit-tested so the plumbing is proven, but it is
-    /// no longer reachable as "the resolver".
+    /// **Superseded by [`Self::resolve_enforced_action`] on the engine path (E0):**
+    /// the engine dispatch no longer calls this. It remains as a compact witness
+    /// that a Lane 2 recommendation is never a Block absent the full enforce
+    /// machinery, so the many `real_*_detector_fires_but_shadow_never_blocks` tests
+    /// still assert the shadow guarantee against a single, side-effect-free helper.
     #[must_use]
     pub fn resolve_action(&self, rec: SemanticAction) -> SemanticAction {
         match self.config.enforcement_mode {
@@ -275,21 +272,46 @@ impl ContentSecuritySubsystem {
         }
     }
 
-    /// **Next-stage** enforcement resolver — the block-capable path (plan §13.3 /
-    /// §13.4 double log-only table). It applies the restart shadow latch, canary
-    /// bucketing, the circuit breaker and the host `log_only_mode` downgrade.
-    /// `now` is injected for deterministic testing.
+    /// The **effective** enforcement mode for a verdict's primary `family` (E0).
+    /// A per-family override (`enforcement_overrides`) wins over the global
+    /// [`RuntimeContentSecurityConfig::enforcement_mode`]; a family with no
+    /// override (or `None`, i.e. no primary) inherits the global mode. The shipped
+    /// empty override map therefore reproduces the pure-global posture exactly.
+    #[must_use]
+    fn effective_enforcement_mode(&self, family: Option<AttackKind>) -> EnforcementMode {
+        family
+            .and_then(|f| self.config.enforcement_overrides.get(&f).copied())
+            .unwrap_or(self.config.enforcement_mode)
+    }
+
+    /// The block-capable enforcement resolver — **the resolver the engine dispatch
+    /// calls in E0** (plan §13.3 / §13.4 double log-only table). It resolves the
+    /// effective per-family mode, then applies the four shadow guardrails in order:
+    /// restart warmup latch → canary bucket → circuit breaker → host `log_only_mode`
+    /// downgrade, plus the A2 blind guard. `now` is injected for deterministic
+    /// testing.
     ///
-    /// **Deliberately NOT wired in P1b (codex A-2):** the engine dispatch never
-    /// calls this, and P1b production config cannot reach it — the engine-facing
-    /// [`Self::resolve_action`] is the only resolver on the P1b path and it caps
-    /// `enforce` at `Log`. This method retains the full machinery (and its unit
-    /// tests) so a future stage can enable enforcement once holdout calibration
-    /// authorises it, but it must not be connected to the block path until then.
+    /// Any of these holds a would-be `Block` to shadow `Log`:
+    /// * effective mode is `log_only` (or `off` → `None`);
+    /// * the restart warmup window has not elapsed since process start (codex A-4);
+    /// * the request's canary bucket is outside `rollout_bps`;
+    /// * the circuit breaker is open;
+    /// * the host is in `log_only_mode` (per-host total kill switch);
+    /// * **A2**: the Block is not `enforce_safe` — i.e. it is carried solely by
+    ///   blind/synthetic views (base64/hex/comment-strip/HPP/parse-error), which
+    ///   may never single-handedly enforce.
+    ///
+    /// Only when the effective mode is `enforce`, all four guardrails pass and the
+    /// Block is enforce-safe does it return `Block`. With the shipped `log_only`
+    /// posture (and empty overrides) it can only ever return `Log`/`None`, so the
+    /// engine dispatch is a no-op on the final action — the zero-behaviour-change
+    /// guarantee.
     #[must_use]
     pub fn resolve_enforced_action(
         &self,
         rec: SemanticAction,
+        family: Option<AttackKind>,
+        enforce_safe: bool,
         host_code: &str,
         request_key: &str,
         host_log_only: bool,
@@ -298,7 +320,7 @@ impl ContentSecuritySubsystem {
         if rec == SemanticAction::None {
             return SemanticAction::None;
         }
-        match self.config.enforcement_mode {
+        match self.effective_enforcement_mode(family) {
             EnforcementMode::Off => SemanticAction::None,
             // Shadow: at most log, never block.
             EnforcementMode::LogOnly => SemanticAction::Log,
@@ -324,7 +346,18 @@ impl ContentSecuritySubsystem {
                 if !allowed {
                     return SemanticAction::Log;
                 }
-                if host_log_only { SemanticAction::Log } else { rec }
+                if host_log_only {
+                    return SemanticAction::Log;
+                }
+                // A2 blind guard: a Block reached SOLELY through blind/synthetic
+                // views is held to shadow Log. blind provenance can never
+                // single-handedly enforce (it may not hard-veto either) — a
+                // base64/hex-wrapped payload the backend never parses raw must not
+                // auto-block on its own.
+                if rec == SemanticAction::Block && !enforce_safe {
+                    return SemanticAction::Log;
+                }
+                rec
             }
         }
     }
@@ -464,13 +497,15 @@ mod tests {
         assert_eq!(rec, SemanticAction::Block, "score 100 ≥ block threshold");
         // Past the restart warmup window (breaker.window default = 300s):
         // host log_only=false → Block; host log_only=true → downgraded to Log.
+        // family=None inherits the global (enforce) mode; enforce_safe=true (a
+        // real, non-blind primary) so the A2 guard does not intervene here.
         let warm = sub.created_at + Duration::from_secs(301);
         assert_eq!(
-            sub.resolve_enforced_action(rec, "h", "k", false, warm),
+            sub.resolve_enforced_action(rec, None, true, "h", "k", false, warm),
             SemanticAction::Block
         );
         assert_eq!(
-            sub.resolve_enforced_action(rec, "h", "k", true, warm),
+            sub.resolve_enforced_action(rec, None, true, "h", "k", true, warm),
             SemanticAction::Log
         );
         // But the P1b engine-facing resolver caps enforce at Log regardless.
@@ -493,7 +528,7 @@ mod tests {
         // Inside the warmup window → shadow Log.
         let cold = sub.created_at + Duration::from_secs(1);
         assert_eq!(
-            sub.resolve_enforced_action(SemanticAction::Block, "h", "k", false, cold),
+            sub.resolve_enforced_action(SemanticAction::Block, None, true, "h", "k", false, cold),
             SemanticAction::Log,
             "within the restart warmup window enforcement stays shadow"
         );
@@ -501,9 +536,84 @@ mod tests {
         // After the warmup window (breaker.window default 300s) → Block allowed.
         let warm = sub.created_at + Duration::from_secs(301);
         assert_eq!(
-            sub.resolve_enforced_action(SemanticAction::Block, "h", "k", false, warm),
+            sub.resolve_enforced_action(SemanticAction::Block, None, true, "h", "k", false, warm),
             SemanticAction::Block,
             "after the warmup window enforcement is permitted"
+        );
+    }
+
+    /// Global `log_only` config with a per-family `enforce` override on
+    /// `sql_injection` and a 100% canary — the E0 "operator turns on one family"
+    /// posture. `struct_rule` weighted 1.0.
+    fn per_family_enforce_sqli_rt() -> RuntimeContentSecurityConfig {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("sql_injection".to_string(), "enforce".to_string());
+        let cfg = ContentSecurityConfig {
+            rollout_bps: 10_000,
+            enforcement_overrides: overrides,
+            ..enabled_enforce_source() // global mode defaults to log_only
+        };
+        RuntimeContentSecurityConfig::compile(&cfg).expect("valid")
+    }
+
+    #[test]
+    fn per_family_override_enforces_only_the_named_family() {
+        // Global posture is log_only; only sql_injection is overridden to enforce.
+        let sub = ContentSecuritySubsystem::with_config(per_family_enforce_sqli_rt());
+        let warm = sub.created_at + Duration::from_secs(301);
+        // The overridden family blocks (warmed, 100% canary, enforce_safe, non
+        // host-log-only).
+        assert_eq!(
+            sub.resolve_enforced_action(
+                SemanticAction::Block,
+                Some(AttackKind::SqlInjection),
+                true,
+                "h",
+                "k",
+                false,
+                warm
+            ),
+            SemanticAction::Block,
+            "the sql_injection override switches that family to enforce"
+        );
+        // A family WITHOUT an override inherits the global log_only → shadow Log.
+        assert_eq!(
+            sub.resolve_enforced_action(
+                SemanticAction::Block,
+                Some(AttackKind::Rce),
+                true,
+                "h",
+                "k",
+                false,
+                warm
+            ),
+            SemanticAction::Log,
+            "an un-overridden family stays shadow under the global log_only"
+        );
+        // No primary family (None) also inherits the global log_only.
+        assert_eq!(
+            sub.resolve_enforced_action(SemanticAction::Block, None, true, "h", "k", false, warm),
+            SemanticAction::Log,
+            "no primary family → global log_only"
+        );
+    }
+
+    #[test]
+    fn enforce_blind_only_block_downgraded_to_log_but_observable_blocks() {
+        // A2 at the resolver: enforce + warmed + 100% canary + host not log_only.
+        // A blind-only Block (enforce_safe = false) is held to shadow Log; the same
+        // context with non-synthetic corroboration (enforce_safe = true) blocks.
+        let sub = ContentSecuritySubsystem::with_config(enabled_enforce_cfg());
+        let warm = sub.created_at + Duration::from_secs(301);
+        assert_eq!(
+            sub.resolve_enforced_action(SemanticAction::Block, None, false, "h", "k", false, warm),
+            SemanticAction::Log,
+            "a Block carried solely by blind/synthetic views must not enforce (A2)"
+        );
+        assert_eq!(
+            sub.resolve_enforced_action(SemanticAction::Block, None, true, "h", "k", false, warm),
+            SemanticAction::Block,
+            "the same context with a non-synthetic view enforces"
         );
     }
 

@@ -189,28 +189,54 @@ cors_origins = []
 # de-identified observation and NEVER blocks. Target-practice measured 0 false
 # positives and 100% detection on the bypass corpus, and every preprocessing /
 # detection step is bounded by the budget caps below, so shadow-on is a safe
-# default. Flip `enforcement_mode` to change the posture; note that `enforce`
-# is not wired in P1b (see the truth table below) so it still cannot block.
+# default. Flip `enforcement_mode` (or a per-family override, below) to change the
+# posture. The shipped `log_only` here is byte-for-byte identical to the pre-E0
+# behaviour — operators must opt in explicitly to enforce.
 #
 # enforcement_mode truth table (when `enabled = true`):
 #   off       → the lane does NO work: no detection, no LogOnly event, no
 #               `semantic_observations` row. Equivalent to `enabled = false`.
 #   log_only  → SHADOW: detect + log a LogOnly security event + persist a
 #               de-identified observation. NEVER a Block.
-#   enforce   → NOT WIRED in P1b. The block path is deliberately not connected to
-#               the scorer yet, so `enforce` behaves EXACTLY like `log_only`
-#               (detect + log + persist, never Block) and startup logs a WARN.
-#               Setting `enforce` today does NOT make the lane block traffic.
+#   enforce   → BLOCK-CAPABLE (E0). A Block is produced ONLY when ALL of these
+#               hold: the process has passed the restart warmup window
+#               (breaker.window), the request's canary bucket is inside
+#               `rollout_bps`, the circuit breaker is closed, the host is NOT in
+#               `log_only_mode`, and the Block is corroborated by a directly-
+#               observable (non-blind/-synthetic) view. Otherwise it stays shadow
+#               `Log`. With the shipped `rollout_bps = 0` even `enforce` blocks
+#               nothing (empty canary) — set `rollout_bps` to opt in gradually.
 #
 # A zero-config install with no config file at all also leaves the lane OFF (the
 # compiled default is `enabled = false`).
 [content_security]
 enabled = true                        # master switch (default-on SHADOW; log_only never blocks)
-enforcement_mode = "log_only"         # off | log_only (shadow) | enforce (P1b: enforce == log_only, never blocks)
+enforcement_mode = "log_only"         # off | log_only (shadow) | enforce (block-capable, opt-in, canary-gated)
 dialect = "generic"                   # global; per-host dialects not claimed in P1
 hpp = false                           # HTTP-parameter-pollution synthetic views (global off)
-rollout_bps = 0                       # canary width in basis points (0..10000)
+rollout_bps = 0                       # canary width in basis points (0..10000); 0 → enforce blocks nothing
 rollout_salt = ""                     # stable salt for deterministic canary bucketing
+
+# Per-family enforcement overrides (E0). Each key is an attack family
+# (sql_injection / rce / xss / traversal); each value is off | log_only | enforce
+# and overrides `enforcement_mode` for THAT family only. A family not listed here
+# inherits the global mode, so this table is EMPTY by default (→ pure global
+# posture, zero behaviour change). This lets an operator switch the single
+# highest-confidence family to enforce while the rest stay shadow, e.g.:
+#   [content_security.enforcement_overrides]
+#   sql_injection = "enforce"
+#
+# ── A3 contract: per-host Lane 1 toggles vs Lane 2 families (READ THIS) ────────
+# The per-host Lane 1 legacy checker toggles (HostConfig.defense_config.sqli /
+# .xss / .rce / .dir_traversal) and the Lane 2 semantic families here are TWO
+# INDEPENDENT switch sets. Turning off a host's Lane 1 sqli checker does NOT turn
+# off that host's Lane 2 sql_injection family — they must be managed separately.
+# The single per-host total kill switch for BOTH lanes' blocking is the host's
+# `log_only_mode`: when a host is in log_only_mode, every Lane 1 veto AND every
+# Lane 2 enforce Block is downgraded to a LogOnly event for that host. (Runtime
+# per-host, per-detector Lane 1 gating of Lane 2 is a backlog item — DefenseConfig
+# has no runtime write path today; contract ② applies until then.)
+[content_security.enforcement_overrides]
 
 [content_security.budget]             # deterministic DoS work caps (conservative)
 max_fields_per_phase = 64

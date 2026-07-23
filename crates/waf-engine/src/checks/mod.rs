@@ -15,7 +15,7 @@ pub use anti_hotlink::AntiHotlinkCheck;
 pub use bot::BotCheck;
 pub use cc::CcCheck;
 pub use content_security::{
-    ContentInspectionState, ContentSecuritySubsystem, ContentVerdict, EnforcementMode, InspectionScope,
+    AttackKind, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict, EnforcementMode, InspectionScope,
     RuntimeContentSecurityConfig, SemanticAction, SemanticVerdict,
 };
 pub use dir_traversal::DirTraversalCheck;

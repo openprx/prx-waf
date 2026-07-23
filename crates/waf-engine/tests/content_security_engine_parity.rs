@@ -671,9 +671,11 @@ async fn side_effect_legacy_block_reaches_community_reporter() {
 // ── P1a: Lane 2 zero-enforcement — never changes the final action ────────────
 
 /// Build an engine with the Lane 2 semantic lane **enabled and in `enforce`
-/// mode with a 100% canary rollout**. P1a ships no production detectors, so even
-/// this most-aggressive configuration must still produce zero signals → score 0
-/// → no semantic action → identical final decisions to a Lane-2-off engine.
+/// mode with a 100% canary rollout** but **no attack families configured**. With
+/// no family in `[attacks]` the detectors contribute zero to the score, so even
+/// this most-aggressive posture produces no signal → score 0 → no semantic action
+/// → identical final decisions to a Lane-2-off engine (isolates the "enabled lane
+/// with nothing to score" case from the block-capable E0 path).
 async fn engine_with_semantic_enforce() -> WafEngine {
     let db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
     db.migrate().await.expect("migrate");
@@ -925,10 +927,12 @@ async fn shadow_sqli_encoding_bypass_detected_but_not_blocked() {
     );
 }
 
-/// Build an engine with the Lane 2 `SQLi` family enabled in **enforce** mode.
-/// In P1b the scorer is deliberately not wired to the block path, so `enforce`
-/// must behave exactly like `log_only` at the engine dispatch: detect + persist,
-/// NEVER block (codex A-2 / A-5).
+/// Build an engine with the Lane 2 `SQLi` family enabled in **enforce** mode
+/// (single `struct_rule` detector, weight 1.0). Post-E0 the enforce path is
+/// wired, but a fresh engine is still inside the restart warmup latch (300s) and
+/// the base64 payload used below is a single-detector sub-threshold (Log) hit, so
+/// this configuration still cannot block — used to prove the shadow guarantee at
+/// the engine dispatch on a fresh process.
 async fn engine_with_enforce_sqli() -> (WafEngine, Arc<Database>) {
     let db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
     db.migrate().await.expect("migrate");
@@ -969,9 +973,10 @@ async fn enforce_mode_still_never_blocks_in_p1b() {
     let baseline = engine().await; // Lane 2 off
     let (enforce, _db) = engine_with_enforce_sqli().await; // Lane 2 SQLi, enforce (100% canary)
 
-    // A base64-wrapped union-select payload the legacy lane never decodes. Even in
-    // enforce mode with a 100% canary, P1b must NOT block (scorer not wired to the
-    // block path) — the final action must match the Lane-2-off baseline.
+    // A base64-wrapped union-select payload the legacy lane never decodes. Post-E0
+    // the enforce path is wired, but a fresh process is still inside the restart
+    // warmup latch AND this single-detector hit is sub-threshold (Log), so the
+    // final action must still match the Lane-2-off baseline — no block.
     let payload = base64_union_payload();
     let mut a = make_ctx("", &payload, false);
     let mut b = make_ctx("", &payload, false);
@@ -1265,4 +1270,128 @@ async fn shadow_rce_shell_normalised_bypass_detected_but_not_blocked() {
     let rows = wait_for_observation(&db, &host_code).await;
     assert_eq!(rows.len(), 1, "detection must persist exactly one observation");
     assert_blind_signal(rows.first().expect("row"), "rce");
+}
+
+// ── E0: zero-behaviour-change parity under the shipped log_only posture ───────
+//
+// After E0 wires the enforce block path, the RED LINE is that the shipped
+// `log_only` posture is byte-for-byte identical to a Lane-2-off engine on the
+// final decision. This is the G1-style parity: a full-fingerprint (action tag +
+// status + body + rule_id + phase) equality across a battery that INCLUDES
+// payloads Lane 2 actually detects (base64-wrapped, invisible to Lane 1). The
+// semantic lane logs + persists but must never alter the returned WafDecision.
+
+/// Enable all four semantic families in the shipped shadow posture
+/// (`enforcement_mode = log_only`, empty overrides). SQLi/XSS are two-detector
+/// (0.5/0.5); RCE/Traversal single-detector (1.0).
+async fn engine_with_shadow_all_families() -> WafEngine {
+    let db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
+    db.migrate().await.expect("migrate");
+    let two = |a: &str, b: &str| {
+        let mut w = std::collections::BTreeMap::new();
+        w.insert(a.to_string(), 0.5);
+        w.insert(b.to_string(), 0.5);
+        waf_common::content_security_config::SemanticAttackConfig {
+            enabled: true,
+            weights: w,
+            log_threshold: 40,
+            block_threshold: 80,
+            hard_veto_allowlist: Vec::new(),
+        }
+    };
+    let one = |d: &str| {
+        let mut w = std::collections::BTreeMap::new();
+        w.insert(d.to_string(), 1.0);
+        waf_common::content_security_config::SemanticAttackConfig {
+            enabled: true,
+            weights: w,
+            log_threshold: 40,
+            block_threshold: 80,
+            hard_veto_allowlist: Vec::new(),
+        }
+    };
+    let mut attacks = std::collections::BTreeMap::new();
+    attacks.insert("sql_injection".to_string(), two("struct_rule", "ast"));
+    attacks.insert("xss".to_string(), two("xss_dom", "xss_js"));
+    attacks.insert("rce".to_string(), one("rce"));
+    attacks.insert("traversal".to_string(), one("traversal"));
+    let cfg = ContentSecurityConfig {
+        enabled: true,
+        enforcement_mode: "log_only".to_string(),
+        rollout_bps: 10_000, // even a 100% canary must not block under log_only
+        attacks,
+        ..ContentSecurityConfig::default()
+    };
+    let content_security = RuntimeContentSecurityConfig::compile(&cfg).expect("valid semantic config");
+    WafEngine::new(
+        db,
+        WafEngineConfig {
+            content_security,
+            ..WafEngineConfig::default()
+        },
+    )
+}
+
+/// Full `WafDecision` fingerprint for byte-level parity: action tag + status +
+/// body + result `rule_id` + phase. Two engines with an identical fingerprint on
+/// the same ctx are behaviourally identical (the E0 zero-behaviour-change gate).
+fn decision_fingerprint(
+    d: &waf_common::WafDecision,
+) -> (&'static str, Option<u16>, Option<String>, Option<String>, Option<Phase>) {
+    let (tag, status, body) = match &d.action {
+        WafAction::Allow => ("allow", None, None),
+        WafAction::Block { status, body } => ("block", Some(*status), body.clone()),
+        WafAction::LogOnly => ("log_only", None, None),
+        WafAction::Redirect { url } => ("redirect", None, Some(url.clone())),
+    };
+    let rule_id = d.result.as_ref().and_then(|r| r.rule_id.clone());
+    let phase = d.result.as_ref().map(|r| r.phase);
+    (tag, status, body, rule_id, phase)
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn lane2_log_only_bytewise_matches_lane2_off() {
+    let baseline = engine().await; // Lane 2 off
+    let shadow = engine_with_shadow_all_families().await; // all families, log_only
+
+    // Battery: clean, each raw legacy attack (Lane 1 vetoes identically), a clean
+    // body, and — crucially — base64-wrapped SQLi / RCE / traversal / XSS that ONLY
+    // Lane 2 detects. Under log_only every one must yield the identical decision.
+    // (`base64::Engine` is already imported at file scope.)
+    let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+    let sqli_b64 = b64("1 union select null,null,null from users");
+    let rce_b64 = b64("bash -c id");
+    let trav_b64 = b64("../../../etc/passwd");
+    let xss_b64 = b64("<svg onload=eval(document.cookie)>");
+    let cases: &[(&str, &str)] = &[
+        ("q=hello", "just a normal body"),
+        ("id=1 union select 1,2,3", ""),
+        ("q=<script>alert(1)</script>", ""),
+        ("q=;cat /etc/passwd", ""),
+        ("q=../../../../etc/passwd", ""),
+        ("", &sqli_b64),
+        ("", &rce_b64),
+        ("", &trav_b64),
+        ("", &xss_b64),
+    ];
+
+    for (query, body) in cases {
+        // Header phase.
+        let mut a = make_ctx(query, body, false);
+        let mut b = make_ctx(query, body, false);
+        assert_eq!(
+            decision_fingerprint(&baseline.inspect(&mut a).await),
+            decision_fingerprint(&shadow.inspect(&mut b).await),
+            "log_only Lane 2 changed the header-phase decision for query={query:?} body={body:?}"
+        );
+        // Body phase.
+        let mut c = make_ctx(query, body, false);
+        let mut d = make_ctx(query, body, false);
+        assert_eq!(
+            decision_fingerprint(&baseline.inspect_body(&mut c).await),
+            decision_fingerprint(&shadow.inspect_body(&mut d).await),
+            "log_only Lane 2 changed the body-phase decision for query={query:?} body={body:?}"
+        );
+    }
 }

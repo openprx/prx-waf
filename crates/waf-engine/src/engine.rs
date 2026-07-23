@@ -1,4 +1,5 @@
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use arc_swap::ArcSwapOption;
 use parking_lot::RwLock as ParkingRwLock;
@@ -366,15 +367,20 @@ impl WafEngine {
         // unchanged `record_block` path (host `log_only_mode` still decides
         // Block vs LogOnly, security-event log + community report preserved) and
         // short-circuits exactly as before. `Semantic` is the Lane 2 additive
-        // result: in P1a it NEVER blocks and NEVER short-circuits — it records
-        // at most a semantic LogOnly event and falls through to the unchanged
-        // suffix (zero-enforcement guarantee). `None` falls through unchanged.
+        // result: [`dispatch_semantic`] persists the observation, resolves the
+        // enforce path and, ONLY when it returns a real Block (enforce +
+        // guardrails + A2), short-circuits here. In the shipped `log_only`
+        // posture it always returns `None`, so control falls through to the
+        // unchanged suffix — byte-for-byte the pre-E0 behaviour. `None` falls
+        // through unchanged.
         match self.content_security.evaluate_scoped(ctx, scope, state) {
             ContentVerdict::LegacyVeto { result } => {
                 return Some(self.record_block(ctx, result, true));
             }
             ContentVerdict::Semantic(verdict) => {
-                self.dispatch_semantic(ctx, scope, verdict);
+                if let Some(decision) = self.dispatch_semantic(ctx, scope, verdict) {
+                    return Some(decision);
+                }
             }
             ContentVerdict::None => {}
         }
@@ -445,39 +451,71 @@ impl WafEngine {
         None
     }
 
-    /// Dispatch a Lane 2 semantic verdict (plan §3.1 / §13.4).
+    /// Dispatch a Lane 2 semantic verdict (plan §3.1 / §13.4, E0 enforce wiring).
     ///
-    /// **P1a is shadow-only at the engine dispatch**: it records at most a
-    /// semantic `LogOnly` security event and **never** blocks and **never**
-    /// short-circuits `inspect_content` — control always falls through to the
-    /// unchanged AppSec/custom/CRS/sensitive suffix, and a Lane 1 legacy veto is
-    /// never downgraded (it took the `LegacyVeto` arm above and returned before
-    /// reaching here). The block-capable enforce path (canary/breaker-gated Block)
-    /// is implemented and unit-tested in the isolated next-stage
-    /// [`crate::checks::ContentSecuritySubsystem::resolve_enforced_action`] but is
-    /// deliberately not connected to the block path until real detectors and
-    /// calibration exist; the P1b engine-facing
-    /// [`crate::checks::ContentSecuritySubsystem::resolve_action`] caps `enforce`
-    /// at `Log`.
+    /// Always persists the de-identified observation first (shadow telemetry,
+    /// unchanged), then resolves the **effective** action through the block-capable
+    /// [`crate::checks::ContentSecuritySubsystem::resolve_enforced_action`]:
     ///
-    /// In P1b the `SQLi` structural detector can produce signals, but the default
-    /// `log_only` posture keeps this to **record + persist** — never a Block and
-    /// never a short-circuit (no resolver is wired to the block path here, and the
-    /// next-stage block-capable resolver is not reachable from P1b config). This
-    /// is the action-level shadow guarantee.
-    fn dispatch_semantic(&self, ctx: &RequestCtx, scope: InspectionScope, verdict: crate::checks::SemanticVerdict) {
+    /// * `Block` (only reachable under `enforce` past all four shadow guardrails +
+    ///   the A2 blind guard) → [`record_block`] with `report_community = false`
+    ///   (unproven semantic signals never seed the shared blocklist) and returns
+    ///   `Some(decision)` so `inspect_content` short-circuits;
+    /// * `Log` → records a shadow `LogOnly` security event and returns `None`;
+    /// * `None` → nothing, returns `None`.
+    ///
+    /// The resolver is fed `client_ip` as the canary bucketing key (a stable
+    /// per-client bucket, not the per-request `req_id`) and the per-host
+    /// `log_only_mode` as the total kill switch. In the shipped `log_only` posture
+    /// (empty overrides) the resolver returns at most `Log`, so this is
+    /// **record + persist** exactly as before E0 — the action-level shadow
+    /// guarantee. A Lane 1 legacy veto never reaches here (it took the `LegacyVeto`
+    /// arm and returned earlier).
+    fn dispatch_semantic(
+        &self,
+        ctx: &RequestCtx,
+        scope: InspectionScope,
+        verdict: crate::checks::SemanticVerdict,
+    ) -> Option<WafDecision> {
         // Shadow persistence (plan §13.1): whenever the semantic lane produced any
         // signal — even sub-threshold or on a degraded (fail-open) request —
         // persist de-identified detection evidence so real-attack target practice
-        // can read detection / false-positive rates from the DB. Persist + LogOnly
-        // ONLY; this path can never Block.
+        // can read detection / false-positive rates from the DB. Independent of the
+        // resolved action (a real Block is persisted too).
         if !verdict.signals.is_empty() {
             self.persist_semantic_observation(ctx, scope, &verdict);
         }
-        if verdict.recommendation != SemanticAction::None
-            && let Some(result) = verdict.primary_result
-        {
-            self.record_semantic_log(ctx, result);
+
+        // Resolve the effective action. `request_key = client_ip` gives a stable
+        // canary bucket per client; `host_config.log_only_mode` is threaded so the
+        // per-host total kill switch downgrades even an enforced family to Log. The
+        // primary family drives the per-family enforcement override.
+        let family = verdict
+            .primary_result
+            .as_ref()
+            .and_then(|r| crate::checks::AttackKind::from_phase(r.phase));
+        let request_key = ctx.client_ip.to_string();
+        let effective = self.content_security.resolve_enforced_action(
+            verdict.recommendation,
+            family,
+            verdict.enforce_safe,
+            &ctx.host_config.code,
+            &request_key,
+            ctx.host_config.log_only_mode,
+            Instant::now(),
+        );
+
+        match effective {
+            SemanticAction::Block => verdict
+                .primary_result
+                .map(|result| self.record_block(ctx, result, false)),
+            SemanticAction::Log => {
+                if let Some(result) = verdict.primary_result {
+                    self.record_semantic_log(ctx, result);
+                }
+                None
+            }
+            SemanticAction::None => None,
         }
     }
 

@@ -50,6 +50,17 @@ pub struct ContentSecurityConfig {
     /// (`"sql_injection"` / `"rce"` / `"xss"` / `"traversal"`). An absent or
     /// disabled family contributes nothing (plan §6.2).
     pub attacks: BTreeMap<String, SemanticAttackConfig>,
+    /// Per-attack-family enforcement-mode overrides (E0). Each key is an attack
+    /// family (`"sql_injection"` / `"rce"` / `"xss"` / `"traversal"`); each value
+    /// is `"off"` / `"log_only"` / `"enforce"` and overrides the global
+    /// [`Self::enforcement_mode`] **for that family only**. A family not listed
+    /// here inherits the global mode, so the shipped **empty** map is
+    /// behaviourally identical to the pure-global posture (zero behaviour
+    /// change). This lets an operator switch a single high-confidence family
+    /// (e.g. `sql_injection`) to `enforce` while the rest of the lane stays
+    /// `log_only`. These are independent of the per-host Lane 1 legacy toggles —
+    /// see the A3 contract note in `configs/default.toml`.
+    pub enforcement_overrides: BTreeMap<String, String>,
 }
 
 /// Per-attack-family scoring configuration (plan §6.2).
@@ -159,6 +170,7 @@ impl Default for ContentSecurityConfig {
             budget: SemanticBudgetConfig::default(),
             breaker: SemanticBreakerConfig::default(),
             attacks: BTreeMap::new(),
+            enforcement_overrides: BTreeMap::new(),
         }
     }
 }
@@ -210,6 +222,27 @@ impl ContentSecurityConfig {
                 ));
             }
             family.validate(name)?;
+        }
+
+        // Per-family enforcement overrides (E0): each key must be a known family
+        // and each value a valid mode. Strict — a typo must fail startup, never
+        // silently fall back to the global mode.
+        for (name, mode) in &self.enforcement_overrides {
+            if !is_known_attack_family(name) {
+                return Err(format!(
+                    "content_security.enforcement_overrides has unknown family '{name}' \
+                     (expected sql_injection/rce/xss/traversal)"
+                ));
+            }
+            match mode.as_str() {
+                "off" | "log_only" | "enforce" => {}
+                other => {
+                    return Err(format!(
+                        "content_security.enforcement_overrides.{name} must be one of \
+                         off/log_only/enforce, got '{other}'"
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -486,5 +519,39 @@ mod tests {
             ..ContentSecurityConfig::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_valid_enforcement_override() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("sql_injection".to_string(), "enforce".to_string());
+        let cfg = ContentSecurityConfig {
+            enabled: true,
+            enforcement_overrides: overrides,
+            ..ContentSecurityConfig::default()
+        };
+        cfg.validate().expect("a single-family enforce override must validate");
+    }
+
+    #[test]
+    fn rejects_enforcement_override_unknown_family() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("sqli".to_string(), "enforce".to_string()); // typo
+        let cfg = ContentSecurityConfig {
+            enforcement_overrides: overrides,
+            ..ContentSecurityConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "an unknown override family must be rejected");
+    }
+
+    #[test]
+    fn rejects_enforcement_override_bad_mode() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("rce".to_string(), "panic".to_string());
+        let cfg = ContentSecurityConfig {
+            enforcement_overrides: overrides,
+            ..ContentSecurityConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "an unknown override mode must be rejected");
     }
 }

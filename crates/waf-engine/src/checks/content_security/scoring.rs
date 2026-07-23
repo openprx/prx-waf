@@ -105,6 +105,11 @@ struct Group<'a> {
     score: f64,
     best: &'a DetectionSignal,
     best_contrib: f64,
+    /// Whether any signal in this group came from a directly-observable,
+    /// non-synthetic view (a [`Provenance::hard_veto_capable`] provenance). Drives
+    /// the E0 / A2 `enforce_safe` gate: a group whose Block is carried **only** by
+    /// blind/synthetic views must not be enforced.
+    has_capable: bool,
 }
 
 /// Severity ranking so we can pick the strongest group recommendation.
@@ -206,6 +211,9 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
             primary_result: None,
             signals: signals.to_vec(),
             degraded: true,
+            // A degraded verdict carries no recommendation, so it is never
+            // enforceable.
+            enforce_safe: false,
         };
     }
 
@@ -243,8 +251,14 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
             score: 0.0,
             best: sig,
             best_contrib: -1.0,
+            has_capable: false,
         });
         g.score += contrib;
+        // A single directly-observable (non-blind, non-synthetic) signal makes
+        // the group's Block enforce-safe (E0 / A2).
+        if sig.provenance.hard_veto_capable() {
+            g.has_capable = true;
+        }
         // Deterministic within-group representative (codex P1c §3.1): higher
         // contribution wins, equal contribution breaks on `(detector_ord,
         // rule_key)` — never on `HashMap` iteration order. The `-1.0` seed makes
@@ -285,6 +299,10 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
     let mut recommendation = SemanticAction::None;
     let mut primary: Option<&'a DetectionSignal> = None;
     let mut best_key: Option<WinnerKey<'a>> = None;
+    // Non-synthetic corroboration of the winning group (E0 / A2). Captured from
+    // the group that becomes primary so the enforce path can refuse to Block a
+    // recommendation carried solely by blind/synthetic views.
+    let mut winner_has_capable = false;
 
     for (&(scope, field, attack), g) in &groups {
         let Some(ac) = cfg.attacks.get(&attack) else { continue };
@@ -313,14 +331,19 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
             best_key = Some(key);
             recommendation = group_rec;
             primary = Some(g.best);
+            winner_has_capable = g.has_capable;
         }
     }
 
-    // 4) Hard-veto overrides to Block regardless of the aggregate score.
+    // 4) Hard-veto overrides to Block regardless of the aggregate score. A
+    //    hard-veto is only reachable from a `hard_veto_capable` provenance
+    //    (structurally excluded for blind/synthetic views), so a hard-veto Block
+    //    is enforce-safe by construction.
     if let Some((_, sig)) = hard_veto {
         recommendation = SemanticAction::Block;
         primary = Some(sig);
         request_score = request_score.max(f64::from(sig.confidence));
+        winner_has_capable = true;
     }
 
     let primary_result = primary.map(|s| DetectionResult {
@@ -336,6 +359,9 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
         primary_result,
         signals: signals.to_vec(),
         degraded,
+        // Only meaningful for a Block recommendation; carries the winning group's
+        // non-synthetic corroboration for the E0 enforce gate (A2).
+        enforce_safe: winner_has_capable,
     }
 }
 
@@ -684,6 +710,101 @@ mod tests {
                 "capable provenance {prov:?} on the allowlist must hard-veto"
             );
         }
+    }
+
+    #[test]
+    fn blind_only_block_is_not_enforce_safe() {
+        // E0 / A2: a single-detector family (rce weight 1.0) whose reverse-shell
+        // rule (conf 92) crosses the Block bar SOLELY on a blind-decoded view is
+        // NOT enforce-safe — the enforce path must downgrade it to shadow Log.
+        let cfg = three_family_cfg();
+        let blind = [sig(
+            AttackKind::Rce,
+            DetectorId::Rce,
+            "body",
+            92,
+            "rce.reverse_shell",
+            Provenance::BlindDecoded,
+        )];
+        let v = score(&blind, &cfg, false);
+        assert_eq!(v.recommendation, SemanticAction::Block, "92 ≥ block threshold 80");
+        assert!(
+            !v.enforce_safe,
+            "a Block carried solely by a blind_decoded view must not be enforce-safe"
+        );
+
+        // The SAME rule on a directly-observable (UrlDecoded) view IS enforce-safe.
+        let observable = [sig(
+            AttackKind::Rce,
+            DetectorId::Rce,
+            "body",
+            92,
+            "rce.reverse_shell",
+            Provenance::UrlDecoded,
+        )];
+        let v = score(&observable, &cfg, false);
+        assert_eq!(v.recommendation, SemanticAction::Block);
+        assert!(
+            v.enforce_safe,
+            "a Block corroborated by a non-synthetic (UrlDecoded) view is enforce-safe"
+        );
+    }
+
+    #[test]
+    fn corroborated_block_needs_one_nonsynthetic_view_to_be_enforce_safe() {
+        // E0 / A2 for double-detector families: two SQLi detectors corroborate to
+        // Block, but if BOTH fire only on blind views the Block is not enforce-safe.
+        let cfg = shipped_sqli_cfg(40); // struct/ast 0.5/0.5
+        let both_blind = [
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::StructRule,
+                "body",
+                90,
+                "sql.dangerous_fn",
+                Provenance::BlindDecoded,
+            ),
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::Ast,
+                "body",
+                90,
+                "ast.dangerous_fn",
+                Provenance::BlindDecoded,
+            ),
+        ];
+        let v = score(&both_blind, &cfg, false);
+        assert_eq!(v.recommendation, SemanticAction::Block, "0.5·90 + 0.5·90 = 90 ≥ 80");
+        assert!(
+            !v.enforce_safe,
+            "two blind detectors corroborate to Block but still lack a non-synthetic view"
+        );
+
+        // One of the two on a Raw view → the winning group has non-synthetic support.
+        let one_observable = [
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::StructRule,
+                "body",
+                90,
+                "sql.dangerous_fn",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::Ast,
+                "body",
+                90,
+                "ast.dangerous_fn",
+                Provenance::BlindDecoded,
+            ),
+        ];
+        let v = score(&one_observable, &cfg, false);
+        assert_eq!(v.recommendation, SemanticAction::Block);
+        assert!(
+            v.enforce_safe,
+            "one non-synthetic view in the winning group makes the corroborated Block enforce-safe"
+        );
     }
 
     #[test]

@@ -89,6 +89,22 @@ impl AttackKind {
             Self::Traversal => Phase::DirTraversal,
         }
     }
+
+    /// Recover the [`AttackKind`] from a semantic [`Phase`] — the inverse of
+    /// [`Self::to_phase`]. Used by the engine dispatch (E0) to look up a verdict's
+    /// primary family from its `primary_result.phase` so the per-family
+    /// enforcement override can be applied. Returns `None` for non-semantic
+    /// phases (which a Lane 2 primary never carries).
+    #[must_use]
+    pub const fn from_phase(phase: Phase) -> Option<Self> {
+        match phase {
+            Phase::SqlInjection => Some(Self::SqlInjection),
+            Phase::Rce => Some(Self::Rce),
+            Phase::Xss => Some(Self::Xss),
+            Phase::DirTraversal => Some(Self::Traversal),
+            _ => None,
+        }
+    }
 }
 
 /// Identity of a semantic detector. P1 will populate these; P1a wires the
@@ -277,4 +293,17 @@ pub struct SemanticVerdict {
     pub signals: Vec<DetectionSignal>,
     /// Budget was exhausted → a semantic-only miss window (plan §12.4).
     pub degraded: bool,
+    /// Whether a `Block` recommendation is eligible to be **enforced** (E0 / A2).
+    /// `true` only when the winning (primary) family's group is corroborated by
+    /// at least one directly-observable, non-synthetic view — i.e. a signal whose
+    /// provenance is [`Provenance::hard_veto_capable`] (`Raw` / `UrlDecoded` /
+    /// `HtmlEntityDecoded` / `JsonDecoded`). A Block reached **solely** through
+    /// blind/synthetic views (`BlindDecoded` base64/hex, `CommentStripped`,
+    /// `SyntheticHpp`, `ParseError`) has `enforce_safe = false`, so `enforce`
+    /// downgrades it to shadow `Log` — a base64-wrapped payload the backend never
+    /// parses raw must never single-handedly Block. It never affects the
+    /// `recommendation`/`request_score`/persisted observation (shadow is
+    /// unchanged); it only gates the enforce block path. Irrelevant (and `false`)
+    /// when `recommendation != Block`.
+    pub enforce_safe: bool,
 }

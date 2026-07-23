@@ -6,11 +6,14 @@
 //! [`super::types::DetectorId`] — `waf-common` deliberately never depends on the
 //! engine's `DetectorId`.
 
+use std::collections::HashMap;
+
 use waf_common::content_security_config::ContentSecurityConfig;
 
 use super::budget::Budget;
 use super::canary::BreakerConfig;
 use super::scoring::RuntimeScoringConfig;
+use super::types::AttackKind;
 
 /// Runtime enforcement mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +24,19 @@ pub enum EnforcementMode {
     LogOnly,
     /// May block, subject to canary + breaker + host `log_only_mode`.
     Enforce,
+}
+
+/// Parse a serialized enforcement-mode string into [`EnforcementMode`]. Shared by
+/// the global mode and the E0 per-family overrides so both accept exactly the
+/// same vocabulary. Assumes [`ContentSecurityConfig::validate`] already ran, but
+/// re-checks defensively (a programmatic config may bypass `load_config`).
+fn parse_enforcement_mode(s: &str) -> Result<EnforcementMode, String> {
+    match s {
+        "off" => Ok(EnforcementMode::Off),
+        "log_only" => Ok(EnforcementMode::LogOnly),
+        "enforce" => Ok(EnforcementMode::Enforce),
+        other => Err(format!("unknown enforcement_mode '{other}'")),
+    }
 }
 
 /// SQL dialect assumption. P1 is global `Generic` only (plan §14.2).
@@ -34,6 +50,10 @@ pub enum Dialect {
 pub struct RuntimeContentSecurityConfig {
     pub enabled: bool,
     pub enforcement_mode: EnforcementMode,
+    /// Per-family enforcement-mode overrides (E0). A family present here uses its
+    /// mode instead of [`Self::enforcement_mode`]; absent families inherit the
+    /// global mode. Empty by default → identical to the pure-global posture.
+    pub enforcement_overrides: HashMap<AttackKind, EnforcementMode>,
     pub dialect: Dialect,
     pub hpp_enabled: bool,
     pub rollout_bps: u32,
@@ -50,6 +70,7 @@ impl Default for RuntimeContentSecurityConfig {
         Self {
             enabled: false,
             enforcement_mode: EnforcementMode::LogOnly,
+            enforcement_overrides: HashMap::new(),
             dialect: Dialect::Generic,
             hpp_enabled: false,
             rollout_bps: 0,
@@ -70,12 +91,20 @@ impl RuntimeContentSecurityConfig {
     pub fn compile(cfg: &ContentSecurityConfig) -> Result<Self, String> {
         cfg.validate()?;
 
-        let enforcement_mode = match cfg.enforcement_mode.as_str() {
-            "off" => EnforcementMode::Off,
-            "log_only" => EnforcementMode::LogOnly,
-            "enforce" => EnforcementMode::Enforce,
-            other => return Err(format!("unknown enforcement_mode '{other}'")),
-        };
+        let enforcement_mode = parse_enforcement_mode(&cfg.enforcement_mode)?;
+
+        // Resolve the per-family overrides (E0): family-key string → AttackKind,
+        // mode string → EnforcementMode. Rejects an unknown family the same way
+        // the scoring compile rejects an unknown `[attacks]` family.
+        let mut enforcement_overrides = HashMap::new();
+        for (family_key, mode) in &cfg.enforcement_overrides {
+            let Some(attack) = AttackKind::from_config_key(family_key) else {
+                return Err(format!(
+                    "enforcement_overrides references unknown attack family '{family_key}'"
+                ));
+            };
+            enforcement_overrides.insert(attack, parse_enforcement_mode(mode)?);
+        }
 
         let dialect = match cfg.dialect.as_str() {
             "generic" => Dialect::Generic,
@@ -85,6 +114,7 @@ impl RuntimeContentSecurityConfig {
         Ok(Self {
             enabled: cfg.enabled,
             enforcement_mode,
+            enforcement_overrides,
             dialect,
             hpp_enabled: cfg.hpp,
             rollout_bps: cfg.rollout_bps,
@@ -170,6 +200,45 @@ mod tests {
                 "{fam:?} hard-veto allowlist must be empty pre-holdout"
             );
         }
+    }
+
+    #[test]
+    fn compile_resolves_enforcement_overrides() {
+        use super::super::types::AttackKind;
+
+        let mut weights = BTreeMap::new();
+        weights.insert("struct_rule".to_string(), 1.0);
+        let mut attacks = BTreeMap::new();
+        attacks.insert(
+            "sql_injection".to_string(),
+            SemanticAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: Vec::new(),
+            },
+        );
+        let mut overrides = BTreeMap::new();
+        overrides.insert("sql_injection".to_string(), "enforce".to_string());
+        let cfg = ContentSecurityConfig {
+            enabled: true,
+            // Global stays log_only; only SQLi is overridden to enforce.
+            attacks,
+            enforcement_overrides: overrides,
+            ..ContentSecurityConfig::default()
+        };
+        let rt = RuntimeContentSecurityConfig::compile(&cfg).expect("valid override compiles");
+        assert_eq!(rt.enforcement_mode, EnforcementMode::LogOnly, "global stays shadow");
+        assert_eq!(
+            rt.enforcement_overrides.get(&AttackKind::SqlInjection).copied(),
+            Some(EnforcementMode::Enforce),
+            "the SQLi family override resolves to enforce"
+        );
+        assert!(
+            !rt.enforcement_overrides.contains_key(&AttackKind::Rce),
+            "an un-overridden family inherits the global mode (absent from the map)"
+        );
     }
 
     #[test]
