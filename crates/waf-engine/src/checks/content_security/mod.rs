@@ -310,7 +310,7 @@ impl ContentSecuritySubsystem {
     /// engine dispatch is a no-op on the final action — the zero-behaviour-change
     /// guarantee.
     #[must_use]
-    pub fn resolve_enforced_action(
+    pub(crate) fn resolve_enforced_action(
         &self,
         rec: SemanticAction,
         family: Option<AttackKind>,
