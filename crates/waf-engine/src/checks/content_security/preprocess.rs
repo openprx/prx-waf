@@ -89,6 +89,26 @@ static NORMALISED_STRONG_STRUCTURE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(&joined).ok()
 });
 
+/// XSS strong-structure marker for the blind base64 / hex gate (P-XSS-1). A
+/// base64 / hex wrapper around an XSS payload (`base64("<svg onload=…>")`) must
+/// surface a `BlindDecoded` view so the [`super::xss_dom::XssDomDetector`] can run
+/// on it — the SQL/RCE/Traversal markers above never match HTML. Kept low-FP: it
+/// requires a dangerous/interactive **tag-open**, a dangerous URL **scheme**, or
+/// an `on<event>=` handler — none of which appear in benign decoded prose. A gate
+/// false-positive only costs a wasted parse (the DOM detector still decides the
+/// actual finding), so the bar mirrors the detector's own trigger set.
+///
+/// `None` only if the constant pattern fails to compile (it will not); the gate
+/// then simply falls through to the weaker keyword tiers (no panic, iron rule).
+static XSS_STRONG_STRUCTURE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"<\s*/?(script|svg|iframe|object|embed|base|animate|img|video|audio|math|a|form|input|marquee)\b",
+        r"|javascript:|vbscript:|data:text/html",
+        r"|\bon[a-z]{3,}\s*=",
+    ))
+    .ok()
+});
+
 /// Whether decoded bytes look like a real (SQL-ish) payload rather than random
 /// noise — the gate that keeps blind base64 / hex decoding from emitting a view
 /// for every high-entropy token (plan §7.2, codex A-4).
@@ -158,6 +178,12 @@ fn looks_structural(decoded: &str) -> bool {
         .as_ref()
         .is_some_and(|re| re.is_match(&lower))
     {
+        return true;
+    }
+    // Tier 2c (P-XSS-1): the same strong-structure bar for XSS — a base64 / hex
+    // wrapper around `<script>` / `<svg onload>` / a `javascript:` URL must also
+    // surface a BlindDecoded view for the XSS DOM detector to inspect.
+    if XSS_STRONG_STRUCTURE.as_ref().is_some_and(|re| re.is_match(&lower)) {
         return true;
     }
     // Tier 3: weak keyword evidence needs corroboration.

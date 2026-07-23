@@ -103,6 +103,8 @@ pub enum DetectorId {
     Rce,
     /// Segment-aware traversal detector (T1).
     Traversal,
+    /// HTML5 DOM semantic XSS detector (P-XSS-1).
+    XssDom,
 }
 
 impl DetectorId {
@@ -114,6 +116,7 @@ impl DetectorId {
             Self::Ast => "ast",
             Self::Rce => "rce",
             Self::Traversal => "traversal",
+            Self::XssDom => "xss_dom",
         }
     }
 
@@ -126,6 +129,7 @@ impl DetectorId {
             "ast" => Some(Self::Ast),
             "rce" => Some(Self::Rce),
             "traversal" => Some(Self::Traversal),
+            "xss_dom" => Some(Self::XssDom),
             _ => None,
         }
     }

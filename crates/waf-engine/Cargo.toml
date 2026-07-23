@@ -38,6 +38,9 @@ base64 = { workspace = true }
 # keeping the supply chain zero-C/zero-unsafe; stack safety is enforced by our own
 # explicit pre-parse nesting-depth guard (see `detectors::AstSqlDetector`).
 sqlparser = { version = "0.62", default-features = false }
+# XSS DOM semantic detector (Lane 2, P-XSS-1). Servo html5ever core via scraper's
+# fragment parser + ego-tree walk. No C toolchain; our code is zero-unsafe.
+scraper = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

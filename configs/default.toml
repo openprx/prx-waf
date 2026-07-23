@@ -217,6 +217,8 @@ max_fields_per_phase = 64
 max_views_per_field = 12
 max_ast_attempts_per_request = 6
 max_ast_input_bytes_total = 262144
+max_html_parse_attempts_per_request = 6    # XSS DOM detector HTML5 fragment-parse cap (P-XSS-1)
+max_html_parse_input_bytes_total = 262144  # total bytes handed to the HTML parser per request
 max_tokens_per_view = 512
 max_list_items = 1024
 max_preprocess_output_bytes_total = 524288
@@ -290,3 +292,22 @@ block_threshold = 80
 hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
 [content_security.attacks.traversal.weights]
 traversal = 1.0                       # segment-aware traversal detector
+
+# XSS DOM (P-XSS-1) — HTML5-parser semantic detector. Upgrades XSS from the
+# frozen Lane 1 regex (kept, additive) to a WHATWG fragment parse: it fires only
+# on structures that REALLY parse into executable content — a `<script>` element,
+# an `on*=` handler on a genuinely-parsed element, a dangerous URL scheme
+# (`javascript:` / `data:text/html` / `vbscript:`) on a real URL attribute, or
+# `<svg onload>` / `<iframe srcdoc>` / `<object>`/`<embed>` / `<base href>`. Text
+# that merely contains the string `onclick=` or `<script` (bug comments, config
+# docs, Markdown, CSV, URL paths) parses to NO such element and stays clean —
+# that is the false-positive win over the Lane 1 regex. Runs on every decode view
+# (base64/hex/entity), so encoded XSS surfaces too; blind-decoded hits are never
+# hard-veto-capable. Still shadow (log_only) — never blocks.
+[content_security.attacks.xss]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.xss.weights]
+xss_dom = 1.0                         # HTML5 DOM semantic detector (P-XSS-1)

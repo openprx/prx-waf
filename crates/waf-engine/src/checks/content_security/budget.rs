@@ -29,6 +29,8 @@ pub struct Budget {
     pub max_views_per_field: u32,
     pub max_ast_attempts_per_request: u32,
     pub max_ast_input_bytes_total: usize,
+    pub max_html_parse_attempts_per_request: u32,
+    pub max_html_parse_input_bytes_total: usize,
     pub max_tokens_per_view: u32,
     pub max_list_items: u32,
     pub max_preprocess_output_bytes_total: usize,
@@ -51,6 +53,8 @@ impl Budget {
             max_views_per_field: cfg.max_views_per_field,
             max_ast_attempts_per_request: cfg.max_ast_attempts_per_request,
             max_ast_input_bytes_total: cfg.max_ast_input_bytes_total,
+            max_html_parse_attempts_per_request: cfg.max_html_parse_attempts_per_request,
+            max_html_parse_input_bytes_total: cfg.max_html_parse_input_bytes_total,
             max_tokens_per_view: cfg.max_tokens_per_view,
             max_list_items: cfg.max_list_items,
             max_preprocess_output_bytes_total: cfg.max_preprocess_output_bytes_total,
@@ -72,6 +76,8 @@ pub struct ContentInspectionState {
     fields_used: u32,
     ast_attempts_used: u32,
     ast_input_bytes_used: usize,
+    html_parse_attempts_used: u32,
+    html_parse_input_bytes_used: usize,
     preprocess_output_bytes_used: usize,
     degraded: bool,
     /// Telemetry: number of Lane 2 evaluations performed on this request
@@ -93,6 +99,8 @@ impl ContentInspectionState {
             fields_used: 0,
             ast_attempts_used: 0,
             ast_input_bytes_used: 0,
+            html_parse_attempts_used: 0,
+            html_parse_input_bytes_used: 0,
             preprocess_output_bytes_used: 0,
             degraded: false,
             semantic_evaluations: 0,
@@ -181,6 +189,33 @@ impl ContentInspectionState {
         }
     }
 
+    /// Try to admit one more HTML5 fragment-parse attempt for this request
+    /// (XSS DOM detector, P-XSS-1). Mirrors [`Self::try_take_ast_attempt`].
+    #[must_use]
+    pub const fn try_take_html_parse_attempt(&mut self) -> bool {
+        if self.html_parse_attempts_used >= self.budget.max_html_parse_attempts_per_request {
+            self.degraded = true;
+            return false;
+        }
+        self.html_parse_attempts_used += 1;
+        true
+    }
+
+    /// Try to reserve `n` bytes against the total HTML-parse input budget.
+    #[must_use]
+    pub const fn try_take_html_parse_input_bytes(&mut self, n: usize) -> bool {
+        match self.html_parse_input_bytes_used.checked_add(n) {
+            Some(next) if next <= self.budget.max_html_parse_input_bytes_total => {
+                self.html_parse_input_bytes_used = next;
+                true
+            }
+            _ => {
+                self.degraded = true;
+                false
+            }
+        }
+    }
+
     /// Try to reserve `n` bytes against the total preprocessor-output budget.
     #[must_use]
     pub const fn try_take_preprocess_bytes(&mut self, n: usize) -> bool {
@@ -207,6 +242,8 @@ mod tests {
             max_views_per_field: 2,
             max_ast_attempts_per_request: 1,
             max_ast_input_bytes_total: 8,
+            max_html_parse_attempts_per_request: 1,
+            max_html_parse_input_bytes_total: 8,
             max_tokens_per_view: 4,
             max_list_items: 4,
             max_preprocess_output_bytes_total: 8,

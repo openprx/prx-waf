@@ -83,6 +83,13 @@ pub struct SemanticBudgetConfig {
     pub max_views_per_field: u32,
     pub max_ast_attempts_per_request: u32,
     pub max_ast_input_bytes_total: usize,
+    /// Maximum HTML5 fragment-parse attempts per request for the XSS DOM
+    /// detector (P-XSS-1). Independent of the AST budget so a request cannot
+    /// double its worst-case work by mixing SQL and HTML payloads.
+    pub max_html_parse_attempts_per_request: u32,
+    /// Total input bytes handed to the HTML5 parser across all views of a
+    /// request. A second, cumulative cap on top of the per-parse byte backstop.
+    pub max_html_parse_input_bytes_total: usize,
     pub max_tokens_per_view: u32,
     pub max_list_items: u32,
     pub max_preprocess_output_bytes_total: usize,
@@ -103,6 +110,8 @@ impl Default for SemanticBudgetConfig {
             max_views_per_field: 12,
             max_ast_attempts_per_request: 6,
             max_ast_input_bytes_total: 256 * 1024,
+            max_html_parse_attempts_per_request: 6,
+            max_html_parse_input_bytes_total: 256 * 1024,
             max_tokens_per_view: 512,
             max_list_items: 1024,
             max_preprocess_output_bytes_total: 512 * 1024,
@@ -209,7 +218,7 @@ impl ContentSecurityConfig {
 
 impl SemanticBudgetConfig {
     fn validate(&self) -> Result<(), String> {
-        let checks: [(&str, u64); 9] = [
+        let checks: [(&str, u64); 11] = [
             ("max_fields_per_phase", u64::from(self.max_fields_per_phase)),
             ("max_views_per_field", u64::from(self.max_views_per_field)),
             (
@@ -217,6 +226,14 @@ impl SemanticBudgetConfig {
                 u64::from(self.max_ast_attempts_per_request),
             ),
             ("max_ast_input_bytes_total", self.max_ast_input_bytes_total as u64),
+            (
+                "max_html_parse_attempts_per_request",
+                u64::from(self.max_html_parse_attempts_per_request),
+            ),
+            (
+                "max_html_parse_input_bytes_total",
+                self.max_html_parse_input_bytes_total as u64,
+            ),
             ("max_tokens_per_view", u64::from(self.max_tokens_per_view)),
             ("max_list_items", u64::from(self.max_list_items)),
             (

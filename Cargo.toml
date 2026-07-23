@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -64,6 +64,11 @@ serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 instant-acme = "0.7"
 rcgen = "0.13"
 base64 = "0.22"
+# HTML5 parser (Servo html5ever core) for the Lane 2 XSS DOM semantic detector
+# (P-XSS-1). WHATWG-compliant fragment parsing + tree walk; no C toolchain. Our
+# own code stays zero-unsafe (the transitive tendril/ego-tree unsafe is mature,
+# audited Servo code, accepted per plan §2.4 option A).
+scraper = "0.27"
 
 # Phase 4 additions
 argon2 = { version = "0.5", features = ["std"] }

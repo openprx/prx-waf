@@ -36,6 +36,7 @@ pub mod detectors;
 pub mod preprocess;
 pub mod scoring;
 pub mod types;
+pub mod xss_dom;
 
 use std::time::Instant;
 
@@ -55,6 +56,7 @@ pub use types::{
     AttackKind, DetectionFinding, DetectionSignal, DetectorId, InspectionScope, Provenance, SemanticAction,
     SemanticVerdict,
 };
+pub use xss_dom::XssDomDetector;
 
 /// Outcome of a content-security evaluation, carrying the verdict's source so
 /// the engine can dispatch it correctly (plan §3.2).
@@ -87,8 +89,9 @@ pub struct ContentSecuritySubsystem {
     legacy_checkers: Vec<Box<dyn Check>>,
     /// Compiled, immutable Lane 2 config (default = lane off).
     config: RuntimeContentSecurityConfig,
-    /// Lane 2 semantic detectors: the structural + AST `SQLi` detectors and the
-    /// RCE / Traversal detectors; tests may push additional mocks.
+    /// Lane 2 semantic detectors: the structural + AST `SQLi` detectors, the
+    /// RCE / Traversal detectors and the XSS DOM detector; tests may push
+    /// additional mocks.
     detectors: Vec<Box<dyn SemanticDetector>>,
     /// Runtime anomaly-rate breaker state (never persisted; restart resets it).
     breaker: Mutex<CircuitBreaker>,
@@ -134,6 +137,7 @@ impl ContentSecuritySubsystem {
             Box::new(detectors::AstSqlDetector::new()),
             Box::new(detectors::RceStructuralDetector::new()),
             Box::new(detectors::TraversalStructuralDetector::new()),
+            Box::new(xss_dom::XssDomDetector::new()),
         ];
         Self {
             legacy_checkers,
@@ -1092,6 +1096,130 @@ mod tests {
             sub.resolve_action(verdict.recommendation),
             SemanticAction::Block,
             "shadow (log_only) never blocks the base64-wrapped AST SQLi"
+        );
+    }
+
+    // ── P-XSS-1: XSS DOM detector fires but shadow never blocks ───────────────
+
+    #[test]
+    fn real_xss_detector_fires_but_shadow_never_blocks() {
+        // The production XssDomDetector fires on a `<svg onload>` (conf 88 ≥ block
+        // threshold 80) so the scorer recommends EXACTLY Block — yet the default
+        // log_only posture downgrades the effective action to Log. Lane 1 would veto
+        // this raw payload first, so we drive the Lane 2 pipeline directly (as the
+        // sibling SQLi/RCE/Traversal shadow tests do).
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("xss", "xss_dom"));
+        let det = XssDomDetector::new();
+        let req = ctx();
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let view = View {
+            location: Cow::Borrowed("body"),
+            round: 0,
+            text: Cow::Borrowed("<svg onload=alert(1)>"),
+            lower_trunc: "<svg onload=alert(1)>".to_string(),
+            provenance: Provenance::Raw,
+        };
+        let mut st = ContentInspectionState::default();
+        let finding = det.detect(&view, &pctx, &mut st).expect("xss must fire on svg onload");
+        assert_eq!(finding.rule_key, "xss.svg_onload");
+        assert_eq!(finding.attack, AttackKind::Xss);
+        let signal = view.to_signal(det.id(), InspectionScope::Body, finding);
+        let verdict = score(std::slice::from_ref(&signal), &sub.config().scoring, false);
+        assert_eq!(
+            verdict.recommendation,
+            SemanticAction::Block,
+            "confidence 88 (weight 1.0) reaches the block threshold (80)"
+        );
+        assert_eq!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Log,
+            "shadow (log_only) downgrades a genuine XSS Block to Log"
+        );
+    }
+
+    #[test]
+    fn lane1_clean_base64_xss_fires_through_production_pipeline() {
+        // A base64-wrapped `<svg onload=…>` — invisible to Lane 1 (it never decodes
+        // base64) — surfaces an XSS DOM signal on a BlindDecoded view through the
+        // real `evaluate_scoped` pipeline, and shadow keeps it advisory. Proves the
+        // encoding-bypass → decode-chain → DOM path, and that a BlindDecoded XSS
+        // signal is (correctly) never hard-veto-capable.
+        use base64::Engine as _;
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("xss", "xss_dom"));
+        // Payload chosen so its STANDARD base64 has no `+` (which URL-decode would
+        // turn into a space and corrupt the token before the blind decoder sees it).
+        let payload = base64::engine::general_purpose::STANDARD.encode("<svg onload=alert(11)>");
+        let mut req = ctx();
+        req.body_preview = Bytes::from(format!("q={payload}"));
+        req.content_length = req.body_preview.len() as u64;
+        let mut st = ContentInspectionState::default();
+        let verdict = match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => v,
+            other => panic!("Lane 1 must stay clean → Semantic, got {other:?}"),
+        };
+        let sig = verdict
+            .signals
+            .iter()
+            .find(|s| s.attack == AttackKind::Xss)
+            .expect("the base64 blind decode must surface an XSS signal");
+        assert_eq!(
+            sig.provenance,
+            Provenance::BlindDecoded,
+            "the XSS signal came through base64 blind decode (never hard-veto)"
+        );
+        assert!(
+            sig.rule_key.starts_with("xss."),
+            "a real XSS rule_key: {}",
+            sig.rule_key
+        );
+        assert_ne!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Block,
+            "shadow (log_only) never blocks the base64-wrapped XSS"
+        );
+    }
+
+    #[test]
+    fn lane1_clean_base64_body_onload_fires_through_production_pipeline() {
+        // FN-1 net-leak proof: a base64-wrapped `<body onload=…>` — invisible to
+        // Lane 1 (never decodes base64) AND dropped by the body-context fragment
+        // parse — must still surface an XSS DOM signal on the BlindDecoded view via
+        // the document reparse, through the real `evaluate_scoped` pipeline. Shadow
+        // keeps it advisory.
+        use base64::Engine as _;
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("xss", "xss_dom"));
+        // STANDARD base64 of `<body onload=alert(11)>` has no `+`/`/` (a `+` would
+        // URL-decode to a space and corrupt the token before the blind decoder).
+        let payload = base64::engine::general_purpose::STANDARD.encode("<body onload=alert(11)>");
+        let mut req = ctx();
+        req.body_preview = Bytes::from(format!("q={payload}"));
+        req.content_length = req.body_preview.len() as u64;
+        let mut st = ContentInspectionState::default();
+        let verdict = match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => v,
+            other => panic!("Lane 1 must stay clean → Semantic, got {other:?}"),
+        };
+        let sig = verdict
+            .signals
+            .iter()
+            .find(|s| s.attack == AttackKind::Xss)
+            .expect("the base64 blind decode + document reparse must surface an XSS signal");
+        assert_eq!(
+            sig.provenance,
+            Provenance::BlindDecoded,
+            "the XSS signal came through base64 blind decode (never hard-veto)"
+        );
+        assert_eq!(
+            sig.rule_key, "xss.event_handler",
+            "a body onload handler recovered by the document reparse"
+        );
+        assert_ne!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Block,
+            "shadow (log_only) never blocks the base64-wrapped body onload"
         );
     }
 

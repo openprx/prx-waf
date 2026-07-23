@@ -156,8 +156,13 @@ mod tests {
             EnforcementMode::LogOnly,
             "shipped posture is log_only"
         );
-        // All three P1c-era families present and enabled.
-        for fam in [AttackKind::SqlInjection, AttackKind::Rce, AttackKind::Traversal] {
+        // All four families present and enabled (SQLi/RCE/Traversal + P-XSS-1 Xss).
+        for fam in [
+            AttackKind::SqlInjection,
+            AttackKind::Rce,
+            AttackKind::Traversal,
+            AttackKind::Xss,
+        ] {
             let ac = rt.scoring.attacks.get(&fam).expect("family present");
             assert!(ac.enabled, "{fam:?} enabled");
             assert!(
