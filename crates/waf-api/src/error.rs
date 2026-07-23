@@ -34,7 +34,11 @@ impl IntoResponse for ApiError {
         // avoid leaking internal/database details.
         let (status, message) = match &self {
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
-            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            // Invalid input rejected in the storage layer is a client error: the
+            // message is caller-facing and carries no internal/DB detail.
+            Self::BadRequest(msg) | Self::Storage(waf_storage::StorageError::InvalidInput(msg)) => {
+                (StatusCode::BAD_REQUEST, msg.clone())
+            }
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             Self::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             Self::Internal(e) => {

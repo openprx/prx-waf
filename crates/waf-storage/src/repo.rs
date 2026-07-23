@@ -14,18 +14,44 @@ use crate::models::{
     WasmPluginRow,
 };
 
+/// Column projection for every `hosts` read.
+///
+/// `remote_ip` is a Postgres `INET` column, but the `Host` model decodes it as
+/// `Option<String>` and sqlx is built without the `ipnetwork` feature, so it has
+/// no native `INET` codec. Selecting the raw column would fail to decode; the
+/// `host(remote_ip)` render yields a plain address with no `/32`|`/128` netmask,
+/// giving a byte-for-byte create → select round-trip. Kept in one constant so
+/// the projection can never drift between the list/get/insert/update paths.
+const HOST_COLUMNS: &str = "id, code, host, port, ssl, guard_status, remote_host, remote_port, \
+     host(remote_ip) AS remote_ip, cert_file, key_file, remarks, start_status, exclude_url_log, \
+     is_enable_load_balance, load_balance_stage, defense_json, log_only_mode, created_at, updated_at";
+
+/// Reject a non-IP `remote_ip` in the repo layer so a bad value surfaces as a
+/// clean [`StorageError::InvalidInput`] instead of a raw Postgres `22P02`
+/// bubbling up from the `::inet` cast. `None` (→ SQL `NULL`) is always allowed.
+fn validate_remote_ip(remote_ip: Option<&str>) -> Result<(), StorageError> {
+    if let Some(ip) = remote_ip
+        && ip.parse::<std::net::IpAddr>().is_err()
+    {
+        return Err(StorageError::InvalidInput(format!(
+            "remote_ip must be a valid IP address, got: {ip}"
+        )));
+    }
+    Ok(())
+}
+
 impl Database {
     // ─── Hosts ───────────────────────────────────────────────────────────────
 
     pub async fn list_hosts(&self) -> Result<Vec<Host>, StorageError> {
-        let rows = sqlx::query_as::<_, Host>("SELECT * FROM hosts ORDER BY created_at DESC")
-            .fetch_all(&self.pool)
-            .await?;
+        let sql = format!("SELECT {HOST_COLUMNS} FROM hosts ORDER BY created_at DESC");
+        let rows = sqlx::query_as::<_, Host>(&sql).fetch_all(&self.pool).await?;
         Ok(rows)
     }
 
     pub async fn get_host(&self, id: Uuid) -> Result<Option<Host>, StorageError> {
-        let row = sqlx::query_as::<_, Host>("SELECT * FROM hosts WHERE id = $1")
+        let sql = format!("SELECT {HOST_COLUMNS} FROM hosts WHERE id = $1");
+        let row = sqlx::query_as::<_, Host>(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -33,7 +59,8 @@ impl Database {
     }
 
     pub async fn get_host_by_code(&self, code: &str) -> Result<Option<Host>, StorageError> {
-        let row = sqlx::query_as::<_, Host>("SELECT * FROM hosts WHERE code = $1")
+        let sql = format!("SELECT {HOST_COLUMNS} FROM hosts WHERE code = $1");
+        let row = sqlx::query_as::<_, Host>(&sql)
             .bind(code)
             .fetch_optional(&self.pool)
             .await?;
@@ -41,12 +68,14 @@ impl Database {
     }
 
     pub async fn create_host(&self, req: CreateHost) -> Result<Host, StorageError> {
+        validate_remote_ip(req.remote_ip.as_deref())?;
+
         let id = Uuid::new_v4();
         let code = Uuid::new_v4().to_string().replace('-', "")[..16].to_string();
         let now = chrono::Utc::now();
 
-        let row = sqlx::query_as::<_, Host>(
-            r"INSERT INTO hosts (
+        let sql = format!(
+            "INSERT INTO hosts (
                 id, code, host, port, ssl, guard_status,
                 remote_host, remote_port, remote_ip, cert_file, key_file,
                 remarks, start_status, log_only_mode,
@@ -54,46 +83,49 @@ impl Database {
                 created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6,
-                $7, $8, $9, $10, $11,
+                $7, $8, $9::inet, $10, $11,
                 $12, $13, $14,
                 false, 0,
                 $15, $15
-            ) RETURNING *",
-        )
-        .bind(id)
-        .bind(&code)
-        .bind(&req.host)
-        .bind(req.port)
-        .bind(req.ssl)
-        .bind(req.guard_status)
-        .bind(&req.remote_host)
-        .bind(req.remote_port)
-        .bind(&req.remote_ip)
-        .bind(&req.cert_file)
-        .bind(&req.key_file)
-        .bind(&req.remarks)
-        .bind(req.start_status)
-        .bind(req.log_only_mode)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await?;
+            ) RETURNING {HOST_COLUMNS}"
+        );
+        let row = sqlx::query_as::<_, Host>(&sql)
+            .bind(id)
+            .bind(&code)
+            .bind(&req.host)
+            .bind(req.port)
+            .bind(req.ssl)
+            .bind(req.guard_status)
+            .bind(&req.remote_host)
+            .bind(req.remote_port)
+            .bind(&req.remote_ip)
+            .bind(&req.cert_file)
+            .bind(&req.key_file)
+            .bind(&req.remarks)
+            .bind(req.start_status)
+            .bind(req.log_only_mode)
+            .bind(now)
+            .fetch_one(&self.pool)
+            .await?;
 
         debug!("Created host: {} (code={})", req.host, code);
         Ok(row)
     }
 
     pub async fn update_host(&self, id: Uuid, req: UpdateHost) -> Result<Option<Host>, StorageError> {
+        validate_remote_ip(req.remote_ip.as_deref())?;
+
         let now = chrono::Utc::now();
 
-        let row = sqlx::query_as::<_, Host>(
-            r"UPDATE hosts SET
+        let sql = format!(
+            "UPDATE hosts SET
                 host = COALESCE($2, host),
                 port = COALESCE($3, port),
                 ssl = COALESCE($4, ssl),
                 guard_status = COALESCE($5, guard_status),
                 remote_host = COALESCE($6, remote_host),
                 remote_port = COALESCE($7, remote_port),
-                remote_ip = COALESCE($8, remote_ip),
+                remote_ip = COALESCE($8::inet, remote_ip),
                 cert_file = COALESCE($9, cert_file),
                 key_file = COALESCE($10, key_file),
                 remarks = COALESCE($11, remarks),
@@ -101,24 +133,25 @@ impl Database {
                 log_only_mode = COALESCE($13, log_only_mode),
                 updated_at = $14
             WHERE id = $1
-            RETURNING *",
-        )
-        .bind(id)
-        .bind(req.host)
-        .bind(req.port)
-        .bind(req.ssl)
-        .bind(req.guard_status)
-        .bind(req.remote_host)
-        .bind(req.remote_port)
-        .bind(req.remote_ip)
-        .bind(req.cert_file)
-        .bind(req.key_file)
-        .bind(req.remarks)
-        .bind(req.start_status)
-        .bind(req.log_only_mode)
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await?;
+            RETURNING {HOST_COLUMNS}"
+        );
+        let row = sqlx::query_as::<_, Host>(&sql)
+            .bind(id)
+            .bind(req.host)
+            .bind(req.port)
+            .bind(req.ssl)
+            .bind(req.guard_status)
+            .bind(req.remote_host)
+            .bind(req.remote_port)
+            .bind(req.remote_ip)
+            .bind(req.cert_file)
+            .bind(req.key_file)
+            .bind(req.remarks)
+            .bind(req.start_status)
+            .bind(req.log_only_mode)
+            .bind(now)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row)
     }
