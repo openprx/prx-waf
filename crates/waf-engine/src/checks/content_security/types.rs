@@ -11,6 +11,54 @@ use std::borrow::Cow;
 
 use waf_common::Phase;
 
+/// A detector confidence in the closed domain `0..=100` (plan §6.1).
+///
+/// Previously a bare `u8` whose `0..=100` invariant lived only in a doc-comment
+/// and each call site's discipline. This checked newtype moves the bound into
+/// the type: a `Confidence` is constructed only through [`Confidence::saturating`],
+/// which clamps into range, so the scorer's convex-combination bound
+/// (`Σ weight · confidence ≤ 100` when `Σ weight ≤ 1`) now rests on a type
+/// guarantee rather than caller convention.
+///
+/// This changes **no** confidence value: every shipped detector already emits
+/// values in `0..=100`, so the clamp is a no-op on all production inputs — the
+/// wrapper is pure plumbing around the existing numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Confidence(u8);
+
+impl Confidence {
+    /// Construct from a raw score, clamping into `0..=100`. Saturating rather
+    /// than fallible: a detector confidence is advisory, an out-of-range input
+    /// is a caller bug that must never panic on the hot path (iron rule), and
+    /// clamping to the ceiling is the safe, deterministic repair.
+    #[must_use]
+    pub const fn saturating(raw: u8) -> Self {
+        if raw > 100 { Self(100) } else { Self(raw) }
+    }
+
+    /// The clamped inner value, always in `0..=100`.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// Compare a [`Confidence`] directly against a raw `u8` — ergonomic for the
+/// detector unit tests that assert a fixed confidence, and for read sites that
+/// still think in raw scores. Serialises transparently as its inner `u8`
+/// (below), so telemetry output is byte-identical to the pre-newtype `u8`.
+impl PartialEq<u8> for Confidence {
+    fn eq(&self, other: &u8) -> bool {
+        self.0 == *other
+    }
+}
+
+impl serde::Serialize for Confidence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(self.0)
+    }
+}
+
 /// Which request phase the Lane 2 preprocessor is operating on.
 ///
 /// **Deliberately distinct from [`waf_common::Phase`]** (which enumerates attack
@@ -237,8 +285,8 @@ impl Provenance {
 #[derive(Debug, Clone)]
 pub struct DetectionFinding {
     pub attack: AttackKind,
-    /// Confidence in `0..=100`.
-    pub confidence: u8,
+    /// Confidence in `0..=100` (bound enforced by the [`Confidence`] newtype).
+    pub confidence: Confidence,
     /// Stable matching key (compile-time constant, e.g. `"sql.into_outfile"`).
     pub rule_key: &'static str,
     /// Human-readable trace text — for logs/dashboards only; **never** matched.
@@ -270,8 +318,8 @@ pub struct DetectionSignal {
     pub attack: AttackKind,
     pub field: Cow<'static, str>,
     pub scope: InspectionScope,
-    /// Confidence in `0..=100`.
-    pub confidence: u8,
+    /// Confidence in `0..=100` (bound enforced by the [`Confidence`] newtype).
+    pub confidence: Confidence,
     /// Stable matching key (compile-time constant, e.g. `"sql.into_outfile"`).
     pub rule_key: &'static str,
     pub provenance: Provenance,

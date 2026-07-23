@@ -54,7 +54,7 @@ use std::borrow::Cow;
 
 use super::budget::ContentInspectionState;
 use super::preprocess::{PreprocessCtx, SemanticDetector, View};
-use super::types::{AttackKind, DetectionFinding, DetectorId};
+use super::types::{AttackKind, Confidence, DetectionFinding, DetectorId};
 
 /// Credential / storage exfiltration tokens — the higher-confidence class
 /// (`xss.js_exfil`, conf 88). Each names an **attack-specific** action a benign
@@ -148,7 +148,7 @@ impl SemanticDetector for XssJsTokenDetector {
         let (rule_key, confidence) = best?;
         Some(DetectionFinding {
             attack: AttackKind::Xss,
-            confidence,
+            confidence: Confidence::saturating(confidence),
             rule_key,
             detail: Cow::Owned(format!(
                 "xss js token '{rule_key}' matched in a parsed handler/js-url context (confidence {confidence})"

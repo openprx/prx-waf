@@ -27,7 +27,7 @@ use tracing::error;
 
 use super::budget::ContentInspectionState;
 use super::preprocess::{PreprocessCtx, SemanticDetector, View};
-use super::types::{AttackKind, DetectionFinding, DetectorId};
+use super::types::{AttackKind, Confidence, DetectionFinding, DetectorId};
 
 /// How a compiled rule decides whether it fired.
 enum RuleKind {
@@ -105,7 +105,7 @@ fn best_match<'a>(rules: &'a [CompiledRule], hay: &str) -> Option<&'a CompiledRu
 fn finding_for(rule: &CompiledRule, attack: AttackKind, family: &str) -> DetectionFinding {
     DetectionFinding {
         attack,
-        confidence: rule.confidence,
+        confidence: Confidence::saturating(rule.confidence),
         rule_key: rule.rule_key,
         detail: std::borrow::Cow::Owned(format!(
             "structural {family} rule '{}' matched (confidence {})",
@@ -994,7 +994,7 @@ impl SemanticDetector for AstSqlDetector {
         };
         Some(DetectionFinding {
             attack: AttackKind::SqlInjection,
-            confidence,
+            confidence: Confidence::saturating(confidence),
             rule_key,
             detail: Cow::Owned(format!(
                 "ast sqli structure '{rule_key}' matched (confidence {confidence})"
@@ -1379,7 +1379,7 @@ impl SemanticDetector for RceAstDetector {
 
         Some(DetectionFinding {
             attack: AttackKind::Rce,
-            confidence: best.confidence,
+            confidence: Confidence::saturating(best.confidence),
             rule_key: best.key,
             detail: Cow::Owned(format!(
                 "ast rce structure '{}' matched (confidence {})",

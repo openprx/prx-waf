@@ -59,7 +59,7 @@ pub use detectors::{
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
 pub use types::{
-    AttackKind, DetectionFinding, DetectionSignal, DetectorId, InspectionScope, Provenance, SemanticAction,
+    AttackKind, Confidence, DetectionFinding, DetectionSignal, DetectorId, InspectionScope, Provenance, SemanticAction,
     SemanticVerdict,
 };
 pub use xss_dom::XssDomDetector;
@@ -407,7 +407,7 @@ mod tests {
             // provenance/field/scope — the pipeline attaches those from the view.
             Some(DetectionFinding {
                 attack: AttackKind::SqlInjection,
-                confidence: self.confidence,
+                confidence: Confidence::saturating(self.confidence),
                 rule_key: "sql.union_null",
                 detail: Cow::Borrowed("mock"),
             })

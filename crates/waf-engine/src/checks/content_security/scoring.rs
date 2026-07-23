@@ -35,6 +35,8 @@ use std::collections::{HashMap, HashSet};
 use waf_common::DetectionResult;
 use waf_common::content_security_config::ContentSecurityConfig;
 
+#[cfg(test)]
+use super::types::Confidence;
 use super::types::{AttackKind, DetectionSignal, DetectorId, InspectionScope, SemanticAction, SemanticVerdict};
 
 /// Runtime (compiled, immutable) per-attack scoring config.
@@ -246,7 +248,7 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
             continue;
         }
         let w = ac.weights.get(&detector).copied().unwrap_or(0.0);
-        let contrib = w * f64::from(sig.confidence);
+        let contrib = w * f64::from(sig.confidence.get());
 
         let g = groups.entry((scope, field, attack)).or_insert(Group {
             score: 0.0,
@@ -278,7 +280,7 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
         // recomputed from `provenance` at scoring time.
         if sig.provenance.hard_veto_capable() && ac.hard_veto_allowlist.contains(sig.rule_key) {
             let hv_key: WinnerKey<'a> = (
-                sig.confidence,
+                sig.confidence.get(),
                 0,
                 Reverse((attack_ord(attack), scope_ord(scope), field, sig.rule_key)),
             );
@@ -343,7 +345,7 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
     if let Some((_, sig)) = hard_veto {
         recommendation = SemanticAction::Block;
         primary = Some(sig);
-        request_score = request_score.max(f64::from(sig.confidence));
+        request_score = request_score.max(f64::from(sig.confidence.get()));
         winner_has_capable = true;
     }
 
@@ -386,7 +388,7 @@ mod tests {
             attack,
             field: Cow::Borrowed(field),
             scope: InspectionScope::Body,
-            confidence: conf,
+            confidence: Confidence::saturating(conf),
             rule_key,
             provenance,
             detail: Cow::Borrowed("test signal"),

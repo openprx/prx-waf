@@ -60,7 +60,7 @@ use scraper::node::Element;
 
 use super::budget::ContentInspectionState;
 use super::preprocess::{PreprocessCtx, SemanticDetector, View};
-use super::types::{AttackKind, DetectionFinding, DetectorId};
+use super::types::{AttackKind, Confidence, DetectionFinding, DetectorId};
 
 /// Per-parse byte backstop (plan §5.3). An input longer than this is declined
 /// for the HTML parser (no signal — fail-open) regardless of the per-request
@@ -737,7 +737,7 @@ impl SemanticDetector for XssDomDetector {
         let (rule_key, confidence) = best?;
         Some(DetectionFinding {
             attack: AttackKind::Xss,
-            confidence,
+            confidence: Confidence::saturating(confidence),
             rule_key,
             detail: Cow::Owned(format!(
                 "xss dom construct '{rule_key}' matched (confidence {confidence})"
