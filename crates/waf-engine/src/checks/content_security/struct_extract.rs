@@ -17,12 +17,29 @@
 //!
 //! # `DoS` safety (Lane A P0 precedent)
 //! Every parser and every walk is depth-bounded so no input can drive unbounded
-//! native recursion into a worker-stack overflow (the Lane A brush-parser P0):
-//!   * [`nesting_depth`] is a cheap, string-aware linear pre-scan that **declines a
-//!     pathologically nested body before any recursive parser is invoked**
-//!     (`serde_json` recurses while building `Value`; `async-graphql-parser`
-//!     recurses over selection sets — both are refused past
-//!     [`MAX_PARSE_INPUT_DEPTH`], set at/under each parser's own internal limit).
+//! native recursion into a worker-stack overflow (the Lane A brush-parser P0). A
+//! Rust stack overflow aborts the process (SIGABRT) and is **not** catchable, so
+//! every pathological input must be refused *before* the recursive parser runs:
+//!   * JSON: [`nesting_depth`] is a cheap, string-aware linear pre-scan that
+//!     **declines a pathologically nested body before `serde_json` (which recurses
+//!     while building `Value`) is invoked** — refused past [`MAX_PARSE_INPUT_DEPTH`],
+//!     set at/under `serde_json`'s own 128 recursion limit.
+//!   * GraphQL: a *lexer-accurate* pre-scan ([`graphql_max_depth`]) is required —
+//!     `async-graphql-parser` only bounds selection-set recursion (at 64); its
+//!     value parser (`parse_value` / `parse_const_value`, over `[…]` / `{…}`
+//!     literals) has **no** depth guard and overflows a 2 MiB worker stack at ~330
+//!     nested levels. A naive scan is not enough: a `#…` line comment or a `"…"` /
+//!     `"""…"""` string can contain a lone `"`/bracket that a JSON-style scan
+//!     mis-tracks, hiding the real depth (a 6 KB request drove a live worker
+//!     `RestartCount 0→1`). [`graphql_max_depth`] therefore skips comments and
+//!     both string forms exactly, then counts `( [ {` nesting; anything past
+//!     [`MAX_PARSE_INPUT_DEPTH`] is declined. As a belt-and-suspenders backstop
+//!     that no comment/string trick can bypass, [`graphql_raw_open_total`] counts
+//!     **every** raw `( [ {` with no skipping — since the total open count is an
+//!     absolute upper bound on achievable nesting, a body exceeding
+//!     [`MAX_GRAPHQL_RAW_OPENS`] (kept well under the ~330 crash depth) is declined
+//!     even if the lexer scan were somehow defeated. Either guard tripping refuses
+//!     the parse and falls back to the whole-body view.
 //!   * Every leaf walk is **iterative** (an explicit stack, never native
 //!     recursion) with a hard [`MAX_STRUCT_DEPTH`] descent cap and a visited-node
 //!     budget, so even a legally-parsed structure cannot exhaust the stack.
@@ -57,9 +74,19 @@ const MAX_STRUCT_DEPTH: usize = 32;
 /// exceeds this is declined **before** any recursive parser runs, so a
 /// pathologically nested payload can never drive parser recursion into a
 /// worker-stack overflow. Set at/under each parser's own limit (`serde_json` 128,
-/// `async-graphql-parser` 64) so admitted input is always within the parser's
-/// safe range.
+/// `async-graphql-parser` selection-set 64) so admitted input is always within the
+/// parser's safe range. GraphQL is additionally backstopped by
+/// [`MAX_GRAPHQL_RAW_OPENS`] because its *value* parser is not depth-limited.
 const MAX_PARSE_INPUT_DEPTH: usize = 64;
+
+/// GraphQL belt-and-suspenders backstop: the maximum number of raw `( [ {` opening
+/// delimiters a GraphQL body may contain (counted with **no** string/comment
+/// skipping). The total open count is an absolute upper bound on achievable
+/// nesting, so this cannot be bypassed by any comment / string lexing trick. Kept
+/// well under the measured ~330-level `parse_value` overflow depth on a 2 MiB
+/// worker stack, yet far above any realistic query's delimiter count, so a normal
+/// wide-but-shallow query is never declined by it.
+const MAX_GRAPHQL_RAW_OPENS: usize = MAX_PARSE_INPUT_DEPTH * 4;
 
 /// Hard ceiling on the whole-body byte length handed to any structured parser.
 /// The gateway already caps `body_preview` at 64 KiB; this keeps the module
@@ -317,16 +344,112 @@ fn collect_xml_attrs(e: &BytesStart<'_>, max_fields: usize, out: &mut Vec<Leaf>)
 
 // ── GraphQL (raw `application/graphql` document) ──────────────────────────────
 
+/// Lexer-accurate maximum `( [ {` nesting depth of a GraphQL document.
+///
+/// Unlike the JSON-oriented [`nesting_depth`], this understands GraphQL lexing so a
+/// bracket hidden in a comment or string cannot inflate the count and — critically
+/// for the `DoS` guard — a lone `"` inside a `#…` comment cannot make a naive scan
+/// treat the rest of the document as an unterminated string and thereby *miss* a
+/// deep value. It skips, exactly:
+///   * `#…` line comments (to the next `\n` / `\r`),
+///   * `"""…"""` block strings (only `\"""` escapes the delimiter),
+///   * `"…"` normal strings (`\` escapes the next char; a raw line terminator ends
+///     the scan of the string defensively),
+///
+/// then counts `( [ {` opens against `) ] }` closes. Over-counting is safe (it only
+/// declines more); the scan never under-counts a real bracket outside a string.
+fn graphql_max_depth(bytes: &[u8]) -> usize {
+    let is_triple =
+        |j: usize| bytes.get(j) == Some(&b'"') && bytes.get(j + 1) == Some(&b'"') && bytes.get(j + 2) == Some(&b'"');
+    let mut depth: usize = 0;
+    let mut max: usize = 0;
+    let mut i = 0usize;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'#' => {
+                i += 1;
+                while let Some(&c) = bytes.get(i) {
+                    if c == b'\n' || c == b'\r' {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' if is_triple(i) => {
+                // Block string: advance past `"""`, then to the closing `"""`,
+                // treating `\"""` as an escaped (non-terminating) delimiter.
+                i += 3;
+                loop {
+                    match bytes.get(i) {
+                        None => break,
+                        Some(&b'\\')
+                            if bytes.get(i + 1) == Some(&b'"')
+                                && bytes.get(i + 2) == Some(&b'"')
+                                && bytes.get(i + 3) == Some(&b'"') =>
+                        {
+                            i += 4;
+                        }
+                        _ if is_triple(i) => {
+                            i += 3;
+                            break;
+                        }
+                        Some(_) => i += 1,
+                    }
+                }
+            }
+            b'"' => {
+                // Normal string: `\` escapes the next byte; ends at an unescaped `"`.
+                i += 1;
+                while let Some(&c) = bytes.get(i) {
+                    match c {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        b'\n' | b'\r' => break,
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'{' | b'[' | b'(' => {
+                depth += 1;
+                max = max.max(depth);
+                i += 1;
+            }
+            b'}' | b']' | b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    max
+}
+
+/// Count of **every** raw `( [ {` opener with no string/comment skipping — an
+/// absolute, un-bypassable upper bound on the document's achievable nesting depth.
+/// The belt-and-suspenders backstop behind [`graphql_max_depth`].
+fn graphql_raw_open_total(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b == b'{' || b == b'[' || b == b'(').count()
+}
+
 /// Extract string literals from a raw GraphQL query document: inline field /
 /// directive argument values (GraphQL-unescaped) and variable default values,
-/// across every operation and fragment. `async-graphql-parser` bounds its own
-/// selection-set recursion at 64 and our pre-parse [`nesting_depth`] guard declines
-/// deeper input first; the selection-set walk and every value walk are iterative
-/// with a depth cap.
+/// across every operation and fragment.
+///
+/// `async-graphql-parser` bounds only its selection-set recursion (at 64); its
+/// value parser (`parse_value` / `parse_const_value`) is **un-guarded** and
+/// overflows the worker stack on a deeply nested `[…]` / `{…}` literal. So before
+/// `parse_query` runs, the document must pass **both** the lexer-accurate
+/// [`graphql_max_depth`] guard (`≤ MAX_PARSE_INPUT_DEPTH`) and the un-bypassable
+/// [`graphql_raw_open_total`] backstop (`≤ MAX_GRAPHQL_RAW_OPENS`); either tripping
+/// declines the parse and falls back to the whole-body view. The post-parse
+/// selection-set walk and every value walk are iterative with a depth cap.
 fn extract_graphql(body: &[u8], max_fields: usize, out: &mut Vec<Leaf>) {
     use async_graphql_parser::types::{Selection, SelectionSet};
 
-    if nesting_depth(body) > MAX_PARSE_INPUT_DEPTH {
+    if graphql_max_depth(body) > MAX_PARSE_INPUT_DEPTH || graphql_raw_open_total(body) > MAX_GRAPHQL_RAW_OPENS {
         return;
     }
     let Ok(text) = std::str::from_utf8(body) else {
@@ -777,6 +900,126 @@ mod tests {
             let leaves = extract_body_fields(body.as_bytes(), Some("application/graphql"), 64);
             assert!(leaves.is_empty(), "n={n}: deep graphql must be declined");
         }
+    }
+
+    /// P0: run each pathological GraphQL body through `extract_body_fields` on an
+    /// **explicit 2 MiB thread** (the Pingora worker stack). `async-graphql-parser`
+    /// does not depth-limit its value parser, so a deep `[…]`/`{…}` literal — the
+    /// depth of which a naive scan can be made to miss with a `#`-comment or string
+    /// trick — overflows the worker stack and aborts (SIGABRT, uncatchable). That
+    /// every case *returns* (`join` succeeds, exit 0) is the `DoS` proof: the
+    /// lexer-accurate guard + raw-open backstop declined the body before `parse_query`.
+    #[test]
+    fn graphql_deep_value_variants_decline_without_stack_overflow() {
+        // Each fixture would, unguarded, drive parse_value recursion past the
+        // ~330-level 2 MiB crash depth. n=3000 far exceeds it.
+        let n = 3000usize;
+        let cases: Vec<(&str, String)> = vec![
+            // Root cause 1a: lone `"` inside a `#` line comment flips a naive
+            // in-string tracker, hiding the deep list that follows.
+            (
+                "comment-trick deep list",
+                format!(
+                    "query {{ a(\n# \"\n x: {}1{} ) {{ b }} }}",
+                    "[".repeat(n),
+                    "]".repeat(n)
+                ),
+            ),
+            // Root cause 1b: a `\"\"\"` block string containing a lone bracket/quote
+            // desynchronises a naive scan the same way.
+            (
+                "block-string-trick deep list",
+                format!(
+                    "query {{ a(c: \"\"\" [ \"\"\" b: {}1{} ) {{ d }} }}",
+                    "[".repeat(n),
+                    "]".repeat(n)
+                ),
+            ),
+            // Plain deep list value, no trick.
+            (
+                "plain deep list",
+                format!("query {{ a(x: {}1{}) {{ b }} }}", "[".repeat(n), "]".repeat(n)),
+            ),
+            // Deep object literal value.
+            (
+                "deep object literal",
+                format!("query {{ a(x: {}{}) {{ b }} }}", "{k:".repeat(n), "}".repeat(n)),
+            ),
+        ];
+        for (label, body) in cases {
+            let handle = std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || extract_body_fields(body.as_bytes(), Some("application/graphql"), 64))
+                .expect("spawn worker-stack thread");
+            let leaves = handle
+                .join()
+                .expect("worker thread aborted (stack overflow not prevented)");
+            assert!(
+                leaves.is_empty(),
+                "{label}: pathological body must be declined, not parsed"
+            );
+        }
+    }
+
+    #[test]
+    fn graphql_wide_shallow_query_still_extracts_leaves() {
+        // A legitimate wide-but-shallow query (many fields, real args & variables,
+        // depth well under 64 and delimiter count well under MAX_GRAPHQL_RAW_OPENS)
+        // must NOT be declined by the DoS guards — leaves are still extracted.
+        use std::fmt::Write as _;
+        let mut q = String::from("query Search($t: String = \"default-term\") {\n");
+        for i in 0..40 {
+            let _ = writeln!(
+                q,
+                "  f{i}(name: \"term-{i}' OR 1=1--\", filter: {{k: \"v{i}\"}}) {{ id title }}"
+            );
+        }
+        q.push('}');
+        assert!(
+            graphql_max_depth(q.as_bytes()) <= MAX_PARSE_INPUT_DEPTH,
+            "fixture must be shallow: depth={}",
+            graphql_max_depth(q.as_bytes())
+        );
+        assert!(
+            graphql_raw_open_total(q.as_bytes()) <= MAX_GRAPHQL_RAW_OPENS,
+            "fixture must be under the raw-open backstop: opens={}",
+            graphql_raw_open_total(q.as_bytes())
+        );
+        let leaves = extract_body_fields(q.as_bytes(), Some("application/graphql"), 512);
+        assert!(
+            any_value_contains(&leaves, "' OR 1=1--"),
+            "wide shallow query args must still be extracted: got {} leaves",
+            leaves.len()
+        );
+        assert!(
+            any_value_contains(&leaves, "default-term"),
+            "variable default must still be extracted"
+        );
+    }
+
+    #[test]
+    fn graphql_max_depth_is_lexer_accurate() {
+        // Real nesting is counted: { (1) ( (2) [ [ [ (3,4,5).
+        assert_eq!(graphql_max_depth(b"query { a(x: [[[1]]]) { b } }"), 5);
+        // A lone `"` in a `#` comment must NOT desync tracking: the deep list after
+        // it is still counted (naive nesting_depth would report ~0 here).
+        let tricked = b"a(\n# \"\n x: [[[[[1]]]]] )";
+        assert_eq!(graphql_max_depth(tricked), 6, "comment-trick must not hide depth");
+        assert!(nesting_depth(tricked) < 6, "naive scan under-counts (the bug)");
+        // Brackets inside strings/comments do not count.
+        assert_eq!(graphql_max_depth(b"a(x: \"[[[[\") "), 1);
+        assert_eq!(graphql_max_depth(b"# [[[[[\nquery { x }"), 1);
+        assert_eq!(graphql_max_depth(b"a(x: \"\"\" {{{{ \"\"\") "), 1);
+    }
+
+    #[test]
+    fn graphql_raw_open_backstop_declines_when_lexer_bypassed() {
+        // Belt-and-suspenders: even if the lexer scan reported a low depth, the raw
+        // open-total backstop declines a body whose bracket count exceeds the cap.
+        let body = format!("query {{ a(x: {}1{}) {{ b }} }}", "[".repeat(300), "]".repeat(300));
+        assert!(graphql_raw_open_total(body.as_bytes()) > MAX_GRAPHQL_RAW_OPENS);
+        let leaves = extract_body_fields(body.as_bytes(), Some("application/graphql"), 64);
+        assert!(leaves.is_empty(), "over-cap raw-open body must be declined");
     }
 
     #[test]
