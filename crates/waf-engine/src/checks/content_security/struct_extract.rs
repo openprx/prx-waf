@@ -251,7 +251,10 @@ fn extract_json(body: &[u8], max_fields: usize, out: &mut Vec<Leaf>) {
 /// (`acc`) coalesces consecutive text / CDATA / entity-ref events into one leaf,
 /// flushing at each element boundary — so an entity-encoded payload is
 /// reconstructed whole (`<script>`) while genuine sibling elements
-/// (`<a>1 UNION</a><b>SELECT</b>`) stay separate leaves.
+/// (`<a>1 UNION</a><b>SELECT</b>`) stay separate leaves. Numeric character
+/// references (`&#39;`, `&#x27;`) are resolved by [`decode_numeric_char_ref`]:
+/// quick-xml 0.41's `BytesRef::resolve_char_ref` does not resolve them, so a
+/// payload encoded as `&#39;`/`&#60;` would otherwise reach Lane 2 as nothing.
 fn extract_xml(body: &[u8], max_fields: usize, out: &mut Vec<Leaf>) {
     let mut reader = Reader::from_reader(body);
     let mut buf: Vec<u8> = Vec::new();
@@ -300,15 +303,17 @@ fn extract_xml(body: &[u8], max_fields: usize, out: &mut Vec<Leaf>) {
                     acc.push_str(&decoded);
                 }
             }
-            // Entity reference: numeric char ref (`&#39;`) or a predefined named
-            // entity (`&lt;`); resolved into the current text run.
+            // Entity reference: numeric char ref (`&#39;`, `&#x27;`) or a predefined
+            // named entity (`&lt;`); resolved into the current text run. Numeric
+            // refs are decoded by hand — quick-xml 0.41's `resolve_char_ref` does
+            // not resolve them, so relying on it silently drops the payload.
             Ok(Event::GeneralRef(r)) => {
-                if depth <= MAX_STRUCT_DEPTH {
-                    if let Ok(Some(c)) = r.resolve_char_ref() {
+                if depth <= MAX_STRUCT_DEPTH
+                    && let Ok(name) = r.decode()
+                {
+                    if let Some(c) = decode_numeric_char_ref(&name) {
                         acc.push(c);
-                    } else if let Ok(name) = r.decode()
-                        && let Some(rep) = quick_xml::escape::resolve_predefined_entity(&name)
-                    {
+                    } else if let Some(rep) = quick_xml::escape::resolve_predefined_entity(&name) {
                         acc.push_str(rep);
                     }
                 }
@@ -326,6 +331,21 @@ fn flush_xml_text(acc: &mut String, max_fields: usize, out: &mut Vec<Leaf>) {
         push_leaf(out, XML_LABEL, acc);
     }
     acc.clear();
+}
+
+/// Resolve an XML numeric character reference from a `GeneralRef` name: decimal
+/// `#NN` (`&#39;`) or hexadecimal `#xNN` / `#XNN` (`&#x27;`). Returns `None` for a
+/// named entity (`apos`), an out-of-range code point, or malformed digits — the
+/// caller then falls back to the predefined-entity table. Never panics.
+fn decode_numeric_char_ref(name: &str) -> Option<char> {
+    let rest = name.strip_prefix('#')?;
+    // Empty digits make both `from_str_radix` and `parse` fail (→ None), so no
+    // explicit emptiness check is needed.
+    let code = match rest.strip_prefix(['x', 'X']) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => rest.parse::<u32>().ok()?,
+    };
+    char::from_u32(code)
 }
 
 /// Collect the (entity-unescaped) attribute values of one start/empty element.
@@ -700,6 +720,55 @@ mod tests {
             "xml entities must be unescaped: {:?}",
             labels_values(&leaves)
         );
+    }
+
+    #[test]
+    fn xml_numeric_char_refs_are_decoded() {
+        // BUG-1: decimal `&#39;` (') and `&#60;` (<) numeric char refs must be
+        // reconstructed — quick-xml 0.41 does not resolve them itself, so a payload
+        // encoded this way otherwise reaches Lane 2 as an empty text run.
+        let body = br"<x>1&#39; OR &#39;1&#39;=&#39;1</x>";
+        let leaves = extract_body_fields(body, Some("application/xml"), 64);
+        assert!(
+            any_value_contains(&leaves, "1' OR '1'='1"),
+            "decimal numeric char refs must be decoded: {:?}",
+            labels_values(&leaves)
+        );
+    }
+
+    #[test]
+    fn xml_hex_char_refs_are_decoded() {
+        // `&#x27;` (') and `&#x3C;` (<) hexadecimal char refs.
+        let body = br"<x>&#x3C;script&#x3E;a(&#x27;xss&#x27;)&#x3C;/script&#x3E;</x>";
+        let leaves = extract_body_fields(body, Some("application/xml"), 64);
+        assert!(
+            any_value_contains(&leaves, "<script>a('xss')</script>"),
+            "hex numeric char refs must be decoded: {:?}",
+            labels_values(&leaves)
+        );
+    }
+
+    #[test]
+    fn xml_numeric_and_named_refs_mix_in_one_run() {
+        // Named (`&lt;`) and numeric (`&#39;`) refs coalesce into one leaf.
+        let body = br"<x>&lt;a&gt;&#39;&#x2D;&#x2D;</x>";
+        let leaves = extract_body_fields(body, Some("application/xml"), 64);
+        assert!(any_value_contains(&leaves, "<a>'--"), "{:?}", labels_values(&leaves));
+    }
+
+    #[test]
+    fn decode_numeric_char_ref_edge_cases() {
+        assert_eq!(decode_numeric_char_ref("#39"), Some('\''));
+        assert_eq!(decode_numeric_char_ref("#x27"), Some('\''));
+        assert_eq!(decode_numeric_char_ref("#X3C"), Some('<'));
+        // Named entity / malformed / empty digits are not numeric refs.
+        assert_eq!(decode_numeric_char_ref("apos"), None);
+        assert_eq!(decode_numeric_char_ref("#"), None);
+        assert_eq!(decode_numeric_char_ref("#x"), None);
+        assert_eq!(decode_numeric_char_ref("#xZZ"), None);
+        assert_eq!(decode_numeric_char_ref("#99z"), None);
+        // Surrogate code point is not a valid char -> None (never panics).
+        assert_eq!(decode_numeric_char_ref("#xD800"), None);
     }
 
     #[test]
