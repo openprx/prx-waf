@@ -59,6 +59,13 @@ fn make_ctx(client_ip: IpAddr) -> RequestCtx {
 #[tokio::test]
 #[ignore = "requires internet + live Postgres; run with --ignored"]
 async fn tor_feed_end_to_end_blocks_listed_ip() {
+    // Install the process-level rustls `ring` CryptoProvider before the
+    // reqwest-backed fetch builds its TLS client (reqwest is built with
+    // `rustls-no-provider`; production does this in `prx-waf` main.rs). Without
+    // it, the HTTPS fetch below panics with "no process-level CryptoProvider".
+    // `install_default` returns Err only if already installed — idempotent here.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // 1. Fetch the real public feed (proves SSRF passes for a public host).
     let body = fetch_ip_feed(TOR_FEED_URL).await.expect("Tor exit list should fetch");
 
