@@ -1097,8 +1097,8 @@ impl SemanticDetector for SstiStructuralDetector {
 /// no signal, so **every bare-metacharacter rule is default-off**. Default-**on**
 /// ships only the *structural co-occurrence* signals that are essentially never
 /// benign in request data: a filter-clause close **immediately followed by** a new
-/// clause open carrying a logical operator (`)(|(`) or an attribute assignment
-/// (`)(uid=`), the canonical wildcard auth-bypass (`*)(uid=*`), the hex-escaped
+/// clause open carrying a logical operator (`)(|(`, or the empty-filter `)(&)`) or
+/// an attribute assignment (`)(uid=`), the canonical wildcard auth-bypass (`*)(uid=*`), the hex-escaped
 /// filter break (`\29\28`) and the null-byte filter truncation (`))\00`). The
 /// generic `)(<any-attr>=` break, the bare `(|(` grouping and the lone
 /// metacharacters ship default-off pending holdout calibration.
@@ -1106,14 +1106,16 @@ impl SemanticDetector for SstiStructuralDetector {
 /// `(rule_key, confidence, pattern, kind, default_on)`.
 const LDAP_RULES: &[RuleRow] = &[
     // Filter-break into a logical operator: a clause close `)` immediately
-    // re-opened as a boolean sub-filter `(|(` / `(&(` / `(!(`. Injecting a logical
-    // operator to widen or invert the search is the LDAP-injection primitive and
-    // this `)(<op>(` shape is essentially never benign in request data.
-    // DEFAULT-ON, highest confidence.
+    // re-opened as a boolean sub-filter that either nests another clause `(|(` /
+    // `(&(` / `(!(` or closes empty `)(&)` / `)(|)` / `)(!)` (the always-true /
+    // always-false empty-filter auth-bypass, e.g. `admin)(&)`). Injecting a logical
+    // operator to widen, invert or short-circuit the search is the LDAP-injection
+    // primitive and this `)(<op>(`-or-`)(<op>)` shape is essentially never benign in
+    // request data. DEFAULT-ON, highest confidence.
     (
         "ldap.filter_break_logical",
         90,
-        r"\)\s*\(\s*[|&!]\s*\(",
+        r"\)\s*\(\s*[|&!]\s*[()]",
         RuleKind::Presence,
         true,
     ),
@@ -1293,26 +1295,32 @@ const XPATH_RULES: &[RuleRow] = &[
     // essentially never benign in request data. DEFAULT-ON, highest confidence.
     ("xpath.node_axis_union", 90, r"\]\s*\|\s*//", RuleKind::Presence, true),
     // Auth-bypass via a logical operator immediately calling an XPath node
-    // function: `' or position()`, `or count(`, `or name()=`, `and last()`. XPath
-    // node functions (`position`/`last`/`name`/`local-name`) are XPath-distinctive
-    // and, gated behind an `or`/`and`, form the canonical XPath auth-bypass tail.
-    // DEFAULT-ON.
+    // function: `' or position()`, `and last()`, `or name()=`. The XPath-distinctive
+    // node functions (`position`/`last`/`name`/`local-name`) fire behind an `or`/`and`
+    // on their own — they are near-unique to XPath. The aggregate/string functions
+    // `count`/`string-length` are also ordinary English/SQL words (`… or count(items)`,
+    // `sum or count(*)`), so they require a following absolute-axis argument
+    // (`or count(//`, `or count(/`) — the blind-XPath extraction shape — instead of a
+    // bare `or count(`. DEFAULT-ON.
     (
         "xpath.auth_bypass_func",
         90,
-        r"\b(?:or|and)\s+(?:position|last|name|local-name|count|string-length)\s*\(",
+        r"\b(?:or|and)\s+(?:position|last|name|local-name)\s*\(|\b(?:or|and)\s+(?:count|string-length)\s*\(\s*/",
         RuleKind::Presence,
         true,
     ),
     // Quote-closed tautology `' or '1'='1` / `" or "1"="1` — the injected input
     // closes the string literal and appends an always-true quoted comparison to
-    // widen node selection past the intended predicate. The quoted-operand shape is
-    // narrower than the bare SQLi tautology and is essentially never benign.
+    // widen node selection past the intended predicate. Both compared operands are a
+    // SINGLE alphanumeric char (`'1'='1`, `'a'='a`): the canonical tautology form.
+    // Requiring single-char operands drops the legitimate faceted-search shape
+    // `author='smith' and 'year'='2020'` (multi-char, distinct field/value operands)
+    // that the old `[a-z0-9]+` matched, while keeping the never-benign `'x'='x` payload.
     // DEFAULT-ON. (Overlaps the SQLi family by design; see the type doc.)
     (
         "xpath.quote_tautology",
         88,
-        r#"['"]\s*(?:or|and)\s*['"]\s*[a-z0-9]+\s*['"]?\s*=\s*['"]?\s*[a-z0-9]+"#,
+        r#"['"]\s*(?:or|and)\s*['"]\s*[a-z0-9]\s*['"]?\s*=\s*['"]?\s*[a-z0-9]"#,
         RuleKind::Presence,
         true,
     ),
@@ -1515,15 +1523,18 @@ const DESER_RULES: &[RuleRow] = &[
         true,
     ),
     // ── PHP (default-on) ─────────────────────────────────────────────────────
-    // PHP `serialize()` OBJECT header `O:<len>:"<class>":<n>:{` — the structural
-    // object-injection primitive (a typed object with a class name and property
-    // count). Distinct from the plain array header `a:<len>:{` (default-off): a typed
-    // object is what drives `__wakeup`/`__destruct` gadget chains. The class char
-    // class is a single bounded repetition (no nesting → linear). DEFAULT-ON.
+    // PHP `serialize()` OBJECT header carrying a KNOWN POP-chain gadget class — the
+    // object-injection primitive whose class name belongs to a framework/library that
+    // ships an exploitable `__wakeup`/`__destruct` gadget (PHPGGC chains): Monolog,
+    // Guzzle, Symfony, Doctrine, Laravel, Zend, SwiftMailer, ThinkPHP, Yii, phpseclib,
+    // Imagick. A typed object with one of these class roots is essentially never benign
+    // request data. The generic `O:<len>:"<any-class>":` header (which matches ordinary
+    // `stdClass` session/cookie payloads) ships default-off below. The class char class
+    // is a single bounded repetition (no nesting → linear). DEFAULT-ON.
     (
-        "deser.php_object_injection",
+        "deser.php_object_gadget",
         88,
-        r#"o:\d+:"[a-z0-9_\\]{1,120}":\d+:\{"#,
+        r#"o:\d+:"[a-z0-9_\\]*(?:monolog|guzzlehttp|symfony|doctrine|laravel|zend|swift_?mailer|thinkphp|yii|phpseclib|imagick|phpggc)[a-z0-9_\\]*":\d+:\{"#,
         RuleKind::Presence,
         true,
     ),
@@ -1537,11 +1548,15 @@ const DESER_RULES: &[RuleRow] = &[
     // preprocessor collapses the opcode newlines to spaces, so the module and callable
     // arrive as adjacent tokens (`cos system`). This is a pickle-RCE reduction — the
     // dangerous-opcode COMBINATION, not a bare token — and hits base64-wrapped pickles
-    // on their decoded view. DEFAULT-ON.
+    // on their decoded view (surfaced by the deser blind-decode marker in preprocess).
+    // Each alternative carries a LEADING `\b` so the pickle module token must start on a
+    // word boundary: `macos system` / `the acos system` (word-internal `cos`) no longer
+    // match, while a real `cos\nsystem` opcode (`c` at a space/start boundary) still does.
+    // DEFAULT-ON.
     (
         "deser.py_pickle_global_exec",
         90,
-        r"c(?:os|posix|nt)\s+system\b|c__builtin__\s+(?:eval|exec|compile)\b|c(?:subprocess|commands|pty)\s+[a-z_]",
+        r"\bc(?:os|posix|nt)\s+system\b|\bc__builtin__\s+(?:eval|exec|compile)\b|\bc(?:subprocess|commands|pty)\s+[a-z_]",
         RuleKind::Presence,
         true,
     ),
@@ -1558,18 +1573,43 @@ const DESER_RULES: &[RuleRow] = &[
         true,
     ),
     // Known .NET deserialization gadget markers: `ObjectDataProvider` /
-    // `TypeConfuseDelegate` / `ActivitySurrogateSelector` (ysoserial.net gadgets),
-    // `System.Windows.Data.ObjectDataProvider`, and the `BinaryFormatter` /
-    // `LosFormatter` type names that carry the payload. Specific gadget/formatter
-    // type names, never a generic namespace. DEFAULT-ON.
+    // `TypeConfuseDelegate` / `ActivitySurrogateSelector` (ysoserial.net gadgets).
+    // These names exist only in exploit payloads, never in benign code/prose. The bare
+    // formatter TYPE names `BinaryFormatter` / `LosFormatter` (which recur in legitimate
+    // .NET source, docs, bug-trackers and security discussion) are NOT gadgets on their
+    // own and ship default-off below. DEFAULT-ON.
     (
         "deser.dotnet_gadget",
         88,
-        r"objectdataprovider|typeconfusedelegate|activitysurrogateselector|losformatter|binaryformatter",
+        r"objectdataprovider|typeconfusedelegate|activitysurrogateselector",
         RuleKind::Presence,
         true,
     ),
     // ── default-off (high-noise, holdout calibration pending) ────────────────
+    // Generic PHP `serialize()` OBJECT header `O:<len>:"<any-class>":<n>:{` — the
+    // structural object-injection primitive, but it also matches the ordinary
+    // `O:8:"stdClass"` objects that legitimate apps carry in cookies / hidden fields /
+    // caches (WP, Laravel). Only fires with the gadget-class narrowing default-on above;
+    // the class-agnostic form is DEFAULT-OFF until holdout-calibrated. The class char
+    // class is a single bounded repetition (no nesting → linear).
+    (
+        "deser.php_object_injection",
+        60,
+        r#"o:\d+:"[a-z0-9_\\]{1,120}":\d+:\{"#,
+        RuleKind::Presence,
+        false,
+    ),
+    // Bare .NET serializer TYPE names `BinaryFormatter` / `LosFormatter` — legitimate
+    // framework type names that recur in .NET source, docs, code-review and security
+    // discussion; not exploit gadgets on their own (the ysoserial.net gadget markers
+    // ship default-on above). DEFAULT-OFF.
+    (
+        "deser.dotnet_formatter_name",
+        30,
+        r"binaryformatter|losformatter",
+        RuleKind::Presence,
+        false,
+    ),
     // PHP serialized ARRAY header `a:<len>:{` — recurs wherever PHP serializes plain
     // arrays (sessions, caches, form state); carries no object-injection signal on its
     // own. DEFAULT-OFF.
@@ -3931,6 +3971,32 @@ mod tests {
     }
 
     #[test]
+    fn ldap_empty_logical_filter_break_fires() {
+        // F-H: the empty-filter auth-bypass forms `)(&)` / `)(|)` / `)(!)` (a clause
+        // close re-opened onto a logical operator that closes empty) now fire — the old
+        // pattern required a nested re-open `)(&(` and missed `admin)(&)`.
+        for payload in [r"admin)(&)", r"user)(|)", r"x)(!)"] {
+            let f = ldap_fire(payload).unwrap_or_else(|| panic!("empty-logical break must fire: {payload}"));
+            assert_eq!(f.attack, AttackKind::LdapInjection);
+            assert_eq!(f.rule_key, "ldap.filter_break_logical", "payload: {payload}");
+        }
+        // The nested re-open form must still fire (no regression).
+        assert_eq!(
+            ldap_fire(r"x)(&(objectClass=*)")
+                .expect("nested re-open still fires")
+                .rule_key,
+            "ldap.filter_break_logical",
+        );
+        // Ordinary parenthesised text with an operator but NO `)(` adjacency must not.
+        for benign in [r"if (x > 0) && (y < 10) { run(); }", r"result = (a|b)&c"] {
+            assert!(
+                ldap_fire(benign).is_none(),
+                "benign parenthesised expression must not fire: {benign}"
+            );
+        }
+    }
+
+    #[test]
     fn ldap_evasion_signatures_fire_default_on() {
         // Hex-escaped `)(` break and the null-byte filter truncation tail.
         for (payload, expect) in [
@@ -4161,6 +4227,66 @@ mod tests {
     }
 
     #[test]
+    fn xpath_quote_tautology_narrowed_to_single_char_operands() {
+        // F-C: the quote-tautology rule now requires single-char operands (`'1'='1`),
+        // so the legitimate faceted-search DSL `author='smith' and 'year'='2020'`
+        // (multi-char distinct field/value operands) no longer fires, while the
+        // canonical `'1'='1` / `'a'='a` / `" or "1"="1` tautology still does.
+        for benign in [
+            r"author='smith' and 'year'='2020'",
+            r"title='foo' or 'category'='books'",
+            r"name='alice' and 'city'='paris'",
+        ] {
+            assert!(
+                xpath_fire(benign).is_none(),
+                "legitimate quoted faceted search must not fire: {benign}"
+            );
+        }
+        for attack in [r"' or '1'='1", r"' or 'a'='a", r#"" or "1"="1"#] {
+            assert_eq!(
+                xpath_fire(attack)
+                    .unwrap_or_else(|| panic!("real tautology must fire: {attack}"))
+                    .rule_key,
+                "xpath.quote_tautology",
+                "payload: {attack}"
+            );
+        }
+    }
+
+    #[test]
+    fn xpath_auth_bypass_func_requires_axis_for_count() {
+        // F-D: `count`/`string-length` (ordinary English/SQL words) now require an
+        // absolute-axis argument (`or count(//`), so bare-prose `or count(items)` /
+        // `or count(*)` no longer fires; the XPath-distinctive node functions
+        // (`position`/`last`/`name`/`local-name`) still fire on their own, and the real
+        // blind-extraction `or count(//user)` fires.
+        for benign in [
+            r"search by name or count(items)",
+            r"sum or count(*) whichever is larger",
+            r"group and count(rows) per bucket",
+        ] {
+            assert!(
+                xpath_fire(benign).is_none(),
+                "bare or/and count( in prose must not fire: {benign}"
+            );
+        }
+        for attack in [
+            r"' or count(//user)>0",
+            r"x' or count(/root/user)>1",
+            r"' or position()=1",
+            r"admin' and last()",
+        ] {
+            assert_eq!(
+                xpath_fire(attack)
+                    .unwrap_or_else(|| panic!("XPath auth-bypass must fire: {attack}"))
+                    .rule_key,
+                "xpath.auth_bypass_func",
+                "payload: {attack}"
+            );
+        }
+    }
+
+    #[test]
     fn xpath_pathological_input_declines_without_stack_overflow() {
         // Pure-regex detector over a backtracking-free automaton: a huge run of
         // bare XPath tokens is a bounded linear scan that returns promptly and never
@@ -4210,14 +4336,23 @@ mod tests {
     fn deser_default_on_excludes_high_noise_rules() {
         let det = DeserStructuralDetector::new();
         let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
-        for off in ["deser.php_array", "deser.py_reduce", "deser.java_pkg_generic"] {
+        for off in [
+            "deser.php_array",
+            "deser.py_reduce",
+            "deser.java_pkg_generic",
+            // F-E / F-F: the class-agnostic PHP object header and the bare .NET
+            // formatter type names are demoted to default-off (FP-prone).
+            "deser.php_object_injection",
+            "deser.dotnet_formatter_name",
+        ] {
             assert!(!on.contains(off), "{off} must be default-off");
         }
         for onk in [
             "deser.java_serial_b64",
             "deser.java_hex_magic",
             "deser.java_gadget_class",
-            "deser.php_object_injection",
+            // F-E: the gadget-class-narrowed PHP object rule replaces the generic one.
+            "deser.php_object_gadget",
             "deser.php_phar",
             "deser.py_pickle_global_exec",
             "deser.dotnet_binaryformatter_b64",
@@ -4242,8 +4377,11 @@ mod tests {
                 "org.apache.commons.collections.functors.InvokerTransformer",
                 "deser.java_gadget_class",
             ),
-            // PHP serialize() typed-object header.
-            (r#"O:8:"Evil":1:{s:3:"cmd";s:2:"id";}"#, "deser.php_object_injection"),
+            // PHP serialize() typed-object header carrying a known PHPGGC gadget class.
+            (
+                r#"O:32:"Monolog\Handler\SyslogUdpHandler":1:{s:4:"data";s:2:"id";}"#,
+                "deser.php_object_gadget",
+            ),
             // PHP phar wrapper.
             ("file=phar://evil.phar/x", "deser.php_phar"),
             // Python pickle GLOBAL opcode reducing os.system (newlines collapse to
@@ -4302,6 +4440,18 @@ mod tests {
                 "dependency: org.apache.commons.collections:3.2.1",
                 "deser.java_pkg_generic",
             ),
+            // F-E: a legit `stdClass` object serialization (WP/Laravel cookie/cache)
+            // matches only the class-agnostic, now default-off generic rule.
+            (
+                r#"O:8:"stdClass":1:{s:4:"name";s:3:"joe";}"#,
+                "deser.php_object_injection",
+            ),
+            // F-F: the bare .NET formatter type name in prose / code review is
+            // default-off; only the true ysoserial.net gadget markers fire default-on.
+            (
+                "we should stop using BinaryFormatter for untrusted input",
+                "deser.dotnet_formatter_name",
+            ),
         ] {
             assert!(
                 deser_fire(payload).is_none(),
@@ -4310,6 +4460,80 @@ mod tests {
             let f = deser_fire_all(payload).unwrap_or_else(|| panic!("fires under full set: {payload}"));
             assert_eq!(f.rule_key, expect, "payload: {payload}");
         }
+    }
+
+    #[test]
+    fn deser_php_gadget_fires_but_benign_stdclass_does_not() {
+        // F-E: the gadget-class-narrowed PHP object rule catches a real PHPGGC chain
+        // (Monolog/Guzzle/Symfony/… class root) default-on, while an ordinary
+        // `O:8:"stdClass"` typed object — normal PHP session/cookie serialization —
+        // does NOT fire under the default set.
+        assert_eq!(
+            deser_fire(r#"O:39:"GuzzleHttp\Psr7\FnStream":2:{s:7:"methods";}"#)
+                .expect("guzzle gadget object fires")
+                .rule_key,
+            "deser.php_object_gadget",
+        );
+        for benign in [
+            r#"O:8:"stdClass":1:{s:4:"name";s:3:"joe";}"#,
+            r#"O:4:"User":2:{s:2:"id";i:7;s:4:"name";s:3:"amy";}"#,
+        ] {
+            assert!(
+                deser_fire(benign).is_none(),
+                "benign PHP object serialization must not fire default-on: {benign}"
+            );
+        }
+    }
+
+    #[test]
+    fn deser_dotnet_gadget_fires_but_bare_formatter_name_does_not() {
+        // F-F: a real ysoserial.net gadget marker fires default-on; the bare formatter
+        // TYPE names (which recur in benign .NET code / docs / discussion) do not.
+        for gadget in [
+            "<ExpandedWrapperOfXamlReaderObjectDataProvider>",
+            "TypeConfuseDelegate",
+            "ActivitySurrogateSelector",
+        ] {
+            assert_eq!(
+                deser_fire(gadget)
+                    .unwrap_or_else(|| panic!(".NET gadget must fire: {gadget}"))
+                    .rule_key,
+                "deser.dotnet_gadget",
+                "payload: {gadget}"
+            );
+        }
+        for benign in [
+            "we should stop using BinaryFormatter for untrusted input",
+            "LosFormatter was deprecated in favour of a safer serializer",
+        ] {
+            assert!(
+                deser_fire(benign).is_none(),
+                "bare .NET formatter type name must not fire default-on: {benign}"
+            );
+        }
+    }
+
+    #[test]
+    fn deser_pickle_word_internal_cos_does_not_fire() {
+        // F-A: the pickle GLOBAL-exec rule carries a leading `\b`, so the extremely
+        // common benign phrase `macOS system` (word-internal `cos`) no longer trips it,
+        // while a real `cos\nsystem` GLOBAL opcode still does.
+        for benign in [
+            "macos system update available",
+            "the acos system returns a radian value",
+            "please restart the macos system service",
+        ] {
+            assert!(
+                deser_fire(benign).is_none(),
+                "word-internal cos must not fire pickle rule: {benign}"
+            );
+        }
+        assert_eq!(
+            deser_fire("cos\nsystem\n(S'id'\ntR.")
+                .expect("real pickle GLOBAL opcode fires")
+                .rule_key,
+            "deser.py_pickle_global_exec",
+        );
     }
 
     #[test]
