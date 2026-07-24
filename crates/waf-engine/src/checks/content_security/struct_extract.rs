@@ -9,10 +9,13 @@
 //! values** out of a structured body so each becomes its own field for the
 //! existing five-family detector set.
 //!
-//! It also surfaces every `$`-prefixed JSON **object key** as its own leaf (under
-//! [`NOSQL_OP_LABEL`]) so a `MongoDB`-style `NoSQL` operator injection — whose signal
-//! lives in the key (`{"user":{"$ne":null}}`), not a string value — reaches the
-//! `NoSqlInjection` detector (T2-B). This is the one place a *key* (not a value)
+//! It also surfaces a `$`-prefixed JSON **object key** as its own leaf (under
+//! [`NOSQL_OP_LABEL`]) when the key is a known `NoSQL` operator, so a `MongoDB`-style
+//! `NoSQL` operator injection — whose signal lives in the key
+//! (`{"user":{"$ne":null}}`), not a string value — reaches the `NoSqlInjection`
+//! detector (T2-B). Only allowlisted operator keys are surfaced
+//! ([`super::detectors::NOSQL_OPERATOR_KEYS`]); a non-operator `$`-key is not, so it
+//! cannot starve the field budget. This is the one place a *key* (not a value)
 //! becomes a field.
 //!
 //! It adds **no detector** and changes **no scoring**: it only widens the field
@@ -116,12 +119,13 @@ const MULTIPART_LABEL: &str = "body.multipart";
 ///
 /// A `MongoDB`-style `NoSQL` operator injection (`{"user":{"$ne":null}}`) carries its
 /// signal in the object **key** (`$ne`), not a string value, so the value-only leaf
-/// extraction above never surfaces it. This module therefore emits every
-/// `$`-prefixed key as a leaf under this label; the `NoSqlInjection` detector
-/// anchored-matches the known dangerous operators against it. `serde_json` has
-/// already unicode-unescaped the key, so a `$`-encoded `$` is caught. A
-/// non-operator `$`-key (`$schema`, `$ref`) is surfaced too but matches no rule, so
-/// it produces no finding.
+/// extraction above never surfaces it. This module therefore emits a `$`-prefixed
+/// key as a leaf under this label **when it is a known operator**
+/// ([`super::detectors::NOSQL_OPERATOR_KEYS`], case-insensitive); the `NoSqlInjection`
+/// detector anchored-matches the dangerous operators against it. `serde_json` has
+/// already unicode-unescaped the key, so a `$`-encoded `$` is caught. A non-operator
+/// `$`-key (`$schema`, `$ref`, or attacker `$k000…` padding) is filtered by the
+/// allowlist: it is not surfaced and consumes no field-budget slot.
 pub(super) const NOSQL_OP_LABEL: &str = "body.nosql.op";
 
 /// Extract leaf string fields from a structured request body.
@@ -206,6 +210,19 @@ fn nesting_depth(bytes: &[u8]) -> usize {
     max
 }
 
+/// Whether a JSON object key is a known `NoSQL` operator, the allowlist gate that
+/// keeps the operator-leaf surface (and the field budget it spends) to real
+/// operators only. The allowlist lives with the detector rules
+/// ([`super::detectors::NOSQL_OPERATOR_KEYS`]) so it cannot drift from them; matched
+/// case-insensitively because the detector lowercases its view before matching. The
+/// cheap `$`-prefix short-circuit keeps the common non-operator key off the scan.
+fn is_nosql_operator_key(k: &str) -> bool {
+    k.starts_with('$')
+        && super::detectors::NOSQL_OPERATOR_KEYS
+            .iter()
+            .any(|op| k.eq_ignore_ascii_case(op))
+}
+
 /// Push one non-empty, trimmed leaf. Empty / whitespace-only leaves never become
 /// a field (they cannot carry an attack and only waste budget).
 fn push_leaf(out: &mut Vec<Leaf>, label: &'static str, value: &str) {
@@ -247,11 +264,14 @@ fn extract_json(body: &[u8], max_fields: usize, out: &mut Vec<Leaf>) {
             }
             serde_json::Value::Object(map) => {
                 for (k, v) in map {
-                    // T2-B: a `$`-prefixed key is a MongoDB-style operator carrier —
-                    // surface it as its own leaf so the NoSQL detector can inspect the
-                    // KEY (the value-only leaves never see it). Bounded by the same
-                    // field cap; the key text is already unicode-unescaped by serde.
-                    if out.len() < max_fields && k.starts_with('$') {
+                    // T2-B: surface a `$`-prefixed key as its own leaf so the NoSQL
+                    // detector can inspect the KEY (the value-only leaves never see
+                    // it) — but ONLY when it is a known MongoDB operator (allowlist).
+                    // A non-operator `$`-key (`$schema`/`$ref`, or attacker `$k000…`
+                    // padding) is dropped so it neither reaches a detector nor starves
+                    // the field budget the deep attack value below needs (F1). Bounded
+                    // by the same field cap; serde has already unicode-unescaped `k`.
+                    if out.len() < max_fields && is_nosql_operator_key(k) {
                         push_leaf(out, NOSQL_OP_LABEL, k);
                     }
                     stack.push((v, depth + 1));
@@ -756,16 +776,69 @@ mod tests {
     }
 
     #[test]
-    fn json_non_operator_dollar_key_is_surfaced_but_harmless() {
-        // A `$`-key that is not a Mongo operator (JSON-Schema `$schema`) is still
-        // surfaced (the detector, not the extractor, owns the operator allowlist),
-        // and a plain value that merely mentions `$ne` is NOT an op leaf.
+    fn json_non_operator_dollar_key_is_filtered_by_allowlist() {
+        // A `$`-key that is not a known Mongo operator (JSON-Schema `$schema`) is
+        // dropped by the extraction allowlist (F1): it is NOT surfaced as an op leaf
+        // and spends no field-budget slot. Its string VALUE is still an ordinary
+        // leaf, and a plain value that merely mentions `$ne` is NOT an op leaf.
         let body = br#"{"$schema":"https://x/schema.json","note":"use $ne carefully"}"#;
         let leaves = extract_body_fields(body, Some("application/json"), 64);
-        assert!(op_leaves(&leaves).contains(&"$schema"));
-        // The value string is a normal JSON leaf, never an op leaf.
+        assert!(
+            !op_leaves(&leaves).contains(&"$schema"),
+            "non-operator $-key must not be an op leaf: {:?}",
+            labels_values(&leaves)
+        );
+        // The value strings are normal JSON leaves, never op leaves.
         assert!(!op_leaves(&leaves).contains(&"use $ne carefully"));
         assert!(any_value_contains(&leaves, "use $ne carefully"));
+        assert!(any_value_contains(&leaves, "https://x/schema.json"));
+    }
+
+    #[test]
+    fn json_operator_allowlist_prevents_budget_starvation() {
+        // F1 adversarial regression: 64 junk non-operator `$`-keys must NOT each
+        // consume a field-budget slot and starve the real deep attack value. serde's
+        // BTreeMap iterates `$`-keys (0x24) before the letter key `z` (0x7a), so
+        // before the allowlist fix the 64 `$k***` padding filled all 64 slots and the
+        // walk broke before ever reaching the deep SQLi value. With the allowlist the
+        // junk keys are dropped, so the deep value is extracted.
+        use std::fmt::Write as _;
+        let mut body = String::from("{");
+        for i in 0..64 {
+            let _ = write!(body, "\"$k{i:03}\":0,");
+        }
+        body.push_str(r#""z":{"deep":"1 UNION SELECT password FROM users"}}"#);
+        let leaves = extract_body_fields(body.as_bytes(), Some("application/json"), 64);
+        // No junk `$k***` key becomes an op leaf (none is a known operator).
+        assert!(
+            op_leaves(&leaves).is_empty(),
+            "junk $-keys must not be surfaced: {:?}",
+            labels_values(&leaves)
+        );
+        // The deep attack value IS now extracted (it was starved out before the fix).
+        assert!(
+            any_value_contains(&leaves, "1 UNION SELECT password FROM users"),
+            "deep attack value must be extracted, not starved by junk $-keys: {:?}",
+            labels_values(&leaves)
+        );
+    }
+
+    #[test]
+    fn json_operator_dollar_key_still_surfaced_alongside_junk() {
+        // The allowlist filters junk but a REAL operator key mixed in with padding is
+        // still surfaced (positive control for the F1 fix).
+        let body = br#"{"$k000":0,"$k001":0,"pw":{"$ne":null},"$k002":0}"#;
+        let leaves = extract_body_fields(body, Some("application/json"), 64);
+        assert!(
+            op_leaves(&leaves).contains(&"$ne"),
+            "the real $ne operator must still surface: {:?}",
+            labels_values(&leaves)
+        );
+        assert!(
+            !op_leaves(&leaves).iter().any(|k| k.starts_with("$k")),
+            "junk $k*** keys must not surface: {:?}",
+            labels_values(&leaves)
+        );
     }
 
     #[test]

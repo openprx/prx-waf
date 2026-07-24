@@ -406,11 +406,13 @@ xxe_struct = 1.0                      # structural XXE detector (T2-A)
 # JSON body is declined by the same guard the value extraction uses. FP honesty: a
 # reverse proxy cannot know the backend is MongoDB and comparison operators recur in
 # legitimate JSON APIs, so this is a FP-prone family. Single detector → weight 1.0;
-# FP control is by a narrow DEFAULT-ON rule (only `$where`/`$expr`/`$function`/
-# `$accumulator`, the JS/expression-execution operators a client API essentially never
-# lets a user control, confidence 90) + DEFAULT-OFF high-noise rules (`$regex`,
-# comparison `$ne`/`$gt`/…, logical `$or`/`$and`/`$nor`) held back until holdout
-# calibration. Shadow (log_only): a default-on hit is recorded/logged, never blocked.
+# FP control is by a narrow DEFAULT-ON rule (only `$where`/`$function`/`$accumulator`,
+# the server-side-JS-execution operators a client API essentially never lets a user
+# control, confidence 90) + DEFAULT-OFF high-noise rules (`$expr`, which evaluates an
+# aggregation expression but does not run arbitrary JS and is a common legitimate
+# operator; `$regex`; comparison `$ne`/`$gt`/…; logical `$or`/`$and`/`$nor`) held back
+# until holdout calibration. Shadow (log_only): a default-on hit is recorded/logged,
+# never blocked.
 # hard_veto_allowlist empty until holdout.
 [content_security.attacks.nosql_injection]
 enabled = true

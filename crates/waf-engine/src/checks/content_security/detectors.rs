@@ -701,29 +701,38 @@ impl SemanticDetector for XxeStructuralDetector {
 /// legitimate JSON query APIs — so this is the family's whole FP story (plan §四.3,
 /// single-detector families narrow with default-off high-noise rules):
 ///   * **DEFAULT-ON, high confidence** — only the operators that execute
-///     server-side JavaScript / arbitrary expressions (`$where` / `$expr` /
-///     `$function` / `$accumulator`). A legitimate client-facing JSON API
-///     essentially never lets the *user* place one of these in a query, so a
-///     user-controlled occurrence is strong evidence.
-///   * **DEFAULT-OFF** — the comparison, `$regex` and logical operators, which a
-///     benign filter API uses constantly. They ship disabled pending holdout
-///     calibration; a single one alone is not worth even a shadow log.
+///     server-side JavaScript (`$where` / `$function` / `$accumulator`). A
+///     legitimate client-facing JSON API essentially never lets the *user* place
+///     one of these in a query, so a user-controlled occurrence is strong evidence.
+///   * **DEFAULT-OFF** — `$expr`, the comparison, `$regex` and logical operators,
+///     which a benign filter API uses constantly. `$expr` evaluates an aggregation
+///     expression but does **not** run arbitrary server-side JS, and is a common,
+///     legitimate `MongoDB` operator, so it is not default-on evidence; it ships
+///     disabled pending holdout calibration alongside the comparison / regex /
+///     logical operators. A single one alone is not worth even a shadow log.
 ///
 /// It runs no query engine and adds no parse surface: the operators are already
 /// isolated leaves bounded by the JSON walk's depth / node / field budgets, so every
 /// rule is an anchored linear match. `(rule_key, confidence, pattern, kind, default_on)`.
 const NOSQL_RULES: &[RuleRow] = &[
-    // Server-side JS / expression execution operators. `$where` and `$function` /
-    // `$accumulator` run attacker JavaScript; `$expr` evaluates an aggregation
-    // expression inside a query filter. A user-controlled occurrence of any is a
-    // near-unambiguous injection, so these are the only DEFAULT-ON rules.
+    // Server-side JavaScript execution operators. `$where` / `$function` /
+    // `$accumulator` run attacker-supplied JavaScript in the query engine — a
+    // user-controlled occurrence is a near-unambiguous injection, so this is the
+    // only DEFAULT-ON rule. `$expr` is intentionally NOT here: it evaluates an
+    // aggregation expression but does not run arbitrary JS and is a common,
+    // legitimate operator, so it ships DEFAULT-OFF (`nosql.expr_operator` below).
     (
         "nosql.query_operator",
         90,
-        r"^\$(where|expr|function|accumulator)$",
+        r"^\$(where|function|accumulator)$",
         RuleKind::Presence,
         true,
     ),
+    // `$expr`: evaluates an aggregation expression inside a query filter. Unlike the
+    // JS operators above it does NOT execute arbitrary server-side JavaScript, and
+    // it is a common, legitimate MongoDB operator (`{"$match":{"$expr":…}}`), so it
+    // is DEFAULT-OFF pending holdout calibration rather than default-on evidence.
+    ("nosql.expr_operator", 75, r"^\$expr$", RuleKind::Presence, false),
     // `$regex`: attacker-supplied regex → ReDoS / auth-filter bypass. Real APIs do
     // expose regex search, so DEFAULT-OFF pending calibration.
     ("nosql.regex_operator", 60, r"^\$regex$", RuleKind::Presence, false),
@@ -745,6 +754,43 @@ const NOSQL_RULES: &[RuleRow] = &[
         RuleKind::Presence,
         false,
     ),
+];
+
+/// Extraction allowlist: every `$`-prefixed `MongoDB` operator key that any
+/// [`NOSQL_RULES`] rule can match — the **default-off rules included**.
+///
+/// The body field-extractor ([`super::struct_extract::extract_body_fields`]) surfaces
+/// a `$`-prefixed JSON object key as an operator leaf **only** when it is in this
+/// list, so a non-operator `$`-key (`$schema` / `$ref` / `$id`, or attacker padding
+/// like `$k000`) neither reaches any detector nor consumes a field-budget slot that
+/// a real deep attack value needs (the F1 budget-starvation regression). Compared
+/// case-insensitively — the detector view is lowercased before matching, so this
+/// mirrors that.
+///
+/// This MUST stay a superset of every operator in `NOSQL_RULES`, including the
+/// default-off rules: an operator that a rule matches but the extractor does not
+/// surface is invisible the moment that rule is enabled. The
+/// `nosql_operator_allowlist_matches_rule_operators` test guards the invariant.
+pub(super) const NOSQL_OPERATOR_KEYS: &[&str] = &[
+    // JS execution (default-on) + `$expr` (default-off).
+    "$where",
+    "$function",
+    "$accumulator",
+    "$expr",
+    // regex (default-off).
+    "$regex",
+    // comparison (default-off).
+    "$ne",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$in",
+    "$nin",
+    // logical (default-off).
+    "$or",
+    "$and",
+    "$nor",
 ];
 
 /// Structural `NoSQL` (`MongoDB` operator) detector (plan T2-B).
@@ -2686,6 +2732,7 @@ mod tests {
             "JS/expr operators must be default-on"
         );
         for off in [
+            "nosql.expr_operator",
             "nosql.regex_operator",
             "nosql.comparison_operator",
             "nosql.logical_operator",
@@ -2696,14 +2743,62 @@ mod tests {
 
     #[test]
     fn nosql_js_expression_operators_fire_default_on() {
-        // The operators that execute server-side JS / arbitrary expressions are the
-        // only default-on signal. Each arrives as its own `$op` leaf.
-        for op in ["$where", "$expr", "$function", "$accumulator"] {
+        // Only the operators that execute server-side JS are the default-on signal.
+        // `$expr` is NOT here (F2: it does not run JS, ships default-off). Each
+        // arrives as its own `$op` leaf.
+        for op in ["$where", "$function", "$accumulator"] {
             let f = nosql_fire(op).unwrap_or_else(|| panic!("{op} must fire default-on"));
             assert_eq!(f.attack, AttackKind::NoSqlInjection);
             assert_eq!(f.rule_key, "nosql.query_operator");
             assert_eq!(f.confidence.get(), 90);
         }
+    }
+
+    #[test]
+    fn nosql_expr_operator_is_default_off() {
+        // F2: `$expr` is a common, legitimate aggregation operator that does not run
+        // server-side JS, so it must NOT produce a default-on finding. It still fires
+        // under the full rule set as its own dedicated rule.
+        assert!(nosql_fire("$expr").is_none(), "$expr must be default-off");
+        let f = nosql_fire_all("$expr").expect("$expr fires under the full rule set");
+        assert_eq!(f.rule_key, "nosql.expr_operator");
+        assert_eq!(f.attack, AttackKind::NoSqlInjection);
+        assert_eq!(f.confidence.get(), 75);
+    }
+
+    #[test]
+    fn nosql_operator_allowlist_matches_rule_operators() {
+        // F1 invariant: every key the extraction allowlist surfaces must be a real
+        // operator some NoSQL rule matches (default-on OR default-off), so the
+        // extractor never surfaces a key no rule can consume — and, conversely,
+        // enabling a default-off rule later can never outrun what extraction
+        // surfaces. Adding an operator to a rule without adding it here (or vice
+        // versa) trips this test.
+        for key in NOSQL_OPERATOR_KEYS {
+            assert!(
+                nosql_fire_all(key).is_some(),
+                "allowlisted key {key} must be matched by some NoSQL rule"
+            );
+        }
+        // Exact-set tripwire against silent drift.
+        let expected = [
+            "$where",
+            "$function",
+            "$accumulator",
+            "$expr",
+            "$regex",
+            "$ne",
+            "$gt",
+            "$gte",
+            "$lt",
+            "$lte",
+            "$in",
+            "$nin",
+            "$or",
+            "$and",
+            "$nor",
+        ];
+        assert_eq!(NOSQL_OPERATOR_KEYS.to_vec(), expected.to_vec(), "allowlist drift");
     }
 
     #[test]
