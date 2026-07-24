@@ -26,6 +26,7 @@ static RCE_DESCS: &[&str] = &[
     "curl to external host (possible SSRF/C2)",
     "wget to external host",
     "nc/netcat reverse shell",
+    "interpreter exec flag (sh -c / python -c / perl -e)",
 ];
 
 /// Fail-closed compile result (Low-1): see the equivalent comment in
@@ -67,6 +68,11 @@ static RCE_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
         r"(?i)\bwget\s+https?://",
         // Netcat reverse shell patterns
         r"(?i)\bnc\b.*-[el]",
+        // Interpreter exec flag: `sh -c id`, `bash -c "..."`, `python -c "..."`,
+        // `perl -e`, `ruby -e`, `node -e`, `--command`/`-eval` variants. Plain
+        // command injection through an interpreter that carries no shell
+        // metacharacter otherwise slips past every pattern above.
+        r"(?i)\b(?:sh|bash|zsh|ksh|dash|ash|busybox|python[0-9.]*|perl|ruby|node|nodejs|php|pwsh|powershell)\s+-{1,2}(?:c|e|eval|command)\b",
     ]) {
         Ok(set) => Some(set),
         Err(e) => {
@@ -186,6 +192,35 @@ mod tests {
     fn allows_clean_request() {
         let checker = RceCheck::new();
         let ctx = make_ctx("action=save&name=hello", "");
+        assert!(checker.check(&ctx).is_none());
+    }
+
+    #[test]
+    fn detects_interpreter_exec_flag() {
+        let checker = RceCheck::new();
+        for payload in [
+            "cmd=sh -c id",
+            "cmd=bash -c \"whoami\"",
+            "cmd=python -c print(1)",
+            "x=perl -e system",
+        ] {
+            let ctx = make_ctx(payload, "");
+            let hit = checker.check(&ctx);
+            assert!(hit.is_some(), "interpreter exec flag must be detected: {payload}");
+            assert_eq!(
+                hit.and_then(|r| r.rule_id).as_deref(),
+                Some("RCE-021"),
+                "new pattern must be the last rule id (indices below it unchanged): {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpreter_without_exec_flag_is_allowed() {
+        // A bare interpreter name with no exec flag is not command injection on
+        // its own and must not fire this rule.
+        let checker = RceCheck::new();
+        let ctx = make_ctx("lang=bash&level=beginner", "");
         assert!(checker.check(&ctx).is_none());
     }
 }
