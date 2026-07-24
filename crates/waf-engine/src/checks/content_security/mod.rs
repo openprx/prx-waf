@@ -55,8 +55,8 @@ pub use budget::{Budget, ContentInspectionState};
 pub use canary::{BreakerState, CircuitBreaker, canary_bucket, in_canary};
 pub use config::{Dialect, EnforcementMode, RuntimeContentSecurityConfig};
 pub use detectors::{
-    AstSqlDetector, RceAstDetector, RceStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector,
-    XxeStructuralDetector,
+    AstSqlDetector, NoSqlStructuralDetector, RceAstDetector, RceStructuralDetector, StructuralSqlDetector,
+    TraversalStructuralDetector, XxeStructuralDetector,
 };
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
@@ -100,8 +100,8 @@ pub struct ContentSecuritySubsystem {
     config: RuntimeContentSecurityConfig,
     /// Lane 2 semantic detectors: the structural + AST `SQLi` detectors, the
     /// RCE / Traversal detectors, the XSS DOM + JS-token detectors (P-XSS-2,
-    /// 0.5/0.5 corroboration) and the structural XXE detector (T2-A); tests may
-    /// push additional mocks.
+    /// 0.5/0.5 corroboration), the structural XXE detector (T2-A) and the structural
+    /// `NoSQL` detector (T2-B); tests may push additional mocks.
     detectors: Vec<Box<dyn SemanticDetector>>,
     /// Runtime anomaly-rate breaker state (never persisted; restart resets it).
     breaker: Mutex<CircuitBreaker>,
@@ -160,6 +160,14 @@ impl ContentSecuritySubsystem {
             // markers on the same normalised view text as the other structural
             // detectors. Shadow (log_only) like every other family.
             Box::new(detectors::XxeStructuralDetector::new()),
+            // T2-B: structural NoSQL detector (single-detector `nosql_injection`
+            // family). Consumes the `$`-prefixed JSON object keys that
+            // `struct_extract` surfaces as leaves (a MongoDB operator injection lives
+            // in the key, not a value); runs no query engine and adds no parse
+            // surface beyond the already-bounded JSON walk. Only the JS/expression
+            // operators are default-on; comparison / regex / logical are default-off
+            // to hold FPs down. Shadow (log_only) like every other family.
+            Box::new(detectors::NoSqlStructuralDetector::new()),
         ];
         Self {
             legacy_checkers,

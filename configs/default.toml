@@ -395,3 +395,27 @@ block_threshold = 80
 hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
 [content_security.attacks.xxe.weights]
 xxe_struct = 1.0                      # structural XXE detector (T2-A)
+
+# NoSQL (MongoDB-style operator) injection — T2-B single-detector structural family.
+# The signal lives in a JSON OBJECT KEY (`{"pw":{"$ne":null}}` — `$ne` is the key),
+# not a string value, so the body field-extractor additionally surfaces every
+# `$`-prefixed JSON key as its own leaf (serde has already unicode-unescaped it, so a
+# `$`-encoded operator is caught); the detector anchored-matches known operators
+# against those leaves. It runs NO query engine and adds no parse surface beyond the
+# already-bounded JSON walk (depth / node / field budgets), so a deep / billion-laughs
+# JSON body is declined by the same guard the value extraction uses. FP honesty: a
+# reverse proxy cannot know the backend is MongoDB and comparison operators recur in
+# legitimate JSON APIs, so this is a FP-prone family. Single detector → weight 1.0;
+# FP control is by a narrow DEFAULT-ON rule (only `$where`/`$expr`/`$function`/
+# `$accumulator`, the JS/expression-execution operators a client API essentially never
+# lets a user control, confidence 90) + DEFAULT-OFF high-noise rules (`$regex`,
+# comparison `$ne`/`$gt`/…, logical `$or`/`$and`/`$nor`) held back until holdout
+# calibration. Shadow (log_only): a default-on hit is recorded/logged, never blocked.
+# hard_veto_allowlist empty until holdout.
+[content_security.attacks.nosql_injection]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.nosql_injection.weights]
+nosql_struct = 1.0                    # structural NoSQL operator detector (T2-B)

@@ -9,6 +9,12 @@
 //! values** out of a structured body so each becomes its own field for the
 //! existing five-family detector set.
 //!
+//! It also surfaces every `$`-prefixed JSON **object key** as its own leaf (under
+//! [`NOSQL_OP_LABEL`]) so a `MongoDB`-style `NoSQL` operator injection — whose signal
+//! lives in the key (`{"user":{"$ne":null}}`), not a string value — reaches the
+//! `NoSqlInjection` detector (T2-B). This is the one place a *key* (not a value)
+//! becomes a field.
+//!
 //! It adds **no detector** and changes **no scoring**: it only widens the field
 //! source set the existing pipeline already consumes. The whole-body view is still
 //! produced unchanged (`super::preprocess::collect_field_sources` keeps it), so
@@ -105,6 +111,18 @@ const JSON_LABEL: &str = "body.json";
 const XML_LABEL: &str = "body.xml";
 const GQL_LABEL: &str = "body.graphql";
 const MULTIPART_LABEL: &str = "body.multipart";
+
+/// Label for a `$`-prefixed JSON **object key** surfaced as its own leaf (T2-B).
+///
+/// A `MongoDB`-style `NoSQL` operator injection (`{"user":{"$ne":null}}`) carries its
+/// signal in the object **key** (`$ne`), not a string value, so the value-only leaf
+/// extraction above never surfaces it. This module therefore emits every
+/// `$`-prefixed key as a leaf under this label; the `NoSqlInjection` detector
+/// anchored-matches the known dangerous operators against it. `serde_json` has
+/// already unicode-unescaped the key, so a `$`-encoded `$` is caught. A
+/// non-operator `$`-key (`$schema`, `$ref`) is surfaced too but matches no rule, so
+/// it produces no finding.
+pub(super) const NOSQL_OP_LABEL: &str = "body.nosql.op";
 
 /// Extract leaf string fields from a structured request body.
 ///
@@ -228,7 +246,14 @@ fn extract_json(body: &[u8], max_fields: usize, out: &mut Vec<Leaf>) {
                 }
             }
             serde_json::Value::Object(map) => {
-                for v in map.values() {
+                for (k, v) in map {
+                    // T2-B: a `$`-prefixed key is a MongoDB-style operator carrier —
+                    // surface it as its own leaf so the NoSQL detector can inspect the
+                    // KEY (the value-only leaves never see it). Bounded by the same
+                    // field cap; the key text is already unicode-unescaped by serde.
+                    if out.len() < max_fields && k.starts_with('$') {
+                        push_leaf(out, NOSQL_OP_LABEL, k);
+                    }
                     stack.push((v, depth + 1));
                 }
             }
@@ -685,6 +710,72 @@ mod tests {
             "graphql variable (json) must be extracted & unescaped: {:?}",
             labels_values(&leaves)
         );
+    }
+
+    // ── NoSQL operator keys (T2-B) ──────────────────────────────────────────────
+
+    fn op_leaves(leaves: &[Leaf]) -> Vec<&str> {
+        leaves
+            .iter()
+            .filter(|(l, _)| l == NOSQL_OP_LABEL)
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn json_dollar_key_is_surfaced_as_op_leaf() {
+        // The classic auth-bypass shape: the operator is the KEY, not a value. It
+        // must surface under the dedicated op label.
+        let body = br#"{"user":"admin","pw":{"$ne":null}}"#;
+        let leaves = extract_body_fields(body, Some("application/json"), 64);
+        assert!(
+            op_leaves(&leaves).contains(&"$ne"),
+            "the $ne operator key must surface as a {NOSQL_OP_LABEL} leaf: {:?}",
+            labels_values(&leaves)
+        );
+    }
+
+    #[test]
+    fn json_unicode_escaped_dollar_key_is_decoded_and_surfaced() {
+        // `$where` decodes to `$where` — serde unescapes the key before we see
+        // it, so the raw-text `$`-encoding evasion cannot slip past.
+        let body = br#"{"$where":"sleep(1000)"}"#;
+        let leaves = extract_body_fields(body, Some("application/json"), 64);
+        assert!(
+            op_leaves(&leaves).contains(&"$where"),
+            "unicode-escaped operator key must decode & surface: {:?}",
+            labels_values(&leaves)
+        );
+    }
+
+    #[test]
+    fn json_deep_nested_operator_key_is_surfaced() {
+        let body = br#"{"a":{"b":{"c":{"$gt":""}}}}"#;
+        let leaves = extract_body_fields(body, Some("application/json"), 64);
+        assert!(op_leaves(&leaves).contains(&"$gt"), "{:?}", labels_values(&leaves));
+    }
+
+    #[test]
+    fn json_non_operator_dollar_key_is_surfaced_but_harmless() {
+        // A `$`-key that is not a Mongo operator (JSON-Schema `$schema`) is still
+        // surfaced (the detector, not the extractor, owns the operator allowlist),
+        // and a plain value that merely mentions `$ne` is NOT an op leaf.
+        let body = br#"{"$schema":"https://x/schema.json","note":"use $ne carefully"}"#;
+        let leaves = extract_body_fields(body, Some("application/json"), 64);
+        assert!(op_leaves(&leaves).contains(&"$schema"));
+        // The value string is a normal JSON leaf, never an op leaf.
+        assert!(!op_leaves(&leaves).contains(&"use $ne carefully"));
+        assert!(any_value_contains(&leaves, "use $ne carefully"));
+    }
+
+    #[test]
+    fn json_object_values_still_extracted_alongside_op_keys() {
+        // Surfacing keys is additive: the sibling string value is still a leaf.
+        let body = br#"{"$where":"this.a==1","name":"alice"}"#;
+        let leaves = extract_body_fields(body, Some("application/json"), 64);
+        assert!(op_leaves(&leaves).contains(&"$where"));
+        assert!(any_value_contains(&leaves, "this.a==1"));
+        assert!(any_value_contains(&leaves, "alice"));
     }
 
     #[test]

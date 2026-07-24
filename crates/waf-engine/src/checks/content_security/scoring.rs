@@ -134,6 +134,7 @@ const fn attack_ord(a: AttackKind) -> u8 {
         AttackKind::Xss => 2,
         AttackKind::Traversal => 3,
         AttackKind::Xxe => 4,
+        AttackKind::NoSqlInjection => 5,
     }
 }
 
@@ -163,6 +164,7 @@ const fn detector_ord(d: DetectorId) -> u8 {
         DetectorId::XssDom => 5,
         DetectorId::XssJs => 6,
         DetectorId::XxeStruct => 7,
+        DetectorId::NoSqlStruct => 8,
     }
 }
 

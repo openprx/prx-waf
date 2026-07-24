@@ -683,6 +683,124 @@ impl SemanticDetector for XxeStructuralDetector {
     }
 }
 
+// ── NoSQL (MongoDB operator) structural detector (plan §T2-B) ─────────────────
+
+/// `NoSQL` operator rule table (plan T2-B). Each rule matches a set of `MongoDB`
+/// query operators, **anchored to the whole normalised view** (`^\$op$`). This is
+/// deliberate: the detector consumes the `$`-prefixed JSON **object keys** that
+/// [`super::struct_extract::extract_body_fields`] surfaces as their own single-token
+/// leaves (label [`super::struct_extract::NOSQL_OP_LABEL`]) — a `MongoDB` operator
+/// injection lives in the key (`{"pw":{"$ne":null}}`), never a string value. Because
+/// each operator arrives as its own leaf whose entire normalised text is the operator,
+/// anchoring gives a precise "this key IS an operator" match with no substring noise:
+/// a string value that merely contains `$ne` in prose is a different leaf and never
+/// anchor-matches.
+///
+/// The signal is honestly weak for a reverse proxy — a pure proxy cannot know the
+/// backend is `MongoDB`, and comparison operators (`$ne` / `$gt` …) recur in perfectly
+/// legitimate JSON query APIs — so this is the family's whole FP story (plan §四.3,
+/// single-detector families narrow with default-off high-noise rules):
+///   * **DEFAULT-ON, high confidence** — only the operators that execute
+///     server-side JavaScript / arbitrary expressions (`$where` / `$expr` /
+///     `$function` / `$accumulator`). A legitimate client-facing JSON API
+///     essentially never lets the *user* place one of these in a query, so a
+///     user-controlled occurrence is strong evidence.
+///   * **DEFAULT-OFF** — the comparison, `$regex` and logical operators, which a
+///     benign filter API uses constantly. They ship disabled pending holdout
+///     calibration; a single one alone is not worth even a shadow log.
+///
+/// It runs no query engine and adds no parse surface: the operators are already
+/// isolated leaves bounded by the JSON walk's depth / node / field budgets, so every
+/// rule is an anchored linear match. `(rule_key, confidence, pattern, kind, default_on)`.
+const NOSQL_RULES: &[RuleRow] = &[
+    // Server-side JS / expression execution operators. `$where` and `$function` /
+    // `$accumulator` run attacker JavaScript; `$expr` evaluates an aggregation
+    // expression inside a query filter. A user-controlled occurrence of any is a
+    // near-unambiguous injection, so these are the only DEFAULT-ON rules.
+    (
+        "nosql.query_operator",
+        90,
+        r"^\$(where|expr|function|accumulator)$",
+        RuleKind::Presence,
+        true,
+    ),
+    // `$regex`: attacker-supplied regex → ReDoS / auth-filter bypass. Real APIs do
+    // expose regex search, so DEFAULT-OFF pending calibration.
+    ("nosql.regex_operator", 60, r"^\$regex$", RuleKind::Presence, false),
+    // Comparison operators — the classic `{"pw":{"$ne":null}}` auth bypass, but also
+    // the bread-and-butter of every legitimate filter API. DEFAULT-OFF: far too
+    // noisy to fire (even to Log) on its own before holdout calibration.
+    (
+        "nosql.comparison_operator",
+        55,
+        r"^\$(ne|gt|gte|lt|lte|in|nin)$",
+        RuleKind::Presence,
+        false,
+    ),
+    // Logical combinators. Ubiquitous in benign queries; DEFAULT-OFF.
+    (
+        "nosql.logical_operator",
+        45,
+        r"^\$(or|and|nor)$",
+        RuleKind::Presence,
+        false,
+    ),
+];
+
+/// Structural `NoSQL` (`MongoDB` operator) detector (plan T2-B).
+///
+/// Registered in the `NoSqlInjection` attack family; a single-detector family, so FP
+/// control is by a narrow default-on rule (JS/expression operators only) plus
+/// default-off high-noise rules, per the plan §四.3 invariant. It inspects the
+/// normalised view text of the `$`-key leaves surfaced by
+/// [`super::struct_extract`]; it never parses or evaluates a query.
+pub struct NoSqlStructuralDetector {
+    rules: Vec<CompiledRule>,
+}
+
+impl NoSqlStructuralDetector {
+    /// Compile the **default-on** rules (JS/expression operators only). The noisy
+    /// comparison / `$regex` / logical rules await holdout calibration and are not
+    /// compiled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            rules: compile_table(NOSQL_RULES, false, "NoSqlStructuralDetector"),
+        }
+    }
+
+    /// Test-only: compile **every** rule, including the default-off ones.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_all_rules() -> Self {
+        Self {
+            rules: compile_table(NOSQL_RULES, true, "NoSqlStructuralDetector"),
+        }
+    }
+}
+
+impl Default for NoSqlStructuralDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SemanticDetector for NoSqlStructuralDetector {
+    fn id(&self) -> DetectorId {
+        DetectorId::NoSqlStruct
+    }
+
+    fn detect(
+        &self,
+        view: &View<'_>,
+        _ctx: &PreprocessCtx<'_>,
+        _state: &mut ContentInspectionState,
+    ) -> Option<DetectionFinding> {
+        let rule = best_match(&self.rules, view.lower_trunc.as_str())?;
+        Some(finding_for(rule, AttackKind::NoSqlInjection, "NoSQL"))
+    }
+}
+
 // ── AST SQLi detector (sqlparser-rs true parse, plan §11, P2) ─────────────────
 
 /// Maximum bracket / prefix-operator nesting depth we will hand to `sqlparser`.
@@ -2526,6 +2644,142 @@ mod tests {
         assert!(xxe_fire(payload).is_none(), "bare param ref is default-off");
         let f = xxe_fire_all(payload).expect("bare param ref fires under full rule set");
         assert_eq!(f.rule_key, "xxe.param_entity_ref");
+    }
+
+    // ── NoSQL structural detector (T2-B) ─────────────────────────────────────
+
+    fn nosql_fire(text: &str) -> Option<DetectionFinding> {
+        run(&NoSqlStructuralDetector::new(), text)
+    }
+
+    fn nosql_fire_all(text: &str) -> Option<DetectionFinding> {
+        run(&NoSqlStructuralDetector::with_all_rules(), text)
+    }
+
+    #[test]
+    fn nosql_all_rules_compile() {
+        let det = NoSqlStructuralDetector::with_all_rules();
+        assert_eq!(det.rules.len(), NOSQL_RULES.len(), "every NoSQL pattern must compile");
+    }
+
+    #[test]
+    fn nosql_id_and_config_string() {
+        assert_eq!(NoSqlStructuralDetector::new().id(), DetectorId::NoSqlStruct);
+        assert_eq!(DetectorId::NoSqlStruct.as_config_str(), "nosql_struct");
+        assert_eq!(
+            DetectorId::from_config_str("nosql_struct"),
+            Some(DetectorId::NoSqlStruct)
+        );
+        assert_eq!(AttackKind::NoSqlInjection.as_config_key(), "nosql_injection");
+        assert_eq!(
+            AttackKind::from_config_key("nosql_injection"),
+            Some(AttackKind::NoSqlInjection)
+        );
+    }
+
+    #[test]
+    fn nosql_default_on_is_js_expression_operators_only() {
+        let det = NoSqlStructuralDetector::new();
+        let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
+        assert!(
+            on.contains("nosql.query_operator"),
+            "JS/expr operators must be default-on"
+        );
+        for off in [
+            "nosql.regex_operator",
+            "nosql.comparison_operator",
+            "nosql.logical_operator",
+        ] {
+            assert!(!on.contains(off), "{off} must be default-off");
+        }
+    }
+
+    #[test]
+    fn nosql_js_expression_operators_fire_default_on() {
+        // The operators that execute server-side JS / arbitrary expressions are the
+        // only default-on signal. Each arrives as its own `$op` leaf.
+        for op in ["$where", "$expr", "$function", "$accumulator"] {
+            let f = nosql_fire(op).unwrap_or_else(|| panic!("{op} must fire default-on"));
+            assert_eq!(f.attack, AttackKind::NoSqlInjection);
+            assert_eq!(f.rule_key, "nosql.query_operator");
+            assert_eq!(f.confidence.get(), 90);
+        }
+    }
+
+    #[test]
+    fn nosql_comparison_operators_are_default_off() {
+        // `$ne`/`$gt`/… are the classic auth-bypass but far too common in benign
+        // filter APIs to fire on their own before calibration: default-off.
+        for op in ["$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin"] {
+            assert!(nosql_fire(op).is_none(), "{op} must be default-off");
+            let f = nosql_fire_all(op).unwrap_or_else(|| panic!("{op} fires under full rule set"));
+            assert_eq!(f.rule_key, "nosql.comparison_operator");
+        }
+    }
+
+    #[test]
+    fn nosql_regex_and_logical_operators_are_default_off() {
+        assert!(nosql_fire("$regex").is_none(), "$regex is default-off");
+        assert_eq!(
+            nosql_fire_all("$regex")
+                .expect("$regex fires under full rules")
+                .rule_key,
+            "nosql.regex_operator"
+        );
+        for op in ["$or", "$and", "$nor"] {
+            assert!(nosql_fire(op).is_none(), "{op} is default-off");
+            assert_eq!(
+                nosql_fire_all(op).unwrap_or_else(|| panic!("{op} fires")).rule_key,
+                "nosql.logical_operator"
+            );
+        }
+    }
+
+    #[test]
+    fn nosql_anchored_match_rejects_substrings_and_prose() {
+        // Anchoring is what keeps FP down: a value that merely CONTAINS an operator
+        // token, or a `$`-word that is not an operator, must never fire — even under
+        // the full rule set.
+        for clean in [
+            "$net",              // not an operator ($ne is, $net is not)
+            "$nexus",            // superstring of $ne
+            "use $ne carefully", // operator token inside prose
+            "$wheres",           // superstring of $where
+            "price is $5",       // stray dollar amount
+            "where",             // keyword without the `$`
+            "ne",                // operator name without the `$`
+            "{\"$ne\":null}",    // a raw compact-JSON body view (not an isolated leaf)
+            "$schema",           // a non-operator `$`-key surfaced by extraction
+            "$ref",
+        ] {
+            assert!(nosql_fire_all(clean).is_none(), "must not fire on {clean:?}");
+        }
+    }
+
+    #[test]
+    fn nosql_end_to_end_operator_key_leaf_fires() {
+        // Integration: a JSON body whose operator is in KEY position must, through
+        // the real preprocessor → struct extraction → detector path, surface a
+        // NoSQL finding on the extracted `$where` leaf.
+        let mut req = throwaway_req();
+        req.body_preview = Bytes::from_static(br#"{"user":"admin","q":{"$where":"sleep(9999)"}}"#);
+        req.content_length = req.body_preview.len() as u64;
+        req.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let views = crate::checks::content_security::semantic_preprocessor(InspectionScope::Body, &req, &mut st);
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let det = NoSqlStructuralDetector::new();
+        let mut st2 = ContentInspectionState::default();
+        let hit = views
+            .iter()
+            .filter_map(|v| det.detect(v, &pctx, &mut st2))
+            .any(|f| f.attack == AttackKind::NoSqlInjection && f.rule_key == "nosql.query_operator");
+        assert!(hit, "the $where key leaf must drive a NoSQL query_operator finding");
     }
 
     // ── AST SQLi detector (P2) ────────────────────────────────────────────────

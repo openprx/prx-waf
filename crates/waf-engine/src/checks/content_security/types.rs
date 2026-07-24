@@ -97,11 +97,19 @@ pub enum AttackKind {
     Xss,
     Traversal,
     Xxe,
+    NoSqlInjection,
 }
 
 impl AttackKind {
     /// All families, for iterating config.
-    pub const ALL: [Self; 5] = [Self::SqlInjection, Self::Rce, Self::Xss, Self::Traversal, Self::Xxe];
+    pub const ALL: [Self; 6] = [
+        Self::SqlInjection,
+        Self::Rce,
+        Self::Xss,
+        Self::Traversal,
+        Self::Xxe,
+        Self::NoSqlInjection,
+    ];
 
     /// Stable config-key spelling (`snake_case`) used in the TOML `[attacks]`
     /// map and in persistence.
@@ -113,6 +121,7 @@ impl AttackKind {
             Self::Xss => "xss",
             Self::Traversal => "traversal",
             Self::Xxe => "xxe",
+            Self::NoSqlInjection => "nosql_injection",
         }
     }
 
@@ -125,6 +134,7 @@ impl AttackKind {
             "xss" => Some(Self::Xss),
             "traversal" => Some(Self::Traversal),
             "xxe" => Some(Self::Xxe),
+            "nosql_injection" => Some(Self::NoSqlInjection),
             _ => None,
         }
     }
@@ -139,6 +149,7 @@ impl AttackKind {
             Self::Xss => Phase::Xss,
             Self::Traversal => Phase::DirTraversal,
             Self::Xxe => Phase::Xxe,
+            Self::NoSqlInjection => Phase::NoSqlInjection,
         }
     }
 
@@ -155,6 +166,7 @@ impl AttackKind {
             Phase::Xss => Some(Self::Xss),
             Phase::DirTraversal => Some(Self::Traversal),
             Phase::Xxe => Some(Self::Xxe),
+            Phase::NoSqlInjection => Some(Self::NoSqlInjection),
             _ => None,
         }
     }
@@ -193,6 +205,15 @@ pub enum DetectorId {
     /// normalised view text. It runs **no** XML parser, so an attacker payload can
     /// never drive a parse-time entity-expansion / deep-nesting `DoS`.
     XxeStruct,
+    /// Structural `NoSQL` (`MongoDB`-style operator) detector (T2-B) — the single
+    /// detector in the `NoSqlInjection` family. Fires when a `MongoDB` query operator
+    /// (`$where` / `$expr` / `$ne` / `$regex` …) appears in a **JSON object key**
+    /// position, surfaced as its own leaf by
+    /// [`super::struct_extract::extract_body_fields`]. The `$`-prefixed key is
+    /// unicode-unescaped by `serde_json` before it reaches the detector, so a
+    /// `$`-encoded operator cannot slip past; it runs no query engine and adds
+    /// no parse surface beyond the already-bounded JSON walk.
+    NoSqlStruct,
 }
 
 impl DetectorId {
@@ -208,6 +229,7 @@ impl DetectorId {
             Self::XssDom => "xss_dom",
             Self::XssJs => "xss_js",
             Self::XxeStruct => "xxe_struct",
+            Self::NoSqlStruct => "nosql_struct",
         }
     }
 
@@ -224,6 +246,7 @@ impl DetectorId {
             "xss_dom" => Some(Self::XssDom),
             "xss_js" => Some(Self::XssJs),
             "xxe_struct" => Some(Self::XxeStruct),
+            "nosql_struct" => Some(Self::NoSqlStruct),
             _ => None,
         }
     }

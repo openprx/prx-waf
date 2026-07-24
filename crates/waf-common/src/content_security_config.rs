@@ -47,11 +47,13 @@ pub struct ContentSecurityConfig {
     /// Anomaly-rate circuit-breaker parameters (plan §13.3).
     pub breaker: SemanticBreakerConfig,
     /// Per-attack-family scoring configuration, keyed by attack family
-    /// (`"sql_injection"` / `"rce"` / `"xss"` / `"traversal"` / `"xxe"`). An absent
-    /// or disabled family contributes nothing (plan §6.2).
+    /// (`"sql_injection"` / `"rce"` / `"xss"` / `"traversal"` / `"xxe"` /
+    /// `"nosql_injection"`). An absent or disabled family contributes nothing
+    /// (plan §6.2).
     pub attacks: BTreeMap<String, SemanticAttackConfig>,
     /// Per-attack-family enforcement-mode overrides (E0). Each key is an attack
-    /// family (`"sql_injection"` / `"rce"` / `"xss"` / `"traversal"` / `"xxe"`); each value
+    /// family (`"sql_injection"` / `"rce"` / `"xss"` / `"traversal"` / `"xxe"` /
+    /// `"nosql_injection"`); each value
     /// is `"off"` / `"log_only"` / `"enforce"` and overrides the global
     /// [`Self::enforcement_mode`] **for that family only**. A family not listed
     /// here inherits the global mode, so the shipped **empty** map is
@@ -218,7 +220,7 @@ impl ContentSecurityConfig {
             if !is_known_attack_family(name) {
                 return Err(format!(
                     "content_security.attacks has unknown family '{name}' \
-                     (expected sql_injection/rce/xss/traversal/xxe)"
+                     (expected sql_injection/rce/xss/traversal/xxe/nosql_injection)"
                 ));
             }
             family.validate(name)?;
@@ -231,7 +233,7 @@ impl ContentSecurityConfig {
             if !is_known_attack_family(name) {
                 return Err(format!(
                     "content_security.enforcement_overrides has unknown family '{name}' \
-                     (expected sql_injection/rce/xss/traversal/xxe)"
+                     (expected sql_injection/rce/xss/traversal/xxe/nosql_injection)"
                 ));
             }
             match mode.as_str() {
@@ -362,7 +364,10 @@ impl SemanticAttackConfig {
 
 /// Recognised attack-family keys (must match `waf_engine`'s `AttackKind`).
 fn is_known_attack_family(name: &str) -> bool {
-    matches!(name, "sql_injection" | "rce" | "xss" | "traversal" | "xxe")
+    matches!(
+        name,
+        "sql_injection" | "rce" | "xss" | "traversal" | "xxe" | "nosql_injection"
+    )
 }
 
 #[cfg(test)]

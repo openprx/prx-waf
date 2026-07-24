@@ -103,6 +103,9 @@ pub enum Phase {
     Community = 18,
     /// XML external entity injection (Lane 2 semantic `xxe` family, T2-A)
     Xxe = 19,
+    /// `NoSQL` (`MongoDB`-style operator) injection (Lane 2 semantic
+    /// `nosql_injection` family, T2-B)
+    NoSqlInjection = 20,
 }
 
 impl std::fmt::Display for Phase {
@@ -127,6 +130,7 @@ impl std::fmt::Display for Phase {
             Self::GeoIp => write!(f, "GeoIP"),
             Self::Community => write!(f, "Community"),
             Self::Xxe => write!(f, "XXE"),
+            Self::NoSqlInjection => write!(f, "NoSQL Injection"),
         }
     }
 }
