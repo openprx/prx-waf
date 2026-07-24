@@ -102,8 +102,10 @@ pub struct WafEngine {
     synced: ArcSwapOption<SyncedRuleStore>,
     /// Bounded, back-pressured sink for Lane 2 semantic observations (codex A-1).
     /// The hot path only `try_send`s here; a single background worker (started in
-    /// [`Self::new`] when a runtime is present) drains and batch-inserts. When the
-    /// lane is off this is never fed, so it stays idle.
+    /// [`Self::new`] when a runtime is present) drains a bounded batch, then
+    /// inserts the rows one-by-one (a drain-batch, **not** a single multi-row SQL
+    /// statement — see [`crate::semantic_sink`]). When the lane is off this is
+    /// never fed, so it stays idle.
     semantic_sink: Arc<SemanticObservationSink>,
 }
 
