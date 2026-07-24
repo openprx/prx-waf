@@ -1,0 +1,363 @@
+[proxy]
+listen_addr = "0.0.0.0:80"
+listen_addr_tls = "0.0.0.0:443"
+
+[api]
+listen_addr = "0.0.0.0:9527"
+
+[storage]
+database_url = "postgresql://prx_waf:prx_waf@postgres:5432/prx_waf"
+max_connections = 20
+
+# ── Phase 5: Response Caching ─────────────────────────────────────────────────
+[cache]
+enabled = true
+max_size_mb = 256
+default_ttl_secs = 60
+max_ttl_secs = 3600
+
+# ── Phase 5: HTTP/3 (QUIC) ────────────────────────────────────────────────────
+# HTTP/3 needs a TLS cert + key, so it stays off for a zero-config single node.
+# It auto-enables once BOTH cert_pem and key_pem are configured (no need to also
+# flip `enabled`); uncomment those two lines to turn it on.
+[http3]
+enabled = false
+listen_addr = "0.0.0.0:443"
+# cert_pem = "/etc/prx-waf/tls/cert.pem"
+# key_pem  = "/etc/prx-waf/tls/key.pem"
+
+# ── GeoIP-based access control ────────────────────────────────────────────────
+# Enabled by default. Pure-detection feature that degrades gracefully: when the
+# xdb database files are missing the service logs a warning and is skipped (no
+# blocking, no crash), and it has no effect until country/region rules are added.
+# Download the databases with:  prx-waf geoip download
+[geoip]
+enabled = true
+ipv4_xdb_path = "data/ip2region_v4.xdb"
+ipv6_xdb_path = "data/ip2region_v6.xdb"
+# Cache policy: full_memory (~20MB, fastest) | vector_index (~2MB) | no_cache
+cache_policy = "full_memory"
+
+# ── Phase 5: Security Hardening ───────────────────────────────────────────────
+[security]
+# List of IPs/CIDRs allowed to access the admin API.  Empty = allow all.
+admin_ip_allowlist = []
+# Maximum request body size (bytes).  Default 10 MB.
+max_request_body_bytes = 10485760
+# Per-IP rate limit for the admin API (req/s).  0 = disabled.
+# Default 100 req/s per IP (burst 500): protects the management surface from
+# brute-force / scripted abuse without disrupting normal admin-UI usage.
+api_rate_limit_rps = 100
+# CORS origins for admin API.  Empty = deny all cross-origin (secure default).
+cors_origins = []
+
+# ── Fire-drill host configuration ─────────────────────────────────────────────
+# Reverse-proxies fire-drill.local (matched via Host header) to the dummy
+# httpbin-style backend container on the compose network.
+[[hosts]]
+host = "fire-drill.local"
+port = 80
+remote_host = "backend"
+remote_port = 80
+guard_status = true
+
+# ── Cluster Configuration (disabled by default — opt-in) ──────────────────────
+# Remove the leading '#' characters from the [cluster] section to enable.
+#
+# [cluster]
+# # Enable clustering. Default: false — zero behavior change for standalone deployments.
+# enabled = false
+#
+# # Unique node identifier. Auto-generated from hostname+uuid suffix if empty.
+# node_id = ""
+#
+# # Role assignment. "auto" participates in leader election.
+# # Values: "auto" | "main" | "worker"
+# role = "auto"
+#
+# # QUIC listen address for inter-node communication.
+# listen_addr = "0.0.0.0:16851"
+#
+# # Static seed nodes. At least one reachable seed required to join a cluster.
+# # seeds = ["10.0.0.1:16851", "10.0.0.2:16851"]
+# seeds = []
+#
+# [cluster.crypto]
+# ca_cert   = "/app/certs/cluster-ca.pem"
+# node_cert = "/app/certs/node.pem"
+# node_key  = "/app/certs/node.key"
+# # Auto-generate CA and node certs on first startup (required for initial main).
+# auto_generate       = true
+# ca_validity_days    = 3650   # 10 years
+# node_validity_days  = 365    # 1 year
+# renewal_before_days = 7      # auto-renew 7 days before expiry
+#
+# [cluster.sync]
+# rules_interval_secs        = 10    # periodic rule version check
+# config_interval_secs       = 30
+# events_batch_size          = 100   # flush event batch at this count
+# events_flush_interval_secs = 5     # flush even if batch not full
+# stats_interval_secs        = 10
+# events_queue_size          = 10000 # drop oldest if worker falls behind
+#
+# [cluster.election]
+# timeout_min_ms        = 150    # random election timeout range (ms)
+# timeout_max_ms        = 300
+# heartbeat_interval_ms = 50     # main → workers heartbeat interval
+# phi_suspect           = 8.0
+# phi_dead              = 12.0
+#
+# [cluster.health]
+# check_interval_secs   = 5
+# max_missed_heartbeats = 3
+
+# ── Community Integration ─────────────────────────────────────────────────────
+# Share threat intelligence with the OpenPRX community network.
+# Enable to report detected attacks and receive the community blocklist.
+# Run `prx-waf community enroll` first to obtain machine_id and api_key.
+#
+# [community]
+# enabled = false
+# server_url = "https://community.openprx.dev"
+# api_key = ""           # Obtained from: prx-waf community enroll
+# machine_id = ""        # Obtained from: prx-waf community enroll
+# public_key = ""        # Ed25519 hex (64 chars). If set but invalid, init is refused.
+# batch_size = 50        # Number of signals to buffer before flushing
+# flush_interval_secs = 30   # Flush buffer even when batch_size not reached
+# sync_interval_secs = 300   # Blocklist sync interval (default: 5 minutes)
+
+# ── Threat-Intelligence IP Feeds (disabled by default — opt-in) ───────────────
+# Pull raw IP/CIDR blocklists from external open-source intelligence sources and
+# fold matching addresses into the WAF IP blacklist (403). NO feed is fetched
+# unless you uncomment an [[ip_feeds]] block below.
+#
+# ⚠ LICENSING — READ BEFORE ENABLING. These sources are free but carry terms:
+#   • ET Open (Emerging Threats) — BSD-licensed. Free to use.
+#   • Tor exit list              — CC0 / public domain. Free to use.
+#   • Spamhaus DROP              — free BUT requires ATTRIBUTION and FORBIDS
+#                                  some commercial redistribution. Review
+#                                  https://www.spamhaus.org/drop/ terms first.
+# Enabling a feed is your acknowledgement of its license. This is why the
+# default ships with everything commented out.
+#
+# format: "plain"         — one IP/CIDR per line; `#` and `;` comments tolerated
+#         "spamhaus_json" — Spamhaus DROP JSONL (one {"cidr":...} object/line)
+#
+# Emerging Threats Open — compromised / known-bad IPs (BSD license):
+# [[ip_feeds]]
+# name = "et-open-compromised"
+# url = "https://rules.emergingthreats.net/blockrules/compromised-ips.txt"
+# format = "plain"
+# update_interval_secs = 3600
+# enabled = true
+#
+# Tor exit nodes (CC0 / public domain):
+# [[ip_feeds]]
+# name = "tor-exit-nodes"
+# url = "https://check.torproject.org/torbulkexitlist"
+# format = "plain"
+# update_interval_secs = 3600
+# enabled = true
+#
+# Spamhaus DROP (Don't Route Or Peer) — ATTRIBUTION REQUIRED, see terms above:
+# [[ip_feeds]]
+# name = "spamhaus-drop"
+# url = "https://www.spamhaus.org/drop/drop_v4.json"
+# format = "spamhaus_json"
+# update_interval_secs = 86400
+# enabled = true
+
+# ── CrowdSec Integration ──────────────────────────────────────────────────────
+# CrowdSec needs an external LAPI endpoint + bouncer key, so it stays off for a
+# zero-config single node. It auto-enables once `api_key` is set (no need to also
+# flip `enabled`). A failed connection fails safe (logged, non-fatal).
+# Run `prx-waf crowdsec setup` for a guided walkthrough.
+#
+# [crowdsec]
+# enabled = false
+# mode = "bouncer"                   # bouncer | appsec | both
+# lapi_url = "http://127.0.0.1:8080"
+# api_key = ""                       # from: cscli bouncers add prx-waf-bouncer
+# update_frequency_secs = 10
+# fallback_action = "allow"          # allow | block | log (LAPI bouncer)
+# appsec_failure_action = "allow"    # allow | block | log (AppSec, independent)
+
+# ── Lane 2 Semantic Content-Security Engine ───────────────────────────────────
+# Additive semantic scoring layer that sits behind the frozen legacy detectors.
+# Shipped detectors: SQLi (P1b structural + P2 sqlparser AST), RCE (P1c), Traversal
+# T1 (P1c), XSS (P-XSS-1 DOM + P-XSS-2 JS-token). E0 wired the enforce block path
+# but the default posture stays shadow.
+#
+# DEFAULT-ON SHADOW: since Task A the lane ships `enabled = true` with
+# `enforcement_mode = "log_only"` — it detects + logs + persists a de-identified
+# observation but NEVER blocks. A zero-config install with no config file at all
+# also has the lane on in shadow (compiled default `enabled = true`, log_only).
+#
+# enforcement_mode truth table:
+#   off       → the lane does NO work: no detection, no LogOnly event, no
+#               `semantic_observations` row.
+#   log_only  → SHADOW: detect + log a LogOnly security event + persist a
+#               de-identified observation. NEVER a Block.
+#   enforce   → block-capable (E0 wired). A Block still needs SIX gates to line up
+#               (effective mode enforce → warmup → canary rollout_bps>0 → breaker
+#               closed → host not log_only → enforce_safe signal). rollout_bps = 0
+#               blocks nothing, so `enforce` with the defaults below still never
+#               blocks. Enforcement awaits holdout calibration + a product decision.
+[content_security]
+enabled = true                        # FIRE-DRILL: master switch (matches shipped default-on shadow)
+enforcement_mode = "log_only"         # off | log_only (shadow) | enforce (block-capable, canary-gated)
+dialect = "generic"                   # global; per-host dialects not claimed in P1
+hpp = false                           # HTTP-parameter-pollution synthetic views (global off)
+rollout_bps = 0                       # canary width in basis points (0..10000); 0 → enforce blocks nothing
+rollout_salt = ""                     # stable salt for deterministic canary bucketing
+
+# Per-family enforcement overrides (E0). Each key is an attack family
+# (sql_injection / rce / xss / traversal); each value is off | log_only | enforce
+# and overrides `enforcement_mode` for THAT family only. Empty = pure global
+# posture, zero behaviour change (the shipped default). Lets an operator flip the
+# single highest-confidence family to enforce while the rest stay shadow, e.g.:
+#   [content_security.enforcement_overrides]
+#   sql_injection = "enforce"
+[content_security.enforcement_overrides]
+
+[content_security.budget]             # deterministic DoS work caps (conservative)
+max_fields_per_phase = 64
+max_views_per_field = 12
+max_ast_attempts_per_request = 6
+max_ast_input_bytes_total = 262144
+max_tokens_per_view = 512
+max_list_items = 1024
+max_preprocess_output_bytes_total = 524288
+max_field_input_bytes = 16384         # per-field input cap, checked before any decode/alloc
+max_decode_rounds = 3
+max_html_parse_attempts_per_request = 6    # XSS DOM detector HTML5 fragment-parse cap (P-XSS-1)
+max_html_parse_input_bytes_total = 262144  # total bytes handed to the HTML parser per request
+
+[content_security.breaker]            # anomaly-rate circuit breaker
+window_secs = 300
+min_samples = 200
+anomaly_rate_threshold = 0.05
+cooldown_secs = 900
+
+# Per-attack scoring families (enabled ones require weights summing to 1.0).
+# SQLi is defined with the single structural detector. The family only runs when
+# the lane above is `enabled = true`.
+#
+# hard_veto_allowlist is EMPTY: no rule is authorised for single-hit Block before
+# holdout calibration (plan v2.2 "先标定、后授权"). Even if a rule were listed, in
+# the P1b shadow posture it can only be logged, never enforced.
+#
+# The structural detector ships high-noise rules (stacked / chr / hex /
+# information_schema) DISABLED by default (plan v2.2). Only the lower-FP rules
+# (into_outfile / dangerous_fn / union_select / union_null / version_comment) run
+# by default; the rest await holdout data before being turned on.
+[content_security.attacks.sql_injection]
+enabled = true
+log_threshold = 30                    # P2 factory value: keeps every single default-on hit observable
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.sql_injection.weights]
+struct_rule = 0.5                     # OpenRASP-style structural / regex detector (P1b)
+ast = 0.5                             # sqlparser-rs true-AST detector (P2)
+
+# RCE (shell command injection) — P1c structural detector. FIRE-DRILL: explicitly
+# enabled for the P1c RCE/Traversal target-practice run (2026-07-23).
+[content_security.attacks.rce]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.rce.weights]
+rce = 0.5                             # self-authored structural shell-injection detector
+rce_ast = 0.5                         # brush-parser true shell-AST detector (T1-A)
+
+# Traversal T1 (encoded path traversal) — P1c structural detector. FIRE-DRILL:
+# explicitly enabled for the P1c RCE/Traversal target-practice run (2026-07-23).
+[content_security.attacks.traversal]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.traversal.weights]
+traversal = 1.0                       # segment-aware traversal detector
+
+# XSS — two-detector HTML5-semantic family (P-XSS-1 DOM + P-XSS-2 JS-token).
+# FIRE-DRILL: explicitly enabled for the XSS target-practice run (2026-07-23).
+# `xss_dom` (P-XSS-1) upgrades XSS from the frozen Lane 1 regex to a real WHATWG
+# HTML5 fragment parse: fires only on genuinely parsed dangerous elements/
+# attributes/schemes, not on text that merely looks like `on*=`/`javascript:`
+# (the core Lane 1 FP fix). `xss_js` (P-XSS-2) is the second detector: from the
+# SAME parse it classifies only ATTACK-SPECIFIC JS tokens (document.cookie /
+# eval / atob …) inside parsed event-handler values and `javascript:` URLs.
+# Equal contribution (Σ = 1.0): a lone hit only Logs; a Block recommendation
+# needs DOM structure AND a JS token to corroborate (still shadow, never blocks).
+# The noisy `xss.object_embed` / `xss.base_href` DOM constructs ship DEFAULT-OFF
+# (fire-drill FP-4: legitimate media/PDF embeds and SPA `<base href>`).
+[content_security.attacks.xss]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.xss.weights]
+xss_dom = 0.5                         # HTML5 DOM semantic detector (P-XSS-1)
+xss_js = 0.5                          # lightweight JS-token detector (P-XSS-2)
+
+# XXE — single structural detector (xxe_struct). FIRE-DRILL: enabled for
+# zero-regression cross-check (2026-07-24 batch drill).
+[content_security.attacks.xxe]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []
+[content_security.attacks.xxe.weights]
+xxe_struct = 1.0
+
+# NoSQL injection — single structural detector (nosql_struct). FIRE-DRILL:
+# enabled for zero-regression cross-check (2026-07-24 batch drill).
+[content_security.attacks.nosql_injection]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []
+[content_security.attacks.nosql_injection.weights]
+nosql_struct = 1.0
+
+# ── 2026-07-24 batch drill: newly landed detection families ───────────────────
+# Each is a single-detector family (weight 1.0), shadow (log_only, inherited from
+# the global enforcement_mode), empty hard-veto allowlist.
+
+# SSTI — server-side template injection structural detector (ssti_struct).
+[content_security.attacks.ssti]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []
+[content_security.attacks.ssti.weights]
+ssti_struct = 1.0
+
+# LDAP injection — filter-break structural detector (ldap_struct).
+[content_security.attacks.ldap_injection]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []
+[content_security.attacks.ldap_injection.weights]
+ldap_struct = 1.0
+
+# XPath injection — predicate/axis structural detector (xpath_struct).
+[content_security.attacks.xpath_injection]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []
+[content_security.attacks.xpath_injection.weights]
+xpath_struct = 1.0
+
+# Deserialization — Java/PHP/Python/.NET gadget structural detector (deser_struct).
+[content_security.attacks.deserialization]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []
+[content_security.attacks.deserialization.weights]
+deser_struct = 1.0

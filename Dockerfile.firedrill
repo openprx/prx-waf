@@ -1,0 +1,25 @@
+FROM debian:trixie-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/release/prx-waf /usr/local/bin/prx-waf
+COPY configs/   /app/configs/
+COPY rules/     /app/rules/
+COPY data/      /app/data/
+COPY web/admin-ui/dist /app/web/admin-ui/dist
+COPY migrations/ /app/migrations/
+
+RUN chmod +x /usr/local/bin/prx-waf
+
+EXPOSE 80 443 9527
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:9527/health || exit 1
+
+CMD ["/usr/local/bin/prx-waf", "--config", "/app/configs/default.toml", "run"]

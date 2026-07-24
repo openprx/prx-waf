@@ -1830,9 +1830,9 @@ mod tests {
         let payload = STANDARD.encode(r#"<!DOCTYPE r [<!ENTITY x SYSTEM "http://e/x">]>"#);
         let views = body_views(format!("xml={payload}").as_bytes());
         assert!(
-            views.iter().any(
-                |v| v.provenance == Provenance::BlindDecoded && v.lower_trunc.contains("<!entity")
-            ),
+            views
+                .iter()
+                .any(|v| v.provenance == Provenance::BlindDecoded && v.lower_trunc.contains("<!entity")),
             "base64-wrapped XXE must surface a BlindDecoded view: {:?}",
             views
                 .iter()

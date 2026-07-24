@@ -1,0 +1,75 @@
+version: "3.9"
+
+# Fire-drill deployment for the P1b shadow SQLi target-practice exercise
+# (task/prx-waf/... 2026-07-22). NOT for production use — separate compose
+# project ("prx-waf-firedrill") so it never collides with docker-compose.yml.
+#
+# Topology: prx-waf (reverse proxy, ports 16880/16843/16827) -> backend
+# (dummy httpbin-style origin) ; postgres holds semantic_observations for
+# read-back after the fire drill.
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    container_name: prx-waf-fd-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: prx_waf
+      POSTGRES_PASSWORD: prx_waf
+      POSTGRES_DB: prx_waf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prx_waf -d prx_waf"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "15432:5432"
+
+  # Dummy upstream origin the WAF reverse-proxies to. httpbin gives us
+  # /anything (echoes back method/path/body/headers as JSON) which is handy
+  # for confirming shadow mode truly forwards every payload (never blocks).
+  backend:
+    image: docker.io/kennethreitz/httpbin:latest
+    container_name: prx-waf-fd-backend
+    restart: unless-stopped
+
+  prx-waf:
+    build:
+      context: .
+      # trixie-slim (not the repo's default bookworm-slim) — this host is
+      # Debian 13 (glibc 2.41) and a locally-built binary against bookworm's
+      # glibc 2.36 fails to start ("GLIBC_2.38 not found").
+      dockerfile: Dockerfile.firedrill
+    container_name: prx-waf-fd
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    environment:
+      JWT_SECRET: "firedrill-jwt-secret-not-for-prod-please-change-me-32chars"
+      MASTER_KEY: "firedrill-master-key-not-for-prod-please-change-32c"
+      ADMIN_PASSWORD: "admin123"
+      DATABASE_URL: "postgresql://prx_waf:prx_waf@postgres:5432/prx_waf"
+      RUST_LOG: "info"
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./rules:/app/rules:ro
+    command: ["/usr/local/bin/prx-waf", "--config", "/app/configs/firedrill.toml", "run"]
+    ports:
+      - "16880:80"
+      - "16843:443"
+      - "16827:9527"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9527/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
