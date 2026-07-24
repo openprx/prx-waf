@@ -250,7 +250,20 @@ pub enum LoadBalanceStrategy {
     LeastConnections,
 }
 
-/// Defense configuration per host
+/// Defense configuration per host.
+///
+/// **A3 contract — these toggles gate Lane 1 (legacy) checkers ONLY.** The
+/// per-host `sqli` / `xss` / `rce` / `dir_traversal` flags below switch the
+/// frozen Lane 1 regex checkers for this host. They are **independent** of the
+/// Lane 2 semantic content-security families (`[content_security.attacks.*]` in
+/// `configs/default.toml`): turning off a host's `sqli` here does **not** turn
+/// off that host's Lane 2 `sql_injection` family — the two switch sets must be
+/// managed separately (chosen contract: *explicit separation*, not linkage).
+/// The single per-host kill switch for **both** lanes' blocking is the host's
+/// `log_only_mode`, which downgrades every Lane 1 veto AND every Lane 2 enforce
+/// Block to a `LogOnly` event. Runtime per-host, per-detector Lane 1 gating of
+/// Lane 2 is a backlog item (no runtime write path today). See the full A3 note
+/// in `configs/default.toml`.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
