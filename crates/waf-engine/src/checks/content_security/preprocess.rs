@@ -811,6 +811,49 @@ fn normalise(text: &str, max_tokens: u32) -> String {
     out
 }
 
+/// Ceiling (bytes) for the UTF-16 BOM transcoder (F-J). A body larger than this
+/// is left on the byte-preserving `from_utf8_lossy` path (fail-open — no worse
+/// than the pre-transcoder behaviour), so a hostile UTF-16 body can never force an
+/// unbounded decode allocation. This is a **second, decoder-local** ceiling: the
+/// per-field input admission cap (`max_field_input_bytes`, default 16 KiB) already
+/// bounds every body before this runs, so under the default budget the transcoder
+/// only ever sees an already-admitted (≤ 16 KiB) body; the constant is
+/// defence-in-depth for a caller configured with a very large field cap.
+const UTF16_TRANSCODE_MAX_BYTES: usize = 512 * 1024;
+
+/// If `bytes` begins with a UTF-16 byte-order mark, transcode it to an owned UTF-8
+/// `String` so the text detectors (XXE, SSTI, …) see the real characters instead
+/// of the NUL-interleaved mojibake `from_utf8_lossy` produces for a UTF-16 body
+/// (F-J: a UTF-16LE/BE XML body with a `\xFF\xFE` / `\xFE\xFF` BOM would otherwise
+/// bypass every text detector).
+///
+/// Returns `None` — leaving the caller's existing UTF-8/lossy path untouched —
+/// when there is **no** UTF-16 BOM (so UTF-8 and every other encoding are
+/// unaffected) or when the body exceeds [`UTF16_TRANSCODE_MAX_BYTES`] (fail-open,
+/// bounded allocation). The decode is pure `std` ([`char::decode_utf16`], no new
+/// dependency, no `unsafe`): each 2-byte code unit is read in the BOM's
+/// endianness, a trailing odd byte (a truncated final unit) is dropped, and an
+/// unpaired surrogate is replaced with U+FFFD — it never panics. The output is at
+/// most `1.5×` the input (≤ 3 UTF-8 bytes per 2-byte BMP unit), so the allocation
+/// stays bounded by the already-capped input length.
+fn utf16_bom_transcode(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > UTF16_TRANSCODE_MAX_BYTES {
+        return None;
+    }
+    // BOM: `FF FE` = little-endian, `FE FF` = big-endian.
+    let (little_endian, rest) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => (true, rest),
+        [0xFE, 0xFF, rest @ ..] => (false, rest),
+        _ => return None,
+    };
+    let units = rest.chunks_exact(2).filter_map(|pair| match pair {
+        [a, b] if little_endian => Some(u16::from_le_bytes([*a, *b])),
+        [a, b] => Some(u16::from_be_bytes([*a, *b])),
+        _ => None,
+    });
+    Some(char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')).collect())
+}
+
 /// One admittable field source for a scope, held **before** any allocation or
 /// UTF-8 conversion so the per-field input cap can be applied on the raw length.
 ///
@@ -955,7 +998,17 @@ pub fn semantic_preprocessor<'a>(
         // header-scope values stay borrowed.
         let (location, raw): (Cow<'static, str>, Cow<'a, str>) = match source {
             FieldSource::Text(loc, s) => (loc, Cow::Borrowed(s)),
-            FieldSource::Body(bytes) => (Cow::Borrowed("body"), String::from_utf8_lossy(bytes)),
+            FieldSource::Body(bytes) => {
+                // F-J: honour a UTF-16 BOM so a UTF-16LE/BE body reaches the
+                // detectors as its real text, not the NUL-interleaved mojibake
+                // `from_utf8_lossy` produces (which bypasses XXE / SSTI / every text
+                // rule). No BOM → the existing UTF-8/lossy path is used verbatim, so
+                // UTF-8 and other encodings are unchanged; the transcode is bounded
+                // and fails open on an oversized body.
+                let materialised =
+                    utf16_bom_transcode(bytes).map_or_else(|| String::from_utf8_lossy(bytes), Cow::Owned);
+                (Cow::Borrowed("body"), materialised)
+            }
             FieldSource::Extracted(loc, s) => (loc, Cow::Owned(s)),
         };
 
@@ -1280,6 +1333,118 @@ mod tests {
     fn normalise_lowercases_and_truncates() {
         let out = normalise("SELECT   UNION", 8);
         assert_eq!(out, "select union");
+    }
+
+    // ── F-J: UTF-16 BOM transcode ────────────────────────────────────────────
+
+    fn utf16le_with_bom(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE];
+        for u in s.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out
+    }
+
+    fn utf16be_with_bom(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFE, 0xFF];
+        for u in s.encode_utf16() {
+            out.extend_from_slice(&u.to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn utf16_transcode_decodes_le_and_be_and_ignores_non_bom() {
+        // LE and BE bodies round-trip to the same UTF-8 text.
+        assert_eq!(
+            utf16_bom_transcode(&utf16le_with_bom("<!ENTITY xxe SYSTEM>")).as_deref(),
+            Some("<!ENTITY xxe SYSTEM>")
+        );
+        assert_eq!(
+            utf16_bom_transcode(&utf16be_with_bom("<!ENTITY xxe SYSTEM>")).as_deref(),
+            Some("<!ENTITY xxe SYSTEM>")
+        );
+        // No BOM → None (UTF-8 and every other encoding untouched).
+        assert!(utf16_bom_transcode(b"<!ENTITY xxe SYSTEM>").is_none());
+        assert!(utf16_bom_transcode(b"").is_none());
+        // A trailing odd byte (truncated final code unit) is dropped, never panics.
+        let mut odd = utf16le_with_bom("ab");
+        odd.push(0x00);
+        assert_eq!(utf16_bom_transcode(&odd).as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn utf16le_bom_body_is_transcoded_and_xxe_fires() {
+        // F-J end-to-end: a UTF-16LE XML body with an external-entity DTD reaches the
+        // detectors as its real text (not NUL-interleaved mojibake) and the XXE
+        // structural detector fires on the whole-body view.
+        let xml = r#"<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>"#;
+        let body = utf16le_with_bom(xml);
+        let views = body_views(&body);
+        let body_view = views
+            .iter()
+            .find(|v| *v.location == *"body" && v.round == 0)
+            .expect("whole-body view produced");
+        assert!(
+            body_view.text.contains("<!ENTITY xxe SYSTEM"),
+            "body view must carry the decoded XML, got: {:?}",
+            body_view.text
+        );
+        assert!(
+            !body_view.text.contains('\u{0}'),
+            "transcoded body must not be NUL-interleaved: {:?}",
+            body_view.text
+        );
+        // Run the real XXE detector over the transcoded view — it must now fire.
+        let det = crate::checks::content_security::detectors::XxeStructuralDetector::new();
+        let req = req_with("/a", "q=1", &body);
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let mut st = ContentInspectionState::default();
+        let finding = det
+            .detect(body_view, &pctx, &mut st)
+            .expect("XXE must fire on the transcoded UTF-16 body");
+        assert!(
+            finding.rule_key.starts_with("xxe."),
+            "expected an xxe.* rule, got: {}",
+            finding.rule_key
+        );
+    }
+
+    #[test]
+    fn utf16_transcode_is_bounded_and_fails_open_on_oversized_input() {
+        // DoS guard: a body over the decoder-local ceiling is declined (fail-open)
+        // rather than allocating an unbounded decode buffer.
+        let huge = utf16le_with_bom(&"A".repeat(UTF16_TRANSCODE_MAX_BYTES));
+        assert!(huge.len() > UTF16_TRANSCODE_MAX_BYTES);
+        assert!(
+            utf16_bom_transcode(&huge).is_none(),
+            "an over-ceiling UTF-16 body must fail open (no unbounded allocation)"
+        );
+        // A body under the ceiling transcodes to a bounded (≤ 1.5×) output.
+        let ok = utf16le_with_bom(&"A".repeat(1_000));
+        let decoded = utf16_bom_transcode(&ok).expect("under-ceiling body transcodes");
+        assert_eq!(decoded.len(), 1_000, "ASCII transcodes 1:1 from UTF-16");
+    }
+
+    #[test]
+    fn utf16_body_view_normalisation_surfaces_tokens_for_detectors() {
+        // The transcoded body flows through the normal round-0 metering + normalise
+        // path, so `lower_trunc` carries the lowercased XML tokens a structural
+        // detector matches on (no special-casing downstream).
+        let body = utf16le_with_bom(r#"<!DOCTYPE r SYSTEM "http://evil/x"><!ENTITY a SYSTEM "y">"#);
+        let views = body_views(&body);
+        let body_view = views
+            .iter()
+            .find(|v| *v.location == *"body" && v.round == 0)
+            .expect("whole-body view produced");
+        assert!(
+            body_view.lower_trunc.contains("<!entity") && body_view.lower_trunc.contains("system"),
+            "normalised view must carry lowercased XML tokens: {:?}",
+            body_view.lower_trunc
+        );
     }
 
     // ── P1b decode-chain views ───────────────────────────────────────────────
