@@ -101,6 +101,8 @@ pub enum Phase {
     GeoIp = 17,
     /// Community threat intelligence blocklist
     Community = 18,
+    /// XML external entity injection (Lane 2 semantic `xxe` family, T2-A)
+    Xxe = 19,
 }
 
 impl std::fmt::Display for Phase {
@@ -124,6 +126,7 @@ impl std::fmt::Display for Phase {
             Self::CrowdSec => write!(f, "CrowdSec"),
             Self::GeoIp => write!(f, "GeoIP"),
             Self::Community => write!(f, "Community"),
+            Self::Xxe => write!(f, "XXE"),
         }
     }
 }

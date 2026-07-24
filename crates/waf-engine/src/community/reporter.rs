@@ -77,7 +77,7 @@ pub struct CommunityReporter {
 const fn compute_confidence(phase: Phase) -> f64 {
     match phase {
         Phase::SqlInjection | Phase::Rce => 0.95,
-        Phase::Xss => 0.90,
+        Phase::Xss | Phase::Xxe => 0.90,
         Phase::DirTraversal | Phase::Owasp => 0.85,
         Phase::CustomRule | Phase::IpBlacklist | Phase::UrlBlacklist => 0.80,
         Phase::Sensitive | Phase::Scanner | Phase::Bot => 0.70,

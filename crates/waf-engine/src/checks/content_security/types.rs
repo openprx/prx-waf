@@ -96,11 +96,12 @@ pub enum AttackKind {
     Rce,
     Xss,
     Traversal,
+    Xxe,
 }
 
 impl AttackKind {
     /// All families, for iterating config.
-    pub const ALL: [Self; 4] = [Self::SqlInjection, Self::Rce, Self::Xss, Self::Traversal];
+    pub const ALL: [Self; 5] = [Self::SqlInjection, Self::Rce, Self::Xss, Self::Traversal, Self::Xxe];
 
     /// Stable config-key spelling (`snake_case`) used in the TOML `[attacks]`
     /// map and in persistence.
@@ -111,6 +112,7 @@ impl AttackKind {
             Self::Rce => "rce",
             Self::Xss => "xss",
             Self::Traversal => "traversal",
+            Self::Xxe => "xxe",
         }
     }
 
@@ -122,6 +124,7 @@ impl AttackKind {
             "rce" => Some(Self::Rce),
             "xss" => Some(Self::Xss),
             "traversal" => Some(Self::Traversal),
+            "xxe" => Some(Self::Xxe),
             _ => None,
         }
     }
@@ -135,6 +138,7 @@ impl AttackKind {
             Self::Rce => Phase::Rce,
             Self::Xss => Phase::Xss,
             Self::Traversal => Phase::DirTraversal,
+            Self::Xxe => Phase::Xxe,
         }
     }
 
@@ -150,6 +154,7 @@ impl AttackKind {
             Phase::Rce => Some(Self::Rce),
             Phase::Xss => Some(Self::Xss),
             Phase::DirTraversal => Some(Self::Traversal),
+            Phase::Xxe => Some(Self::Xxe),
             _ => None,
         }
     }
@@ -181,6 +186,13 @@ pub enum DetectorId {
     /// `javascript:`-URL contexts the DOM detector extracts, for the 0.5/0.5
     /// corroboration that gates a Block recommendation.
     XssJs,
+    /// Structural XXE (XML external entity) detector (T2-A) — the single detector
+    /// in the `Xxe` family. Matches the DTD / prolog structures that mark an XXE
+    /// attempt (external `<!ENTITY … SYSTEM/PUBLIC>`, parameter-entity definitions,
+    /// external `<!DOCTYPE … SYSTEM/PUBLIC>`, internal-entity expansion) on the
+    /// normalised view text. It runs **no** XML parser, so an attacker payload can
+    /// never drive a parse-time entity-expansion / deep-nesting `DoS`.
+    XxeStruct,
 }
 
 impl DetectorId {
@@ -195,6 +207,7 @@ impl DetectorId {
             Self::Traversal => "traversal",
             Self::XssDom => "xss_dom",
             Self::XssJs => "xss_js",
+            Self::XxeStruct => "xxe_struct",
         }
     }
 
@@ -210,6 +223,7 @@ impl DetectorId {
             "traversal" => Some(Self::Traversal),
             "xss_dom" => Some(Self::XssDom),
             "xss_js" => Some(Self::XssJs),
+            "xxe_struct" => Some(Self::XxeStruct),
             _ => None,
         }
     }

@@ -56,6 +56,7 @@ pub use canary::{BreakerState, CircuitBreaker, canary_bucket, in_canary};
 pub use config::{Dialect, EnforcementMode, RuntimeContentSecurityConfig};
 pub use detectors::{
     AstSqlDetector, RceAstDetector, RceStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector,
+    XxeStructuralDetector,
 };
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
@@ -98,8 +99,9 @@ pub struct ContentSecuritySubsystem {
     /// Compiled, immutable Lane 2 config (default = lane off).
     config: RuntimeContentSecurityConfig,
     /// Lane 2 semantic detectors: the structural + AST `SQLi` detectors, the
-    /// RCE / Traversal detectors and the XSS DOM + JS-token detectors (P-XSS-2,
-    /// 0.5/0.5 corroboration); tests may push additional mocks.
+    /// RCE / Traversal detectors, the XSS DOM + JS-token detectors (P-XSS-2,
+    /// 0.5/0.5 corroboration) and the structural XXE detector (T2-A); tests may
+    /// push additional mocks.
     detectors: Vec<Box<dyn SemanticDetector>>,
     /// Runtime anomaly-rate breaker state (never persisted; restart resets it).
     breaker: Mutex<CircuitBreaker>,
@@ -153,6 +155,11 @@ impl ContentSecuritySubsystem {
             Box::new(detectors::TraversalStructuralDetector::new()),
             Box::new(xss_dom::XssDomDetector::new()),
             Box::new(xss_js::XssJsTokenDetector::new()),
+            // T2-A: structural XXE detector (single-detector `xxe` family). Runs no
+            // XML parser, so it adds no parse-time DoS surface; matches DTD/prolog
+            // markers on the same normalised view text as the other structural
+            // detectors. Shadow (log_only) like every other family.
+            Box::new(detectors::XxeStructuralDetector::new()),
         ];
         Self {
             legacy_checkers,

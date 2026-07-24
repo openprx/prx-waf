@@ -371,3 +371,27 @@ hard_veto_allowlist = []              # empty until holdout-calibrated (no singl
 [content_security.attacks.xss.weights]
 xss_dom = 0.5                         # HTML5 DOM semantic detector (P-XSS-1)
 xss_js = 0.5                          # lightweight JS-token detector (P-XSS-2)
+
+# XXE (XML external entity) — T2-A single-detector structural family. Matches the
+# DTD / prolog markers of an XML-external-entity attack (external
+# `<!ENTITY … SYSTEM/PUBLIC>`, parameter-entity `<!ENTITY % …>` definitions, and —
+# default-off — external `<!DOCTYPE … SYSTEM/PUBLIC>`, bare `%name;` references,
+# internal-entity expansion / billion-laughs) on the SAME normalised view text as
+# the other structural detectors. It runs NO XML parser: the XXE grammar is a set
+# of textual markers, and not parsing removes the entire parse-time DoS surface
+# (billion-laughs entity expansion / deep nesting / oversized entities) — the
+# input is already length/token-bounded by the preprocessor budget, so every rule
+# is a bounded linear scan and the billion-laughs indicator is a bounded frequency
+# count, never an expansion. Single detector → weight 1.0; FP control is by narrow
+# default-on rules (external entity decl / parameter-entity def, essentially never
+# benign) + default-off high-noise rules (external DOCTYPE as used by every XHTML
+# page, bare `%name;`, a few internal entity decls). Shadow (log_only): a single
+# default-on hit scores its confidence (entity_external 90, param_entity_def 80)
+# and is recorded/logged, never blocked. hard_veto_allowlist empty until holdout.
+[content_security.attacks.xxe]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.xxe.weights]
+xxe_struct = 1.0                      # structural XXE detector (T2-A)
