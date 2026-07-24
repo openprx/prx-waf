@@ -48,7 +48,10 @@ pub fn rules() -> Vec<Rule> {
             "OWASP-942400",
             "SQL Hex Encoding",
             "sqli",
-            r"(?i)(0x[0-9a-f]{4,}|\\x[0-9a-f]{2})",
+            // `0x…` only in an SQL syntactic position (right of an operator /
+            // delimiter) so free-text hex (colour codes, hashes) is not flagged;
+            // `\xNN` byte escapes keep their original bare match.
+            r"(?i)([=(,<>]\s*0x[0-9a-f]{4,}|\\x[0-9a-f]{2})",
             "medium",
         ),
         // XSS

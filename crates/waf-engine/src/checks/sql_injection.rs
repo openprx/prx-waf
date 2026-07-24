@@ -44,16 +44,21 @@ static SQLI_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
         r"(?i)\b(sleep|benchmark|waitfor[\s]+delay|pg_sleep)\s*\(",
         // xp_cmdshell
         r"(?i)\bxp_cmdshell\b",
-        // INFORMATION_SCHEMA / sys.tables / sysobjects
-        r"(?i)\b(information_schema|sys\.(tables|columns|databases)|sysobjects|sysusers)\b",
+        // INFORMATION_SCHEMA / sys.tables / sysobjects. `information_schema`
+        // requires the structural `.<catalog table>` form so a bare field named
+        // `information_schema` (e.g. `?column=information_schema`) no longer
+        // fires — mirrors the narrowed content-security detector.
+        r"(?i)\b(information_schema\s*\.\s*(tables|columns|schemata|routines|databases)|sys\.(tables|columns|databases)|sysobjects|sysusers)\b",
         // OR/AND tautologies
         r"(?i)\b(or|and)\b[\s]+'[^']*'[\s]*=[\s]*'[^']*'",
         // LOAD_FILE()
         r"(?i)\bload_file\s*\(",
         // INTO OUTFILE / DUMPFILE
         r"(?i)\binto[\s]+(outfile|dumpfile)\b",
-        // Hex literals 0x41…
-        r"(?i)0x[0-9a-f]{4,}",
+        // Hex literals 0x41… in an SQL syntactic position (right of an operator
+        // / delimiter). A bare long hex run in free text (colour codes, hashes)
+        // no longer fires — only hex used as an SQL operand does.
+        r"(?i)[=(,<>]\s*0x[0-9a-f]{4,}\b",
         // Single-quote escapes common in error-based injection
         r"'[\s]*(or|and|union|select|drop|insert|update|delete)\b",
         // MySQL/MSSQL catalog tables
@@ -179,6 +184,50 @@ mod tests {
         let checker = SqlInjectionCheck::new();
         let ctx = make_ctx("name=alice&page=2", "");
         assert!(checker.check(&ctx).is_none(), "Should allow clean request");
+    }
+
+    #[test]
+    fn information_schema_bare_field_name_is_allowed() {
+        // A plain field named `information_schema` (no `.tables`/`.columns`) must
+        // not fire after the structural-context narrowing.
+        let checker = SqlInjectionCheck::new();
+        let ctx = make_ctx("column=information_schema&sort=asc", "");
+        assert!(
+            checker.check(&ctx).is_none(),
+            "bare information_schema field must not fire"
+        );
+    }
+
+    #[test]
+    fn information_schema_structural_still_detected() {
+        let checker = SqlInjectionCheck::new();
+        let ctx = make_ctx("id=1 UNION SELECT table_name FROM information_schema.tables", "");
+        assert!(
+            checker.check(&ctx).is_some(),
+            "information_schema.tables enumeration must still fire"
+        );
+    }
+
+    #[test]
+    fn bare_long_hex_in_free_text_is_allowed() {
+        // A long hex run that is not operator-adjacent (e.g. a commit hash / hash
+        // fragment sitting in free text) must not trip the hex-literal rule; the
+        // original bare `0x[0-9a-f]{4,}` matched it anywhere.
+        let checker = SqlInjectionCheck::new();
+        let ctx = make_ctx("note=commit 0xdeadbeefcafe1234 reverted", "");
+        assert!(checker.check(&ctx).is_none(), "free-text hex must not fire");
+    }
+
+    #[test]
+    fn hex_literal_as_sql_operand_still_detected() {
+        // Hex directly adjacent to an SQL operator / delimiter (function arg here)
+        // is a genuine operand and must still fire.
+        let checker = SqlInjectionCheck::new();
+        let ctx = make_ctx("q=cast(0x41414141 as char)", "");
+        assert!(
+            checker.check(&ctx).is_some(),
+            "hex literal used as an SQL operand must still fire"
+        );
     }
 
     #[test]
