@@ -12,7 +12,7 @@ use waf_storage::models::{
     CreateSensitivePattern, CreateUrlRule, Host, SecurityEventQuery, UpdateHost, UpsertHotlinkConfig,
 };
 
-use waf_common::HostConfig;
+use waf_common::{DefenseConfig, HostConfig};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -40,10 +40,20 @@ impl<T: Serialize> ApiResponse<T> {
 /// log-only hosts silently blocking — cannot drift between the two paths.
 ///
 /// This is a deliberately partial projection: fields the admin API does not yet
-/// surface into the runtime (load-balancing, `defense_json`, `exclude_url_log`,
-/// block page template, backends) keep their `HostConfig::default()` values.
+/// surface into the runtime (load-balancing, `exclude_url_log`, block page
+/// template, backends) keep their `HostConfig::default()` values.
+///
+/// `defense_config` is projected from the persisted `defense_json` JSONB column:
+/// a stored config drives the per-host Lane1 detector toggles, while `NULL` (or
+/// a value that fails to deserialise) falls back to `DefenseConfig::default()`
+/// — every detector on, the historical behaviour.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn host_runtime_config(host: &Host) -> HostConfig {
+    let defense_config = host
+        .defense_json
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<DefenseConfig>(v.clone()).ok())
+        .unwrap_or_default();
     HostConfig {
         code: host.code.clone(),
         host: host.host.clone(),
@@ -57,6 +67,7 @@ pub fn host_runtime_config(host: &Host) -> HostConfig {
         key_file: host.key_file.clone(),
         start_status: host.start_status,
         log_only_mode: host.log_only_mode,
+        defense_config,
         ..HostConfig::default()
     }
 }

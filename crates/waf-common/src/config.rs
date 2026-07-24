@@ -390,6 +390,11 @@ pub struct HostEntry {
     /// `backends` is non-empty. Defaults to round-robin.
     #[serde(default)]
     pub load_balance_strategy: crate::types::LoadBalanceStrategy,
+    /// Per-host Lane1 detector toggles. Defaults to every detector on
+    /// (`DefenseConfig::default`), matching the historical config-file
+    /// behaviour when the key is absent.
+    #[serde(default)]
+    pub defense_config: crate::types::DefenseConfig,
 }
 
 /// Response caching configuration

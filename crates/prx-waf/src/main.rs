@@ -1510,6 +1510,9 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
             is_enable_load_balance: !entry.backends.is_empty(),
             load_balance_strategy: entry.load_balance_strategy.clone(),
             backends: entry.backends.clone(),
+            // Per-host Lane1 detector toggles from the config file (defaults to
+            // every detector on when the key is absent).
+            defense_config: entry.defense_config.clone(),
             ..HostConfig::default()
         });
         router.register(&cfg);
@@ -2040,6 +2043,105 @@ mod tests {
         assert!(
             matches!(action, WafAction::Block { status: 403, .. }),
             "log_only_mode=false host reloaded at startup must still Block the SQLi request, got {action:?}"
+        );
+    }
+
+    // ── startup restart wiring (regression: per-host DefenseConfig projection) ──
+    //
+    // Companion to the `log_only_mode` restart tests above, for the newly-wired
+    // `defense_json` → `HostConfig::defense_config` projection. Before this fix
+    // both `host_runtime_config` and the config-file build path hard-coded
+    // `..HostConfig::default()` for `defense_config`, so a host whose `sqli`
+    // detector was turned off in the DB would silently re-enable it on every
+    // restart. This seeds a host with `sqli = false`, reloads it exactly the way
+    // `init_async` does, and proves a live `WafEngine` verdict honours the toggle
+    // (allow, not block) after the restart — and conversely that `sqli = true`
+    // still blocks.
+
+    /// Seed a host row carrying a `defense_json` with the given `sqli` toggle
+    /// (all other detectors left on). Inserts directly for the same reason
+    /// `seed_host` does (unrelated `remote_ip`/inet binding defect).
+    async fn seed_host_with_sqli(db: &Database, sqli: bool) -> Host {
+        let code = Uuid::new_v4().to_string().replace('-', "")[..16].to_string();
+        let host = format!("defense-restart-{}.test", Uuid::new_v4());
+        let defense = waf_common::DefenseConfig {
+            sqli,
+            ..waf_common::DefenseConfig::default()
+        };
+        sqlx::query_as::<_, Host>(
+            r"INSERT INTO hosts (
+                code, host, port, ssl, guard_status,
+                remote_host, remote_port, start_status, log_only_mode, defense_json
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING *",
+        )
+        .bind(&code)
+        .bind(&host)
+        .bind(80_i32)
+        .bind(false)
+        .bind(true)
+        .bind("127.0.0.1")
+        .bind(8080_i32)
+        .bind(true)
+        .bind(false)
+        .bind(sqlx::types::Json(defense))
+        .fetch_one(db.pool())
+        .await
+        .expect("seed host row")
+    }
+
+    /// Reload a `defense_json`-carrying host the way `init_async` does at
+    /// startup and drive a live `WafEngine` with the resolved config.
+    async fn restart_and_inspect_defense(sqli: bool) -> WafAction {
+        let db = Database::connect(&database_url(), 5).await.expect("connect Postgres");
+        db.migrate().await.expect("migrate");
+        let seeded = seed_host_with_sqli(&db, sqli).await;
+
+        let reloaded = db.list_hosts().await.expect("list_hosts");
+        let persisted = reloaded
+            .iter()
+            .find(|h| h.id == seeded.id)
+            .expect("seeded host must survive the reload")
+            .clone();
+
+        let router = HostRouter::new();
+        let cfg = Arc::new(waf_api::handlers::host_runtime_config(&persisted));
+        router.register(&cfg);
+
+        let resolved = router
+            .resolve(&persisted.host)
+            .expect("router must resolve the just-registered host");
+        assert_eq!(
+            resolved.defense_config.sqli, sqli,
+            "startup projection dropped defense_config.sqli across restart"
+        );
+
+        let engine_db = Arc::new(Database::connect(&database_url(), 5).await.expect("connect Postgres"));
+        let engine = WafEngine::new(engine_db, WafEngineConfig::default());
+        let mut ctx = malicious_ctx(resolved);
+        let decision = engine.inspect(&mut ctx).await;
+
+        let _ = db.delete_host(seeded.id).await;
+        decision.action
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres; run with --ignored"]
+    async fn restart_reload_of_sqli_disabled_allows_sqli_request() {
+        let action = restart_and_inspect_defense(false).await;
+        assert!(
+            matches!(action, WafAction::Allow),
+            "sqli-disabled host reloaded at startup must ALLOW the SQLi request, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres; run with --ignored"]
+    async fn restart_reload_of_sqli_enabled_blocks_sqli_request() {
+        let action = restart_and_inspect_defense(true).await;
+        assert!(
+            matches!(action, WafAction::Block { status: 403, .. }),
+            "sqli-enabled host reloaded at startup must BLOCK the SQLi request, got {action:?}"
         );
     }
 }

@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
+use waf_common::DefenseConfig;
 
 /// Host / site configuration
 #[allow(clippy::struct_excessive_bools)]
@@ -215,6 +216,11 @@ pub struct CreateHost {
     pub remarks: Option<String>,
     pub start_status: bool,
     pub log_only_mode: bool,
+    /// Per-host Lane1 detector toggles (SQLi/XSS/RCE/traversal/...). `None`
+    /// stores SQL `NULL` → the runtime falls back to `DefenseConfig::default()`
+    /// (every detector on), preserving the historical default.
+    #[serde(default)]
+    pub defense_config: Option<DefenseConfig>,
 }
 
 /// Update host request
@@ -232,6 +238,10 @@ pub struct UpdateHost {
     pub remarks: Option<String>,
     pub start_status: Option<bool>,
     pub log_only_mode: Option<bool>,
+    /// Per-host Lane1 detector toggles. `None` leaves the stored value
+    /// unchanged (COALESCE); `Some(cfg)` overwrites it.
+    #[serde(default)]
+    pub defense_config: Option<DefenseConfig>,
 }
 
 /// Create IP rule request

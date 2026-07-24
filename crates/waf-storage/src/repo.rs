@@ -40,6 +40,20 @@ fn validate_remote_ip(remote_ip: Option<&str>) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Serialise an optional [`DefenseConfig`](waf_common::DefenseConfig) for the
+/// `defense_json` JSONB column. `None` → SQL `NULL` (runtime falls back to the
+/// default all-on config). Serialisation of a fixed-shape struct of scalars
+/// cannot realistically fail, but the error is surfaced as `InvalidInput`
+/// rather than panicking (iron rule: no unwrap in production).
+fn defense_json(defense_config: Option<&waf_common::DefenseConfig>) -> Result<Option<serde_json::Value>, StorageError> {
+    match defense_config {
+        Some(cfg) => Ok(Some(serde_json::to_value(cfg).map_err(|e| {
+            StorageError::InvalidInput(format!("defense_config serialisation failed: {e}"))
+        })?)),
+        None => Ok(None),
+    }
+}
+
 impl Database {
     // ─── Hosts ───────────────────────────────────────────────────────────────
 
@@ -69,6 +83,7 @@ impl Database {
 
     pub async fn create_host(&self, req: CreateHost) -> Result<Host, StorageError> {
         validate_remote_ip(req.remote_ip.as_deref())?;
+        let defense = defense_json(req.defense_config.as_ref())?;
 
         let id = Uuid::new_v4();
         let code = Uuid::new_v4().to_string().replace('-', "")[..16].to_string();
@@ -78,15 +93,15 @@ impl Database {
             "INSERT INTO hosts (
                 id, code, host, port, ssl, guard_status,
                 remote_host, remote_port, remote_ip, cert_file, key_file,
-                remarks, start_status, log_only_mode,
+                remarks, start_status, log_only_mode, defense_json,
                 is_enable_load_balance, load_balance_stage,
                 created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9::inet, $10, $11,
-                $12, $13, $14,
+                $12, $13, $14, $15::jsonb,
                 false, 0,
-                $15, $15
+                $16, $16
             ) RETURNING {HOST_COLUMNS}"
         );
         let row = sqlx::query_as::<_, Host>(&sql)
@@ -104,6 +119,7 @@ impl Database {
             .bind(&req.remarks)
             .bind(req.start_status)
             .bind(req.log_only_mode)
+            .bind(defense)
             .bind(now)
             .fetch_one(&self.pool)
             .await?;
@@ -114,6 +130,7 @@ impl Database {
 
     pub async fn update_host(&self, id: Uuid, req: UpdateHost) -> Result<Option<Host>, StorageError> {
         validate_remote_ip(req.remote_ip.as_deref())?;
+        let defense = defense_json(req.defense_config.as_ref())?;
 
         let now = chrono::Utc::now();
 
@@ -131,7 +148,8 @@ impl Database {
                 remarks = COALESCE($11, remarks),
                 start_status = COALESCE($12, start_status),
                 log_only_mode = COALESCE($13, log_only_mode),
-                updated_at = $14
+                defense_json = COALESCE($14::jsonb, defense_json),
+                updated_at = $15
             WHERE id = $1
             RETURNING {HOST_COLUMNS}"
         );
@@ -149,6 +167,7 @@ impl Database {
             .bind(req.remarks)
             .bind(req.start_status)
             .bind(req.log_only_mode)
+            .bind(defense)
             .bind(now)
             .fetch_optional(&self.pool)
             .await?;

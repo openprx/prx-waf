@@ -39,6 +39,7 @@ fn create_req(remote_ip: Option<&str>) -> CreateHost {
         remarks: None,
         start_status: true,
         log_only_mode: false,
+        defense_config: None,
     }
 }
 
@@ -116,6 +117,7 @@ async fn update_changes_remote_ip() {
         remarks: None,
         start_status: None,
         log_only_mode: None,
+        defense_config: None,
     };
     let updated = db
         .update_host(created.id, update)
