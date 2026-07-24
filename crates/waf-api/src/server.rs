@@ -34,6 +34,7 @@ use crate::middleware::{require_admin, require_auth};
 use crate::notifications::{
     create_notification, delete_notification, list_notifications, notification_log, test_notification,
 };
+use crate::observations::{list_observations, observation_stats};
 use crate::plugins::{WASM_UPLOAD_MAX, delete_plugin, disable_plugin, enable_plugin, list_plugins, upload_plugin};
 use crate::security::{admin_ip_check_middleware, list_audit_log, rate_limit_middleware, security_headers_middleware};
 use crate::state::AppState;
@@ -93,6 +94,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/block-urls", get(list_block_urls))
         .route("/api/attack-logs", get(list_attack_logs))
         .route("/api/security-events", get(list_security_events))
+        .route("/api/observations", get(list_observations))
+        .route("/api/observations/stats", get(observation_stats))
         .route("/api/status", get(get_status))
         .route("/api/custom-rules", get(list_custom_rules))
         .route("/api/sensitive-patterns", get(list_sensitive_patterns))

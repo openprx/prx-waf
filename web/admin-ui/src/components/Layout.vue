@@ -12,6 +12,7 @@
         <NavItem to="/ip-rules" :icon="Shield">{{ $t('nav.ipRules') }}</NavItem>
         <NavItem to="/url-rules" :icon="LinkIcon">{{ $t('nav.urlRules') }}</NavItem>
         <NavItem to="/security-events" :icon="AlertTriangle">{{ $t('nav.securityEvents') }}</NavItem>
+        <NavItem to="/observations" :icon="Eye">{{ $t('nav.observations') }}</NavItem>
         <NavItem to="/custom-rules" :icon="FileEdit">{{ $t('nav.customRules') }}</NavItem>
         <NavItem to="/certificates" :icon="Lock">{{ $t('nav.certificates') }}</NavItem>
         <NavItem to="/cc-protection" :icon="ShieldCheck">{{ $t('nav.ccProtection') }}</NavItem>
@@ -81,6 +82,7 @@ import {
   Shield,
   Link as LinkIcon,
   AlertTriangle,
+  Eye,
   FileEdit,
   Lock,
   ShieldCheck,

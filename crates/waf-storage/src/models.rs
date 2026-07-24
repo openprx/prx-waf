@@ -334,6 +334,37 @@ pub struct SemanticObservationQuery {
     pub page_size: Option<i64>,
 }
 
+/// Rich, read-only filter for the P1a-2 semantic observation admin panel.
+///
+/// Every field is optional and predicates are AND-combined. `attack` and
+/// `rule_key` match a signal *inside* the JSONB `observations` array (via
+/// containment); the rest match row columns. This is a view-layer query only —
+/// it never mutates detection, scoring or the shadow posture.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SemanticObservationFilter {
+    pub host_code: Option<String>,
+    /// Attack family to match inside the signal array (e.g. `"sql_injection"`).
+    pub attack: Option<String>,
+    /// Structural rule key to match inside the signal array.
+    pub rule_key: Option<String>,
+    /// Minimum aggregate request score (0..=100).
+    pub min_score: Option<i16>,
+    /// Inclusive lower bound on `created_at`.
+    pub from: Option<DateTime<Utc>>,
+    /// Inclusive upper bound on `created_at`.
+    pub to: Option<DateTime<Utc>>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+}
+
+/// A grouped `(label, count)` tally used by the observation panel's shadow
+/// distribution summaries (attack families / recommendations).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct LabeledCount {
+    pub label: String,
+    pub count: i64,
+}
+
 /// Security event query parameters
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SecurityEventQuery {

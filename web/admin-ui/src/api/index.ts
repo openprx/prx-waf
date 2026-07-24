@@ -74,6 +74,50 @@ export const eventsApi = {
   listSecurityEvents: (params?: any) => api.get('/api/security-events', { params }),
 }
 
+// ─── Semantic Observations (Lane 2 shadow telemetry) ──────────────────────────
+export interface ObservationSignal {
+  detector?: string | null
+  attack?: string | null
+  field?: string | null
+  scope?: string | null
+  confidence?: number | null
+  rule_key?: string | null
+  provenance?: string | null
+}
+export interface Observation {
+  id: string
+  host_code: string
+  client_ip: string
+  req_id: string
+  scope: string
+  request_score: number
+  recommendation: string
+  degraded: boolean
+  exhausted: boolean
+  pipeline: string
+  schema_version: number
+  created_at: string
+  signals: ObservationSignal[]
+}
+export interface LabeledCount {
+  label: string
+  count: number
+}
+export interface ObservationFilters {
+  host_code?: string
+  attack?: string
+  rule_key?: string
+  min_score?: number
+  from?: string
+  to?: string
+  page?: number
+  page_size?: number
+}
+export const observationsApi = {
+  list: (params?: ObservationFilters) => api.get('/api/observations', { params }),
+  stats: (hours?: number) => api.get('/api/observations/stats', { params: { hours } }),
+}
+
 // ─── Custom Rules ─────────────────────────────────────────────────────────────
 export const customRulesApi = {
   list: (hostCode?: string) => api.get('/api/custom-rules', { params: { host_code: hostCode } }),

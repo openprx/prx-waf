@@ -8,6 +8,7 @@ pub mod handlers;
 pub mod health;
 pub mod middleware;
 pub mod notifications;
+pub mod observations;
 pub mod plugins;
 pub mod security;
 pub mod server;

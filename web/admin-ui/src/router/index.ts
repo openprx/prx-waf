@@ -9,6 +9,7 @@ const routes = [
   { path: '/ip-rules', component: () => import('../views/IpRules.vue') },
   { path: '/url-rules', component: () => import('../views/UrlRules.vue') },
   { path: '/security-events', component: () => import('../views/SecurityEvents.vue') },
+  { path: '/observations', component: () => import('../views/Observations.vue') },
   { path: '/custom-rules', component: () => import('../views/CustomRules.vue') },
   { path: '/certificates', component: () => import('../views/Certificates.vue') },
   { path: '/cc-protection', component: () => import('../views/CCProtection.vue') },

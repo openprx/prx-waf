@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -8,10 +9,10 @@ use crate::models::{
     Certificate, CreateAdminUser, CreateCertificate, CreateCrowdSecEvent, CreateCustomRule, CreateHost, CreateIpRule,
     CreateLbBackend, CreateNotificationConfig, CreateSecurityEvent, CreateSemanticObservation, CreateSensitivePattern,
     CreateTunnel, CreateUrlRule, CreateWasmPlugin, CrowdSecConfigRow, CrowdSecEventQuery, CrowdSecEventRow, CustomRule,
-    GeoDistEntry, GeoStats, Host, HotlinkConfig, LbBackend, NotificationConfig, NotificationLog, RefreshToken,
-    SecurityEvent, SecurityEventQuery, SemanticObservation, SemanticObservationQuery, SensitivePattern, StatsOverview,
-    TimeSeriesPoint, TopEntry, TunnelRow, UpdateCertificatePem, UpdateHost, UpsertCrowdSecConfig, UpsertHotlinkConfig,
-    WasmPluginRow,
+    GeoDistEntry, GeoStats, Host, HotlinkConfig, LabeledCount, LbBackend, NotificationConfig, NotificationLog,
+    RefreshToken, SecurityEvent, SecurityEventQuery, SemanticObservation, SemanticObservationFilter,
+    SemanticObservationQuery, SensitivePattern, StatsOverview, TimeSeriesPoint, TopEntry, TunnelRow,
+    UpdateCertificatePem, UpdateHost, UpsertCrowdSecConfig, UpsertHotlinkConfig, WasmPluginRow,
 };
 
 /// Column projection for every `hosts` read.
@@ -532,6 +533,133 @@ impl Database {
             }
         };
         Ok(rows)
+    }
+
+    /// Query semantic observations for the read-only P1a-2 admin panel with
+    /// rich filtering, most recent first. Returns the requested page plus the
+    /// total number of matching rows for pagination.
+    ///
+    /// Every predicate is a bound parameter — no string concatenation. The
+    /// `attack` / `rule_key` filters use JSONB containment (`observations @>
+    /// $probe`) so they match a signal *inside* the de-identified array; the
+    /// probe object is built in Rust and bound as a single `jsonb` parameter.
+    pub async fn query_semantic_observations(
+        &self,
+        filter: &SemanticObservationFilter,
+    ) -> Result<(Vec<SemanticObservation>, i64), StorageError> {
+        let page = filter.page.unwrap_or(1).max(1);
+        let page_size = filter.page_size.unwrap_or(50).clamp(1, 500);
+        let offset = (page - 1) * page_size;
+
+        // Containment probes: `[{"attack": <v>}]` / `[{"rule_key": <v>}]`, bound
+        // as jsonb. `None` binds SQL NULL, which the `$n::jsonb IS NULL` guard
+        // turns into "no filter".
+        let attack_probe = filter.attack.as_ref().map(|a| serde_json::json!([{ "attack": a }]));
+        let rule_key_probe = filter.rule_key.as_ref().map(|k| serde_json::json!([{ "rule_key": k }]));
+        let min_score = filter.min_score.map(i32::from);
+
+        let total: i64 = sqlx::query_scalar(
+            r"SELECT COUNT(*) FROM semantic_observations
+               WHERE ($1::text IS NULL OR host_code = $1)
+                 AND ($2::jsonb IS NULL OR observations @> $2)
+                 AND ($3::jsonb IS NULL OR observations @> $3)
+                 AND ($4::int IS NULL OR request_score >= $4)
+                 AND ($5::timestamptz IS NULL OR created_at >= $5)
+                 AND ($6::timestamptz IS NULL OR created_at <= $6)",
+        )
+        .bind(&filter.host_code)
+        .bind(attack_probe.clone())
+        .bind(rule_key_probe.clone())
+        .bind(min_score)
+        .bind(filter.from)
+        .bind(filter.to)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let rows = sqlx::query_as::<_, SemanticObservation>(
+            r"SELECT * FROM semantic_observations
+               WHERE ($1::text IS NULL OR host_code = $1)
+                 AND ($2::jsonb IS NULL OR observations @> $2)
+                 AND ($3::jsonb IS NULL OR observations @> $3)
+                 AND ($4::int IS NULL OR request_score >= $4)
+                 AND ($5::timestamptz IS NULL OR created_at >= $5)
+                 AND ($6::timestamptz IS NULL OR created_at <= $6)
+               ORDER BY created_at DESC
+               LIMIT $7 OFFSET $8",
+        )
+        .bind(&filter.host_code)
+        .bind(attack_probe)
+        .bind(rule_key_probe)
+        .bind(min_score)
+        .bind(filter.from)
+        .bind(filter.to)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((rows, total))
+    }
+
+    /// Attack-family distribution for the observation panel: number of distinct
+    /// observations carrying each `attack` family within the last `window_hours`.
+    ///
+    /// The window cutoff is computed in Rust and bound as `$1` (no `INTERVAL`
+    /// string interpolation); `window_hours` / `limit` are clamped to sane
+    /// bounds so a caller can never request an unbounded scan.
+    pub async fn semantic_observation_family_counts(
+        &self,
+        window_hours: i64,
+        limit: i64,
+    ) -> Result<Vec<LabeledCount>, StorageError> {
+        let cutoff = Self::window_cutoff(window_hours)?;
+        let limit = limit.clamp(1, 100);
+        let rows = sqlx::query_as::<_, LabeledCount>(
+            r"SELECT COALESCE(sig->>'attack', 'unknown') AS label,
+                     COUNT(DISTINCT s.id) AS count
+               FROM semantic_observations s,
+                    LATERAL jsonb_array_elements(s.observations) AS sig
+               WHERE s.created_at >= $1
+               GROUP BY label
+               ORDER BY count DESC
+               LIMIT $2",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Recommendation distribution (`block` / `log` / `none`) for the observation
+    /// panel within the last `window_hours`. Same bounded-window contract as
+    /// [`Self::semantic_observation_family_counts`].
+    pub async fn semantic_observation_recommendation_counts(
+        &self,
+        window_hours: i64,
+    ) -> Result<Vec<LabeledCount>, StorageError> {
+        let cutoff = Self::window_cutoff(window_hours)?;
+        let rows = sqlx::query_as::<_, LabeledCount>(
+            r"SELECT recommendation AS label, COUNT(*) AS count
+               FROM semantic_observations
+               WHERE created_at >= $1
+               GROUP BY recommendation
+               ORDER BY count DESC",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Compute a `now() - window_hours` cutoff, clamping the window to
+    /// `1..=2160` hours (90 days) and rejecting an overflowing value instead of
+    /// panicking.
+    fn window_cutoff(window_hours: i64) -> Result<DateTime<Utc>, StorageError> {
+        let window_hours = window_hours.clamp(1, 24 * 90);
+        let delta = chrono::TimeDelta::try_hours(window_hours)
+            .ok_or_else(|| StorageError::InvalidInput(format!("window_hours {window_hours} is out of range")))?;
+        Ok(chrono::Utc::now() - delta)
     }
 
     /// Prune Lane 2 semantic observations older than `retention_days` — the
