@@ -1046,6 +1046,30 @@ mod tests {
     }
 
     #[test]
+    fn frameset_window_reflected_event_handlers_fire() {
+        // Audit follow-up (D-3): the bare `<frameset on*=>` FN. The document-reparse
+        // recovery is event-agnostic — every window-reflected handler the WHATWG spec
+        // hoists onto `<body>`/`<frameset>` (`onpageshow` / `onpagehide` /
+        // `onbeforeunload` / `onhashchange` / `onresize` / `onstorage` / `onpopstate`
+        // / `onmessage` …) recovers identically to `onload`, so a bare
+        // `<frameset onpageshow=…>` must fire just like `<frameset onload=…>`.
+        for payload in [
+            "<frameset onpageshow=alert(1)>",
+            "<frameset onpagehide=alert(1)>",
+            "<frameset onbeforeunload=alert(1)>",
+            "<frameset onhashchange=alert(1)>",
+            "<frameset onresize=alert(1)>",
+            "<frameset onstorage=alert(1)>",
+            "<frameset onpopstate=alert(1)>",
+            "<frameset onmessage=alert(1)>",
+        ] {
+            let f = fire(payload).unwrap_or_else(|| panic!("frameset window handler must fire: {payload:?}"));
+            assert_eq!(f.rule_key, "xss.event_handler", "payload {payload:?}");
+            assert_eq!(f.attack, AttackKind::Xss);
+        }
+    }
+
+    #[test]
     fn frameset_word_in_prose_stays_clean() {
         // Anti-FP for FN-2: the word "frameset"/"body" in prose (no `<frameset`
         // start tag) and a real `<frameset>`/`<body>` with no handler must both
