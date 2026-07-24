@@ -78,10 +78,13 @@ const fn compute_confidence(phase: Phase) -> f64 {
     match phase {
         Phase::SqlInjection | Phase::Rce => 0.95,
         Phase::Xss | Phase::Xxe => 0.90,
-        // NoSQL (MongoDB-style operator) injection: a reverse proxy cannot confirm
-        // the backend is MongoDB and comparison operators recur in legitimate JSON
-        // APIs, so the community-reporting confidence is deliberately below XXE's.
-        Phase::DirTraversal | Phase::Owasp | Phase::NoSqlInjection => 0.85,
+        // DirTraversal / Owasp sit here; NoSQL and SSTI join them because a reverse
+        // proxy cannot confirm the backend actually interprets the payload — it
+        // cannot know MongoDB is the store (NoSQL comparison operators recur in
+        // legitimate JSON), and it cannot know a template engine evaluated the field
+        // (`{{7*7}}` is only known to be SSTI once rendered). Structural / input-side
+        // confidence, deliberately below the AST-backed XSS/XXE families.
+        Phase::DirTraversal | Phase::Owasp | Phase::NoSqlInjection | Phase::Ssti => 0.85,
         Phase::CustomRule | Phase::IpBlacklist | Phase::UrlBlacklist => 0.80,
         Phase::Sensitive | Phase::Scanner | Phase::Bot => 0.70,
         Phase::RateLimit | Phase::CrowdSec => 0.60,

@@ -421,3 +421,35 @@ block_threshold = 80
 hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
 [content_security.attacks.nosql_injection.weights]
 nosql_struct = 1.0                    # structural NoSQL operator detector (T2-B)
+
+# SSTI (server-side template injection) — T2-C single-detector structural family.
+# Detects expression-delimiter + dangerous-sink CO-OCCURRENCE and polyglot exec /
+# reflection / sandbox-escape sinks (`freemarker.template.utility.Execute`,
+# `T(java.…)` SpEL type evaluator, `getClass().forName(`, `__import__(`, the Python
+# `__mro__`/`__subclasses__`/`__globals__` dunder chain, `<% … system(…) %>`) on the
+# SAME normalised view text as the other structural detectors. It runs NO template
+# engine and has NO parser at all — every rule is a single bounded-regex scan over the
+# already length/token-bounded preprocessor output, so there is no recursion and thus
+# NO parse-time stack-overflow / template-expansion DoS surface (the P0 depth-bound
+# red-line targets recursive parsers; a pure-regex detector has none). HONEST BOUNDARY
+# (RASP ceiling): a reverse proxy sees only the payload and can never confirm the
+# backend actually evaluates the template (`{{7*7}}` is only known to be SSTI once
+# something renders it to `49`); these rules judge whether a payload LOOKS structurally
+# like SSTI, not whether it truly executed. FP honesty: SSTI is the worst FP family —
+# bare `{{ }}` / `${ }` / `#{ }` delimiters are ubiquitous in legitimate content (JS
+# template literals incl. the i18n `${t('key')}` idiom, Angular/Vue interpolation,
+# SCSS/CSS-in-JS, shell `${VAR}`, Ruby interpolation), so EVERY bare-delimiter rule is
+# DEFAULT-OFF. Single detector → weight 1.0; FP control is by narrow DEFAULT-ON rules
+# (exec/reflection/sandbox sinks that are essentially never benign + delimiter-gated
+# co-occurrence like `{{…config.items…}}` / `<%… system(…) %>`) + DEFAULT-OFF
+# high-noise rules (bare delimiters, `{{7*7}}` arithmetic probe, lone `.__class__`,
+# lone `getClass(`, bare FreeMarker/Velocity directives) held back until holdout
+# calibration. Shadow (log_only): a default-on hit is recorded/logged, never blocked.
+# hard_veto_allowlist empty until holdout.
+[content_security.attacks.ssti]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.ssti.weights]
+ssti_struct = 1.0                     # structural SSTI detector (T2-C)

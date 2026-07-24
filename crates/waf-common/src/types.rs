@@ -106,6 +106,8 @@ pub enum Phase {
     /// `NoSQL` (`MongoDB`-style operator) injection (Lane 2 semantic
     /// `nosql_injection` family, T2-B)
     NoSqlInjection = 20,
+    /// Server-side template injection (Lane 2 semantic `ssti` family, T2-C)
+    Ssti = 21,
 }
 
 impl std::fmt::Display for Phase {
@@ -131,6 +133,7 @@ impl std::fmt::Display for Phase {
             Self::Community => write!(f, "Community"),
             Self::Xxe => write!(f, "XXE"),
             Self::NoSqlInjection => write!(f, "NoSQL Injection"),
+            Self::Ssti => write!(f, "SSTI"),
         }
     }
 }

@@ -98,17 +98,19 @@ pub enum AttackKind {
     Traversal,
     Xxe,
     NoSqlInjection,
+    Ssti,
 }
 
 impl AttackKind {
     /// All families, for iterating config.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::SqlInjection,
         Self::Rce,
         Self::Xss,
         Self::Traversal,
         Self::Xxe,
         Self::NoSqlInjection,
+        Self::Ssti,
     ];
 
     /// Stable config-key spelling (`snake_case`) used in the TOML `[attacks]`
@@ -122,6 +124,7 @@ impl AttackKind {
             Self::Traversal => "traversal",
             Self::Xxe => "xxe",
             Self::NoSqlInjection => "nosql_injection",
+            Self::Ssti => "ssti",
         }
     }
 
@@ -135,6 +138,7 @@ impl AttackKind {
             "traversal" => Some(Self::Traversal),
             "xxe" => Some(Self::Xxe),
             "nosql_injection" => Some(Self::NoSqlInjection),
+            "ssti" => Some(Self::Ssti),
             _ => None,
         }
     }
@@ -150,6 +154,7 @@ impl AttackKind {
             Self::Traversal => Phase::DirTraversal,
             Self::Xxe => Phase::Xxe,
             Self::NoSqlInjection => Phase::NoSqlInjection,
+            Self::Ssti => Phase::Ssti,
         }
     }
 
@@ -167,6 +172,7 @@ impl AttackKind {
             Phase::DirTraversal => Some(Self::Traversal),
             Phase::Xxe => Some(Self::Xxe),
             Phase::NoSqlInjection => Some(Self::NoSqlInjection),
+            Phase::Ssti => Some(Self::Ssti),
             _ => None,
         }
     }
@@ -214,6 +220,17 @@ pub enum DetectorId {
     /// `$`-encoded operator cannot slip past; it runs no query engine and adds
     /// no parse surface beyond the already-bounded JSON walk.
     NoSqlStruct,
+    /// Structural SSTI (server-side template injection) detector (T2-C) — the
+    /// single detector in the `Ssti` family. Matches expression-delimiter +
+    /// dangerous-sink co-occurrence and polyglot exec/reflection/sandbox sinks
+    /// (`freemarker.template.utility.Execute`, `T(java.…)`, `getClass().forName(`,
+    /// `__import__(`, Python sandbox-escape dunders, `<% … system(…) %>`) on the
+    /// normalised view text. It runs **no** template parser — a pure bounded-regex
+    /// scan with no recursion, so a payload can never drive a parse-time
+    /// stack-overflow / template-expansion `DoS`. Honest boundary: input-side only,
+    /// it judges whether a payload *looks* like SSTI, not whether the backend
+    /// template engine actually evaluates it (the RASP ceiling).
+    SstiStruct,
 }
 
 impl DetectorId {
@@ -230,6 +247,7 @@ impl DetectorId {
             Self::XssJs => "xss_js",
             Self::XxeStruct => "xxe_struct",
             Self::NoSqlStruct => "nosql_struct",
+            Self::SstiStruct => "ssti_struct",
         }
     }
 
@@ -247,6 +265,7 @@ impl DetectorId {
             "xss_js" => Some(Self::XssJs),
             "xxe_struct" => Some(Self::XxeStruct),
             "nosql_struct" => Some(Self::NoSqlStruct),
+            "ssti_struct" => Some(Self::SstiStruct),
             _ => None,
         }
     }

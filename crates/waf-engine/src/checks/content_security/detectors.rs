@@ -847,6 +847,223 @@ impl SemanticDetector for NoSqlStructuralDetector {
     }
 }
 
+// ── SSTI (server-side template injection) structural detector (plan §T2-C) ────
+
+/// SSTI structural rule table (plan T2-C). Matches expression-delimiter +
+/// dangerous-sink **co-occurrence** and polyglot exec sinks on the **normalised
+/// view text** — the same `lower_trunc` surface every other structural detector
+/// uses. Patterns are authored lowercase because the view text is lowercased
+/// (`T(java.lang.Runtime)` reaches the detector as `t(java.lang.runtime)`).
+///
+/// **No template engine is built or invoked, and there is no parser at all** —
+/// every rule is a single [`regex`] scan over the already length/token-bounded
+/// preprocessor output, so there is no recursion and therefore no stack-overflow
+/// / expansion `DoS` surface (the P0 red-line's depth-bound requirement applies to
+/// recursive parsers; a pure-regex detector has none). Jinja2 / Freemarker /
+/// Velocity / Thymeleaf / ERB each have an incompatible grammar and there is no
+/// universal template AST, so per the plan we deliberately do **not** parse: we
+/// match the expression delimiters (`{{…}}` / `${…}` / `#{…}` / `<%…%>` /
+/// `*{…}` / `<#…>` / `#set(…)`) together with the exec/reflection/sandbox-escape
+/// sinks that turn a template expression into code execution.
+///
+/// **Honest boundary (RASP ceiling).** A pure reverse proxy sees only the
+/// payload; it can never confirm the field is actually evaluated by a template
+/// engine on the backend (`{{7*7}}` is only known to be SSTI once something
+/// renders it to `49`). These rules therefore judge whether the payload *looks
+/// structurally like* SSTI, not whether the template truly evaluated it — the
+/// same input-side ceiling the plan §二.2 calls out for every Lane 2 detector.
+///
+/// **FP discipline (SSTI is the worst FP family).** Bare `{{ }}` / `${ }` /
+/// `#{ }` delimiters are *everywhere* in legitimate content — JS template
+/// literals (`${t('key')}` i18n!), Angular / Vue interpolation, SCSS/CSS-in-JS,
+/// shell `${VAR}`, Ruby string interpolation — so **every bare-delimiter rule is
+/// default-off**. Default-**on** ships only the strong signals: an exec/reflection
+/// sink that is essentially never benign in request data
+/// (`freemarker.template.utility.Execute`, `T(java.…)` `SpEL` type evaluator,
+/// `getClass().forName(`, `__import__(`, the Python sandbox-escape dunders), or a
+/// delimiter that *co-occurs* with such a sink (`{{…config.items…}}`, `<%…
+/// system(…) %>`). Bare delimiters, `{{7*7}}` arithmetic probes, lone
+/// `.__class__`, lone `getClass(` and bare FreeMarker/Velocity directives ship
+/// default-off pending holdout calibration.
+///
+/// `(rule_key, confidence, pattern, kind, default_on)`.
+const SSTI_RULES: &[RuleRow] = &[
+    // FreeMarker's canonical RCE gadget: the `Execute` utility class, reached via
+    // `<#assign x="freemarker.template.utility.Execute"?new()>${x("id")}`. The
+    // fully-qualified class path is essentially never benign in request data.
+    // DEFAULT-ON, highest confidence.
+    (
+        "ssti.freemarker_exec",
+        95,
+        r"freemarker\.template\.utility\.execute",
+        RuleKind::Presence,
+        true,
+    ),
+    // SpEL / JSP-EL / Thymeleaf type evaluator into a `java.*` package:
+    // `${T(java.lang.Runtime).getRuntime().exec(…)}` /
+    // `*{T(java.lang.ProcessBuilder)…}`. `\bt\(` matches only a standalone `t(`
+    // token (a word boundary precedes the `t`), so `format(java…)` / `insert(java…)`
+    // do NOT match; `t(java.` as a lone token is the SpEL type-evaluator primitive
+    // and is essentially never benign. Catches the sink with or without an
+    // enclosing delimiter. DEFAULT-ON. Note this is intentionally narrower than a
+    // bare `${t(…)}` rule, which would false-positive on the ubiquitous i18n
+    // `${t('key')}` JS-template idiom.
+    ("ssti.spel_type_java", 90, r"\bt\(\s*java\.", RuleKind::Presence, true),
+    // Java reflection gadget `getClass().forName("java.lang.Runtime")` used by the
+    // Velocity / SpEL / OGNL exec chains. The `getClass().forName(` pair is a
+    // reflection-into-classloader move essentially never present in benign request
+    // data (a lone `getClass(` is not — see the default-off `ssti.getclass` rule).
+    // DEFAULT-ON.
+    (
+        "ssti.java_reflect_forname",
+        90,
+        r"\.getclass\s*\(\s*\)\s*\.\s*forname\b",
+        RuleKind::Presence,
+        true,
+    ),
+    // Jinja2 / Flask sink **inside** the `{{ … }}` delimiter (co-occurrence). The
+    // `{{ }}` gate + a Jinja SSTI accessor (`config.items()`, `request.application`,
+    // `self.__init__`, `.__class__`, `cycler.__init__`, `lipsum.__globals__`,
+    // `get_flashed_messages`) is the canonical Flask/Jinja SSTI shape and is
+    // essentially never benign — the delimiter requirement keeps ordinary prose
+    // that merely mentions `config` from firing. DEFAULT-ON.
+    (
+        "ssti.jinja_sink",
+        88,
+        r"\{\{[^}]{0,200}?(config\.items|request\.application|self\.__init__|\.__class__|cycler\.__init__|lipsum\.__globals__|get_flashed_messages)",
+        RuleKind::Presence,
+        true,
+    ),
+    // Python sandbox-escape dunder chain — `__mro__` / `__subclasses__` /
+    // `__bases__` / `__globals__`. These object-graph-walk dunders are the payload
+    // core of every Jinja / Python SSTI and pyjail escape (`''.__class__.__mro__[1]
+    // .__subclasses__()[…]`); they essentially never occur in benign HTTP input.
+    // DEFAULT-ON. (`__class__` / `__init__` alone are noisier and gated behind the
+    // `{{ }}` delimiter in `ssti.jinja_sink`, or default-off in `ssti.py_class`.)
+    (
+        "ssti.py_sandbox_dunder",
+        85,
+        r"\b__(mro|subclasses|bases|globals)__\b",
+        RuleKind::Presence,
+        true,
+    ),
+    // ERB / JSP / ASP scriptlet `<% … %>` or `<%= … %>` **co-occurring** with an
+    // exec sink (`system(`, a backtick command, `Runtime`, `.exec(`, `eval(`). A
+    // server-script scriptlet carrying a shell/exec primitive in request data is
+    // the ERB/JSP SSTI shape; the scriptlet + sink co-occurrence keeps it off
+    // ordinary text. `[^%]{0,200}?` cannot span another `%`, bounding the scan.
+    // DEFAULT-ON.
+    (
+        "ssti.erb_scriptlet_exec",
+        82,
+        r"<%=?[^%]{0,200}?(system\s*\(|`|\bruntime\b|\.exec\s*\(|\beval\s*\()",
+        RuleKind::Presence,
+        true,
+    ),
+    // Python `__import__('os')` primitive — the import-then-exec SSTI bootstrap.
+    // `__import__(` in web input is essentially never benign. DEFAULT-ON.
+    ("ssti.py_import", 82, r"\b__import__\s*\(", RuleKind::Presence, true),
+    // ── default-off (high-noise, holdout calibration pending) ────────────────
+    // `getClass(` alone — the reflection entry point, but it also appears in benign
+    // Java code snippets / discussions, so it is default-off; the strong
+    // `getClass().forName(` chain is default-on above.
+    ("ssti.getclass", 50, r"\.getclass\s*\(", RuleKind::Presence, false),
+    // Bare FreeMarker / Velocity directive (`<#assign …>` / `<#list …>` /
+    // `#set(…)`). Suspicious in request data but occasionally legitimate template
+    // source; default-off until calibrated.
+    (
+        "ssti.template_directive",
+        45,
+        r"<#(assign|list|if|macro|import)\b|#set\s*\(",
+        RuleKind::Presence,
+        false,
+    ),
+    // `{{ 7*7 }}` arithmetic probe. The evaluation probe attackers send first, but
+    // Angular / Vue templates legitimately carry `{{ price * qty }}`; default-off.
+    (
+        "ssti.jinja_arith_probe",
+        45,
+        r"\{\{\s*\d{1,6}\s*\*\s*\d{1,6}\s*\}\}",
+        RuleKind::Presence,
+        false,
+    ),
+    // Lone `.__class__` (outside a `{{ }}` delimiter). Appears in Python code and
+    // documentation, so default-off; the `{{ }}`-gated form is default-on via
+    // `ssti.jinja_sink`.
+    ("ssti.py_class", 40, r"\.__class__\b", RuleKind::Presence, false),
+    // Bare `{{ … }}` interpolation delimiter — Vue / Angular / Handlebars /
+    // mustache use it pervasively; hugely noisy alone, default-off.
+    (
+        "ssti.jinja_delim",
+        30,
+        r"\{\{[^}]{1,100}\}\}",
+        RuleKind::Presence,
+        false,
+    ),
+    // Bare `${ … }` delimiter — JS template literals, shell `${VAR}`, FreeMarker /
+    // JSP-EL interpolation; the noisiest possible signal, default-off.
+    ("ssti.dollar_delim", 25, r"\$\{[^}]{1,100}\}", RuleKind::Presence, false),
+    // Bare `#{ … }` delimiter — Ruby string interpolation, Thymeleaf, SCSS;
+    // default-off.
+    ("ssti.hash_delim", 25, r"#\{[^}]{1,100}\}", RuleKind::Presence, false),
+];
+
+/// Structural SSTI (server-side template injection) detector (plan T2-C).
+///
+/// Registered in the `Ssti` attack family; matches on the normalised view text.
+/// Single-detector family — no corroboration partner — so FP control is by narrow
+/// default-on rules (exec/reflection/sandbox sinks + delimiter-gated co-occurrence)
+/// plus default-off high-noise bare-delimiter rules, per the plan §四.3 invariant.
+/// Runs **no** template parser: pure bounded-regex scan, no recursion, no
+/// stack-overflow / expansion `DoS` surface.
+pub struct SstiStructuralDetector {
+    rules: Vec<CompiledRule>,
+}
+
+impl SstiStructuralDetector {
+    /// Compile the **default-on** rules (exec/reflection/sandbox sinks and the
+    /// delimiter-gated co-occurrence rules). The high-noise bare-delimiter,
+    /// arithmetic-probe, lone-`getClass(`, lone-`.__class__` and bare-directive
+    /// rules await holdout calibration and are not compiled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            rules: compile_table(SSTI_RULES, false, "SstiStructuralDetector"),
+        }
+    }
+
+    /// Test-only: compile **every** rule, including the default-off ones.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_all_rules() -> Self {
+        Self {
+            rules: compile_table(SSTI_RULES, true, "SstiStructuralDetector"),
+        }
+    }
+}
+
+impl Default for SstiStructuralDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SemanticDetector for SstiStructuralDetector {
+    fn id(&self) -> DetectorId {
+        DetectorId::SstiStruct
+    }
+
+    fn detect(
+        &self,
+        view: &View<'_>,
+        _ctx: &PreprocessCtx<'_>,
+        _state: &mut ContentInspectionState,
+    ) -> Option<DetectionFinding> {
+        let rule = best_match(&self.rules, view.lower_trunc.as_str())?;
+        Some(finding_for(rule, AttackKind::Ssti, "SSTI"))
+    }
+}
+
 // ── AST SQLi detector (sqlparser-rs true parse, plan §11, P2) ─────────────────
 
 /// Maximum bracket / prefix-operator nesting depth we will hand to `sqlparser`.
@@ -2875,6 +3092,185 @@ mod tests {
             .filter_map(|v| det.detect(v, &pctx, &mut st2))
             .any(|f| f.attack == AttackKind::NoSqlInjection && f.rule_key == "nosql.query_operator");
         assert!(hit, "the $where key leaf must drive a NoSQL query_operator finding");
+    }
+
+    // ── SSTI structural detector (T2-C) ──────────────────────────────────────
+
+    fn ssti_fire(text: &str) -> Option<DetectionFinding> {
+        run(&SstiStructuralDetector::new(), text)
+    }
+
+    fn ssti_fire_all(text: &str) -> Option<DetectionFinding> {
+        run(&SstiStructuralDetector::with_all_rules(), text)
+    }
+
+    #[test]
+    fn ssti_all_rules_compile() {
+        let det = SstiStructuralDetector::with_all_rules();
+        assert_eq!(det.rules.len(), SSTI_RULES.len(), "every SSTI pattern must compile");
+    }
+
+    #[test]
+    fn ssti_id_and_config_string() {
+        assert_eq!(SstiStructuralDetector::new().id(), DetectorId::SstiStruct);
+        assert_eq!(DetectorId::SstiStruct.as_config_str(), "ssti_struct");
+        assert_eq!(DetectorId::from_config_str("ssti_struct"), Some(DetectorId::SstiStruct));
+        assert_eq!(AttackKind::Ssti.as_config_key(), "ssti");
+        assert_eq!(AttackKind::from_config_key("ssti"), Some(AttackKind::Ssti));
+    }
+
+    #[test]
+    fn ssti_default_on_excludes_high_noise_rules() {
+        let det = SstiStructuralDetector::new();
+        let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
+        for off in [
+            "ssti.getclass",
+            "ssti.template_directive",
+            "ssti.jinja_arith_probe",
+            "ssti.py_class",
+            "ssti.jinja_delim",
+            "ssti.dollar_delim",
+            "ssti.hash_delim",
+        ] {
+            assert!(!on.contains(off), "{off} must be default-off");
+        }
+        for onk in [
+            "ssti.freemarker_exec",
+            "ssti.spel_type_java",
+            "ssti.java_reflect_forname",
+            "ssti.jinja_sink",
+            "ssti.py_sandbox_dunder",
+            "ssti.erb_scriptlet_exec",
+            "ssti.py_import",
+        ] {
+            assert!(on.contains(onk), "{onk} must be default-on");
+        }
+    }
+
+    #[test]
+    fn ssti_java_exec_gadgets_fire_default_on() {
+        // The strongest, essentially-never-benign Java template exec gadgets.
+        for (payload, expect) in [
+            (
+                r#"<#assign x="freemarker.template.utility.Execute"?new()>${x("id")}"#,
+                "ssti.freemarker_exec",
+            ),
+            (
+                r#"${T(java.lang.Runtime).getRuntime().exec("id")}"#,
+                "ssti.spel_type_java",
+            ),
+            (r"*{T(java.lang.ProcessBuilder)}", "ssti.spel_type_java"),
+            (
+                r#"$e.getClass().forName("java.lang.Runtime")"#,
+                "ssti.java_reflect_forname",
+            ),
+        ] {
+            let f = ssti_fire(payload).unwrap_or_else(|| panic!("gadget must fire: {payload}"));
+            assert_eq!(f.attack, AttackKind::Ssti);
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn ssti_jinja_python_sinks_fire_default_on() {
+        // Flask/Jinja sink gated by the `{{ }}` delimiter, and the standalone
+        // Python sandbox-escape dunder / import primitives.
+        for (payload, expect) in [
+            (r"{{ config.items() }}", "ssti.jinja_sink"),
+            (r"{{ ''.__class__.__mro__[1].__subclasses__() }}", "ssti.jinja_sink"),
+            (r"{{ request.application.__globals__ }}", "ssti.jinja_sink"),
+            (r"''.__class__.__mro__[2].__subclasses__()", "ssti.py_sandbox_dunder"),
+            (r"__import__('os').system('id')", "ssti.py_import"),
+        ] {
+            let f = ssti_fire(payload).unwrap_or_else(|| panic!("sink must fire: {payload}"));
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn ssti_erb_scriptlet_exec_fires_default_on() {
+        for payload in [
+            r#"<%= system("id") %>"#,
+            "<%= `id` %>",
+            r#"<% Runtime.getRuntime.exec("id") %>"#,
+        ] {
+            let f = ssti_fire(payload).unwrap_or_else(|| panic!("erb scriptlet must fire: {payload}"));
+            assert_eq!(f.rule_key, "ssti.erb_scriptlet_exec", "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn ssti_strongest_rule_wins() {
+        // A FreeMarker payload that also carries `${…}` reports the higher-confidence
+        // exec rule, not a default-off delimiter rule.
+        let f = ssti_fire(r#"${freemarker.template.utility.Execute("id")}"#).expect("freemarker exec fires");
+        assert_eq!(f.rule_key, "ssti.freemarker_exec", "highest-confidence rule wins");
+    }
+
+    #[test]
+    fn ssti_bare_delimiters_are_default_off() {
+        // Bare interpolation delimiters — the ubiquitous i18n / framework idioms —
+        // must NOT fire under the default rule set (the whole FP-control thesis of
+        // T2-C); they only fire under the full rule set.
+        for (payload, expect) in [
+            (r"${t('welcome.title')}", "ssti.dollar_delim"),
+            (r"<div>{{ user.name }}</div>", "ssti.jinja_delim"),
+            (r#"greeting = "hi #{name}""#, "ssti.hash_delim"),
+            (r"{{ 7*7 }}", "ssti.jinja_arith_probe"),
+        ] {
+            assert!(
+                ssti_fire(payload).is_none(),
+                "bare-delimiter payload must be default-off: {payload}"
+            );
+            let f = ssti_fire_all(payload).unwrap_or_else(|| panic!("fires under full set: {payload}"));
+            // `{{ 7*7 }}` matches both the arith probe (45) and the bare delim (30);
+            // the stronger rule wins.
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn ssti_clean_traffic_does_not_fire() {
+        // Legitimate content that merely resembles template syntax or mentions the
+        // keywords must not trip the default-on rules.
+        for clean in [
+            // i18n JS template literals — the single biggest SSTI FP source.
+            r"const msg = `Hello ${name}, you have ${count} messages`;",
+            r"label: t('nav.settings')",
+            // Vue / Angular interpolation.
+            r"<p>{{ item.price | currency }}</p>",
+            r"<span>{{ user.firstName }} {{ user.lastName }}</span>",
+            // Shell variable expansion.
+            r#"export PATH="${HOME}/bin:${PATH}""#,
+            // CSS / SCSS.
+            r".button { color: #{$primary}; width: 100%; }",
+            // Prose mentioning the keywords.
+            "please configure the runtime environment and system settings",
+            "the class implements getClass semantics for reflection docs",
+            "import the module then run the system check",
+            // JSON that mentions template words.
+            r#"{"template":"invoice","config":"default","system":"prod"}"#,
+            // Ruby interpolation in a legit string.
+            r#"puts "Total: #{subtotal + tax}""#,
+        ] {
+            assert!(ssti_fire(clean).is_none(), "clean SSTI negative fired: {clean:?}");
+        }
+    }
+
+    #[test]
+    fn ssti_deeply_nested_delimiters_decline_without_stack_overflow() {
+        // Pure-regex detector: no recursion, so a pathologically nested / repeated
+        // delimiter payload is a bounded linear scan that returns promptly and never
+        // overflows the stack. (Belt-and-braces: the P0 depth-bound red-line targets
+        // recursive parsers; this detector has none.)
+        let bomb = format!("{}{}", "${".repeat(50_000), "}".repeat(50_000));
+        // No default-on rule matches this contentless nest; must be a clean decline.
+        assert!(
+            ssti_fire(&bomb).is_none(),
+            "nested bare delimiters must not fire default-on rules"
+        );
+        let nested_braces = "{{".repeat(50_000);
+        assert!(ssti_fire(&nested_braces).is_none(), "nested braces decline cleanly");
     }
 
     // ── AST SQLi detector (P2) ────────────────────────────────────────────────

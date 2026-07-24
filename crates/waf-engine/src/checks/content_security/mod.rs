@@ -55,8 +55,8 @@ pub use budget::{Budget, ContentInspectionState};
 pub use canary::{BreakerState, CircuitBreaker, canary_bucket, in_canary};
 pub use config::{Dialect, EnforcementMode, RuntimeContentSecurityConfig};
 pub use detectors::{
-    AstSqlDetector, NoSqlStructuralDetector, RceAstDetector, RceStructuralDetector, StructuralSqlDetector,
-    TraversalStructuralDetector, XxeStructuralDetector,
+    AstSqlDetector, NoSqlStructuralDetector, RceAstDetector, RceStructuralDetector, SstiStructuralDetector,
+    StructuralSqlDetector, TraversalStructuralDetector, XxeStructuralDetector,
 };
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
@@ -100,8 +100,9 @@ pub struct ContentSecuritySubsystem {
     config: RuntimeContentSecurityConfig,
     /// Lane 2 semantic detectors: the structural + AST `SQLi` detectors, the
     /// RCE / Traversal detectors, the XSS DOM + JS-token detectors (P-XSS-2,
-    /// 0.5/0.5 corroboration), the structural XXE detector (T2-A) and the structural
-    /// `NoSQL` detector (T2-B); tests may push additional mocks.
+    /// 0.5/0.5 corroboration), the structural XXE detector (T2-A), the structural
+    /// `NoSQL` detector (T2-B) and the structural SSTI detector (T2-C); tests may
+    /// push additional mocks.
     detectors: Vec<Box<dyn SemanticDetector>>,
     /// Runtime anomaly-rate breaker state (never persisted; restart resets it).
     breaker: Mutex<CircuitBreaker>,
@@ -168,6 +169,16 @@ impl ContentSecuritySubsystem {
             // operators are default-on; comparison / regex / logical are default-off
             // to hold FPs down. Shadow (log_only) like every other family.
             Box::new(detectors::NoSqlStructuralDetector::new()),
+            // T2-C: structural SSTI detector (single-detector `ssti` family). Runs
+            // no template parser — a pure bounded-regex scan (no recursion, so no
+            // stack-overflow / template-expansion DoS surface) over the same
+            // normalised view text. Default-on rules are exec/reflection/sandbox
+            // sinks + delimiter-gated co-occurrence; the ubiquitous bare `{{ }}` /
+            // `${ }` / `#{ }` delimiters are default-off to hold FPs down (SSTI is
+            // the worst FP family). Honest boundary: input-side only, it cannot
+            // confirm the backend actually evaluates the template. Shadow (log_only)
+            // like every other family.
+            Box::new(detectors::SstiStructuralDetector::new()),
         ];
         Self {
             legacy_checkers,
