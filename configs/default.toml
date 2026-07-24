@@ -519,3 +519,43 @@ block_threshold = 80
 hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
 [content_security.attacks.xpath_injection.weights]
 xpath_struct = 1.0                    # structural XPath-injection detector (T2-E)
+
+# Unsafe deserialization — T2-F single-detector structural family. Detects
+# cross-language serialized-object injection / gadget chains by SIGNATURE, NOT by
+# deserializing: it matches each language's serialization FORMAT MAGIC plus the
+# KNOWN EXPLOIT GADGET CLASS / DANGEROUS OPCODE that weaponises it — Java stream
+# magic in base64 (`rO0AB…`, i.e. `\xAC\xED\x00\x05` encoded) or hex (`aced0005`)
+# form + ysoserial gadget classes (`InvokerTransformer`, `TemplatesImpl`,
+# `JdbcRowSetImpl`, `BadAttributeValueExpException`, `BeanComparator`); PHP
+# `serialize()` typed-object header (`O:<len>:"<class>":<n>:{`) + `phar://`
+# wrapper; Python pickle `GLOBAL`-opcode reductions to system/exec
+# (`cos\nsystem`, `c__builtin__\neval`, `csubprocess\n…`); and .NET
+# `BinaryFormatter`/`LosFormatter` base64 header (`AAEAAAD/////`) + gadget markers
+# (`ObjectDataProvider`, `TypeConfuseDelegate`, `ActivitySurrogateSelector`) — on
+# the SAME normalised view text as the other structural detectors, INCLUDING the
+# base64/hex DECODED views the preprocessor already produces (serialized payloads
+# are routinely base64-wrapped: `rO0AB…` and `AAEAAAD/////` hit the raw view
+# directly, a wrapped pickle hits its decoded view). It invokes NO deserializer
+# and has NO parser at all: every rule is a single bounded-regex scan over a
+# backtracking-free automaton (linear time regardless of input), so there is no
+# recursion, no catastrophic-backtracking (ReDoS) and thus NO parse-time
+# stack-overflow / DoS surface (the P0 depth-bound red-line targets recursive
+# parsers; a pure-regex detector has none). HONEST BOUNDARY (RASP ceiling): a
+# reverse proxy sees only the payload and can never confirm the backend actually
+# DESERIALIZES it — a magic, gadget name or pickle opcode could sit inertly in a
+# log line or a base64 attachment; these rules judge whether a payload PRESENTS a
+# known unsafe-deserialization format / gadget signature, not whether it was
+# deserialized. FP honesty: a bare base64 blob, a lone class-name substring and a
+# PHP array header `a:\d+:{` recur in legitimate traffic, so DEFAULT-ON ships ONLY
+# serialization magic + known exploit gadget/opcode; the generic markers (PHP
+# array header, bare `__reduce__`, generic `org.apache.commons.collections`
+# package) are DEFAULT-OFF until holdout calibration. Single detector → weight 1.0.
+# Shadow (log_only): a default-on hit is recorded/logged, never blocked.
+# hard_veto_allowlist empty until holdout.
+[content_security.attacks.deserialization]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.deserialization.weights]
+deser_struct = 1.0                    # structural unsafe-deserialization detector (T2-F)

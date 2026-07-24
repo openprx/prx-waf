@@ -55,9 +55,9 @@ pub use budget::{Budget, ContentInspectionState};
 pub use canary::{BreakerState, CircuitBreaker, canary_bucket, in_canary};
 pub use config::{Dialect, EnforcementMode, RuntimeContentSecurityConfig};
 pub use detectors::{
-    AstSqlDetector, LdapStructuralDetector, NoSqlStructuralDetector, RceAstDetector, RceStructuralDetector,
-    SstiStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector, XpathStructuralDetector,
-    XxeStructuralDetector,
+    AstSqlDetector, DeserStructuralDetector, LdapStructuralDetector, NoSqlStructuralDetector, RceAstDetector,
+    RceStructuralDetector, SstiStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector,
+    XpathStructuralDetector, XxeStructuralDetector,
 };
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
@@ -103,8 +103,9 @@ pub struct ContentSecuritySubsystem {
     /// RCE / Traversal detectors, the XSS DOM + JS-token detectors (P-XSS-2,
     /// 0.5/0.5 corroboration), the structural XXE detector (T2-A), the structural
     /// `NoSQL` detector (T2-B), the structural SSTI detector (T2-C), the
-    /// structural LDAP-injection detector (T2-D) and the structural
-    /// `XPath`-injection detector (T2-E); tests may push additional mocks.
+    /// structural LDAP-injection detector (T2-D), the structural
+    /// `XPath`-injection detector (T2-E) and the structural unsafe-deserialization
+    /// detector (T2-F); tests may push additional mocks.
     detectors: Vec<Box<dyn SemanticDetector>>,
     /// Runtime anomaly-rate breaker state (never persisted; restart resets it).
     breaker: Mutex<CircuitBreaker>,
@@ -206,6 +207,22 @@ impl ContentSecuritySubsystem {
             // cannot confirm the backend actually evaluates an XPath query. Shadow
             // (log_only) like every other family.
             Box::new(detectors::XpathStructuralDetector::new()),
+            // T2-F: structural unsafe-deserialization detector (single-detector
+            // `deserialization` family). Runs no deserializer and no parser — a pure
+            // bounded-regex scan over a backtracking-free automaton (no recursion, no
+            // ReDoS, so no stack-overflow surface) on the same normalised view text,
+            // including the base64/hex DECODED views the preprocessor already produces
+            // (a `rO0AB…` java stream base64 hits the raw view directly; a decoded
+            // pickle GLOBAL opcode hits its BlindDecoded view). Default-on rules are
+            // serialization magic + known exploit gadget/opcode signatures only: java
+            // base64/hex magic + ysoserial gadget classes, PHP object header + phar://,
+            // python pickle GLOBAL→system/exec combos, .NET BinaryFormatter base64 +
+            // gadget markers; the high-noise `a:\d+:{` PHP array, bare `__reduce__` and
+            // generic `org.apache.commons.collections` package are default-off (recur in
+            // legitimate data). Honest boundary: input-side only, it cannot confirm the
+            // backend actually deserializes the payload. Shadow (log_only) like every
+            // other family.
+            Box::new(detectors::DeserStructuralDetector::new()),
         ];
         Self {
             legacy_checkers,

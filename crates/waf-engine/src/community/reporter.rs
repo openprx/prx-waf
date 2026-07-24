@@ -78,21 +78,24 @@ const fn compute_confidence(phase: Phase) -> f64 {
     match phase {
         Phase::SqlInjection | Phase::Rce => 0.95,
         Phase::Xss | Phase::Xxe => 0.90,
-        // DirTraversal / Owasp sit here; NoSQL, SSTI, LDAP and XPath injection join
-        // them because a reverse proxy cannot confirm the backend actually interprets
-        // the payload — it cannot know MongoDB is the store (NoSQL comparison operators
-        // recur in legitimate JSON), it cannot know a template engine evaluated the
-        // field (`{{7*7}}` is only known to be SSTI once rendered), it cannot know an
-        // LDAP search consumed the field (filter metacharacters recur in ordinary
-        // text/URLs), and it cannot know an XPath query evaluated the field (`//`, `[]`
-        // and `or`/`and` recur everywhere). Structural / input-side confidence,
-        // deliberately below the AST-backed XSS/XXE families.
+        // DirTraversal / Owasp sit here; NoSQL, SSTI, LDAP, XPath and unsafe
+        // deserialization join them because a reverse proxy cannot confirm the backend
+        // actually interprets the payload — it cannot know MongoDB is the store (NoSQL
+        // comparison operators recur in legitimate JSON), it cannot know a template
+        // engine evaluated the field (`{{7*7}}` is only known to be SSTI once rendered),
+        // it cannot know an LDAP search consumed the field (filter metacharacters recur
+        // in ordinary text/URLs), it cannot know an XPath query evaluated the field
+        // (`//`, `[]` and `or`/`and` recur everywhere), and it cannot know the backend
+        // actually deserialized the field (a serialized-object magic / gadget class name
+        // could equally sit inertly in a log line or a base64 blob). Structural /
+        // input-side confidence, deliberately below the AST-backed XSS/XXE families.
         Phase::DirTraversal
         | Phase::Owasp
         | Phase::NoSqlInjection
         | Phase::Ssti
         | Phase::LdapInjection
-        | Phase::XpathInjection => 0.85,
+        | Phase::XpathInjection
+        | Phase::Deserialization => 0.85,
         Phase::CustomRule | Phase::IpBlacklist | Phase::UrlBlacklist => 0.80,
         Phase::Sensitive | Phase::Scanner | Phase::Bot => 0.70,
         Phase::RateLimit | Phase::CrowdSec => 0.60,

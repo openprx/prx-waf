@@ -1430,6 +1430,226 @@ impl SemanticDetector for XpathStructuralDetector {
     }
 }
 
+// ── Unsafe-deserialization structural detector (plan §T2-F) ──────────────────
+
+/// Unsafe / insecure deserialization structural rule table (plan T2-F). Matches
+/// **cross-language serialized-object-injection / gadget-chain signatures** — the
+/// serialization *format magic* (a Java stream header, a PHP `serialize()` object
+/// header, a Python `pickle` `GLOBAL`-opcode reduction, a .NET `BinaryFormatter`
+/// header) plus the **known exploit gadget class / dangerous opcode** that makes a
+/// serialized blob weaponisable — on the **normalised view text** (the same
+/// `lower_trunc` surface every other structural detector uses).
+///
+/// **This is a signature / feature match, NOT deserialization.** No language
+/// deserializer is ever invoked and there is **no parser at all** — every rule is a
+/// single [`regex`] scan over the already length/token-bounded preprocessor output.
+/// The `regex` crate compiles to a finite automaton with **no backtracking**, so
+/// match time is linear in the input regardless of the payload; every quantifier
+/// here is a single bounded char-class star (`\s*` / `\s+`) or a bounded `{m,n}`
+/// repetition — never a nested quantifier — so there is no catastrophic-backtracking
+/// (`ReDoS`) and no recursion, hence no stack-overflow / expansion `DoS` surface
+/// (the P0 depth-bound red-line targets recursive parsers; a pure-regex detector has
+/// none).
+///
+/// **Decode-chain reuse.** Serialized payloads are routinely base64/hex-wrapped, so
+/// the strongest signals are authored to hit on **both** the raw view and the
+/// base64/hex **decoded** views the preprocessor already emits (each stamped
+/// [`super::preprocess::Provenance::BlindDecoded`] — never hard-veto). The Java
+/// stream base64 prefix `rO0AB…` (magic `\xAC\xED\x00\x05` base64-encoded, here
+/// lowercased to `ro0ab`) and the .NET `BinaryFormatter` base64 header
+/// `AAEAAAD/////` are **directly matchable base64 tokens** that fire on the raw view
+/// with no decode needed; a base64-wrapped Python pickle instead surfaces its
+/// `GLOBAL`-opcode → `system`/`eval` reduction only after the preprocessor's blind
+/// base64 decode, where this table matches it on the decoded view. (The raw binary
+/// magic bytes themselves are lossy-converted to `U+FFFD` on the UTF-8 view surface,
+/// so the base64/hex text forms — not the raw bytes — are the reliable signals.)
+///
+/// **Honest boundary (RASP ceiling).** A pure reverse proxy sees only the payload
+/// and can never confirm the backend actually **deserializes** it — a Java magic, a
+/// gadget class name or a pickle opcode could equally sit inertly inside a log line,
+/// a base64 attachment or free-form text. These rules therefore judge whether a
+/// payload *presents a known unsafe-deserialization format / gadget signature*, not
+/// whether the backend truly deserialized it — the same input-side ceiling the plan
+/// §二.2 calls out for every Lane 2 detector.
+///
+/// **FP discipline.** A bare base64 blob, a lone `[` / `{`, a single fully-qualified
+/// class-name substring and a PHP array header `a:\d+:{` all recur in perfectly
+/// legitimate traffic, so **default-on ships only serialization magic + a known
+/// exploit gadget class / dangerous opcode combination** — signatures essentially
+/// never benign in request data. The high-noise generic markers (the PHP array
+/// header, a bare `__reduce__` dunder, and the generic
+/// `org.apache.commons.collections` *package* as opposed to the specific gadget
+/// leaf classes) ship **default-off** pending holdout calibration.
+///
+/// `(rule_key, confidence, pattern, kind, default_on)`.
+const DESER_RULES: &[RuleRow] = &[
+    // ── Java (default-on strong signals) ─────────────────────────────────────
+    // Java serialized-stream magic `\xAC\xED\x00\x05` in base64 form: the stream
+    // header base64-encodes to `rO0AB…` (lowercased `ro0ab` on the view surface).
+    // A directly-matchable base64 token — fires on the RAW view with no decode, the
+    // canonical Java-deserialization indicator (matches ModSecurity CRS's `rO0AB`).
+    // DEFAULT-ON.
+    ("deser.java_serial_b64", 90, r"ro0ab", RuleKind::Presence, true),
+    // Java serialized-stream magic in hex-text form (`aced0005`) or as an escaped
+    // byte literal (`\xac\xed`) — the hex/escaped spelling of `\xAC\xED\x00\x05` that
+    // survives on the UTF-8 view where the raw bytes would be lossy-mangled.
+    // DEFAULT-ON.
+    (
+        "deser.java_hex_magic",
+        88,
+        r"aced0005|\\xac\\xed",
+        RuleKind::Presence,
+        true,
+    ),
+    // Known ysoserial gadget classes — the specific exploit leaf classes that turn a
+    // Java stream into RCE (Commons-Collections `InvokerTransformer`, JAXP
+    // `TemplatesImpl`, `JdbcRowSetImpl`, `BadAttributeValueExpException`, Commons-
+    // BeanUtils `BeanComparator`). The FULLY-qualified gadget leaf, never the bare
+    // `org.apache` package (that ships default-off), so a legit dependency line or
+    // stack trace mentioning `org.apache.commons` does not fire. DEFAULT-ON.
+    (
+        "deser.java_gadget_class",
+        90,
+        r"org\.apache\.commons\.collections\.functors|invokertransformer|templatesimpl|com\.sun\.rowset\.jdbcrowsetimpl|badattributevalueexpexception|org\.apache\.commons\.beanutils\.beancomparator",
+        RuleKind::Presence,
+        true,
+    ),
+    // ── PHP (default-on) ─────────────────────────────────────────────────────
+    // PHP `serialize()` OBJECT header `O:<len>:"<class>":<n>:{` — the structural
+    // object-injection primitive (a typed object with a class name and property
+    // count). Distinct from the plain array header `a:<len>:{` (default-off): a typed
+    // object is what drives `__wakeup`/`__destruct` gadget chains. The class char
+    // class is a single bounded repetition (no nesting → linear). DEFAULT-ON.
+    (
+        "deser.php_object_injection",
+        88,
+        r#"o:\d+:"[a-z0-9_\\]{1,120}":\d+:\{"#,
+        RuleKind::Presence,
+        true,
+    ),
+    // PHP `phar://` stream wrapper — triggers phar-metadata deserialization on file
+    // operations; never legitimate in request data. DEFAULT-ON.
+    ("deser.php_phar", 85, r"phar://", RuleKind::Presence, true),
+    // ── Python pickle (default-on) ───────────────────────────────────────────
+    // Pickle `GLOBAL` opcode (`c<module>\n<callable>`) resolving a dangerous callable:
+    // `cos\nsystem` / `cposix\nsystem` / `cnt\nsystem` (os.system), `c__builtin__\n
+    // eval|exec|compile`, `csubprocess\n…` / `ccommands\n…` / `cpty\n…`. The
+    // preprocessor collapses the opcode newlines to spaces, so the module and callable
+    // arrive as adjacent tokens (`cos system`). This is a pickle-RCE reduction — the
+    // dangerous-opcode COMBINATION, not a bare token — and hits base64-wrapped pickles
+    // on their decoded view. DEFAULT-ON.
+    (
+        "deser.py_pickle_global_exec",
+        90,
+        r"c(?:os|posix|nt)\s+system\b|c__builtin__\s+(?:eval|exec|compile)\b|c(?:subprocess|commands|pty)\s+[a-z_]",
+        RuleKind::Presence,
+        true,
+    ),
+    // ── .NET (default-on) ────────────────────────────────────────────────────
+    // .NET `BinaryFormatter` / `LosFormatter` serialized header in base64: the stream
+    // header `\x00\x01\x00\x00\x00\xFF\xFF\xFF\xFF` base64-encodes to `AAEAAAD/////`
+    // (lowercased `aaeaaad/////`). A directly-matchable base64 token that fires on the
+    // raw view, the canonical .NET-deserialization indicator. DEFAULT-ON.
+    (
+        "deser.dotnet_binaryformatter_b64",
+        90,
+        r"aaeaaad/////",
+        RuleKind::Presence,
+        true,
+    ),
+    // Known .NET deserialization gadget markers: `ObjectDataProvider` /
+    // `TypeConfuseDelegate` / `ActivitySurrogateSelector` (ysoserial.net gadgets),
+    // `System.Windows.Data.ObjectDataProvider`, and the `BinaryFormatter` /
+    // `LosFormatter` type names that carry the payload. Specific gadget/formatter
+    // type names, never a generic namespace. DEFAULT-ON.
+    (
+        "deser.dotnet_gadget",
+        88,
+        r"objectdataprovider|typeconfusedelegate|activitysurrogateselector|losformatter|binaryformatter",
+        RuleKind::Presence,
+        true,
+    ),
+    // ── default-off (high-noise, holdout calibration pending) ────────────────
+    // PHP serialized ARRAY header `a:<len>:{` — recurs wherever PHP serializes plain
+    // arrays (sessions, caches, form state); carries no object-injection signal on its
+    // own. DEFAULT-OFF.
+    ("deser.php_array", 20, r"a:\d+:\{", RuleKind::Presence, false),
+    // Bare pickle dunder `__reduce__` — appears in ordinary Python source, docs and
+    // tracebacks that a paste / bug-tracker / code-review backend legitimately carries;
+    // the RCE signal is the GLOBAL-opcode combo above, not this token. DEFAULT-OFF.
+    ("deser.py_reduce", 25, r"__reduce__", RuleKind::Presence, false),
+    // Generic `org.apache.commons.collections` PACKAGE (as opposed to the specific
+    // gadget leaf classes) — recurs in dependency manifests, class-path logs and stack
+    // traces of perfectly benign Java apps. DEFAULT-OFF.
+    (
+        "deser.java_pkg_generic",
+        25,
+        r"org\.apache\.commons\.collections",
+        RuleKind::Presence,
+        false,
+    ),
+];
+
+/// Structural unsafe-deserialization detector (plan T2-F).
+///
+/// Registered in the `Deserialization` attack family; matches on the normalised
+/// view text — **including the base64/hex decoded views** the preprocessor already
+/// produces, so a wrapped payload is caught after the shared blind-decode chain.
+/// Single-detector family — no corroboration partner — so FP control is by narrow
+/// default-on rules (serialization magic + known exploit gadget class / dangerous
+/// opcode) plus default-off high-noise generic markers, per the plan §四.3 invariant.
+/// Runs **no** deserializer and **no** parser: a pure bounded-regex scan over a
+/// backtracking-free automaton, so no recursion, no `ReDoS`, no stack-overflow
+/// surface.
+pub struct DeserStructuralDetector {
+    rules: Vec<CompiledRule>,
+}
+
+impl DeserStructuralDetector {
+    /// Compile the **default-on** rules (Java base64/hex magic + gadget classes, the
+    /// PHP object header + `phar://`, the Python pickle `GLOBAL`-exec combos, and the
+    /// .NET `BinaryFormatter` base64 + gadget markers). The high-noise generic markers
+    /// (PHP array header, bare `__reduce__`, generic Commons-Collections package) await
+    /// holdout calibration and are not compiled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            rules: compile_table(DESER_RULES, false, "DeserStructuralDetector"),
+        }
+    }
+
+    /// Test-only: compile **every** rule, including the default-off ones.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_all_rules() -> Self {
+        Self {
+            rules: compile_table(DESER_RULES, true, "DeserStructuralDetector"),
+        }
+    }
+}
+
+impl Default for DeserStructuralDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SemanticDetector for DeserStructuralDetector {
+    fn id(&self) -> DetectorId {
+        DetectorId::DeserStruct
+    }
+
+    fn detect(
+        &self,
+        view: &View<'_>,
+        _ctx: &PreprocessCtx<'_>,
+        _state: &mut ContentInspectionState,
+    ) -> Option<DetectionFinding> {
+        let rule = best_match(&self.rules, view.lower_trunc.as_str())?;
+        Some(finding_for(rule, AttackKind::Deserialization, "deserialization"))
+    }
+}
+
 // ── AST SQLi detector (sqlparser-rs true parse, plan §11, P2) ─────────────────
 
 /// Maximum bracket / prefix-operator nesting depth we will hand to `sqlparser`.
@@ -3953,6 +4173,189 @@ mod tests {
         assert!(xpath_fire(&logic).is_none(), "repeated ' or run declines default-on");
         let brackets = "][".repeat(100_000);
         assert!(xpath_fire(&brackets).is_none(), "bare bracket run declines default-on");
+    }
+
+    // ── Unsafe-deserialization structural detector (T2-F) ────────────────────
+
+    fn deser_fire(text: &str) -> Option<DetectionFinding> {
+        run(&DeserStructuralDetector::new(), text)
+    }
+
+    fn deser_fire_all(text: &str) -> Option<DetectionFinding> {
+        run(&DeserStructuralDetector::with_all_rules(), text)
+    }
+
+    #[test]
+    fn deser_all_rules_compile() {
+        let det = DeserStructuralDetector::with_all_rules();
+        assert_eq!(det.rules.len(), DESER_RULES.len(), "every deser pattern must compile");
+    }
+
+    #[test]
+    fn deser_id_and_config_string() {
+        assert_eq!(DeserStructuralDetector::new().id(), DetectorId::DeserStruct);
+        assert_eq!(DetectorId::DeserStruct.as_config_str(), "deser_struct");
+        assert_eq!(
+            DetectorId::from_config_str("deser_struct"),
+            Some(DetectorId::DeserStruct)
+        );
+        assert_eq!(AttackKind::Deserialization.as_config_key(), "deserialization");
+        assert_eq!(
+            AttackKind::from_config_key("deserialization"),
+            Some(AttackKind::Deserialization)
+        );
+    }
+
+    #[test]
+    fn deser_default_on_excludes_high_noise_rules() {
+        let det = DeserStructuralDetector::new();
+        let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
+        for off in ["deser.php_array", "deser.py_reduce", "deser.java_pkg_generic"] {
+            assert!(!on.contains(off), "{off} must be default-off");
+        }
+        for onk in [
+            "deser.java_serial_b64",
+            "deser.java_hex_magic",
+            "deser.java_gadget_class",
+            "deser.php_object_injection",
+            "deser.php_phar",
+            "deser.py_pickle_global_exec",
+            "deser.dotnet_binaryformatter_b64",
+            "deser.dotnet_gadget",
+        ] {
+            assert!(on.contains(onk), "{onk} must be default-on");
+        }
+    }
+
+    #[test]
+    fn deser_structural_signatures_fire_default_on() {
+        // Each payload is chosen to trip exactly one default-on rule so the winning
+        // rule_key is deterministic. Serialized payloads / gadget class names are WAF
+        // detection fixtures — inert data matched by regex, never deserialized.
+        for (payload, expect) in [
+            // Java stream base64 prefix (rO0AB…) — hits the raw view, no decode.
+            ("rO0ABXNyABNqYXZhLnV0aWwuQXJyYXlMaXN0", "deser.java_serial_b64"),
+            // Java stream magic in hex-text form.
+            ("payload=aced0005737200", "deser.java_hex_magic"),
+            // ysoserial gadget leaf class.
+            (
+                "org.apache.commons.collections.functors.InvokerTransformer",
+                "deser.java_gadget_class",
+            ),
+            // PHP serialize() typed-object header.
+            (r#"O:8:"Evil":1:{s:3:"cmd";s:2:"id";}"#, "deser.php_object_injection"),
+            // PHP phar wrapper.
+            ("file=phar://evil.phar/x", "deser.php_phar"),
+            // Python pickle GLOBAL opcode reducing os.system (newlines collapse to
+            // spaces at the view surface).
+            ("cos\nsystem\n(S'id'\ntR.", "deser.py_pickle_global_exec"),
+            // .NET BinaryFormatter serialized base64 header.
+            ("AAEAAAD/////AAAAAA", "deser.dotnet_binaryformatter_b64"),
+            // .NET ysoserial.net gadget marker.
+            ("<ExpandedWrapperOfXamlReaderObjectDataProvider>", "deser.dotnet_gadget"),
+        ] {
+            let f = deser_fire(payload).unwrap_or_else(|| panic!("must fire: {payload}"));
+            assert_eq!(f.attack, AttackKind::Deserialization);
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn deser_pickle_builtin_and_subprocess_variants_fire() {
+        // __builtin__ eval and subprocess reductions, plus posix.system.
+        for payload in [
+            "c__builtin__\neval\n(...",
+            "csubprocess\ncheck_output\n(",
+            "cposix\nsystem\n(",
+        ] {
+            assert_eq!(
+                deser_fire(payload)
+                    .unwrap_or_else(|| panic!("pickle combo fires: {payload}"))
+                    .rule_key,
+                "deser.py_pickle_global_exec",
+                "payload: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn deser_decoded_view_catches_wrapped_pickle() {
+        // A base64-wrapped pickle surfaces its GLOBAL opcode only on the decoded view
+        // the preprocessor produces; the detector consumes that view text just like any
+        // other. Here we feed the already-decoded surface (BlindDecoded provenance in
+        // production) to prove the rule matches the decoded form.
+        let decoded = "cos\nsystem\n(S'whoami'\ntR.";
+        assert_eq!(
+            deser_fire(decoded).expect("decoded pickle fires").rule_key,
+            "deser.py_pickle_global_exec"
+        );
+    }
+
+    #[test]
+    fn deser_high_noise_tokens_are_default_off() {
+        // Generic serialization markers must NOT fire under the default rule set (the
+        // FP-control thesis of T2-F); they only fire under the full set.
+        for (payload, expect) in [
+            (r#"a:3:{i:0;s:1:"x";i:1;i:2;i:2;b:1;}"#, "deser.php_array"),
+            ("class Foo:\n    def __reduce__(self):", "deser.py_reduce"),
+            (
+                "dependency: org.apache.commons.collections:3.2.1",
+                "deser.java_pkg_generic",
+            ),
+        ] {
+            assert!(
+                deser_fire(payload).is_none(),
+                "high-noise payload must be default-off: {payload}"
+            );
+            let f = deser_fire_all(payload).unwrap_or_else(|| panic!("fires under full set: {payload}"));
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn deser_clean_traffic_does_not_fire() {
+        // Legitimate content that merely resembles serialization tokens (ordinary
+        // base64, JSON, PHP arrays, java package names in prose/logs) must not trip the
+        // default-on rules.
+        for clean in [
+            // Ordinary base64 blobs (avatars, tokens) without the java/.NET magic.
+            "data=SGVsbG8gV29ybGQgdGhpcyBpcyBqdXN0IHRleHQ",
+            "token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            // Plain JSON with brackets, braces and colons.
+            r#"{"user":"john","roles":["admin","editor"],"active":true}"#,
+            // A benign dependency / class-path mention (generic package, default-off).
+            "loaded org.apache.commons.lang3 and org.apache.commons.io",
+            "stacktrace at com.example.service.UserController.handle",
+            // Prose that happens to contain the words system / eval / object.
+            "the system will eval the object and return a data provider",
+            "please reduce the object count in the data set",
+            // A URL with slashes and query operators.
+            "https://cdn.example.com/assets/app.v2.min.js?cache=1",
+            // A legit PHP array serialize (structurally an array, default-off).
+            r#"a:2:{s:4:"name";s:4:"john";s:3:"age";i:30;}"#,
+        ] {
+            assert!(deser_fire(clean).is_none(), "clean deser negative fired: {clean:?}");
+        }
+    }
+
+    #[test]
+    fn deser_pathological_input_declines_without_stack_overflow() {
+        // Pure-regex detector over a backtracking-free automaton: a huge run of
+        // serialization-ish tokens is a bounded linear scan that returns promptly and
+        // never overflows the stack or blows up on backtracking (ReDoS). The default-on
+        // rules require the magic/gadget/opcode signature, so a contentless token run is
+        // a clean decline.
+        let arrays = "a:9:{".repeat(200_000);
+        assert!(deser_fire(&arrays).is_none(), "bare php-array run declines default-on");
+        let b64 = "aGVsbG8".repeat(200_000);
+        assert!(deser_fire(&b64).is_none(), "bare base64 run declines default-on");
+        let objs = "o:1:".repeat(200_000);
+        assert!(
+            deser_fire(&objs).is_none(),
+            "truncated php-object run declines default-on"
+        );
+        let colons = "c:o:s:".repeat(200_000);
+        assert!(deser_fire(&colons).is_none(), "colon run declines default-on");
     }
 
     // ── AST SQLi detector (P2) ────────────────────────────────────────────────

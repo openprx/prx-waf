@@ -101,11 +101,12 @@ pub enum AttackKind {
     Ssti,
     LdapInjection,
     XpathInjection,
+    Deserialization,
 }
 
 impl AttackKind {
     /// All families, for iterating config.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::SqlInjection,
         Self::Rce,
         Self::Xss,
@@ -115,6 +116,7 @@ impl AttackKind {
         Self::Ssti,
         Self::LdapInjection,
         Self::XpathInjection,
+        Self::Deserialization,
     ];
 
     /// Stable config-key spelling (`snake_case`) used in the TOML `[attacks]`
@@ -131,6 +133,7 @@ impl AttackKind {
             Self::Ssti => "ssti",
             Self::LdapInjection => "ldap_injection",
             Self::XpathInjection => "xpath_injection",
+            Self::Deserialization => "deserialization",
         }
     }
 
@@ -147,6 +150,7 @@ impl AttackKind {
             "ssti" => Some(Self::Ssti),
             "ldap_injection" => Some(Self::LdapInjection),
             "xpath_injection" => Some(Self::XpathInjection),
+            "deserialization" => Some(Self::Deserialization),
             _ => None,
         }
     }
@@ -165,6 +169,7 @@ impl AttackKind {
             Self::Ssti => Phase::Ssti,
             Self::LdapInjection => Phase::LdapInjection,
             Self::XpathInjection => Phase::XpathInjection,
+            Self::Deserialization => Phase::Deserialization,
         }
     }
 
@@ -185,6 +190,7 @@ impl AttackKind {
             Phase::Ssti => Some(Self::Ssti),
             Phase::LdapInjection => Some(Self::LdapInjection),
             Phase::XpathInjection => Some(Self::XpathInjection),
+            Phase::Deserialization => Some(Self::Deserialization),
             _ => None,
         }
     }
@@ -268,6 +274,24 @@ pub enum DetectorId {
     /// query, so it judges whether a payload *looks structurally like* an `XPath`
     /// injection, not whether an `XPath` query truly used it.
     XpathStruct,
+    /// Structural unsafe-deserialization detector (T2-F) — the single detector in
+    /// the `Deserialization` family. Matches cross-language serialized-object
+    /// signatures: the Java serialization magic in base64 (`rO0AB…`) or hex
+    /// (`aced0005`) form and known `ysoserial` gadget class names
+    /// (`InvokerTransformer`, `TemplatesImpl`, `JdbcRowSetImpl`), the PHP
+    /// `serialize()` object header (`O:\d+:"…":\d+:{`) and `phar://` wrapper, the
+    /// Python `pickle` `GLOBAL`-opcode → system/exec combos (`cos\nsystem`,
+    /// `c__builtin__\neval`) and the .NET `BinaryFormatter` base64 header
+    /// (`AAEAAAD/////`) / gadget markers (`ObjectDataProvider`,
+    /// `TypeConfuseDelegate`), on the normalised view text — including the
+    /// base64/hex **decoded** views the preprocessor already produces. It runs
+    /// **no** deserializer and has **no** parser — a pure bounded-regex scan with no
+    /// recursion, so a payload can never drive a parse-time stack-overflow /
+    /// catastrophic-backtracking `DoS`. Honest boundary: input-side only, a reverse
+    /// proxy cannot know the backend actually deserializes the payload, so it judges
+    /// whether a payload *presents* a known unsafe-deserialization format / gadget
+    /// signature, not whether the backend truly deserialized it.
+    DeserStruct,
 }
 
 impl DetectorId {
@@ -287,6 +311,7 @@ impl DetectorId {
             Self::SstiStruct => "ssti_struct",
             Self::LdapStruct => "ldap_struct",
             Self::XpathStruct => "xpath_struct",
+            Self::DeserStruct => "deser_struct",
         }
     }
 
@@ -307,6 +332,7 @@ impl DetectorId {
             "ssti_struct" => Some(Self::SstiStruct),
             "ldap_struct" => Some(Self::LdapStruct),
             "xpath_struct" => Some(Self::XpathStruct),
+            "deser_struct" => Some(Self::DeserStruct),
             _ => None,
         }
     }

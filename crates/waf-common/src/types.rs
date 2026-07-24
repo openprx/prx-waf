@@ -114,6 +114,9 @@ pub enum Phase {
     /// `XPath` / `XQuery` injection (Lane 2 semantic `xpath_injection` family,
     /// T2-E)
     XpathInjection = 23,
+    /// Unsafe / insecure deserialization — object-injection & gadget-chain
+    /// signatures (Lane 2 semantic `deserialization` family, T2-F)
+    Deserialization = 24,
 }
 
 impl std::fmt::Display for Phase {
@@ -142,6 +145,7 @@ impl std::fmt::Display for Phase {
             Self::Ssti => write!(f, "SSTI"),
             Self::LdapInjection => write!(f, "LDAP Injection"),
             Self::XpathInjection => write!(f, "XPath Injection"),
+            Self::Deserialization => write!(f, "Unsafe Deserialization"),
         }
     }
 }
