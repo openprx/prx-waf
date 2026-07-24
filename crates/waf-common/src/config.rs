@@ -327,6 +327,12 @@ pub struct ProxyConfig {
     /// behaviour, NOT recommended for production).
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Enable HTTP request-smuggling structural detection in the gateway
+    /// header phase. Detection is **shadow / log-only**: matched requests are
+    /// logged (`tracing::warn`, target `waf.smuggling`) but never blocked or
+    /// altered. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub smuggling_detection: bool,
 }
 
 impl Default for ProxyConfig {
@@ -337,6 +343,7 @@ impl Default for ProxyConfig {
             worker_threads: None,
             trust_proxy_headers: false,
             trusted_proxies: Vec::new(),
+            smuggling_detection: true,
         }
     }
 }

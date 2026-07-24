@@ -1226,6 +1226,7 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     // Optionally start HTTP/3 listener
     if http3_enabled {
         let h3_config = config.http3.clone();
+        let h3_smuggling_detection = config.proxy.smuggling_detection;
         let h3_engine = Arc::clone(&engine);
         let h3_router = Arc::clone(&router);
         std::thread::spawn(move || {
@@ -1276,6 +1277,7 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
                     cert_pem,
                     key_pem,
                     h3_config.upstream_tls_verify,
+                    h3_smuggling_detection,
                     Arc::clone(&h3_engine),
                     Arc::clone(&h3_router),
                 )
@@ -1332,6 +1334,7 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     proxy.lb_registry = lb_registry;
     proxy.cache = response_cache;
     proxy.trust_proxy_headers = config.proxy.trust_proxy_headers;
+    proxy.smuggling_detection = config.proxy.smuggling_detection;
     proxy.trusted_proxies = config
         .proxy
         .trusted_proxies

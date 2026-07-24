@@ -42,6 +42,11 @@ pub struct WafProxy {
     /// the request/response paths behave exactly as before (no cache lookups or
     /// stores are performed).
     pub cache: Option<Arc<ResponseCache>>,
+    /// Enable shadow / log-only HTTP request-smuggling structural detection in
+    /// [`request_filter`]. When `true` (default) the request framing headers are
+    /// inspected for desync indicators and any match is logged; the request's
+    /// allow/block decision is **never** changed. `false` skips the check.
+    pub smuggling_detection: bool,
 }
 
 impl WafProxy {
@@ -54,6 +59,7 @@ impl WafProxy {
             acme_challenges: Arc::new(ChallengeStore::new()),
             lb_registry: Arc::new(LoadBalancerRegistry::new()),
             cache: None,
+            smuggling_detection: true,
         }
     }
 
@@ -330,6 +336,21 @@ impl ProxyHttp for WafProxy {
         let upstream_addr = format!("{}:{}", host_config.remote_host, host_config.remote_port);
         ctx.upstream_addr = Some(upstream_addr);
         ctx.host_config = Some(Arc::clone(&host_config));
+
+        // ── HTTP request-smuggling structural detection (shadow / log-only) ───
+        // Inspect the *raw* request framing headers (the `RequestCtx` HashMap
+        // collapses duplicates, so we must read `HeaderMap` directly). Cheap:
+        // two `get_all` walks, zero allocation for a clean request, no body
+        // access. Matches are logged only — the request continues unchanged and
+        // the allow/block decision below is untouched.
+        if self.smuggling_detection {
+            let findings = crate::smuggling::detect(&session.req_header().headers);
+            if !findings.is_empty() {
+                let client_ip = self.extract_client_ip(session);
+                let path = session.req_header().uri.path();
+                crate::smuggling::log_findings(&findings, client_ip, &host_header, path);
+            }
+        }
 
         // ── WAF header-phase inspection ───────────────────────────────────────
         let mut request_ctx = self.build_request_ctx(session, host_config);

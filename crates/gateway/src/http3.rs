@@ -120,6 +120,7 @@ pub async fn start_http3_server(
     cert_pem: String,
     key_pem: String,
     upstream_tls_verify: bool,
+    smuggling_detection: bool,
     engine: Arc<WafEngine>,
     router: Arc<HostRouter>,
 ) -> anyhow::Result<()> {
@@ -139,7 +140,7 @@ pub async fn start_http3_server(
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
-                    if let Err(e) = handle_quic_connection(conn, verify_tls, eng, rtr).await {
+                    if let Err(e) = handle_quic_connection(conn, verify_tls, smuggling_detection, eng, rtr).await {
                         warn!("HTTP/3 connection error: {e}");
                     }
                 }
@@ -155,6 +156,7 @@ pub async fn start_http3_server(
 async fn handle_quic_connection(
     conn: quinn::Connection,
     upstream_tls_verify: bool,
+    smuggling_detection: bool,
     engine: Arc<WafEngine>,
     router: Arc<HostRouter>,
 ) -> anyhow::Result<()> {
@@ -184,7 +186,9 @@ async fn handle_quic_connection(
                     // h3 0.0.8: use resolver.resolve_request() to get (req, stream)
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
-                            if let Err(e) = handle_h3_request(req, stream, &client, &eng, &rtr, remote).await {
+                            if let Err(e) =
+                                handle_h3_request(req, stream, &client, &eng, &rtr, remote, smuggling_detection).await
+                            {
                                 warn!("HTTP/3 request error: {e}");
                             }
                         }
@@ -247,6 +251,7 @@ async fn handle_h3_request<C>(
     engine: &WafEngine,
     router: &HostRouter,
     peer: SocketAddr,
+    smuggling_detection: bool,
 ) -> anyhow::Result<()>
 where
     C: h3::quic::BidiStream<Bytes>,
@@ -278,6 +283,21 @@ where
         )
         .await;
     };
+
+    // ── HTTP request-smuggling structural detection (shadow / log-only) ──────
+    // The CL/TE desync primitives are HTTP/1.1-specific: HTTP/3 carries body
+    // length via its own frame layer and forbids the `Transfer-Encoding` and
+    // connection-specific headers at the protocol level (the `h3`/`http` stack
+    // enforces this). The same structural detector is still applied here for
+    // defence in depth — a duplicate/obfuscated framing header that somehow
+    // survives into the parsed map is logged. In practice h3 requests rarely
+    // trip it; the check is cheap and log-only, and never alters routing.
+    if smuggling_detection {
+        let findings = crate::smuggling::detect(&parts.headers);
+        if !findings.is_empty() {
+            crate::smuggling::log_findings(&findings, peer.ip(), host_header, &path);
+        }
+    }
 
     // Administratively closed site → 503.
     if !host_config.start_status {

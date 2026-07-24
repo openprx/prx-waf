@@ -4,6 +4,7 @@ pub mod http3;
 pub mod lb;
 pub mod proxy;
 pub mod router;
+pub mod smuggling;
 pub mod ssl;
 pub mod tunnel;
 
