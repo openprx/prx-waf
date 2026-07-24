@@ -879,10 +879,11 @@ impl SemanticDetector for NoSqlStructuralDetector {
 /// shell `${VAR}`, Ruby string interpolation — so **every bare-delimiter rule is
 /// default-off**. Default-**on** ships only the strong signals: an exec/reflection
 /// sink that is essentially never benign in request data
-/// (`freemarker.template.utility.Execute`, `T(java.…)` `SpEL` type evaluator,
-/// `getClass().forName(`, `__import__(`, the Python sandbox-escape dunders), or a
-/// delimiter that *co-occurs* with such a sink (`{{…config.items…}}`, `<%…
-/// system(…) %>`). Bare delimiters, `{{7*7}}` arithmetic probes, lone
+/// (`freemarker.template.utility.Execute`, `T(java.…)` / `T (java.…)` `SpEL` type
+/// evaluator, `javax.script.ScriptEngine…`, `getClass().forName(`, `__import__(`,
+/// the Python sandbox-escape dunders), or a delimiter that *co-occurs* with such a
+/// sink (`{{…config.items…}}`, `<%… system(…) %>`, `{%… _self.env… %}` /
+/// `{% import os %}`). Bare delimiters, `{{7*7}}` arithmetic probes, lone
 /// `.__class__`, lone `getClass(` and bare FreeMarker/Velocity directives ship
 /// default-off pending holdout calibration.
 ///
@@ -901,14 +902,54 @@ const SSTI_RULES: &[RuleRow] = &[
     ),
     // SpEL / JSP-EL / Thymeleaf type evaluator into a `java.*` package:
     // `${T(java.lang.Runtime).getRuntime().exec(…)}` /
-    // `*{T(java.lang.ProcessBuilder)…}`. `\bt\(` matches only a standalone `t(`
-    // token (a word boundary precedes the `t`), so `format(java…)` / `insert(java…)`
-    // do NOT match; `t(java.` as a lone token is the SpEL type-evaluator primitive
-    // and is essentially never benign. Catches the sink with or without an
-    // enclosing delimiter. DEFAULT-ON. Note this is intentionally narrower than a
-    // bare `${t(…)}` rule, which would false-positive on the ubiquitous i18n
-    // `${t('key')}` JS-template idiom.
-    ("ssti.spel_type_java", 90, r"\bt\(\s*java\.", RuleKind::Presence, true),
+    // `*{T(java.lang.ProcessBuilder)…}`. `\bt\s*\(` matches a standalone `t(`
+    // token (a word boundary precedes the `t`) **with or without whitespace before
+    // the paren** — SpEL tolerates `T (java.lang.Runtime)` and attackers use the
+    // spaced form to slip a strict `t(` blocklist (FN, audit A). `format(java…)` /
+    // `insert(java…)` still do NOT match (no word boundary before the `t`); `t(java.`
+    // / `t (java.` as a lone token is the SpEL type-evaluator primitive and is
+    // essentially never benign. Catches the sink with or without an enclosing
+    // delimiter. DEFAULT-ON. Note this is intentionally narrower than a bare
+    // `${t(…)}` rule, which would false-positive on the ubiquitous i18n `${t('key')}`
+    // JS-template idiom.
+    (
+        "ssti.spel_type_java",
+        90,
+        r"\bt\s*\(\s*java\.",
+        RuleKind::Presence,
+        true,
+    ),
+    // `javax.script.ScriptEngine[Manager]` reflection RCE gadget: the Java scripting
+    // API a template / SpEL / OGNL payload reaches to evaluate attacker JS
+    // (`new javax.script.ScriptEngineManager().getEngineByName("js").eval(…)`, FN,
+    // audit A). A fully-qualified `javax.script.scriptengine…` classpath in request
+    // data is essentially never benign — the same fully-qualified-gadget discipline
+    // as `freemarker.template.utility.execute`. DEFAULT-ON.
+    (
+        "ssti.javax_script_engine",
+        88,
+        r"javax\.script\.scriptengine",
+        RuleKind::Presence,
+        true,
+    ),
+    // Jinja2 / Twig **statement block** `{% … %}` carrying a dangerous sink
+    // (co-occurrence, FN, audit A). The tag-statement delimiter differs from the
+    // `{{ … }}` expression delimiter and previously had no rule at all, so
+    // `{% import os %}` / `{% set x = _self.env… %}` slipped through. FP discipline:
+    // a **bare** `{% … %}` (the ubiquitous `{% if %}` / `{% for %}` / `{% block %}`
+    // control flow and `{% include 'tpl.html' %}` / `{% import 'forms.html' %}`
+    // template composition) must NOT fire — only the co-occurrence with a genuine
+    // exec / sandbox-escape sink (a `__dunder`, Twig `_self.`, `system(` / `popen` /
+    // `subprocess`, an `os.`/`getruntime` call, or a Python module `import os` /
+    // `import subprocess` …) does. `[^%]{0,200}?` cannot span the closing `%`,
+    // bounding the scan. DEFAULT-ON.
+    (
+        "ssti.jinja_statement_sink",
+        85,
+        r"\{%[^%]{0,200}?(\b__|_self\.|\bsystem\s*\(|\bpopen|\bsubprocess|\bos\.|\bgetruntime|\bimport\s+(os|subprocess|sys|commands|platform|socket|pty)\b)",
+        RuleKind::Presence,
+        true,
+    ),
     // Java reflection gadget `getClass().forName("java.lang.Runtime")` used by the
     // Velocity / SpEL / OGNL exec chains. The `getClass().forName(` pair is a
     // reflection-into-classloader move essentially never present in benign request
@@ -1134,11 +1175,17 @@ const LDAP_RULES: &[RuleRow] = &[
     // `)(objectclass=`, `)(userpassword=`, … A clause close re-opened onto a
     // directory attribute assignment is the LDAP-injection shape; restricting the
     // attribute to the well-known directory schema names keeps this default-on
-    // narrow (the generic `)(<any-ident>=` form is default-off below). DEFAULT-ON.
+    // narrow (the generic `)(<any-ident>=` form is default-off below). The list
+    // spans the common inetOrgPerson / posixAccount / Active-Directory attributes an
+    // injection targets — identity (`uid`/`cn`/`sn`/`givenname`/`displayname`),
+    // credential (`userpassword`), contact (`mail`/`telephonenumber`), group
+    // (`memberof`/`member`), AD (`samaccountname`/`userprincipalname`/
+    // `distinguishedname`) and POSIX (`uidnumber`/`gidnumber`/`homedirectory`)
+    // schema (audit A attribute-whitelist FN). DEFAULT-ON.
     (
         "ldap.filter_break_known_attr",
         88,
-        r"\)\s*\(\s*(uid|cn|sn|objectclass|userpassword|mail|givenname|memberof|samaccountname|ou|dc)\s*=",
+        r"\)\s*\(\s*(uid|cn|sn|givenname|displayname|objectclass|userpassword|mail|telephonenumber|memberof|member|samaccountname|userprincipalname|distinguishedname|uidnumber|gidnumber|homedirectory|title|ou|dc)\s*=",
         RuleKind::Presence,
         true,
     ),
@@ -1148,6 +1195,21 @@ const LDAP_RULES: &[RuleRow] = &[
     // request data. DEFAULT-ON. (`\29` is `)`, `\28` is `(`; the view text keeps the
     // literal backslash-escape since it is not URL/entity encoding.)
     ("ldap.hex_escape_break", 85, r"\\29\s*\\28", RuleKind::Presence, true),
+    // Hex-escaped filter-metacharacter **pair** — any two adjacent RFC-4515 escapes
+    // among `\28` `(`, `\29` `)`, `\2a` `*` (audit A: the specific `\29\28` rule
+    // above missed the wildcard-bearing combos `\2a\29` / `\28\2a` / `\29\2a` and
+    // the reversed `\28\29`). Two adjacent hex-escaped filter metacharacters are an
+    // RFC-4515 evasion sequence with no benign meaning in request data (a lone `\2a`
+    // is not — it needs a second adjacent escape). Confidence sits just below the
+    // specific `\29\28` rule so that exact break still reports as
+    // `ldap.hex_escape_break`. DEFAULT-ON.
+    (
+        "ldap.hex_escape_meta_pair",
+        82,
+        r"\\2[89a]\s*\\2[89a]",
+        RuleKind::Presence,
+        true,
+    ),
     // Null-byte filter truncation `))\00` — a NUL after clause-close bytes
     // truncates the remainder of the filter the application appended, a classic
     // LDAP-injection / auth-bypass tail. Matches both an actual NUL and the literal
@@ -3763,13 +3825,70 @@ mod tests {
         for onk in [
             "ssti.freemarker_exec",
             "ssti.spel_type_java",
+            "ssti.javax_script_engine",
             "ssti.java_reflect_forname",
             "ssti.jinja_sink",
+            "ssti.jinja_statement_sink",
             "ssti.py_sandbox_dunder",
             "ssti.erb_scriptlet_exec",
             "ssti.py_import",
         ] {
             assert!(on.contains(onk), "{onk} must be default-on");
+        }
+    }
+
+    #[test]
+    fn ssti_audit_a_fn_gaps_fire_default_on() {
+        // Audit A FN closures: the `javax.script` reflection RCE gadget, the SpEL
+        // `T (java.…)` **spaced** type-evaluator variant, and Jinja/Twig `{% … %}`
+        // statement blocks carrying a dangerous sink.
+        for (payload, expect) in [
+            // ① javax reflection RCE class.
+            (
+                r#"${new javax.script.ScriptEngineManager().getEngineByName("js").eval("x")}"#,
+                "ssti.javax_script_engine",
+            ),
+            // ② SpEL type-evaluator with a space before the paren (strict `t(` FN).
+            (r"*{T (java.lang.Runtime).getRuntime()}", "ssti.spel_type_java"),
+            (r"${T  (java.lang.ProcessBuilder)}", "ssti.spel_type_java"),
+            // ③ Jinja/Twig statement blocks with a real exec / sandbox sink.
+            (r"{% import os %}", "ssti.jinja_statement_sink"),
+            (
+                r"{% set x = subprocess.check_output('id') %}",
+                "ssti.jinja_statement_sink",
+            ),
+            (
+                r"{% set df = _self.env.registerUndefinedFilterCallback('system') %}",
+                "ssti.jinja_statement_sink",
+            ),
+            (r"{% set r = ''.__class__ %}", "ssti.jinja_statement_sink"),
+        ] {
+            let f = ssti_fire(payload).unwrap_or_else(|| panic!("audit-A FN must fire: {payload}"));
+            assert_eq!(f.attack, AttackKind::Ssti);
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn ssti_audit_a_benign_statement_blocks_stay_clean() {
+        // FP discipline for the new `{% … %}` rule: ordinary Jinja/Twig control flow
+        // and template-composition statements (no exec/sandbox sink) must NOT fire,
+        // and a fully-qualified `javax.script` mention only fires on the scripting
+        // engine classes, never a bare `javax.` prose mention.
+        for clean in [
+            r"{% if user.is_active %}welcome{% endif %}",
+            r"{% for item in cart.items %}{{ item.name }}{% endfor %}",
+            r"{% block content %}{% endblock %}",
+            r"{% include 'partials/header.html' %}",
+            r"{% import 'forms.html' as forms %}",
+            r"{% set total = price * quantity %}",
+            // `javax.` prose that is not the scripting-engine gadget.
+            r"the javax.servlet API and javax.naming package are documented here",
+        ] {
+            assert!(
+                ssti_fire(clean).is_none(),
+                "clean SSTI statement negative fired: {clean:?}"
+            );
         }
     }
 
@@ -3945,10 +4064,47 @@ mod tests {
             "ldap.auth_bypass_wildcard",
             "ldap.filter_break_known_attr",
             "ldap.hex_escape_break",
+            "ldap.hex_escape_meta_pair",
             "ldap.null_byte_truncation",
         ] {
             assert!(on.contains(onk), "{onk} must be default-on");
         }
+    }
+
+    #[test]
+    fn ldap_audit_a_fn_gaps_fire_default_on() {
+        // Audit A FN closures: the hex-escaped wildcard/paren combos the specific
+        // `\29\28` rule missed, and the extended directory-attribute whitelist.
+        for (payload, expect) in [
+            // ① hex-escaped metacharacter pairs involving the wildcard `\2a`
+            //    (deliberately NOT containing `\29\28`, which the higher-confidence
+            //    `ldap.hex_escape_break` rule owns).
+            (r"admin\2a\29next", "ldap.hex_escape_meta_pair"),
+            (r"user\28\2a", "ldap.hex_escape_meta_pair"),
+            (r"x\29\2a", "ldap.hex_escape_meta_pair"),
+            // reversed `\28\29` (open-then-close) the `\29\28` rule did not cover.
+            (r"val\28\29", "ldap.hex_escape_meta_pair"),
+            // ② extended attribute whitelist — a filter break onto each new attr.
+            (r"admin)(memberof=cn=admins)", "ldap.filter_break_known_attr"),
+            (r"x)(samaccountname=administrator)", "ldap.filter_break_known_attr"),
+            (r"y)(displayname=*)", "ldap.filter_break_known_attr"),
+            (r"z)(userprincipalname=root@corp)", "ldap.filter_break_known_attr"),
+            (r"a)(uidnumber=0)", "ldap.filter_break_known_attr"),
+        ] {
+            let f = ldap_fire(payload).unwrap_or_else(|| panic!("audit-A FN must fire: {payload}"));
+            assert_eq!(f.attack, AttackKind::LdapInjection);
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+        // The exact `\29\28` break must still report the SPECIFIC rule, not the
+        // broader pair rule (confidence ordering, no regression).
+        assert_eq!(
+            ldap_fire(r"admin\29\28uid=*")
+                .expect("specific hex break still fires")
+                .rule_key,
+            "ldap.hex_escape_break",
+        );
+        // A lone single hex escape carries no signal — must NOT fire.
+        assert!(ldap_fire(r"value\2a").is_none(), "lone hex escape must not fire");
     }
 
     #[test]
