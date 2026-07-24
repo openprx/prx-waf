@@ -99,11 +99,12 @@ pub enum AttackKind {
     Xxe,
     NoSqlInjection,
     Ssti,
+    LdapInjection,
 }
 
 impl AttackKind {
     /// All families, for iterating config.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::SqlInjection,
         Self::Rce,
         Self::Xss,
@@ -111,6 +112,7 @@ impl AttackKind {
         Self::Xxe,
         Self::NoSqlInjection,
         Self::Ssti,
+        Self::LdapInjection,
     ];
 
     /// Stable config-key spelling (`snake_case`) used in the TOML `[attacks]`
@@ -125,6 +127,7 @@ impl AttackKind {
             Self::Xxe => "xxe",
             Self::NoSqlInjection => "nosql_injection",
             Self::Ssti => "ssti",
+            Self::LdapInjection => "ldap_injection",
         }
     }
 
@@ -139,6 +142,7 @@ impl AttackKind {
             "xxe" => Some(Self::Xxe),
             "nosql_injection" => Some(Self::NoSqlInjection),
             "ssti" => Some(Self::Ssti),
+            "ldap_injection" => Some(Self::LdapInjection),
             _ => None,
         }
     }
@@ -155,6 +159,7 @@ impl AttackKind {
             Self::Xxe => Phase::Xxe,
             Self::NoSqlInjection => Phase::NoSqlInjection,
             Self::Ssti => Phase::Ssti,
+            Self::LdapInjection => Phase::LdapInjection,
         }
     }
 
@@ -173,6 +178,7 @@ impl AttackKind {
             Phase::Xxe => Some(Self::Xxe),
             Phase::NoSqlInjection => Some(Self::NoSqlInjection),
             Phase::Ssti => Some(Self::Ssti),
+            Phase::LdapInjection => Some(Self::LdapInjection),
             _ => None,
         }
     }
@@ -231,6 +237,18 @@ pub enum DetectorId {
     /// it judges whether a payload *looks* like SSTI, not whether the backend
     /// template engine actually evaluates it (the RASP ceiling).
     SstiStruct,
+    /// Structural LDAP search-filter injection detector (T2-D) — the single
+    /// detector in the `LdapInjection` family. Matches structural filter-injection
+    /// signatures where a payload closes an existing filter clause and opens a new
+    /// one (`)(uid=*`, `*)(|(`, `)(&(`, `)(objectclass=`) or their LDAP hex-escape
+    /// variants (`\29\28`, `\2a`), plus null-byte filter truncation (`*))\00`) on
+    /// the normalised view text. It runs **no** LDAP parser — a pure bounded-regex
+    /// scan with no recursion, so a payload can never drive a parse-time
+    /// stack-overflow / catastrophic-backtracking `DoS`. Honest boundary:
+    /// input-side only, a reverse proxy cannot know the backend actually issues an
+    /// LDAP search, so it judges whether a payload *looks structurally like* an
+    /// LDAP filter injection, not whether an LDAP query truly used it.
+    LdapStruct,
 }
 
 impl DetectorId {
@@ -248,6 +266,7 @@ impl DetectorId {
             Self::XxeStruct => "xxe_struct",
             Self::NoSqlStruct => "nosql_struct",
             Self::SstiStruct => "ssti_struct",
+            Self::LdapStruct => "ldap_struct",
         }
     }
 
@@ -266,6 +285,7 @@ impl DetectorId {
             "xxe_struct" => Some(Self::XxeStruct),
             "nosql_struct" => Some(Self::NoSqlStruct),
             "ssti_struct" => Some(Self::SstiStruct),
+            "ldap_struct" => Some(Self::LdapStruct),
             _ => None,
         }
     }

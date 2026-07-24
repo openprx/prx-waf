@@ -453,3 +453,34 @@ block_threshold = 80
 hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
 [content_security.attacks.ssti.weights]
 ssti_struct = 1.0                     # structural SSTI detector (T2-C)
+
+# LDAP injection — T2-D single-detector structural family. Detects LDAP
+# search-filter injection: a payload that closes an existing filter clause and
+# re-opens a new one carrying a logical operator (`)(|(`) or an attribute
+# assignment (`)(uid=`), the canonical wildcard auth-bypass (`*)(uid=*`), and the
+# RFC-4515 hex-escape (`\29\28`) and null-byte truncation (`))\00`) evasion
+# variants — on the SAME normalised view text as the other structural detectors.
+# It runs NO LDAP parser and has NO parser at all: every rule is a single
+# bounded-regex scan over a backtracking-free automaton (linear time regardless of
+# input), so there is no recursion, no catastrophic-backtracking (ReDoS) and thus
+# NO parse-time stack-overflow / DoS surface (the P0 depth-bound red-line targets
+# recursive parsers; a pure-regex detector has none). HONEST BOUNDARY (RASP
+# ceiling): a reverse proxy sees only the payload and can never confirm the backend
+# actually issues an LDAP search against it (the same field could feed SQL, a log
+# line, or nothing); these rules judge whether a payload LOOKS structurally like an
+# LDAP filter injection, not whether an LDAP query truly consumed it. FP honesty:
+# LDAP filter metacharacters (`*` `(` `)` `&` `|`) recur EVERYWHERE in legitimate
+# text, URLs and code, so EVERY bare-metacharacter rule is DEFAULT-OFF. Single
+# detector → weight 1.0; FP control is by narrow DEFAULT-ON rules (structural
+# filter-break CO-OCCURRENCE + escape/null-byte evasion signatures that are
+# essentially never benign) + DEFAULT-OFF high-noise rules (generic `)(<any>=`
+# break, bare `(|(` grouping, lone `*`/`(`/`)`/`&`/`|`) held back until holdout
+# calibration. Shadow (log_only): a default-on hit is recorded/logged, never
+# blocked. hard_veto_allowlist empty until holdout.
+[content_security.attacks.ldap_injection]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.ldap_injection.weights]
+ldap_struct = 1.0                     # structural LDAP-injection detector (T2-D)

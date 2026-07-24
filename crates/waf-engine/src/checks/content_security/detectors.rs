@@ -1064,6 +1064,184 @@ impl SemanticDetector for SstiStructuralDetector {
     }
 }
 
+// ── LDAP injection structural detector (plan §T2-D) ──────────────────────────
+
+/// LDAP search-filter injection structural rule table (plan T2-D). Matches
+/// **structural filter-break signatures** — a payload that closes an existing
+/// filter clause and re-opens a new one (`)(uid=*`, `*)(|(`, `)(&(`), plus the
+/// LDAP hex-escape and null-byte evasion variants — on the **normalised view
+/// text** (the same `lower_trunc` surface every other structural detector uses,
+/// so attribute names arrive lowercased: `objectClass` reaches the detector as
+/// `objectclass`).
+///
+/// **No LDAP parser is built or invoked, and there is no parser at all** — every
+/// rule is a single [`regex`] scan over the already length/token-bounded
+/// preprocessor output. The `regex` crate compiles to a finite automaton with
+/// **no backtracking**, so match time is linear in the input regardless of the
+/// payload; combined with the fact that every quantifier here is a single bounded
+/// char-class star (`\s*`) or a bounded `{0,n}` repetition — never a nested
+/// quantifier — there is no catastrophic-backtracking (`ReDoS`) and no recursion,
+/// hence no stack-overflow / expansion `DoS` surface (the P0 depth-bound red-line
+/// targets recursive parsers; a pure-regex detector has none).
+///
+/// **Honest boundary (RASP ceiling).** A pure reverse proxy sees only the payload
+/// and can never confirm the backend actually issues an LDAP search against it —
+/// the same field could feed a SQL query, a log line, or nothing. These rules
+/// therefore judge whether a payload *looks structurally like* an LDAP filter
+/// injection, not whether an LDAP query truly consumed it — the same input-side
+/// ceiling the plan §二.2 calls out for every Lane 2 detector.
+///
+/// **FP discipline (LDAP metacharacters are ubiquitous).** The LDAP filter
+/// metacharacters `*` `(` `)` `&` `|` recur *everywhere* in legitimate text, URLs
+/// and code — a bare `*` wildcard, a lone `(` / `)`, a bare `|` / `&` carry almost
+/// no signal, so **every bare-metacharacter rule is default-off**. Default-**on**
+/// ships only the *structural co-occurrence* signals that are essentially never
+/// benign in request data: a filter-clause close **immediately followed by** a new
+/// clause open carrying a logical operator (`)(|(`) or an attribute assignment
+/// (`)(uid=`), the canonical wildcard auth-bypass (`*)(uid=*`), the hex-escaped
+/// filter break (`\29\28`) and the null-byte filter truncation (`))\00`). The
+/// generic `)(<any-attr>=` break, the bare `(|(` grouping and the lone
+/// metacharacters ship default-off pending holdout calibration.
+///
+/// `(rule_key, confidence, pattern, kind, default_on)`.
+const LDAP_RULES: &[RuleRow] = &[
+    // Filter-break into a logical operator: a clause close `)` immediately
+    // re-opened as a boolean sub-filter `(|(` / `(&(` / `(!(`. Injecting a logical
+    // operator to widen or invert the search is the LDAP-injection primitive and
+    // this `)(<op>(` shape is essentially never benign in request data.
+    // DEFAULT-ON, highest confidence.
+    (
+        "ldap.filter_break_logical",
+        90,
+        r"\)\s*\(\s*[|&!]\s*\(",
+        RuleKind::Presence,
+        true,
+    ),
+    // Canonical wildcard authentication bypass `*)(uid=*` / `*)(cn=*` — a trailing
+    // wildcard closes the current clause, then a new attribute clause is opened
+    // with a `=*` match-anything. The `*)(<attr>=*` shape is the textbook LDAP
+    // auth-bypass and is never benign. DEFAULT-ON.
+    (
+        "ldap.auth_bypass_wildcard",
+        90,
+        r"\*\s*\)\s*\(\s*[a-z][a-z0-9;.-]{0,62}\s*=\s*\*",
+        RuleKind::Presence,
+        true,
+    ),
+    // Filter-break into a **known LDAP attribute** clause: `)(uid=`, `)(cn=`,
+    // `)(objectclass=`, `)(userpassword=`, … A clause close re-opened onto a
+    // directory attribute assignment is the LDAP-injection shape; restricting the
+    // attribute to the well-known directory schema names keeps this default-on
+    // narrow (the generic `)(<any-ident>=` form is default-off below). DEFAULT-ON.
+    (
+        "ldap.filter_break_known_attr",
+        88,
+        r"\)\s*\(\s*(uid|cn|sn|objectclass|userpassword|mail|givenname|memberof|samaccountname|ou|dc)\s*=",
+        RuleKind::Presence,
+        true,
+    ),
+    // Hex-escaped filter break `\29\28` — the LDAP RFC-4515 escape of `)(`, used to
+    // slip a filter break past a naive literal-`)(` blocklist. The escaped
+    // close-then-open pair is an evasion signature with no benign meaning in
+    // request data. DEFAULT-ON. (`\29` is `)`, `\28` is `(`; the view text keeps the
+    // literal backslash-escape since it is not URL/entity encoding.)
+    ("ldap.hex_escape_break", 85, r"\\29\s*\\28", RuleKind::Presence, true),
+    // Null-byte filter truncation `))\00` — a NUL after clause-close bytes
+    // truncates the remainder of the filter the application appended, a classic
+    // LDAP-injection / auth-bypass tail. Matches both an actual NUL and the literal
+    // `\00` escape form. `))` alone is ubiquitous (nested calls), so the NUL is the
+    // load-bearing, essentially-never-benign token. DEFAULT-ON.
+    (
+        "ldap.null_byte_truncation",
+        80,
+        r"\)\s*\)\s*(\\00|\x00)",
+        RuleKind::Presence,
+        true,
+    ),
+    // ── default-off (high-noise, holdout calibration pending) ────────────────
+    // Generic filter break `)(<any-ident>=` — the structural signal, but a
+    // non-directory identifier widens the FP surface (some config/query DSLs use
+    // `)(name=`), so it is default-off until calibrated; the known-attribute form
+    // is default-on above.
+    (
+        "ldap.filter_break_any_attr",
+        60,
+        r"\)\s*\(\s*[a-z][a-z0-9;.-]{0,62}\s*=",
+        RuleKind::Presence,
+        false,
+    ),
+    // Bare boolean-group open `(|(` / `(&(` — legitimate LDAP filter grammar, and
+    // it can also arise in ordinary parenthesised text; too noisy alone,
+    // default-off.
+    ("ldap.filter_group", 35, r"\(\s*[|&]\s*\(", RuleKind::Presence, false),
+    // Bare `)(` clause adjacency without an attribute/operator — appears in
+    // ordinary text (`(foo)(bar)`) and curried calls; default-off.
+    ("ldap.paren_adjacency", 25, r"\)\s*\(", RuleKind::Presence, false),
+    // Bare `*` wildcard — ubiquitous (globs, multiplication, markdown emphasis);
+    // the noisiest possible LDAP signal, default-off.
+    ("ldap.bare_wildcard", 20, r"\*", RuleKind::Presence, false),
+    // Bare boolean metacharacter `|` / `&` — pervasive in prose, URLs (`a&b`) and
+    // code; carries essentially no signal alone, default-off.
+    ("ldap.bare_logical", 20, r"[|&]", RuleKind::Presence, false),
+];
+
+/// Structural LDAP search-filter injection detector (plan T2-D).
+///
+/// Registered in the `LdapInjection` attack family; matches on the normalised
+/// view text. Single-detector family — no corroboration partner — so FP control
+/// is by narrow default-on rules (structural filter-break co-occurrence + escape /
+/// null-byte evasion signatures) plus default-off high-noise bare-metacharacter
+/// rules, per the plan §四.3 invariant. Runs **no** LDAP parser: a pure
+/// bounded-regex scan over a backtracking-free automaton, so no recursion, no
+/// `ReDoS`, no stack-overflow surface.
+pub struct LdapStructuralDetector {
+    rules: Vec<CompiledRule>,
+}
+
+impl LdapStructuralDetector {
+    /// Compile the **default-on** rules (the structural filter-break, wildcard
+    /// auth-bypass, hex-escape and null-byte signatures). The high-noise generic
+    /// break, bare-group and lone-metacharacter rules await holdout calibration and
+    /// are not compiled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            rules: compile_table(LDAP_RULES, false, "LdapStructuralDetector"),
+        }
+    }
+
+    /// Test-only: compile **every** rule, including the default-off ones.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_all_rules() -> Self {
+        Self {
+            rules: compile_table(LDAP_RULES, true, "LdapStructuralDetector"),
+        }
+    }
+}
+
+impl Default for LdapStructuralDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SemanticDetector for LdapStructuralDetector {
+    fn id(&self) -> DetectorId {
+        DetectorId::LdapStruct
+    }
+
+    fn detect(
+        &self,
+        view: &View<'_>,
+        _ctx: &PreprocessCtx<'_>,
+        _state: &mut ContentInspectionState,
+    ) -> Option<DetectionFinding> {
+        let rule = best_match(&self.rules, view.lower_trunc.as_str())?;
+        Some(finding_for(rule, AttackKind::LdapInjection, "LDAP"))
+    }
+}
+
 // ── AST SQLi detector (sqlparser-rs true parse, plan §11, P2) ─────────────────
 
 /// Maximum bracket / prefix-operator nesting depth we will hand to `sqlparser`.
@@ -3271,6 +3449,167 @@ mod tests {
         );
         let nested_braces = "{{".repeat(50_000);
         assert!(ssti_fire(&nested_braces).is_none(), "nested braces decline cleanly");
+    }
+
+    // ── LDAP injection structural detector (T2-D) ────────────────────────────
+
+    fn ldap_fire(text: &str) -> Option<DetectionFinding> {
+        run(&LdapStructuralDetector::new(), text)
+    }
+
+    fn ldap_fire_all(text: &str) -> Option<DetectionFinding> {
+        run(&LdapStructuralDetector::with_all_rules(), text)
+    }
+
+    #[test]
+    fn ldap_all_rules_compile() {
+        let det = LdapStructuralDetector::with_all_rules();
+        assert_eq!(det.rules.len(), LDAP_RULES.len(), "every LDAP pattern must compile");
+    }
+
+    #[test]
+    fn ldap_id_and_config_string() {
+        assert_eq!(LdapStructuralDetector::new().id(), DetectorId::LdapStruct);
+        assert_eq!(DetectorId::LdapStruct.as_config_str(), "ldap_struct");
+        assert_eq!(DetectorId::from_config_str("ldap_struct"), Some(DetectorId::LdapStruct));
+        assert_eq!(AttackKind::LdapInjection.as_config_key(), "ldap_injection");
+        assert_eq!(
+            AttackKind::from_config_key("ldap_injection"),
+            Some(AttackKind::LdapInjection)
+        );
+    }
+
+    #[test]
+    fn ldap_default_on_excludes_high_noise_rules() {
+        let det = LdapStructuralDetector::new();
+        let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
+        for off in [
+            "ldap.filter_break_any_attr",
+            "ldap.filter_group",
+            "ldap.paren_adjacency",
+            "ldap.bare_wildcard",
+            "ldap.bare_logical",
+        ] {
+            assert!(!on.contains(off), "{off} must be default-off");
+        }
+        for onk in [
+            "ldap.filter_break_logical",
+            "ldap.auth_bypass_wildcard",
+            "ldap.filter_break_known_attr",
+            "ldap.hex_escape_break",
+            "ldap.null_byte_truncation",
+        ] {
+            assert!(on.contains(onk), "{onk} must be default-on");
+        }
+    }
+
+    #[test]
+    fn ldap_filter_break_signatures_fire_default_on() {
+        // The structural filter-break co-occurrence signatures — a clause close
+        // re-opened onto a logical operator or an attribute assignment.
+        for (payload, expect) in [
+            (r"admin*)(uid=*", "ldap.auth_bypass_wildcard"),
+            (r"*)(|(uid=*", "ldap.filter_break_logical"),
+            (r"foo)(|(cn=admin)", "ldap.filter_break_logical"),
+            (r"x)(&(objectClass=*)", "ldap.filter_break_logical"),
+            (r"bar)(uid=admin)", "ldap.filter_break_known_attr"),
+            (r"john)(userPassword=*)", "ldap.filter_break_known_attr"),
+            (r"a)(objectClass=user)", "ldap.filter_break_known_attr"),
+        ] {
+            let f = ldap_fire(payload).unwrap_or_else(|| panic!("break must fire: {payload}"));
+            assert_eq!(f.attack, AttackKind::LdapInjection);
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn ldap_evasion_signatures_fire_default_on() {
+        // Hex-escaped `)(` break and the null-byte filter truncation tail.
+        for (payload, expect) in [
+            (r"admin\29\28uid=*", "ldap.hex_escape_break"),
+            (r"value\29\28|\28cn=*", "ldap.hex_escape_break"),
+            (r"admin*))\00", "ldap.null_byte_truncation"),
+            ("admin*))\u{0}", "ldap.null_byte_truncation"),
+        ] {
+            let f = ldap_fire(payload).unwrap_or_else(|| panic!("evasion must fire: {payload}"));
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn ldap_strongest_rule_wins() {
+        // The wildcard auth-bypass also contains a `)(` adjacency (a default-off
+        // rule); the high-confidence auth-bypass rule wins under the default set.
+        let f = ldap_fire(r"*)(uid=*").expect("auth bypass fires");
+        assert_eq!(f.rule_key, "ldap.auth_bypass_wildcard", "highest-confidence rule wins");
+    }
+
+    #[test]
+    fn ldap_bare_metacharacters_are_default_off() {
+        // The ubiquitous bare LDAP metacharacters must NOT fire under the default
+        // rule set (the whole FP-control thesis of T2-D); they only fire under the
+        // full rule set.
+        for (payload, expect) in [
+            (r"price * quantity", "ldap.bare_wildcard"),
+            (r"(foo)(bar)", "ldap.paren_adjacency"),
+            (r"(|(a", "ldap.filter_group"),
+            (r"cats & dogs", "ldap.bare_logical"),
+        ] {
+            assert!(
+                ldap_fire(payload).is_none(),
+                "bare-metacharacter payload must be default-off: {payload}"
+            );
+            assert!(ldap_fire_all(payload).is_some(), "fires under full set: {payload}");
+            let f = ldap_fire_all(payload).unwrap_or_else(|| panic!("fires under full set: {payload}"));
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn ldap_clean_traffic_does_not_fire() {
+        // Legitimate content that merely contains LDAP filter metacharacters must
+        // not trip the default-on structural rules.
+        for clean in [
+            // Math / boolean expressions with parens and operators.
+            r"result = (a|b)&c",
+            r"total = (price * qty) + tax",
+            r"if (x > 0) && (y < 10) { run(); }",
+            // Ordinary URL query strings.
+            r"https://example.com/search?name=john&age=30&sort=asc",
+            r"/api/items?filter=active&limit=100",
+            // Curried / nested call syntax with adjacency.
+            r"const add = (a)(b) => a + b;",
+            r"foo(bar)(baz)",
+            // Prose and glob patterns with wildcards.
+            r"select all files matching *.txt in the folder",
+            r"5 * 3 = 15 and 2 * 4 = 8",
+            // A legit LDAP-ish attribute mention without a filter break.
+            r"the uid attribute maps to the user id column",
+            // JSON payload with ampersands / stars in values.
+            r#"{"query":"cats & dogs","wildcard":"a*b"}"#,
+        ] {
+            assert!(ldap_fire(clean).is_none(), "clean LDAP negative fired: {clean:?}");
+        }
+    }
+
+    #[test]
+    fn ldap_pathological_input_declines_without_stack_overflow() {
+        // Pure-regex detector over a backtracking-free automaton: a huge run of
+        // metacharacters is a bounded linear scan that returns promptly and never
+        // overflows the stack or blows up on backtracking (ReDoS). The default-on
+        // rules require the structural co-occurrence, so a contentless nest of bare
+        // metacharacters is a clean decline.
+        let stars = "*".repeat(200_000);
+        assert!(ldap_fire(&stars).is_none(), "bare wildcard run declines default-on");
+        let parens = "()".repeat(100_000);
+        assert!(ldap_fire(&parens).is_none(), "bare paren run declines default-on");
+        let adjacency = ")(".repeat(100_000);
+        // `)(` adjacency alone is default-off (no attribute / operator), so even this
+        // pathological repeat must not fire a default-on rule and must return fast.
+        assert!(
+            ldap_fire(&adjacency).is_none(),
+            "bare )( adjacency run declines default-on"
+        );
     }
 
     // ── AST SQLi detector (P2) ────────────────────────────────────────────────
