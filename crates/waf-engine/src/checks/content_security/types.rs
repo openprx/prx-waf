@@ -100,11 +100,12 @@ pub enum AttackKind {
     NoSqlInjection,
     Ssti,
     LdapInjection,
+    XpathInjection,
 }
 
 impl AttackKind {
     /// All families, for iterating config.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::SqlInjection,
         Self::Rce,
         Self::Xss,
@@ -113,6 +114,7 @@ impl AttackKind {
         Self::NoSqlInjection,
         Self::Ssti,
         Self::LdapInjection,
+        Self::XpathInjection,
     ];
 
     /// Stable config-key spelling (`snake_case`) used in the TOML `[attacks]`
@@ -128,6 +130,7 @@ impl AttackKind {
             Self::NoSqlInjection => "nosql_injection",
             Self::Ssti => "ssti",
             Self::LdapInjection => "ldap_injection",
+            Self::XpathInjection => "xpath_injection",
         }
     }
 
@@ -143,6 +146,7 @@ impl AttackKind {
             "nosql_injection" => Some(Self::NoSqlInjection),
             "ssti" => Some(Self::Ssti),
             "ldap_injection" => Some(Self::LdapInjection),
+            "xpath_injection" => Some(Self::XpathInjection),
             _ => None,
         }
     }
@@ -160,6 +164,7 @@ impl AttackKind {
             Self::NoSqlInjection => Phase::NoSqlInjection,
             Self::Ssti => Phase::Ssti,
             Self::LdapInjection => Phase::LdapInjection,
+            Self::XpathInjection => Phase::XpathInjection,
         }
     }
 
@@ -179,6 +184,7 @@ impl AttackKind {
             Phase::NoSqlInjection => Some(Self::NoSqlInjection),
             Phase::Ssti => Some(Self::Ssti),
             Phase::LdapInjection => Some(Self::LdapInjection),
+            Phase::XpathInjection => Some(Self::XpathInjection),
             _ => None,
         }
     }
@@ -249,6 +255,19 @@ pub enum DetectorId {
     /// LDAP search, so it judges whether a payload *looks structurally like* an
     /// LDAP filter injection, not whether an LDAP query truly used it.
     LdapStruct,
+    /// Structural `XPath` / `XQuery` injection detector (T2-E) — the single
+    /// detector in the `XpathInjection` family. Matches structural injection
+    /// signatures where a payload closes an existing location-step / predicate /
+    /// string literal and re-opens a new node path or tautology (`] | //`,
+    /// `' or '1'='1`, `'] or`, `' or position()`) or pulls a string function from an
+    /// absolute axis (`count(//`, `substring(name(`, `//*[contains(`) on the
+    /// normalised view text. It runs **no** `XPath` parser — a pure bounded-regex
+    /// scan with no recursion, so a payload can never drive a parse-time
+    /// stack-overflow / catastrophic-backtracking `DoS`. Honest boundary: input-side
+    /// only, a reverse proxy cannot know the backend actually evaluates an `XPath`
+    /// query, so it judges whether a payload *looks structurally like* an `XPath`
+    /// injection, not whether an `XPath` query truly used it.
+    XpathStruct,
 }
 
 impl DetectorId {
@@ -267,6 +286,7 @@ impl DetectorId {
             Self::NoSqlStruct => "nosql_struct",
             Self::SstiStruct => "ssti_struct",
             Self::LdapStruct => "ldap_struct",
+            Self::XpathStruct => "xpath_struct",
         }
     }
 
@@ -286,6 +306,7 @@ impl DetectorId {
             "nosql_struct" => Some(Self::NoSqlStruct),
             "ssti_struct" => Some(Self::SstiStruct),
             "ldap_struct" => Some(Self::LdapStruct),
+            "xpath_struct" => Some(Self::XpathStruct),
             _ => None,
         }
     }

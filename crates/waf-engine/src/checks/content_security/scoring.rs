@@ -137,6 +137,7 @@ const fn attack_ord(a: AttackKind) -> u8 {
         AttackKind::NoSqlInjection => 5,
         AttackKind::Ssti => 6,
         AttackKind::LdapInjection => 7,
+        AttackKind::XpathInjection => 8,
     }
 }
 
@@ -169,6 +170,7 @@ const fn detector_ord(d: DetectorId) -> u8 {
         DetectorId::NoSqlStruct => 8,
         DetectorId::SstiStruct => 9,
         DetectorId::LdapStruct => 10,
+        DetectorId::XpathStruct => 11,
     }
 }
 

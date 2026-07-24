@@ -48,12 +48,13 @@ pub struct ContentSecurityConfig {
     pub breaker: SemanticBreakerConfig,
     /// Per-attack-family scoring configuration, keyed by attack family
     /// (`"sql_injection"` / `"rce"` / `"xss"` / `"traversal"` / `"xxe"` /
-    /// `"nosql_injection"` / `"ssti"` / `"ldap_injection"`). An absent or disabled
-    /// family contributes nothing (plan §6.2).
+    /// `"nosql_injection"` / `"ssti"` / `"ldap_injection"` / `"xpath_injection"`).
+    /// An absent or disabled family contributes nothing (plan §6.2).
     pub attacks: BTreeMap<String, SemanticAttackConfig>,
     /// Per-attack-family enforcement-mode overrides (E0). Each key is an attack
     /// family (`"sql_injection"` / `"rce"` / `"xss"` / `"traversal"` / `"xxe"` /
-    /// `"nosql_injection"` / `"ssti"` / `"ldap_injection"`); each value
+    /// `"nosql_injection"` / `"ssti"` / `"ldap_injection"` / `"xpath_injection"`);
+    /// each value
     /// is `"off"` / `"log_only"` / `"enforce"` and overrides the global
     /// [`Self::enforcement_mode`] **for that family only**. A family not listed
     /// here inherits the global mode, so the shipped **empty** map is
@@ -220,7 +221,7 @@ impl ContentSecurityConfig {
             if !is_known_attack_family(name) {
                 return Err(format!(
                     "content_security.attacks has unknown family '{name}' \
-                     (expected sql_injection/rce/xss/traversal/xxe/nosql_injection/ssti/ldap_injection)"
+                     (expected sql_injection/rce/xss/traversal/xxe/nosql_injection/ssti/ldap_injection/xpath_injection)"
                 ));
             }
             family.validate(name)?;
@@ -233,7 +234,7 @@ impl ContentSecurityConfig {
             if !is_known_attack_family(name) {
                 return Err(format!(
                     "content_security.enforcement_overrides has unknown family '{name}' \
-                     (expected sql_injection/rce/xss/traversal/xxe/nosql_injection/ssti/ldap_injection)"
+                     (expected sql_injection/rce/xss/traversal/xxe/nosql_injection/ssti/ldap_injection/xpath_injection)"
                 ));
             }
             match mode.as_str() {
@@ -366,7 +367,15 @@ impl SemanticAttackConfig {
 fn is_known_attack_family(name: &str) -> bool {
     matches!(
         name,
-        "sql_injection" | "rce" | "xss" | "traversal" | "xxe" | "nosql_injection" | "ssti" | "ldap_injection"
+        "sql_injection"
+            | "rce"
+            | "xss"
+            | "traversal"
+            | "xxe"
+            | "nosql_injection"
+            | "ssti"
+            | "ldap_injection"
+            | "xpath_injection"
     )
 }
 

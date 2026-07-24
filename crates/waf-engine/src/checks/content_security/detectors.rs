@@ -1242,6 +1242,194 @@ impl SemanticDetector for LdapStructuralDetector {
     }
 }
 
+// ── XPath injection structural detector (plan §T2-E) ─────────────────────────
+
+/// `XPath` / `XQuery` injection structural rule table (plan T2-E). Matches
+/// **structural `XPath`-injection signatures** — a payload that closes an existing
+/// location-step / predicate / string literal and re-opens a new node path or a
+/// tautology to subvert node selection or bypass authentication — on the
+/// **normalised view text** (the same `lower_trunc` surface every other
+/// structural detector uses, so `count(//` reaches the detector lowercased).
+///
+/// **No `XPath` parser is built or invoked, and there is no parser at all** — every
+/// rule is a single [`regex`] scan over the already length/token-bounded
+/// preprocessor output. The `regex` crate compiles to a finite automaton with
+/// **no backtracking**, so match time is linear in the input regardless of the
+/// payload; every quantifier here is a single bounded char-class star (`\s*`) or
+/// a bounded `{0,n}` repetition — never a nested quantifier — so there is no
+/// catastrophic-backtracking (`ReDoS`) and no recursion, hence no
+/// stack-overflow / expansion `DoS` surface (the P0 depth-bound red-line targets
+/// recursive parsers; a pure-regex detector has none).
+///
+/// **Honest boundary (RASP ceiling).** A pure reverse proxy sees only the payload
+/// and can never confirm the backend actually evaluates an `XPath` / `XQuery`
+/// expression against it — the same field could feed a SQL query, a log line, or
+/// nothing. These rules therefore judge whether a payload *looks structurally
+/// like* an `XPath` injection, not whether an `XPath` query truly consumed it — the
+/// same input-side ceiling the plan §二.2 calls out for every Lane 2 detector.
+/// (The quote-closed tautology `' or '1'='1` deliberately overlaps the `SQLi`
+/// tautology; the two families record independently, which is fine — the payload
+/// is structurally a tautology-injection whichever backend consumes it.)
+///
+/// **FP discipline (`XPath` tokens are ubiquitous).** The bare `XPath` tokens `//`
+/// (URLs, comments, paths), the logical words `or` / `and` (prose), the lone
+/// predicate brackets `[` / `]` (array access) and the bare function calls
+/// `count(` / `substring(` (ordinary programming) recur *everywhere* in
+/// legitimate text, URLs and code — a bare token carries almost no signal, so
+/// **every bare-token rule is default-off**. Default-**on** ships only the
+/// *structural co-occurrence* signals that are essentially never benign in
+/// request data: a node-axis union (`] | //`), a quote-closed tautology
+/// (`' or '1'='1`), a predicate/quote close re-opened onto a logical operator
+/// (`'] or`), a logical operator immediately calling an `XPath` node function
+/// (`' or position()`, `or count(`), an `XPath` string function whose argument is
+/// an absolute axis (`count(//`, `substring(name(`), and a node axis with a
+/// functional predicate (`//*[contains(`).
+///
+/// `(rule_key, confidence, pattern, kind, default_on)`.
+const XPATH_RULES: &[RuleRow] = &[
+    // Node-axis union / step injection: a predicate close `]` re-opened as a new
+    // absolute location path `//` via the XPath union operator `|`. The
+    // `] | //` shape injects an entirely new node set into the result and is
+    // essentially never benign in request data. DEFAULT-ON, highest confidence.
+    ("xpath.node_axis_union", 90, r"\]\s*\|\s*//", RuleKind::Presence, true),
+    // Auth-bypass via a logical operator immediately calling an XPath node
+    // function: `' or position()`, `or count(`, `or name()=`, `and last()`. XPath
+    // node functions (`position`/`last`/`name`/`local-name`) are XPath-distinctive
+    // and, gated behind an `or`/`and`, form the canonical XPath auth-bypass tail.
+    // DEFAULT-ON.
+    (
+        "xpath.auth_bypass_func",
+        90,
+        r"\b(?:or|and)\s+(?:position|last|name|local-name|count|string-length)\s*\(",
+        RuleKind::Presence,
+        true,
+    ),
+    // Quote-closed tautology `' or '1'='1` / `" or "1"="1` — the injected input
+    // closes the string literal and appends an always-true quoted comparison to
+    // widen node selection past the intended predicate. The quoted-operand shape is
+    // narrower than the bare SQLi tautology and is essentially never benign.
+    // DEFAULT-ON. (Overlaps the SQLi family by design; see the type doc.)
+    (
+        "xpath.quote_tautology",
+        88,
+        r#"['"]\s*(?:or|and)\s*['"]\s*[a-z0-9]+\s*['"]?\s*=\s*['"]?\s*[a-z0-9]+"#,
+        RuleKind::Presence,
+        true,
+    ),
+    // XPath string function whose argument is an absolute axis or a nested node
+    // function: `count(//`, `string-length(//`, `substring(name(`,
+    // `contains(local-name(`. A string/aggregate function pulling from an absolute
+    // `//` axis (or `name(` / `local-name(`) is a blind-XPath extraction primitive
+    // and is never benign in request data. DEFAULT-ON.
+    (
+        "xpath.func_axis",
+        88,
+        r"\b(?:count|string-length|substring|substring-before|substring-after|contains|starts-with|concat|normalize-space)\s*\(\s*(?://|name\s*\(|local-name\s*\()",
+        RuleKind::Presence,
+        true,
+    ),
+    // Predicate / quote close re-opened onto a logical operator: `'] or`, `")] and`,
+    // `'] and`. The input closes the intended string literal and predicate, then
+    // chains a boolean clause to alter the surviving node set. The `close-then-logic`
+    // co-occurrence is the injection shape; bare `]` or bare `or` alone are
+    // default-off. DEFAULT-ON.
+    (
+        "xpath.predicate_close_logic",
+        85,
+        r#"['"]\s*\)?\s*\]\s*(?:or|and)\b"#,
+        RuleKind::Presence,
+        true,
+    ),
+    // Node axis with a functional predicate: `//*[contains(`, `//user[position(`,
+    // `//book[starts-with(`. An absolute axis whose predicate opens an XPath
+    // string/position function is a node-enumeration / blind-extraction shape.
+    // A bare `//`, a bare `[`, or a bare `contains(` alone are default-off; their
+    // co-occurrence here is the signal. DEFAULT-ON.
+    (
+        "xpath.axis_predicate_func",
+        85,
+        r"//[a-z0-9_*.:@-]{0,64}\[\s*(?:contains|starts-with|count|position|string-length|substring|text|node)\s*\(",
+        RuleKind::Presence,
+        true,
+    ),
+    // ── default-off (high-noise, holdout calibration pending) ────────────────
+    // Bare absolute-axis `//` — ubiquitous in URLs (`http://`), comments and file
+    // paths; the noisiest possible XPath signal, default-off.
+    ("xpath.bare_double_slash", 25, r"//", RuleKind::Presence, false),
+    // Bare logical word `or` / `and` — pervasive in ordinary prose; carries
+    // essentially no signal alone, default-off.
+    ("xpath.bare_logical", 20, r"\b(?:or|and)\b", RuleKind::Presence, false),
+    // Bare predicate bracket `[` / `]` — ordinary array / index access
+    // (`items[0]`); default-off.
+    ("xpath.bare_predicate", 15, r"[\[\]]", RuleKind::Presence, false),
+    // Bare XPath-ish function call `count(` / `substring(` / `string-length(` —
+    // legitimate in most programming languages; default-off.
+    (
+        "xpath.bare_func",
+        20,
+        r"\b(?:count|substring|string-length)\s*\(",
+        RuleKind::Presence,
+        false,
+    ),
+];
+
+/// Structural `XPath` / `XQuery` injection detector (plan T2-E).
+///
+/// Registered in the `XpathInjection` attack family; matches on the normalised
+/// view text. Single-detector family — no corroboration partner — so FP control
+/// is by narrow default-on rules (structural node-axis / tautology / close-then-
+/// logic / function-axis co-occurrence signatures) plus default-off high-noise
+/// bare-token rules, per the plan §四.3 invariant. Runs **no** `XPath` parser: a
+/// pure bounded-regex scan over a backtracking-free automaton, so no recursion,
+/// no `ReDoS`, no stack-overflow surface.
+pub struct XpathStructuralDetector {
+    rules: Vec<CompiledRule>,
+}
+
+impl XpathStructuralDetector {
+    /// Compile the **default-on** rules (the node-axis union, tautology,
+    /// close-then-logic, auth-bypass-function, function-axis and axis-predicate
+    /// signatures). The high-noise bare-token rules await holdout calibration and
+    /// are not compiled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            rules: compile_table(XPATH_RULES, false, "XpathStructuralDetector"),
+        }
+    }
+
+    /// Test-only: compile **every** rule, including the default-off ones.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_all_rules() -> Self {
+        Self {
+            rules: compile_table(XPATH_RULES, true, "XpathStructuralDetector"),
+        }
+    }
+}
+
+impl Default for XpathStructuralDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SemanticDetector for XpathStructuralDetector {
+    fn id(&self) -> DetectorId {
+        DetectorId::XpathStruct
+    }
+
+    fn detect(
+        &self,
+        view: &View<'_>,
+        _ctx: &PreprocessCtx<'_>,
+        _state: &mut ContentInspectionState,
+    ) -> Option<DetectionFinding> {
+        let rule = best_match(&self.rules, view.lower_trunc.as_str())?;
+        Some(finding_for(rule, AttackKind::XpathInjection, "XPath"))
+    }
+}
+
 // ── AST SQLi detector (sqlparser-rs true parse, plan §11, P2) ─────────────────
 
 /// Maximum bracket / prefix-operator nesting depth we will hand to `sqlparser`.
@@ -3610,6 +3798,161 @@ mod tests {
             ldap_fire(&adjacency).is_none(),
             "bare )( adjacency run declines default-on"
         );
+    }
+
+    // ── XPath injection structural detector (T2-E) ───────────────────────────
+
+    fn xpath_fire(text: &str) -> Option<DetectionFinding> {
+        run(&XpathStructuralDetector::new(), text)
+    }
+
+    fn xpath_fire_all(text: &str) -> Option<DetectionFinding> {
+        run(&XpathStructuralDetector::with_all_rules(), text)
+    }
+
+    #[test]
+    fn xpath_all_rules_compile() {
+        let det = XpathStructuralDetector::with_all_rules();
+        assert_eq!(det.rules.len(), XPATH_RULES.len(), "every XPath pattern must compile");
+    }
+
+    #[test]
+    fn xpath_id_and_config_string() {
+        assert_eq!(XpathStructuralDetector::new().id(), DetectorId::XpathStruct);
+        assert_eq!(DetectorId::XpathStruct.as_config_str(), "xpath_struct");
+        assert_eq!(
+            DetectorId::from_config_str("xpath_struct"),
+            Some(DetectorId::XpathStruct)
+        );
+        assert_eq!(AttackKind::XpathInjection.as_config_key(), "xpath_injection");
+        assert_eq!(
+            AttackKind::from_config_key("xpath_injection"),
+            Some(AttackKind::XpathInjection)
+        );
+    }
+
+    #[test]
+    fn xpath_default_on_excludes_high_noise_rules() {
+        let det = XpathStructuralDetector::new();
+        let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
+        for off in [
+            "xpath.bare_double_slash",
+            "xpath.bare_logical",
+            "xpath.bare_predicate",
+            "xpath.bare_func",
+        ] {
+            assert!(!on.contains(off), "{off} must be default-off");
+        }
+        for onk in [
+            "xpath.node_axis_union",
+            "xpath.auth_bypass_func",
+            "xpath.quote_tautology",
+            "xpath.func_axis",
+            "xpath.predicate_close_logic",
+            "xpath.axis_predicate_func",
+        ] {
+            assert!(on.contains(onk), "{onk} must be default-on");
+        }
+    }
+
+    #[test]
+    fn xpath_structural_signatures_fire_default_on() {
+        // Each payload is chosen to trip exactly one default-on rule so the winning
+        // rule_key is deterministic.
+        for (payload, expect) in [
+            (r"abc']|//user/password", "xpath.node_axis_union"),
+            (r"' or position()=1", "xpath.auth_bypass_func"),
+            (r"' or '1'='1", "xpath.quote_tautology"),
+            (r"string-length(//user/pass)>10", "xpath.func_axis"),
+            (r"admin'] and 1=1", "xpath.predicate_close_logic"),
+            (r"//*[contains(text(),'x')]", "xpath.axis_predicate_func"),
+        ] {
+            let f = xpath_fire(payload).unwrap_or_else(|| panic!("must fire: {payload}"));
+            assert_eq!(f.attack, AttackKind::XpathInjection);
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn xpath_double_quote_tautology_and_union_variants_fire() {
+        // Double-quote tautology and the quote-prefixed union break.
+        assert_eq!(
+            xpath_fire(r#"" or "1"="1"#)
+                .expect("double-quote tautology fires")
+                .rule_key,
+            "xpath.quote_tautology"
+        );
+        assert_eq!(
+            xpath_fire(r"x')] | //node").expect("quoted union break fires").rule_key,
+            "xpath.node_axis_union"
+        );
+        // `substring(name(` — function pulling from a nested node function.
+        assert_eq!(
+            xpath_fire(r"substring(name(//user[1]),1,1)")
+                .expect("func over name() fires")
+                .rule_key,
+            "xpath.func_axis"
+        );
+    }
+
+    #[test]
+    fn xpath_bare_tokens_are_default_off() {
+        // The ubiquitous bare XPath tokens must NOT fire under the default rule set
+        // (the whole FP-control thesis of T2-E); they only fire under the full set.
+        for (payload, expect) in [
+            (r"see http://example.com//docs", "xpath.bare_double_slash"),
+            (r"cats and dogs or birds", "xpath.bare_logical"),
+            (r"items[0] = value", "xpath.bare_predicate"),
+            (r"total = count(rows)", "xpath.bare_func"),
+        ] {
+            assert!(
+                xpath_fire(payload).is_none(),
+                "bare-token payload must be default-off: {payload}"
+            );
+            let f = xpath_fire_all(payload).unwrap_or_else(|| panic!("fires under full set: {payload}"));
+            assert_eq!(f.rule_key, expect, "payload: {payload}");
+        }
+    }
+
+    #[test]
+    fn xpath_clean_traffic_does_not_fire() {
+        // Legitimate content that merely contains XPath tokens (`//`, `or`/`and`,
+        // `[]`, function calls) must not trip the default-on structural rules.
+        for clean in [
+            // Ordinary URLs with `//` and query operators.
+            r"https://example.com/search?name=john&sort=asc",
+            r"visit http://a//b for the mirror",
+            r"/api/items?active=true&limit=100",
+            // Math / boolean prose with `or` / `and`.
+            r"choose red or blue and keep the receipt",
+            r"if (x > 0 and y < 10) then run",
+            r"5 or 6 apples, either is fine",
+            // Array / index access and legit function calls.
+            r"const n = items[0] + rows[1];",
+            r"total = count(rows) + substring(name, 0, 3)",
+            r"array[index] = value[key]",
+            // A legit mention of xpath-ish words without a break.
+            r"the position and name fields map to columns",
+            // JSON with brackets, slashes and operators in values.
+            r#"{"path":"a/b//c","q":"cats and dogs","list":[1,2,3]}"#,
+        ] {
+            assert!(xpath_fire(clean).is_none(), "clean XPath negative fired: {clean:?}");
+        }
+    }
+
+    #[test]
+    fn xpath_pathological_input_declines_without_stack_overflow() {
+        // Pure-regex detector over a backtracking-free automaton: a huge run of
+        // bare XPath tokens is a bounded linear scan that returns promptly and never
+        // overflows the stack or blows up on backtracking (ReDoS). The default-on
+        // rules require the structural co-occurrence, so a contentless token run is a
+        // clean decline.
+        let slashes = "//".repeat(200_000);
+        assert!(xpath_fire(&slashes).is_none(), "bare // run declines default-on");
+        let logic = "' or ".repeat(100_000);
+        assert!(xpath_fire(&logic).is_none(), "repeated ' or run declines default-on");
+        let brackets = "][".repeat(100_000);
+        assert!(xpath_fire(&brackets).is_none(), "bare bracket run declines default-on");
     }
 
     // ── AST SQLi detector (P2) ────────────────────────────────────────────────

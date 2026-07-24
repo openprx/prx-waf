@@ -484,3 +484,38 @@ block_threshold = 80
 hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
 [content_security.attacks.ldap_injection.weights]
 ldap_struct = 1.0                     # structural LDAP-injection detector (T2-D)
+
+# XPath injection — T2-E single-detector structural family. Detects XPath /
+# XQuery injection: a payload that closes an existing location-step / predicate /
+# string literal and re-opens a new node path or tautology to subvert node
+# selection or bypass authentication — a node-axis union (`] | //`), a
+# quote-closed tautology (`' or '1'='1`), a predicate/quote close chained to a
+# logical operator (`'] or`), a logical operator immediately calling an XPath
+# node function (`' or position()`, `or count(`), an XPath string function pulling
+# from an absolute axis (`count(//`, `substring(name(`), and a node axis with a
+# functional predicate (`//*[contains(`) — on the SAME normalised view text as the
+# other structural detectors. It runs NO XPath parser and has NO parser at all:
+# every rule is a single bounded-regex scan over a backtracking-free automaton
+# (linear time regardless of input), so there is no recursion, no
+# catastrophic-backtracking (ReDoS) and thus NO parse-time stack-overflow / DoS
+# surface (the P0 depth-bound red-line targets recursive parsers; a pure-regex
+# detector has none). HONEST BOUNDARY (RASP ceiling): a reverse proxy sees only
+# the payload and can never confirm the backend actually evaluates an XPath / XQuery
+# expression against it (the same field could feed SQL, a log line, or nothing);
+# these rules judge whether a payload LOOKS structurally like an XPath injection,
+# not whether an XPath query truly consumed it. (The quote tautology deliberately
+# overlaps the SQLi family; both record independently, which is fine.) FP honesty:
+# XPath tokens (`//`, `or`/`and`, `[`/`]`, `count(`/`substring(`) recur EVERYWHERE
+# in legitimate text, URLs and code, so EVERY bare-token rule is DEFAULT-OFF.
+# Single detector → weight 1.0; FP control is by narrow DEFAULT-ON rules
+# (structural CO-OCCURRENCE signatures that are essentially never benign) +
+# DEFAULT-OFF high-noise rules (bare `//`, bare `or`/`and`, lone `[`/`]`, bare
+# `count(`) held back until holdout calibration. Shadow (log_only): a default-on
+# hit is recorded/logged, never blocked. hard_veto_allowlist empty until holdout.
+[content_security.attacks.xpath_injection]
+enabled = true
+log_threshold = 40
+block_threshold = 80
+hard_veto_allowlist = []              # empty until holdout-calibrated (no single-hit Block authorised)
+[content_security.attacks.xpath_injection.weights]
+xpath_struct = 1.0                    # structural XPath-injection detector (T2-E)

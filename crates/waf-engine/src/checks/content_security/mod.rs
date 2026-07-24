@@ -56,7 +56,8 @@ pub use canary::{BreakerState, CircuitBreaker, canary_bucket, in_canary};
 pub use config::{Dialect, EnforcementMode, RuntimeContentSecurityConfig};
 pub use detectors::{
     AstSqlDetector, LdapStructuralDetector, NoSqlStructuralDetector, RceAstDetector, RceStructuralDetector,
-    SstiStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector, XxeStructuralDetector,
+    SstiStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector, XpathStructuralDetector,
+    XxeStructuralDetector,
 };
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
@@ -101,8 +102,9 @@ pub struct ContentSecuritySubsystem {
     /// Lane 2 semantic detectors: the structural + AST `SQLi` detectors, the
     /// RCE / Traversal detectors, the XSS DOM + JS-token detectors (P-XSS-2,
     /// 0.5/0.5 corroboration), the structural XXE detector (T2-A), the structural
-    /// `NoSQL` detector (T2-B), the structural SSTI detector (T2-C) and the
-    /// structural LDAP-injection detector (T2-D); tests may push additional mocks.
+    /// `NoSQL` detector (T2-B), the structural SSTI detector (T2-C), the
+    /// structural LDAP-injection detector (T2-D) and the structural
+    /// `XPath`-injection detector (T2-E); tests may push additional mocks.
     detectors: Vec<Box<dyn SemanticDetector>>,
     /// Runtime anomaly-rate breaker state (never persisted; restart resets it).
     breaker: Mutex<CircuitBreaker>,
@@ -191,6 +193,19 @@ impl ContentSecuritySubsystem {
             // backend actually issues an LDAP search. Shadow (log_only) like every
             // other family.
             Box::new(detectors::LdapStructuralDetector::new()),
+            // T2-E: structural XPath-injection detector (single-detector
+            // `xpath_injection` family). Runs no XPath parser — a pure bounded-regex
+            // scan over a backtracking-free automaton (no recursion, no ReDoS, so no
+            // stack-overflow surface) on the same normalised view text. Default-on
+            // rules are the structural co-occurrence signatures (node-axis union
+            // `] | //`, quote-closed tautology `' or '1'='1`, close-then-logic
+            // `'] or`, auth-bypass `' or position()`, function-axis `count(//`,
+            // axis-predicate `//*[contains(`); the ubiquitous bare tokens `//`,
+            // `or`/`and`, `[`/`]` and bare `count(` are default-off to hold FPs down
+            // (XPath tokens recur everywhere). Honest boundary: input-side only, it
+            // cannot confirm the backend actually evaluates an XPath query. Shadow
+            // (log_only) like every other family.
+            Box::new(detectors::XpathStructuralDetector::new()),
         ];
         Self {
             legacy_checkers,

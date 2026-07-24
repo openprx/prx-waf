@@ -111,6 +111,9 @@ pub enum Phase {
     /// LDAP search-filter injection (Lane 2 semantic `ldap_injection` family,
     /// T2-D)
     LdapInjection = 22,
+    /// `XPath` / `XQuery` injection (Lane 2 semantic `xpath_injection` family,
+    /// T2-E)
+    XpathInjection = 23,
 }
 
 impl std::fmt::Display for Phase {
@@ -138,6 +141,7 @@ impl std::fmt::Display for Phase {
             Self::NoSqlInjection => write!(f, "NoSQL Injection"),
             Self::Ssti => write!(f, "SSTI"),
             Self::LdapInjection => write!(f, "LDAP Injection"),
+            Self::XpathInjection => write!(f, "XPath Injection"),
         }
     }
 }
