@@ -45,10 +45,12 @@ static SQLI_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
         // xp_cmdshell
         r"(?i)\bxp_cmdshell\b",
         // INFORMATION_SCHEMA / sys.tables / sysobjects. `information_schema`
-        // requires the structural `.<catalog table>` form so a bare field named
+        // requires the structural `.<identifier>` form so a bare field named
         // `information_schema` (e.g. `?column=information_schema`) no longer
-        // fires — mirrors the narrowed content-security detector.
-        r"(?i)\b(information_schema\s*\.\s*(tables|columns|schemata|routines|databases)|sys\.(tables|columns|databases)|sysobjects|sysusers)\b",
+        // fires, while ANY catalog view/table selected off it (`.triggers`,
+        // `.views`, `.statistics`, `.key_column_usage`, … not just the original
+        // five) is caught — mirrors the narrowed content-security detector.
+        r"(?i)\b(information_schema\s*\.\s*\w+|sys\.(tables|columns|databases)|sysobjects|sysusers)\b",
         // OR/AND tautologies
         r"(?i)\b(or|and)\b[\s]+'[^']*'[\s]*=[\s]*'[^']*'",
         // LOAD_FILE()
@@ -206,6 +208,24 @@ mod tests {
             checker.check(&ctx).is_some(),
             "information_schema.tables enumeration must still fire"
         );
+    }
+
+    #[test]
+    fn information_schema_non_listed_views_now_detected() {
+        // F-B: the original narrowing only accepted five catalog tables
+        // (tables/columns/schemata/routines/databases), silently missing every
+        // other injectable catalog view. `information_schema\.\w+` now catches
+        // the blind-injection favourites `.triggers`, `.views`, `.statistics`,
+        // `.key_column_usage` with no `union`/comment needed.
+        let checker = SqlInjectionCheck::new();
+        for view in ["triggers", "views", "statistics", "key_column_usage"] {
+            let payload = format!("id=1 and (select count(*) from information_schema.{view})>0");
+            let ctx = make_ctx(&payload, "");
+            assert!(
+                checker.check(&ctx).is_some(),
+                "information_schema.{view} enumeration must fire"
+            );
+        }
     }
 
     #[test]
