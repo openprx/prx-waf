@@ -109,6 +109,35 @@ static XSS_STRONG_STRUCTURE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     .ok()
 });
 
+/// Deserialization + XXE strong-structure marker for the blind base64 / hex gate
+/// (F-I). A base64 / hex wrapper around a Python pickle GLOBAL opcode
+/// (`cos\nsystem`), a PHP `serialize()` object header (`O:8:"…"`), a `__reduce__`
+/// dunder, or an XML external-entity / DOCTYPE declaration must surface a
+/// `BlindDecoded` view so the [`super::detectors::DeserStructuralDetector`] /
+/// [`super::xxe::XxeDetector`] can run on it — the SQL/RCE/Traversal/XSS markers
+/// above never match a serialized object or an XML DTD. Kept low-FP: each marker is
+/// a complete, essentially-never-benign structure (a resolved pickle callable, a
+/// typed PHP object header, or an XML `<!ENTITY` / `<!DOCTYPE`), none of which
+/// appear in ordinary base64-wrapped prose, JSON or a JWT. A gate false-positive
+/// only costs a wasted view (the detector still decides the finding).
+///
+/// `None` only if the constant pattern fails to compile (it will not); the gate
+/// then simply falls through to the weaker keyword tiers (no panic, iron rule).
+static DESER_XXE_STRONG_STRUCTURE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(concat!(
+        // Python pickle GLOBAL opcode resolving a dangerous callable (newline or
+        // whitespace between module and callable).
+        r"c(?:os|posix|nt)\s*system",
+        r"|c__builtin__\s*(?:eval|exec|compile)",
+        r"|__reduce__",
+        // PHP serialize() typed-object header.
+        r#"|o:\d+:""#,
+        // XML external-entity / DOCTYPE declaration (XXE).
+        r"|<!entity|<!doctype",
+    ))
+    .ok()
+});
+
 /// Whether decoded bytes look like a real (SQL-ish) payload rather than random
 /// noise — the gate that keeps blind base64 / hex decoding from emitting a view
 /// for every high-entropy token (plan §7.2, codex A-4).
@@ -184,6 +213,16 @@ fn looks_structural(decoded: &str) -> bool {
     // wrapper around `<script>` / `<svg onload>` / a `javascript:` URL must also
     // surface a BlindDecoded view for the XSS DOM detector to inspect.
     if XSS_STRONG_STRUCTURE.as_ref().is_some_and(|re| re.is_match(&lower)) {
+        return true;
+    }
+    // Tier 2d (F-I): the same strong-structure bar for deserialization + XXE — a
+    // base64 / hex wrapper around a Python pickle GLOBAL opcode, a PHP object header,
+    // a `__reduce__` dunder or an XML `<!ENTITY` / `<!DOCTYPE` must surface a
+    // BlindDecoded view so the deser / XXE detectors can inspect the decoded form.
+    if DESER_XXE_STRONG_STRUCTURE
+        .as_ref()
+        .is_some_and(|re| re.is_match(&lower))
+    {
         return true;
     }
     // Tier 3: weak keyword evidence needs corroboration.
@@ -1744,6 +1783,85 @@ mod tests {
             "benign base64 prose must not surface a blind view: {:?}",
             views.iter().map(|v| v.provenance).collect::<Vec<_>>()
         );
+    }
+
+    // ── F-I: blind gate now surfaces deserialization + XXE payloads ───────────
+
+    #[test]
+    fn blind_gate_passes_base64_wrapped_pickle() {
+        // F-I: base64("cposix\nsystem\n(S'id'\ntR.") — a Python pickle GLOBAL opcode
+        // resolving os.system — must now surface a BlindDecoded view so the deser
+        // detector can inspect it (the SQL/RCE/Traversal/XSS markers never matched it).
+        let payload = STANDARD.encode("cposix\nsystem\n(S'id'\ntR.");
+        let views = body_views(format!("data={payload}").as_bytes());
+        assert!(
+            views
+                .iter()
+                .any(|v| v.provenance == Provenance::BlindDecoded && v.text.contains("system")),
+            "base64-wrapped pickle must surface a BlindDecoded view: {:?}",
+            views
+                .iter()
+                .map(|v| (v.provenance, v.text.as_ref()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn blind_gate_passes_base64_wrapped_php_object() {
+        // F-I: base64 of a PHP serialize() typed-object header must surface a view.
+        let payload = STANDARD.encode(r#"O:8:"Evil":1:{s:3:"cmd";s:2:"id";}"#);
+        let views = body_views(format!("data={payload}").as_bytes());
+        assert!(
+            views
+                .iter()
+                .any(|v| v.provenance == Provenance::BlindDecoded && v.lower_trunc.contains("o:8:")),
+            "base64-wrapped PHP object must surface a BlindDecoded view: {:?}",
+            views
+                .iter()
+                .map(|v| (v.provenance, v.text.as_ref()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn blind_gate_passes_base64_wrapped_xxe() {
+        // F-I: base64 of an XML external-entity declaration must surface a view for
+        // the XXE detector (mirrors the XSS F-2 sibling gate).
+        let payload = STANDARD.encode(r#"<!DOCTYPE r [<!ENTITY x SYSTEM "http://e/x">]>"#);
+        let views = body_views(format!("xml={payload}").as_bytes());
+        assert!(
+            views.iter().any(
+                |v| v.provenance == Provenance::BlindDecoded && v.lower_trunc.contains("<!entity")
+            ),
+            "base64-wrapped XXE must surface a BlindDecoded view: {:?}",
+            views
+                .iter()
+                .map(|v| (v.provenance, v.text.as_ref()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn blind_gate_rejects_benign_base64_with_new_deser_xxe_markers() {
+        // F-I noise control: the new deser/XXE markers must be strong enough that
+        // ordinary base64 data (a JWT, a JSON object with colons) does NOT surface a
+        // blind view — only real pickle/PHP-object/XXE structure does.
+        let benign = [
+            // A normal JWT header/body.
+            "token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9".to_string(),
+            // base64 of a plain JSON object with colon-separated keys/values.
+            format!("body={}", STANDARD.encode(r#"{"user":{"id":42,"role":"member"}}"#)),
+            // base64 of ordinary prose that mentions the words object / system.
+            format!("note={}", STANDARD.encode("the object system reduces boilerplate")),
+        ];
+        for benign in &benign {
+            let views = body_views(benign.as_bytes());
+            assert!(
+                views.iter().all(|v| v.provenance == Provenance::Raw),
+                "benign base64 must not surface a blind view via deser/XXE markers: {:?}",
+                views.iter().map(|v| v.provenance).collect::<Vec<_>>()
+            );
+        }
     }
 
     // ── A-3: shell gate mirrors the default-on RCE rule set (codex A-3) ────────
