@@ -15,9 +15,51 @@
 //! range. Detectors that produced no signal contribute `0 ≤ their max`, so the
 //! bound holds for any subset of firing detectors.
 //!
+//! **ε-slack reconciliation (codex P1a — "epsilon vs clamp口径").** The loader
+//! does not enforce `Σ weight = 1` *exactly*: `WEIGHT_SUM_EPSILON` (`1e-6`)
+//! admits any family whose weights sum to `1 ± 1e-6`
+//! (`waf_common::ContentSecurityConfig::validate`). At the positive boundary the
+//! group score is a *near*-convex combination whose raw `f64` value can reach
+//! `100·(1 + 1e-6) = 100.0001` — i.e. marginally over 100, so the pure
+//! convex-combination argument above is not *literally* airtight. This is a
+//! documentation口径 gap, **not** an output bug: [`clamp_score_to_u8`] is the
+//! load-bearing invariant. Every score that leaves this module (`request_score`
+//! and every `group_u` used for a threshold comparison) passes through that
+//! clamp, which maps any `x ≥ 100.0` to `100`. The two口径 are therefore
+//! consistent — the weight-sum rule keeps the raw score at `≈ 100`, and the
+//! clamp closes the `1e-6` slack so the emitted byte is provably in `0..=100`.
+//! `epsilon_weight_slack_still_clamps_to_100` fixes this invariant.
+//!
 //! Hard-veto is an explicit per-attack allowlist keyed on the **stable
 //! `rule_key`** (never on `detail`), and blind/synthetic/parse-error provenance
 //! is structurally excluded (plan §6.3).
+//!
+//! **`BlindDecoded` aggregation semantics (codex P1c — enforce decision point).**
+//! A `BlindDecoded` signal (base64/hex blind-decode view) is **not** a hard-veto
+//! candidate — `Provenance::hard_veto_capable` excludes it, so it can never
+//! single-signal Block on its own. It **does**, however, participate in the
+//! ordinary weighted sum exactly like any other view: its `weight · confidence`
+//! contribution counts toward the group score, so a `BlindDecoded` hit at high
+//! confidence *can* push a group to (or past) its `log_threshold` /
+//! `block_threshold` and yield a `Block` **recommendation**. The one guard on the
+//! enforce path is `SemanticVerdict::enforce_safe`: a group whose Block is
+//! carried **only** by blind/synthetic views has `has_capable == false`, so
+//! `enforce_safe` is `false` and the enforce dispatch downgrades that Block to a
+//! shadow `Log` (E0 / A2). Net current semantics: `BlindDecoded` **can** raise a
+//! `Block` *recommendation* through the weighted threshold but **cannot** cause an
+//! *enforced* block unless some directly-observable (`Raw`/`UrlDecoded`/…) view in
+//! the same group corroborates it.
+//!
+//! **Enforce-time decision point (do NOT change here — shadow behaviour frozen).**
+//! Before enforcement is switched on, revisit whether `BlindDecoded` should carry
+//! its full detector weight in the aggregate. Options on the table: (a) keep
+//! today's behaviour — full weight, gated solely by `enforce_safe`; (b) apply a
+//! per-provenance down-weight or ceiling so a blind-only view contributes a capped
+//! fraction; (c) require ≥2 corroborating views before a blind contribution counts
+//! toward `block_threshold`. This module intentionally implements (a) today; the
+//! choice is an enforcement-tuning decision, not a scoring bug, and must be made
+//! with holdout calibration data — not silently here. Fixed by
+//! `blind_decoded_participates_in_weighted_threshold_but_not_enforce_safe`.
 //!
 //! **Primary/`request_score` contract (codex A-1).** `request_score` is the max
 //! group score and is computed independently of the primary family. The
@@ -969,6 +1011,111 @@ mod tests {
             seen,
             std::collections::HashSet::from([Some("sql.union_null".to_string())]),
             "equal-contribution group best must be the deterministic (detector_ord) winner: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn epsilon_weight_slack_still_clamps_to_100() {
+        // codex P1a ("epsilon vs clamp口径"): the loader tolerates a weight sum of
+        // 1 ± WEIGHT_SUM_EPSILON (1e-6). At the positive boundary the raw group
+        // score with both detectors at confidence 100 is 100·(1 + 1e-6) =
+        // 100.0001 — marginally over 100 — so the convex-combination bound is not
+        // literally airtight. The load-bearing invariant is `clamp_score_to_u8`:
+        // the emitted `request_score` must still be exactly 100, never 101, never a
+        // wrap/panic. This test fixes that口径 reconciliation.
+        const EPS: f64 = 1e-6;
+        let mut weights = HashMap::new();
+        // Sum = 0.6 + (0.4 + 1e-6) = 1 + 1e-6, the max a validated config admits.
+        weights.insert(DetectorId::StructRule, 0.6);
+        weights.insert(DetectorId::Ast, 0.4 + EPS);
+        let mut attacks = HashMap::new();
+        attacks.insert(
+            AttackKind::SqlInjection,
+            RuntimeAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: HashSet::new(),
+            },
+        );
+        let cfg = RuntimeScoringConfig { attacks };
+        let signals = [
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::StructRule,
+                "body",
+                100,
+                "sql.union_null",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::SqlInjection,
+                DetectorId::Ast,
+                "body",
+                100,
+                "sql.tautology",
+                Provenance::Raw,
+            ),
+        ];
+        let v = score(&signals, &cfg, false);
+        // Raw score 100.0001 → clamp maps ≥ 100.0 to exactly 100.
+        assert_eq!(
+            v.request_score, 100,
+            "an epsilon-over weight sum must still clamp to 100, never overflow the byte"
+        );
+        assert_eq!(v.recommendation, SemanticAction::Block);
+    }
+
+    #[test]
+    fn blind_decoded_participates_in_weighted_threshold_but_not_enforce_safe() {
+        // codex P1c (BlindDecoded aggregation semantics — enforce decision point).
+        // Documents + fixes today's behaviour: a BlindDecoded signal is NOT a
+        // hard-veto candidate, yet it DOES count toward the ordinary weighted
+        // threshold. A lone single-detector (weight 1.0) BlindDecoded hit at conf
+        // 92 crosses the Block bar → Block *recommendation*, but the Block is
+        // carried solely by a blind view → `enforce_safe == false`, so at enforce
+        // time it is downgraded to shadow Log.
+        let cfg = three_family_cfg(); // rce weight 1.0, block_threshold 80
+        let blind_over = [sig(
+            AttackKind::Rce,
+            DetectorId::Rce,
+            "body",
+            92,
+            "rce.reverse_shell",
+            Provenance::BlindDecoded,
+        )];
+        let v = score(&blind_over, &cfg, false);
+        assert_eq!(
+            v.request_score, 92,
+            "BlindDecoded contributes its full weighted share to the aggregate"
+        );
+        assert_eq!(
+            v.recommendation,
+            SemanticAction::Block,
+            "a BlindDecoded hit past block_threshold yields a Block RECOMMENDATION"
+        );
+        assert!(
+            !v.enforce_safe,
+            "but a blind-only Block is not enforce-safe — enforce path downgrades it"
+        );
+
+        // Below the threshold the blind contribution produces no recommendation at
+        // all (it is plain weighted scoring, not a veto floor).
+        let blind_under = [sig(
+            AttackKind::Rce,
+            DetectorId::Rce,
+            "body",
+            30,
+            "rce.reverse_shell",
+            Provenance::BlindDecoded,
+        )];
+        let v = score(&blind_under, &cfg, false);
+        assert_eq!(v.request_score, 30, "weighted contribution 1.0 × 30 = 30");
+        assert_eq!(
+            v.recommendation,
+            SemanticAction::None,
+            "30 < log_threshold 40 → no recommendation; BlindDecoded is not a veto floor"
         );
     }
 

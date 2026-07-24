@@ -455,6 +455,66 @@ mod tests {
     }
 
     #[test]
+    fn accepts_weight_sum_within_positive_epsilon_boundary() {
+        // codex P1a ("epsilon vs clamp口径"): the tolerance is INCLUSIVE at
+        // 1 + WEIGHT_SUM_EPSILON. This fixes the exact slack the scorer's
+        // `epsilon_weight_slack_still_clamps_to_100` test relies on: a config
+        // summing to 1 + 1e-6 must validate (and the scorer's final clamp then
+        // absorbs the resulting 100.0001 raw score).
+        let mut weights = BTreeMap::new();
+        weights.insert("struct_rule".to_string(), 0.6);
+        weights.insert("ast".to_string(), 0.4 + WEIGHT_SUM_EPSILON); // sum = 1 + 1e-6
+        let mut attacks = BTreeMap::new();
+        attacks.insert(
+            "sql_injection".to_string(),
+            SemanticAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: Vec::new(),
+            },
+        );
+        let cfg = ContentSecurityConfig {
+            enabled: true,
+            attacks,
+            ..ContentSecurityConfig::default()
+        };
+        cfg.validate()
+            .expect("a weight sum at the +epsilon boundary (1 + 1e-6) must be accepted");
+    }
+
+    #[test]
+    fn rejects_weight_sum_beyond_epsilon_boundary() {
+        // Just past the tolerance (1 + 1e-5) must be rejected — the boundary is
+        // tight, so the raw score can never exceed 100 by more than the ~1e-4 the
+        // clamp is documented to absorb.
+        let mut weights = BTreeMap::new();
+        weights.insert("struct_rule".to_string(), 0.6);
+        weights.insert("ast".to_string(), 0.4 + 1e-5); // sum = 1 + 1e-5, > epsilon
+        let mut attacks = BTreeMap::new();
+        attacks.insert(
+            "sql_injection".to_string(),
+            SemanticAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: Vec::new(),
+            },
+        );
+        let cfg = ContentSecurityConfig {
+            enabled: true,
+            attacks,
+            ..ContentSecurityConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("a weight sum beyond the epsilon boundary must be rejected");
+        assert!(err.contains("sum to 1.0"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn rejects_empty_enabled_family() {
         let mut attacks = BTreeMap::new();
         attacks.insert(
