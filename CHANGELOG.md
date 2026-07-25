@@ -11,6 +11,317 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.2.31] — 2026-07-25
+
+This release finishes the retention rollout (all nine accumulating tables
+now covered), closes further CRS/regex decoding gaps, rewrites Lane 1's
+structural shell-injection judgment (false positives on ordinary traffic
+drop sharply), and fixes a licensing gap. It does **not** contain the
+cluster or notification changes below — those already shipped in 0.2.29
+and 0.2.30; see those sections if you are jumping straight to 0.2.31 from
+an older release.
+
+### Security
+
+- **Regex-based CRS rules bypassed via encoding.** 308 of 352 shipped CRS
+  operators are regex, and regex was matched against the raw, undecoded
+  request while only `@pm`/SQLi/XSS operators saw decoded input.
+  `${jndi:` written as `%24%7Bjndi%3A`, a double-encoded payload, and an
+  encoded `php://` wrapper all passed the entire regex ruleset before this
+  fix; confirmed 200 → 403 against a running proxy for all three. Decoding
+  is now chosen per request surface to match how the origin parses it —
+  path, query, body and cookies decode; headers, User-Agent and Referer
+  intentionally do not (decoding those introduces its own false
+  positives, e.g. a Referer carrying a literal `%5B0%5D`).
+- **Chained CRS rules only evaluated their first condition.** 18 shipped
+  rules are chains upstream (a match followed by further conditions on
+  the same value or a capture group); the converter kept only the head,
+  so every one was looser than intended — `CRS-944110` reduced to "any
+  log line mentioning the Java runtime", `CRS-931130` to "any parameter
+  holding `scheme://`" (i.e. any OAuth `redirect_uri`). Chains are now
+  evaluated in full; a condition the engine cannot express rejects the
+  whole rule by name instead of running a weakened head.
+- **CRS transformation (`t:`) directives were parsed and discarded.**
+  Rules were evaluated against an approximated surface instead of the
+  form they actually target, causing both false negatives (`t:lowercase`
+  never applied, so a real `InvokerTransformer` went undetected on 46
+  rules while its lowercase spelling did not) and false positives
+  (`CRS-920230`, which expects a double-decoded value, instead fired on
+  plain `q=100%25`). Rules now apply their declared transformation chain,
+  in order, before matching; an unsupported transformation is rejected by
+  name at load time rather than silently approximated.
+- **Shell-injection detection missed common obfuscation.** Lane 1 (the
+  regex/structural checkers) matched injected command chains as literal
+  text, so brace expansion (`cat /etc/{passwd,shadow}`) and ANSI-C
+  quoting (`$'\x63\x61\x74'`, `${!x}`) were invisible to all three
+  detection layers. These are now expanded/decoded the way a shell would
+  before matching (brace expansion bounded to 16 results, compared
+  against the same sensitive-path list as before — the match surface does
+  not widen). A new structural rule also catches bare command-separator
+  chains (`;`, `&&`, `|` followed by a lowercase executor with arguments)
+  that keyword lists missed; a single match of this rule alone cannot
+  trigger a block (weighted at exactly half of the block threshold).
+
+### Changed (breaking / behavior)
+
+- **`LICENSE` renamed to `LICENSE-APACHE`; `LICENSE-MIT` added.** The
+  crate has advertised `MIT OR Apache-2.0` since the first release but
+  the repository only ever shipped the Apache text under a bare
+  `LICENSE`. Any tooling or automation that reads the license by the
+  literal path `LICENSE` will break — update references to
+  `LICENSE-APACHE` (or `LICENSE-MIT`, now present for the first time).
+- **Lane 1 structural checkers rewritten to judge shape, not vocabulary
+  — false-positive rate on ordinary traffic drops sharply.** A live-proxy
+  probe of 60 ordinary business requests found 35 answered with 403
+  before this release: `TRAV-007` blocked any absolute path containing a
+  common directory name (so a site serving `/home` or
+  `/dev/api/v1/status` blocked its own routes), and `RCE-001` treated any
+  separator next to a case-insensitive word from its list as command
+  injection — flagging `name | id | email` field lists, markdown inline
+  code, `$(document).ready()`, book titles containing "JavaScript", and
+  ordinary curl examples in documentation. The same 60-request probe now
+  returns 1 false positive. Detection did not get weaker: `?id=1; DROP
+  TABLE users--`, previously missed entirely, is now caught, and a
+  50-probe attack corpus has zero misses. **If anything downstream was
+  written to tolerate or work around the old over-blocking behavior of
+  Lane 1, that workaround is no longer needed and that traffic now passes
+  through as normal.**
+- **Retention pruning now covers all nine accumulating tables** (up from
+  five as of 0.2.30): `crowdsec_decisions`, `refresh_tokens`,
+  `notification_log` and `request_stats` are newly covered. Each keys on
+  the column that reflects when the row actually stopped mattering
+  (`expires_at` for decisions/tokens, `period_start` for stats); a
+  revoked refresh token is deleted immediately regardless of its window,
+  and a decision with no known expiry is left untouched rather than
+  guessed at. As with the tables added in earlier releases, defaults are
+  configurable under `[storage]` and `0` retains a table's history
+  indefinitely.
+- CRS rules now carry their declared surface's transformation and
+  decoding behavior; the total number of rules the engine can enforce is
+  unchanged by this release (still 215 of 328, see 0.2.30), but which
+  specific traffic those 215 rules match against has changed per the
+  Security entries above — expect some previously-passing encoded or
+  obfuscated payloads to now be caught, and some previously-blocked
+  plain-text lookalikes to now pass.
+
+### Fixed
+
+- CI's database-dependent `waf-storage` test suites (retention,
+  observation round-trip, INET address handling) are now actually
+  executed against a real Postgres instance in CI. They previously
+  existed only as `#[ignore]`d tests that no CI job invoked — including
+  the retention logic shipped across 0.2.29–0.2.31, which had never run
+  anywhere but a developer's machine before this fix.
+
+### Performance
+
+- Encoded-traffic detection got cheaper after the transformation-chain
+  fix above, since a request is now matched against exactly one derived
+  form instead of approximated across three: five-layer-encoded input
+  drops from 3.27ms to 0.37ms. Plain-text requests cost about 11% more,
+  reflecting the lowercasing/command-line-folding work that was
+  previously being skipped rather than performed.
+- The brace-expansion/quoting decode step for shell-injection detection
+  is a word-at-a-time scan (a naive byte-by-byte scan cost 125µs on a
+  2 KB query, judged too expensive); plain-text cost from this change was
+  not separately measured but is reported as not measurable in the
+  20-benign-probe verification run.
+
+---
+
+## [0.2.30] — 2026-07-25
+
+### Security
+
+- **Cluster election forgery.** Any node holding a valid cluster
+  certificate could broadcast a fabricated, unsigned election result
+  (`term: u64::MAX`, itself as winner, no real votes) and be accepted as
+  the cluster main — whatever it then pushed (rules, configuration)
+  passed the existing "is this the main" gate, letting one compromised
+  worker rewrite the WAF policy of the entire cluster. A result is now
+  accepted only if the receiving node itself voted for the winner in
+  that exact term, the winner is a declared member, and the provable
+  votes reach a real majority; an unverifiable-but-plausible claim can
+  make an incumbent main step down without adopting the claimant's term
+  (a re-join loop then recovers the legitimate main), but can never grant
+  authority outright. Terms can no longer be pinned at `u64::MAX`
+  (advances are capped at 1024 per message), non-main nodes can no
+  longer answer join requests with a CA key, and node certificates now
+  declare key usage and EKU. **Breaking:** join tokens now carry a format
+  version, and tokens minted before this release (v1) are rejected
+  outright with "unsupported join token version" — **re-issue join
+  tokens for any node you plan to add to a cluster after upgrading.**
+  New tokens also carry a per-token nonce with server-side replay
+  tracking and can be bound to a specific node id. A minority-split
+  forgery against nodes that genuinely voted for the attacker is still
+  possible; closing that needs signed quorum certificates and is not
+  done in this release.
+- **CRS `Field::All` header over-matching.** 170 CRS rules were scoped to
+  scan every request header (`Field::All`) because the rule converter
+  fell back to that whenever it could not map an upstream variable, even
+  though only 22 of those rules actually target `REQUEST_HEADERS`. A
+  live-proxy probe found 9 of 11 ordinary requests blocked at paranoia
+  level 1 as a result — `CRS-941130` fires on the word "xhtml", which
+  every browser sends via `Accept: application/xhtml+xml`; `CRS-933150`
+  fires on the PHP function name `urlencode`, which every form POST
+  sends via `Content-Type: application/x-www-form-urlencoded`. A browser
+  could not load a page through this WAF with `owasp_set` enabled. Rules
+  are now scoped per-rule against upstream CRS v4.25.0 (no rule gained a
+  surface it did not already have); 8 rules whose upstream variable the
+  engine cannot reach at all (upload filenames, multipart part headers, a
+  header-count test, two chained capture comparisons) are now rejected by
+  name instead of scanning everything, and the converter no longer falls
+  back to `Field::All` for an unmapped variable. Verified against a
+  running proxy: false positives 9 → 0, all 13 attack probes still
+  blocked. **Enforceable CRS rules move from 224 to 215 of 328** as a
+  result of this fix (113 rules are now explicitly rejected at load and
+  named individually in a startup `WARN`, versus the previous silent
+  mismatch).
+
+### Changed (breaking / behavior)
+
+- **Retention pruning extended from one table to five.** Added
+  `security_events`, `attack_logs`, `audit_log`, and `crowdsec_events` —
+  none of which previously had any pruning caller, so a default
+  deployment retained every client IP address indefinitely. Default
+  windows: 90 days for the attack-telemetry pair (kept in sync, since
+  they're two views of the same incident), 365 days for the audit trail,
+  30 days for the CrowdSec echo (its authoritative copy lives in the
+  LAPI). Configurable under `[storage]`; deletes run in bounded batches
+  against the `created_at` index so a large existing backlog does not
+  hold the database for minutes on first run. Four more tables were
+  covered in 0.2.31 (see that section) and one more (`semantic_observations`)
+  already had its own pruner as of 0.2.29.
+
+---
+
+## [0.2.29] — 2026-07-25
+
+### Added
+
+- Tag-triggered release pipeline: builds the Admin UI, gates on
+  fmt/clippy/test, cross-builds for x86_64 and aarch64, and publishes
+  signed release tarballs with a CycloneDX SBOM and SLSA build
+  provenance (cosign keyless signing via GitHub OIDC — no long-lived
+  signing key is stored in the repository).
+- `SECURITY.md` disclosure channel and response timeline (previously the
+  project had none), plus OpenSSF Scorecard and Dependabot workflows.
+- `CHANGELOG.md` entries reconstructed for 0.2.1 through 0.2.28; every
+  prior release had been folded into a single "Unreleased" section with
+  no per-version notes for the new release pipeline to extract from.
+
+### Security
+
+- **Three request-parsing bypasses of the detection pipeline:**
+  - Repeated headers were flattened with last-value-wins, so only the
+    final value of a duplicated header name reached the detectors.
+    Header values are now folded the way the origin reassembles them,
+    bounded at 64 values and 32 KiB per name; a request that exceeds
+    that bound, or carries a duplicate `Host` header, is now refused
+    rather than silently truncated. `X-Forwarded-For` is now read across
+    every occurrence of the header instead of only the last one.
+  - A payload split across two `Cookie` header lines was scanned as if
+    only the second line existed, while the origin reassembles both per
+    RFC 6265.
+  - URL whitelist matching decoded the path once and never normalized
+    dot segments, so `/static/..%2f..%2f..%2fetc/passwd` matched a
+    `/static` whitelist prefix and skipped every detection phase. Paths
+    are now decoded to a fixed point and normalized per RFC 3986; a path
+    whose structure changes under decoding no longer qualifies as
+    whitelist-eligible at all. **Breaking:** whitelisting a URL no longer
+    skips CrowdSec, the community blocklist, GeoIP, or rate limiting —
+    only WAF rule matching is skipped for a whitelisted path. Previously
+    all four checks were bypassed, which made any whitelisted prefix a
+    free denial-of-service channel; deployments that whitelisted a path
+    expecting it to also skip rate limiting will now see that path rate
+    limited.
+- **Body inspection changed from a partial preview to full windowed
+  inspection.** Bodies were previously inspected for their first 64 KiB
+  only, with the remainder forwarded unread — 64 KiB of filler could hide
+  an attack payload placed after it. Bodies are now inspected in
+  overlapping windows across their full length, with bytes withheld from
+  the origin until their window is confirmed clean. **Breaking:** by
+  default, a body larger than 10 MiB is now rejected with `413` rather
+  than let through uninspected; configurable via
+  `PRXWAF_BODY_INSPECT_MAX_BYTES` (byte ceiling, `0` = unlimited) and
+  `PRXWAF_BODY_INSPECT_OVERFLOW` (`reject`, the default, or `log`).
+  **Deployments that accept uploads larger than 10 MiB must review this
+  setting before upgrading**, or those uploads will start being
+  rejected.
+- Lane 2 (the semantic engine) could be switched off by an attacker via
+  two counters under their control: a degraded request zeroed its whole
+  verdict instead of abstaining only on the unchecked part, and token
+  normalization split on whitespace before truncating to 64 bytes — which
+  does nothing for headers, query strings or cookies (no whitespace), so
+  the entire value was one token and only its first 64 bytes were ever
+  seen. Header-scope views now use an 8 KiB per-token / 32 KiB per-view
+  ceiling; body scope keeps its 64-byte cap. A degraded request now
+  abstains on the unchecked part rather than discarding signals Lane 1
+  already observed.
+- **Notification channel credentials were stored and served in
+  plaintext.** SMTP passwords, webhook secrets and Telegram bot tokens
+  were stored as plaintext in `config_json`, and `list_notifications`
+  returned the column verbatim to any authenticated user. A Telegram
+  transport failure was worse than the column itself: the rendered
+  request URL (containing `bot<TOKEN>`) was logged to `notification_log`
+  and shown in the Admin UI. Credentials are now encrypted at rest with
+  the same master-key path CrowdSec uses; API responses carry a
+  `password_set` boolean instead of the value, and transport failures
+  report a category only. Existing plaintext rows are upgraded
+  transparently on next save. **Breaking:** both notification routes
+  move from the `readonly` role group to `admin` — a `user`-role token
+  that previously had read access to notification configuration now
+  gets `403`.
+- `waf-api` error handlers in the tunnels, CrowdSec, security, and
+  notifications routes previously returned raw `e.to_string()` values,
+  which for SQL errors exposed table/column/constraint names and for
+  CrowdSec exposed the internal LAPI address. These now go through
+  `ApiError`; input-validation error text is unaffected.
+- Of 328 shipped CRS (OWASP Core Rule Set) rules, only 248 could ever
+  match — rules naming a field with no accessor, or using an unsupported
+  operator, compiled successfully and were counted as active but every
+  match arm tested them with `is_some_and`, so they were permanently
+  false and mostly logged nothing. Unsupported fields/operators are now
+  rejected explicitly at load with a startup warning naming the rule and
+  the reason; three new operators (`pm_from_file`, `contains_any`,
+  `equals`) and five new fields were also implemented, taking active
+  rules to 279 (re-scoped down in later releases as further gaps were
+  found — see 0.2.30 and 0.2.31 for the current count).
+- 54 `RESPONSE-95x` CRS rules across six rule files, plus `CRS-950100`,
+  were tagged with the wrong field (`field: body` / `field: all`) so
+  patterns meant to catch error text leaking out of an origin server
+  instead ran against incoming request data — a request body starting
+  with a shebang, the text "we call SQLBindCol here", or posting
+  `<title>Tiny File Manager</title>` were all blocked at paranoia level
+  1, and any request whose body was 500–599 bytes was blocked outright
+  by `CRS-950100`. These 55 rules are now correctly scoped to
+  `response_body`/`response_status`, which the engine does not yet
+  evaluate — they are rejected at load with a startup warning rather
+  than misfiring. Active CRS rules go from 279 to 224 (further re-scoped
+  in 0.2.30 — see that section for the number that ships). The root
+  cause was in the rule converter, which mapped any unrecognized
+  ModSecurity variable to the widest possible scan; the missing
+  variables are mapped explicitly now.
+- The startup log claiming Lane 2 enforcement "would be treated as
+  log_only" was stale — it no longer reflected the enforce-block code
+  path that had already landed, so an operator turning enforcement on
+  could be told they were still in shadow mode while requests could
+  already be answered with `403`. Startup now reports the resolved
+  per-family mode, the canary and circuit-breaker gates, and a verdict
+  line stating whether the process can block and what is preventing it.
+  Semantic observations gained a retention pruner (default 30 days,
+  configurable, `0` retains indefinitely) — the table previously had no
+  cleanup caller and grew without bound.
+
+### Fixed
+
+- The build-status badge in `README.md` was a static "build passing"
+  image that stayed green through 40 consecutive failing CI runs. It now
+  points at the real GitHub Actions workflow status, plus a badge for
+  the new security-audit workflow.
+
+---
+
 ## [0.2.28] — 2026-07-25
 
 ### Fixed
