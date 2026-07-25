@@ -1,0 +1,3 @@
+SecDefaultAction "phase:2,log,auditlog,pass"
+SecComponentSignature "OWASP_CRS/4.0.0"
+SecMarker END-REQUEST

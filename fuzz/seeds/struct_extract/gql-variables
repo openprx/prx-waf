@@ -1,0 +1,1 @@
+query($n:String="' OR 1=1--"){u(name:$n){id}}

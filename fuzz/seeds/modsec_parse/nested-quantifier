@@ -1,0 +1,1 @@
+SecRule ARGS "@rx (a+)+$" "id:1010,deny"

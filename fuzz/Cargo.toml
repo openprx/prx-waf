@@ -1,0 +1,87 @@
+[package]
+name = "prx-waf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# IMPORTANT: this empty table makes `fuzz/` its own workspace root, so the
+# fuzz crate is invisible to the parent workspace. `cargo check` / `cargo
+# clippy --workspace` / `cargo test --workspace` at the repository root
+# therefore never see it, and the nightly-only `libfuzzer-sys` dependency
+# cannot break the stable self-check gates.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+http = "1"
+
+waf-common = { path = "../crates/waf-common" }
+waf-engine = { path = "../crates/waf-engine" }
+gateway = { path = "../crates/gateway" }
+
+[lib]
+name = "prx_waf_fuzz"
+path = "src/lib.rs"
+test = false
+doctest = false
+bench = false
+
+# Keep symbols/line tables so a crash report points at a real frame, but stay
+# optimised so the fuzzer actually reaches interesting states.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "preprocess_header"
+path = "fuzz_targets/preprocess_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "struct_extract"
+path = "fuzz_targets/struct_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "content_security"
+path = "fuzz_targets/content_security.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "owasp_crs"
+path = "fuzz_targets/owasp_crs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "modsec_parse"
+path = "fuzz_targets/modsec_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smuggling_headers"
+path = "fuzz_targets/smuggling_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url_validator"
+path = "fuzz_targets/url_validator.rs"
+test = false
+doc = false
+bench = false

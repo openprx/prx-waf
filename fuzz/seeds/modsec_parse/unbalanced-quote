@@ -1,0 +1,1 @@
+SecRule ARGS "@rx "unclosed "id:1009,deny"

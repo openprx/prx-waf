@@ -1,0 +1,11 @@
+# cargo-fuzz build output and run state.
+target/
+coverage/
+artifacts/
+Cargo.lock
+
+# The WORKING corpus libFuzzer grows during a run. It is throwaway (tens of
+# thousands of files after a soak) and must never enter the repository.
+# The curated, hand-reviewed inputs live in `seeds/` and ARE tracked — see
+# fuzz/README.md for why the two are separate directories.
+corpus/

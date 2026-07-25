@@ -1,0 +1,2 @@
+# This is a comment
+SecRule REQUEST_URI "@rx /test" "id:1003,deny"

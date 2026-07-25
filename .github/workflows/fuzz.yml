@@ -1,0 +1,188 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "fuzz/**"
+      - "crates/waf-engine/src/checks/content_security/**"
+      - "crates/waf-engine/src/checks/owasp.rs"
+      - "crates/waf-engine/src/rules/formats/**"
+      - "crates/gateway/src/smuggling.rs"
+      - "crates/waf-common/src/url_validator.rs"
+      - ".github/workflows/fuzz.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "fuzz/**"
+      - "crates/waf-engine/src/checks/content_security/**"
+      - "crates/waf-engine/src/checks/owasp.rs"
+      - "crates/waf-engine/src/rules/formats/**"
+      - "crates/gateway/src/smuggling.rs"
+      - "crates/waf-common/src/url_validator.rs"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    # Mondays 04:00 UTC — before the 06:00 sec-audit slot so the two long jobs
+    # do not contend for runners.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds to fuzz each target"
+        required: false
+        default: "600"
+
+concurrency:
+  group: fuzz-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Read-only: this workflow never writes to the repository. Crash reproducers
+# leave as build artifacts, not commits, because a committed reproducer for an
+# unfixed parser bug is a published exploit.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    # Regression mode on every PR/push (short, seeded); soak mode on the weekly
+    # cron and on manual dispatch.
+    name: ${{ github.event_name == 'schedule' && 'Soak' || 'Regression' }} — ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    # 30 min ceiling covers the longest soak (1800s of fuzzing) plus the build.
+    timeout-minutes: 60
+    env:
+      # cargo-fuzz shells out to `cargo build` with `-Zsanitizer=address`, which
+      # stable rejects. Pinning the toolchain here rather than relying on the
+      # installer having made nightly the default keeps the job working even if
+      # a future step installs a stable toolchain alongside it.
+      RUSTUP_TOOLCHAIN: nightly
+    strategy:
+      # One target's crash must not cancel the others — we want the full picture
+      # in a single run, not the first failure.
+      fail-fast: false
+      matrix:
+        target:
+          - preprocess_header
+          - struct_extract
+          - content_security
+          - owasp_crs
+          - modsec_parse
+          - smuggling_headers
+          - url_validator
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # cargo-fuzz needs nightly for -Z sanitizer / -C instrument-coverage.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      # `fuzz/` is its own workspace (see fuzz/Cargo.toml), so it needs its own
+      # cache key; sharing the root workspace's cache would thrash both.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: fuzz-${{ matrix.target }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version ^0.13
+
+      - name: Determine run length
+        id: budget
+        env:
+          EVENT: ${{ github.event_name }}
+          DISPATCH_SECONDS: ${{ github.event.inputs.seconds }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            schedule)          seconds=1800 ;;
+            workflow_dispatch) seconds="${DISPATCH_SECONDS:-600}" ;;
+            *)                 seconds=60 ;;
+          esac
+          # Reject a non-numeric or absurd dispatch input rather than feeding it
+          # straight to libFuzzer.
+          case "$seconds" in
+            ''|*[!0-9]*) echo "::error::seconds must be a positive integer"; exit 1 ;;
+          esac
+          if [ "$seconds" -gt 3000 ]; then
+            echo "::error::seconds must be <= 3000 to stay inside the job timeout"
+            exit 1
+          fi
+          echo "seconds=$seconds" >> "$GITHUB_OUTPUT"
+
+      # Corpus arguments: libFuzzer writes new units only into the FIRST
+      # directory, so `corpus/` is the throwaway working set and `seeds/` is
+      # mounted read-only alongside it. That keeps the committed seeds curated.
+      #
+      # Flags worth their salt here:
+      #   -timeout=25     a stalled input (catastrophic regex backtracking,
+      #                   exponential expansion) becomes a reportable hang
+      #                   instead of a silent job timeout. This is the primary
+      #                   finding mode for owasp_crs.
+      #   -rss_limit_mb   runaway allocation becomes a reportable OOM.
+      #   -max_len=8192   the depth guards under test sit at 64 nested levels
+      #                   and 256 raw brackets. With libFuzzer's default length
+      #                   ramp a short run never generates an input long enough
+      #                   to reach them, so the guards would go untested.
+      #   -len_control=0  disables that ramp, for the same reason.
+      #   -dict           where a dictionary exists, it is what lets the mutator
+      #                   assemble nested/structured documents at all.
+      #
+      # `working-directory: fuzz` is load-bearing: cargo-fuzz resolves
+      # `-artifact_prefix` to an absolute path but passes the corpus directories
+      # through to libFuzzer verbatim, so they are relative to the invocation
+      # directory. Running this from the repository root fails with
+      # `The required directory "corpus/<target>" does not exist`.
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          SECONDS_BUDGET: ${{ steps.budget.outputs.seconds }}
+          # owasp_crs loads the real CRS rule set; resolve it from the checkout
+          # rather than relative to the fuzz working directory.
+          PRX_WAF_FUZZ_RULES_DIR: ${{ github.workspace }}/rules/owasp-crs
+        run: |
+          set -euo pipefail
+          mkdir -p "corpus/${TARGET}"
+          dict_arg=()
+          if [ -f "dictionaries/${TARGET}.dict" ]; then
+            dict_arg=("-dict=dictionaries/${TARGET}.dict")
+          fi
+          cargo fuzz run "${TARGET}" \
+            "corpus/${TARGET}" "seeds/${TARGET}" \
+            -- \
+            "${dict_arg[@]}" \
+            -max_total_time="$SECONDS_BUDGET" \
+            -max_len=8192 \
+            -len_control=0 \
+            -timeout=25 \
+            -rss_limit_mb=4096 \
+            -print_final_stats=1
+
+      # Only runs when the step above failed, i.e. libFuzzer wrote a reproducer.
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # The corpus the soak grew is worth keeping: it is the starting point for
+      # the next soak and for a local repro session. Not committed — it is tens
+      # of thousands of files, and `seeds/` is the curated set instead.
+      - name: Upload grown corpus
+        if: github.event_name == 'schedule' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/corpus/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 14

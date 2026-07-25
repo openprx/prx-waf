@@ -1,0 +1,1 @@
+query { ...F } fragment F on T { a b c }

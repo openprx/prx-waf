@@ -1,0 +1,1 @@
+SecRule REQUEST_URI "@rx /admin" "id:1001,phase:1,deny,status:403,msg:'Admin blocked'"

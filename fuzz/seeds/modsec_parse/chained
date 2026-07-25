@@ -1,0 +1,2 @@
+SecRule REQUEST_METHOD "@streq POST" "id:1006,chain,deny"
+    SecRule REQUEST_HEADERS:Content-Type "!@rx ^application/json" "t:lowercase"
