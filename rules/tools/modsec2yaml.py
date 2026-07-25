@@ -95,6 +95,12 @@ ENGINE_FIELDS = {
     "path_raw",
     "query",
     "body",
+    "args",
+    "args_get",
+    "args_post",
+    "args_names",
+    "args_get_names",
+    "args_post_names",
     "content_length",
     "content_type",
     "header_content_type",
@@ -104,6 +110,7 @@ ENGINE_FIELDS = {
     "query_arg_count",
     "headers",
     "cookies",
+    "cookies_names",
     "header_referer",
     "header_host",
     "header_range",
@@ -114,7 +121,33 @@ UNMAPPED_PREFIX = "unmapped_"
 # Request surfaces an engine field reads.  Mirrors `Surfaces` in
 # crates/waf-engine/src/checks/owasp.rs; the order below is the canonical order
 # surface names appear in a composite field name.
-SURFACE_ORDER = ["path", "path_raw", "query", "body", "cookies", "headers", "user_agent", "referer"]
+#
+# `args_*` and `cookies*` are *collection member* surfaces: the engine runs the
+# rule once per parameter / per cookie.  `query` and `body` are *whole* surfaces
+# — one string covering everything — and back only the ModSecurity variables
+# that really are one string (`QUERY_STRING`, `REQUEST_BODY`, `XML:/*`).
+SURFACE_ORDER = [
+    "path",
+    "path_raw",
+    "query",
+    "args_get",
+    "args_post",
+    "args_get_names",
+    "args_post_names",
+    "body",
+    "cookies",
+    "cookies_names",
+    "headers",
+    "user_agent",
+    "referer",
+]
+
+# Atomic surface sets that collapse into one aggregate name, so there is exactly
+# one spelling per meaning.  Mirrors `Surfaces::NAMED` in owasp.rs.
+SURFACE_AGGREGATES = [
+    (frozenset({"args_get", "args_post"}), "args"),
+    (frozenset({"args_get_names", "args_post_names"}), "args_names"),
+]
 
 # `headers` here means "every header value"; a field naming one specific header
 # contributes only that header's surface.  Scalar/derived fields (`method`,
@@ -124,7 +157,14 @@ FIELD_SURFACES = {
     "path_raw":          ("path_raw",),
     "query":             ("query",),
     "body":              ("body",),
+    "args":              ("args_get", "args_post"),
+    "args_get":          ("args_get",),
+    "args_post":         ("args_post",),
+    "args_names":        ("args_get_names", "args_post_names"),
+    "args_get_names":    ("args_get_names",),
+    "args_post_names":   ("args_post_names",),
     "cookies":           ("cookies",),
+    "cookies_names":     ("cookies_names",),
     "headers":           ("headers",),
     "user_agent":        ("user_agent",),
     "header_user_agent": ("user_agent",),
@@ -135,30 +175,43 @@ FIELD_SURFACES = {
 # single label.
 FIELD_SURFACE = {field: surfaces[0] for field, surfaces in FIELD_SURFACES.items()}
 
-# `ModSecurity` ARGS spans the query string *and* the parsed request body, and
-# the engine approximates the body half with the raw body preview: without it,
-# every argument rule could be bypassed by moving the payload into a POST body.
+# `XML:/*` selects nodes of a body parsed as XML.  The engine has no XML node
+# accessor, so the variable is approximated by the whole-`body` surface — which
+# is wider than upstream for every body that is not XML.
 #
-# The approximation is not extended to rules whose variable list is *only* the
-# ARGS family.  CRS calls those out in their own names — "Restricted SQL
-# Character Anomaly Detection (args)" — because they describe one parameter
-# value, and the engine has no parameter splitter: it hands the rule the whole
-# `a=1&b=2` string.  CRS-942430 fires on twelve special characters, which any
-# JSON body clears trivially.  Those rules keep the single surface they already
-# had; widening them would trade one class of false positive for two.
+# The approximation is withheld from rules whose variable list is *only* the
+# ARGS family (`ARGS|ARGS_NAMES|XML:/*`).  CRS calls those out in their own
+# names — "Restricted SQL Character Anomaly Detection (args)" — because they
+# describe one parameter value, and a whole JSON body trivially clears
+# CRS-942430's "twelve special characters" bar.  Those rules keep the parameter
+# members they asked for; widening them to the raw body would trade one class of
+# false positive for two.  A list that also names cookies or headers already
+# scans several surfaces at once, so the body approximation stays there.
 ARGS_FAMILY_PREFIXES = ("ARGS", "QUERY_STRING", "XML:")
 
 
 def _surface_field(surfaces) -> str:
     """Canonical field name for a set of surfaces."""
-    ordered = [s for s in SURFACE_ORDER if s in surfaces]
-    if not ordered:
+    remaining = set(surfaces)
+    if not remaining:
         return "all"
+    if remaining == {"path", "query", "body", "cookies", "headers"}:
+        return "all"
+
+    # Collapse `args_get`+`args_post` into `args` (and the names pair likewise)
+    # before ordering, so the composite reads the way the CRS variable list does.
+    named = {}
+    for atoms, aggregate in SURFACE_AGGREGATES:
+        if atoms <= remaining:
+            remaining -= atoms
+            named[aggregate] = min(SURFACE_ORDER.index(a) for a in atoms)
+    for atom in remaining:
+        named[atom] = SURFACE_ORDER.index(atom)
+
+    ordered = [name for name, _ in sorted(named.items(), key=lambda item: item[1])]
     if len(ordered) == 1:
         single = {"headers": "headers", "user_agent": "user_agent", "referer": "header_referer"}
         return single.get(ordered[0], ordered[0])
-    if set(ordered) == {"path", "query", "body", "cookies", "headers"}:
-        return "all"
     return "+".join(ordered)
 
 
@@ -257,8 +310,19 @@ def _single_var_map(v: str) -> str:
         return "path"
     if v in ("REQUEST_URI_RAW", "REQUEST_LINE"):
         return "path_raw"
+    # The ARGS family is a *collection*: upstream evaluates the rule once per
+    # parameter, and the engine now does the same.  Folding it onto the whole
+    # query string is what made CRS-942130 read `?tab=tab`'s own `name=value`
+    # separator as a `1=1` tautology, kept CRS-942440's `^(?:JWT|token)$`
+    # exemption from ever being true, and left CRS-943110's anchored
+    # `ARGS_NAMES` pattern unable to match anything at all.
+    #
+    # `QUERY_STRING` is *not* part of the family: upstream really does hand that
+    # variable the whole undivided query string.
     if v in ("ARGS", "ARGS_NAMES", "ARGS_GET", "ARGS_POST",
-             "ARGS_GET_NAMES", "ARGS_POST_NAMES", "QUERY_STRING"):
+             "ARGS_GET_NAMES", "ARGS_POST_NAMES"):
+        return v.lower()
+    if v == "QUERY_STRING":
         return "query"
     # XML:/... selects nodes of the request body parsed as XML.
     if v.startswith("XML:"):
@@ -283,6 +347,8 @@ def _single_var_map(v: str) -> str:
         return f"header_{header}"
     if v in ("REQUEST_HEADERS", "REQUEST_HEADERS_NAMES"):
         return "headers"
+    if v.startswith("REQUEST_COOKIES_NAMES"):
+        return "cookies_names"
     if v.startswith("REQUEST_COOKIES"):
         return "cookies"
     if v.startswith("RESPONSE_BODY"):
@@ -718,7 +784,31 @@ def _collect_chain_children(lines: list[str], index: int) -> list[dict]:
     raise ChainUnsupported("syntax")
 
 
-def build_chain(head_operator: str, head_value: str, head_opts: dict,
+# Engine fields whose values are *collection members* — one parameter, one
+# cookie — rather than a whole request surface.  A capture-equality chain
+# (`TX:1 @streq %{TX.2}`) is only meaningful over one of these; see the note at
+# the `args_self_equality` refusal below.  Mirrors the collection bits of
+# `Surfaces` in crates/waf-engine/src/checks/owasp.rs.
+PER_MEMBER_SURFACES = frozenset({
+    "args_get", "args_post", "args_get_names", "args_post_names",
+    "cookies", "cookies_names",
+})
+
+
+def _is_per_member_field(field: str) -> bool:
+    """Whether every value `field` yields is a single collection member."""
+    if not field:
+        return False
+    atoms = set()
+    for token in field.split("+"):
+        mapped = FIELD_SURFACES.get(token)
+        if mapped is None:
+            return False
+        atoms.update(mapped)
+    return bool(atoms) and atoms <= PER_MEMBER_SURFACES
+
+
+def build_chain(head_field: str, head_operator: str, head_value: str, head_opts: dict,
                 lines: list[str], index: int) -> tuple[list[dict], bool]:
     """Build the YAML chain conditions for the rule at `index`.
 
@@ -755,15 +845,19 @@ def build_chain(head_operator: str, head_value: str, head_opts: dict,
                 raise ChainUnsupported("capture")
             used_providers.add(bound_source)
             # `TX:1 @streq %{TX.2}` asserts that the two captures are the same
-            # word — a tautology such as `1=1` *inside one parameter*.  The
-            # engine has no ARGS splitter: it hands the rule the whole
-            # `a=1&b=2` query string, in which the `name=value` separator is
-            # itself a `word = word` pair, so `?tab=tab` would read as a
-            # tautology.  Reproducing this needs per-parameter variables, so
-            # the rule is refused (CRS-942130).  The *dis*equality form has no
-            # such problem: a `name=value` separator is not an inequality
-            # operator, so CRS-942131 converts faithfully.
-            if operator == "equals" and not negate and "%{" in value:
+            # word — a tautology such as `1=1` *inside one parameter*
+            # (CRS-942130).  It only says that when the head is evaluated one
+            # parameter at a time.  Run against a whole `a=1&b=2` query string
+            # the `name=value` separator is itself a `word = word` pair, so
+            # `?tab=tab` reads as a tautology and the rule becomes a false
+            # positive generator; that is why this used to be refused outright.
+            #
+            # The engine now evaluates the ARGS family per member, so the
+            # refusal is scoped to heads that are still whole surfaces.  The
+            # *dis*equality form (CRS-942131) never had the problem: a
+            # `name=value` separator is not an inequality operator.
+            if operator == "equals" and not negate and "%{" in value \
+                    and not _is_per_member_field(head_field):
                 raise ChainUnsupported("args_self_equality")
         _check_macros(operator, value, bound_captures)
         if "%{" in value and bound_source is not None:
@@ -954,7 +1048,7 @@ def parse_conf_file(path: str, default_category: str) -> list[dict]:
         if "chain" in opts:
             try:
                 chain, head_capture = build_chain(
-                    rule["operator"], rule["value"], opts, lines, index
+                    rule["field"], rule["operator"], rule["value"], opts, lines, index
                 )
             except ChainUnsupported as unsupported:
                 # Refuse the whole rule rather than enforce its first condition,

@@ -86,7 +86,7 @@ rules:
     category: protocol-attack
     severity: warning
     paranoia: 2
-    field: query
+    field: args
     operator: regex
     value: '%[0-9a-fA-F]{2}'
     action: block
@@ -100,7 +100,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 4
-    field: path+query+headers
+    field: path+args+args_names+headers
     operator: regex
     value: (?:^|[^\x5c])\x5c[cdeghijklmpqwxyz123456789]
     transform:

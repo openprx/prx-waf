@@ -20,7 +20,7 @@
 //! rule set.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fmt;
@@ -33,7 +33,7 @@ use regex::Regex;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
-use waf_common::{DetectionResult, Phase, RequestCtx};
+use waf_common::{DetectionResult, Phase, RequestCtx, is_form_urlencoded, split_form_args};
 
 use super::Check;
 
@@ -530,31 +530,82 @@ impl LoadSummary {
 ///
 /// So the surfaces are carried explicitly and only the ones the upstream rule
 /// asked for are walked.
+///
+/// # Whole surfaces vs. collection members
+///
+/// Two kinds of bit live in here and the difference is the whole point of the
+/// `ARGS` work:
+///
+/// * **Whole surfaces** ([`Self::QUERY`], [`Self::BODY`], [`Self::PATH`], the
+///   header ones) hand the rule one string covering the entire surface. They
+///   back the `ModSecurity` variables that really are one string —
+///   `QUERY_STRING`, `REQUEST_BODY`, `REQUEST_URI`.
+/// * **Collection members** ([`Self::ARGS_GET`], [`Self::ARGS_POST`], their
+///   `_NAMES` counterparts, [`Self::COOKIES`], [`Self::COOKIE_NAMES`]) hand the
+///   rule one value *per parameter*, which is what `ARGS` / `ARGS_NAMES` /
+///   `REQUEST_COOKIES` mean upstream. A rule is evaluated once per member and
+///   fires if any single member satisfies it.
+///
+/// Running an `ARGS` rule against the whole `a=1&b=2` string instead is not a
+/// harmless approximation, it changes what the rule says: CRS-942130 asks
+/// whether the two words around an `=` are identical, and in a whole query
+/// string the `name=value` separator supplies that equality by itself, so
+/// `?tab=tab` reads as a `1=1` tautology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Surfaces(u8);
+struct Surfaces(u16);
 
 impl Surfaces {
-    const PATH: u8 = 1 << 0;
-    const QUERY: u8 = 1 << 1;
-    const BODY: u8 = 1 << 2;
-    const COOKIES: u8 = 1 << 3;
+    const PATH: u16 = 1 << 0;
+    /// `QUERY_STRING`: the whole query string, as one value.
+    const QUERY: u16 = 1 << 1;
+    /// `REQUEST_BODY` / `XML:/*`: the whole request body, as one value.
+    const BODY: u16 = 1 << 2;
+    /// `REQUEST_COOKIES`: each cookie **value**.
+    const COOKIES: u16 = 1 << 3;
     /// Every request header **value**.  Header *names* are only scanned by
     /// [`Field::Headers`], whose upstream (`REQUEST_HEADERS_NAMES`) asks for
     /// them explicitly.
-    const HEADER_VALUES: u8 = 1 << 4;
-    const USER_AGENT: u8 = 1 << 5;
-    const REFERER: u8 = 1 << 6;
+    const HEADER_VALUES: u16 = 1 << 4;
+    const USER_AGENT: u16 = 1 << 5;
+    const REFERER: u16 = 1 << 6;
     /// `REQUEST_URI_RAW` / `REQUEST_LINE`: the URI as received, before the
     /// parser percent-decodes it.
-    const PATH_RAW: u8 = 1 << 7;
+    const PATH_RAW: u16 = 1 << 7;
+    /// `ARGS_GET`: each query-string parameter **value**, decoded.
+    const ARGS_GET: u16 = 1 << 8;
+    /// `ARGS_GET_NAMES`: each query-string parameter **name**, decoded.
+    const ARGS_GET_NAMES: u16 = 1 << 9;
+    /// `ARGS_POST`: each urlencoded body parameter **value**, decoded.
+    const ARGS_POST: u16 = 1 << 10;
+    /// `ARGS_POST_NAMES`: each urlencoded body parameter **name**, decoded.
+    const ARGS_POST_NAMES: u16 = 1 << 11;
+    /// `REQUEST_COOKIES_NAMES`: each cookie **name**.
+    const COOKIE_NAMES: u16 = 1 << 12;
+
+    /// Every `ARGS` value bit, i.e. what the bare `ARGS` variable covers.
+    const ARGS: u16 = Self::ARGS_GET | Self::ARGS_POST;
+    /// Every `ARGS` name bit, i.e. what `ARGS_NAMES` covers.
+    const ARGS_NAMES: u16 = Self::ARGS_GET_NAMES | Self::ARGS_POST_NAMES;
 
     /// Canonical order — also the order surface names appear in a field name.
-    const NAMED: [(&'static str, u8); 8] = [
+    ///
+    /// A name may stand for more than one bit (`args` is `ARGS_GET |
+    /// ARGS_POST`); the aggregate spellings come first so the converter's
+    /// canonicaliser prefers them and there is exactly one spelling per
+    /// meaning.
+    const NAMED: [(&'static str, u16); 15] = [
         ("path", Self::PATH),
         ("path_raw", Self::PATH_RAW),
         ("query", Self::QUERY),
+        ("args", Self::ARGS),
+        ("args_get", Self::ARGS_GET),
+        ("args_post", Self::ARGS_POST),
+        ("args_names", Self::ARGS_NAMES),
+        ("args_get_names", Self::ARGS_GET_NAMES),
+        ("args_post_names", Self::ARGS_POST_NAMES),
         ("body", Self::BODY),
         ("cookies", Self::COOKIES),
+        ("cookies_names", Self::COOKIE_NAMES),
         ("headers", Self::HEADER_VALUES),
         ("user_agent", Self::USER_AGENT),
         ("referer", Self::REFERER),
@@ -563,23 +614,23 @@ impl Surfaces {
     /// What the bare field name `all` means: the whole request.
     const ALL: Self = Self(Self::PATH | Self::QUERY | Self::BODY | Self::COOKIES | Self::HEADER_VALUES);
 
-    const fn has(self, bit: u8) -> bool {
+    const fn has(self, bit: u16) -> bool {
         self.0 & bit != 0
     }
 
-    /// Parse a `+`-joined surface list (`"query+body+cookies"`).
+    /// Parse a `+`-joined surface list (`"args+cookies"`).
     ///
-    /// Returns `None` for an unknown surface name or a duplicate, so a typo in
-    /// a rule file is rejected at load time instead of quietly scanning less
-    /// than the rule says.
+    /// Returns `None` for an unknown surface name or an overlapping one, so a
+    /// typo — or a redundant `args+args_get` — is rejected at load time instead
+    /// of quietly scanning less (or more) than the rule says.
     fn parse(name: &str) -> Option<Self> {
-        let mut bits = 0u8;
+        let mut bits = 0u16;
         for token in name.split('+') {
-            let (_, bit) = Self::NAMED.iter().find(|(n, _)| *n == token)?;
-            if bits & bit != 0 {
+            let (_, mask) = Self::NAMED.iter().find(|(n, _)| *n == token)?;
+            if bits & mask != 0 {
                 return None;
             }
-            bits |= bit;
+            bits |= mask;
         }
         (bits != 0).then_some(Self(bits))
     }
@@ -681,9 +732,15 @@ impl Field {
             "header_referer" => Self::HeaderReferer,
             "header_host" => Self::HeaderHost,
             "header_range" => Self::HeaderRange,
-            // Composite surface list, e.g. `query+body+cookies`.  Requires a
-            // `+` so a single-surface rule keeps using its dedicated field and
-            // there is exactly one spelling per meaning.
+            // `ARGS` and friends: collections evaluated one member at a time.
+            // They have no dedicated `Field` variant because the surface bitset
+            // already distinguishes GET from POST and names from values, and a
+            // rule naming several of them at once must be one field.
+            "args" | "args_get" | "args_post" | "args_names" | "args_get_names" | "args_post_names"
+            | "cookies_names" => Self::Multi(Surfaces::parse(name)?),
+            // Composite surface list, e.g. `args+cookies`.  Requires a `+` so a
+            // single-surface rule keeps using its dedicated field and there is
+            // exactly one spelling per meaning.
             multi if multi.contains('+') => Self::Multi(Surfaces::parse(multi)?),
             _ => return None,
         })
@@ -752,11 +809,26 @@ impl Field {
                 if s.has(Surfaces::QUERY) {
                     out.push(Cow::Borrowed(view.query.as_ref()));
                 }
-                if s.has(Surfaces::BODY) {
+                if view.body_surface_applies(s) {
                     out.push(Cow::Borrowed(view.body.as_ref()));
+                }
+                if s.has(Surfaces::ARGS_GET) {
+                    out.extend(view.args_get().iter().map(|arg| Cow::Borrowed(arg.value.as_str())));
+                }
+                if s.has(Surfaces::ARGS_GET_NAMES) {
+                    out.extend(view.args_get().iter().map(|arg| Cow::Borrowed(arg.name.as_str())));
+                }
+                if s.has(Surfaces::ARGS_POST) {
+                    out.extend(view.args_post().iter().map(|arg| Cow::Borrowed(arg.value.as_str())));
+                }
+                if s.has(Surfaces::ARGS_POST_NAMES) {
+                    out.extend(view.args_post().iter().map(|arg| Cow::Borrowed(arg.name.as_str())));
                 }
                 if s.has(Surfaces::COOKIES) {
                     out.extend(cookie_values(ctx).map(Cow::Borrowed));
+                }
+                if s.has(Surfaces::COOKIE_NAMES) {
+                    out.extend(cookie_names(ctx).map(Cow::Borrowed));
                 }
                 if s.has(Surfaces::HEADER_VALUES) {
                     out.extend(ctx.headers.values().map(|v| Cow::Borrowed(v.as_str())));
@@ -792,8 +864,13 @@ impl Field {
                 (s.has(Surfaces::PATH) && f(&view.path))
                     || (s.has(Surfaces::PATH_RAW) && f(&ctx.path))
                     || (s.has(Surfaces::QUERY) && f(&view.query))
-                    || (s.has(Surfaces::BODY) && f(&view.body))
+                    || (view.body_surface_applies(s) && f(&view.body))
+                    || (s.has(Surfaces::ARGS_GET) && view.args_get().iter().any(|a| f(&a.value)))
+                    || (s.has(Surfaces::ARGS_GET_NAMES) && view.args_get().iter().any(|a| f(&a.name)))
+                    || (s.has(Surfaces::ARGS_POST) && view.args_post().iter().any(|a| f(&a.value)))
+                    || (s.has(Surfaces::ARGS_POST_NAMES) && view.args_post().iter().any(|a| f(&a.name)))
                     || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(&mut f))
+                    || (s.has(Surfaces::COOKIE_NAMES) && cookie_names(ctx).any(&mut f))
                     || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| f(v)))
                     || (s.has(Surfaces::USER_AGENT) && header("user-agent", &mut f))
                     || (s.has(Surfaces::REFERER) && header("referer", &mut f))
@@ -805,20 +882,65 @@ impl Field {
     }
 }
 
-/// Individual cookie values from the folded `Cookie` header.
-fn cookie_values(ctx: &RequestCtx) -> impl Iterator<Item = &str> + '_ {
+/// `(name, value)` of each cookie in the folded `Cookie` header.
+///
+/// Neither half is percent-decoded: `ModSecurity` does not decode headers, and
+/// the CRS rules that need it attach `t:urlDecodeUni` themselves.
+fn cookie_pairs(ctx: &RequestCtx) -> impl Iterator<Item = (&str, &str)> + '_ {
     ctx.headers
         .get("cookie")
         .into_iter()
         .flat_map(|raw| raw.split(';'))
         .map(|pair| {
             let pair = pair.trim();
-            pair.split_once('=').map_or(pair, |(_, value)| value)
+            pair.split_once('=')
+                .map_or((pair, ""), |(name, value)| (name.trim(), value))
         })
+}
+
+/// Individual cookie values from the folded `Cookie` header.
+fn cookie_values(ctx: &RequestCtx) -> impl Iterator<Item = &str> + '_ {
+    cookie_pairs(ctx)
+        .map(|(_, value)| value)
         .filter(|value| !value.is_empty())
 }
 
+/// Individual cookie names from the folded `Cookie` header
+/// (`REQUEST_COOKIES_NAMES`).
+fn cookie_names(ctx: &RequestCtx) -> impl Iterator<Item = &str> + '_ {
+    cookie_pairs(ctx).map(|(name, _)| name).filter(|name| !name.is_empty())
+}
+
 // ── Request view ──────────────────────────────────────────────────────────────
+
+/// One member of the `ARGS` collection, decoded.
+///
+/// Owned because decoding allocates: the split borrows from the request, but
+/// `a%3Db` has to become `a=b` somewhere.  A member whose text needs no
+/// decoding still copies — the alternative is a self-referential view, and the
+/// copy is bounded by the surface the gateway already capped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Arg {
+    name: String,
+    value: String,
+}
+
+/// Split a urlencoded surface into `ARGS` members and decode each half.
+///
+/// The order matters and is `ModSecurity`'s: **split first, decode second**.
+/// Decoding the whole surface up front — which is what this engine used to do —
+/// turns an encoded `%26` inside a value into a member separator and an encoded
+/// `%3D` into a `name=value` split point, so the parameters a rule sees are not
+/// the parameters the origin will parse.
+fn decode_args(surface: &str) -> Vec<Arg> {
+    split_form_args(surface)
+        .into_iter()
+        .map(|raw| Arg {
+            name: percent_decode(raw.name, Plus::IsSpace).into_owned(),
+            value: percent_decode(raw.value, Plus::IsSpace).into_owned(),
+        })
+        .collect()
+}
 
 /// `(chain id, value address, value length)` → that chain's output for that
 /// value, or `None` when the chain left it alone.
@@ -850,16 +972,27 @@ struct RequestView<'a> {
     /// `REQUEST_URI` / `REQUEST_FILENAME`: percent-decoded.  `+` is left alone
     /// — it is a literal plus in a path, not a space.
     path: Cow<'a, str>,
-    /// `ARGS` / `ARGS_NAMES` from the query string: percent- and `+`-decoded.
-    ///
-    /// The engine has no per-parameter splitter, so a rule is handed the whole
-    /// `a=1&b=2` string with every parameter decoded in place, rather than one
-    /// decoded value at a time.
+    /// `QUERY_STRING`: the whole query string, percent- and `+`-decoded in
+    /// place.  Per-parameter `ARGS` members come from [`Self::args_get`]
+    /// instead.
     query: Cow<'a, str>,
-    /// `ARGS_POST` / `REQUEST_BODY`: the body preview as lossy UTF-8, then
-    /// percent- and `+`-decoded, on the same whole-surface approximation as
-    /// [`Self::query`].
+    /// `REQUEST_BODY` / `XML:/*`: the body preview as lossy UTF-8, then percent-
+    /// and `+`-decoded (a multipart envelope is reduced to its payloads first).
+    /// Per-parameter `ARGS_POST` members come from [`Self::args_post`].
     body: Cow<'a, str>,
+    /// `true` when the request body is `application/x-www-form-urlencoded`, so
+    /// [`Self::args_post`] can split it and the whole-`body` surface must stand
+    /// aside for the fields that read `ARGS_POST` (see
+    /// [`Self::body_surface_applies`]).
+    body_is_form: bool,
+    /// `ARGS_GET` / `ARGS_GET_NAMES`, split from the **raw** query string and
+    /// then decoded member by member.  Built on first use: a rule set with no
+    /// argument rules never pays for it.
+    args_get: OnceCell<Vec<Arg>>,
+    /// `ARGS_POST` / `ARGS_POST_NAMES`, from a urlencoded body only.  Empty for
+    /// every other content type — see [`Self::body_surface_applies`] for how
+    /// those bodies stay covered.
+    args_post: OnceCell<Vec<Arg>>,
     /// `(chain id, value address, value length)` → what that chain made of that
     /// value, for the current request.
     ///
@@ -875,8 +1008,9 @@ struct RequestView<'a> {
 
 impl<'a> RequestView<'a> {
     fn new(ctx: &'a RequestCtx) -> Self {
+        let content_type = ctx.headers.get("content-type").map(String::as_str);
         let lossy = String::from_utf8_lossy(&ctx.body_preview);
-        let boundary = ctx.headers.get("content-type").and_then(|ct| multipart_boundary(ct));
+        let boundary = content_type.and_then(multipart_boundary);
         let body = match (boundary, lossy) {
             // A multipart envelope is not `ARGS`; see `multipart_payloads`.
             (Some(boundary), envelope) => Cow::Owned(multipart_payloads(&envelope, boundary)),
@@ -888,8 +1022,43 @@ impl<'a> RequestView<'a> {
             path: percent_decode(&ctx.path, Plus::IsLiteral),
             query: percent_decode(&ctx.query, Plus::IsSpace),
             body,
+            body_is_form: is_form_urlencoded(content_type),
+            args_get: OnceCell::new(),
+            args_post: OnceCell::new(),
             memo: RefCell::new(TransformMemo::new()),
         }
+    }
+
+    /// `ARGS_GET`: the query string's parameters, split then decoded.
+    fn args_get(&self) -> &[Arg] {
+        self.args_get.get_or_init(|| decode_args(&self.ctx.query))
+    }
+
+    /// `ARGS_POST`: the body's parameters when it is a urlencoded form, and
+    /// nothing at all otherwise.
+    fn args_post(&self) -> &[Arg] {
+        self.args_post.get_or_init(|| {
+            if !self.body_is_form {
+                return Vec::new();
+            }
+            decode_args(&String::from_utf8_lossy(&self.ctx.body_preview))
+        })
+    }
+
+    /// Whether the whole-`body` surface contributes a value for the field
+    /// described by `surfaces`.
+    ///
+    /// It normally does.  The one exception is a **urlencoded body read by a
+    /// field that also names `ARGS_POST`**: the parameter members already carry
+    /// every byte of that body, and handing the same bytes over a second time
+    /// as one blob re-creates exactly the cross-parameter matching this whole
+    /// change removes — a `tab=tab` form post would satisfy CRS-942130's
+    /// `word = word` tautology test through the blob while the split members
+    /// correctly do not.  Structured bodies (JSON, XML, multipart) produce no
+    /// `ARGS_POST` members, so for them the blob is the only coverage there is
+    /// and it always applies.
+    const fn body_surface_applies(&self, surfaces: Surfaces) -> bool {
+        surfaces.has(Surfaces::BODY) && !(self.body_is_form && surfaces.has(Surfaces::ARGS_POST))
     }
 
     /// `value` with `chain` applied, reusing this request's earlier answer for
@@ -2112,6 +2281,45 @@ impl Condition {
         })
     }
 
+    /// Every value of this condition's field that satisfies it, transformed.
+    ///
+    /// Used for the head of a chained rule, which is re-evaluated one value at
+    /// a time so each hit can drive the chain on its own — see
+    /// [`CompiledRule::matches`].
+    fn hits<'v>(&self, view: &'v RequestView<'_>) -> Vec<Cow<'v, str>> {
+        let CondField::Request(field) = self.field else {
+            return Vec::new();
+        };
+        let empty = ChainState::default();
+        let mut hits: Vec<Cow<'v, str>> = Vec::new();
+        for value in field.collect_values(view) {
+            let subject: Cow<'v, str> = self.transform.apply(&value).map_or(value, Cow::Owned);
+            match (self.matcher.test(&subject, view.ctx, &empty), self.negate) {
+                (Outcome::Match, false) | (Outcome::NoMatch, true) => hits.push(subject),
+                _ => {}
+            }
+        }
+        hits
+    }
+
+    /// Seed a fresh chain state from one value this condition matched.
+    ///
+    /// `MATCHED_VARS` becomes exactly that value and `TX:N` its capture groups,
+    /// which is what a chain link expects to read: for a per-parameter field the
+    /// value is one parameter, not the surface it came from.
+    fn bind<'v>(&self, hit: Cow<'v, str>, state: &mut ChainState<'v>) {
+        if self.capture
+            && let CompiledMatcher::Regex(re) = &self.matcher
+            && let Some(groups) = re.captures(&hit)
+        {
+            state.captures = groups
+                .iter()
+                .map(|group| group.map_or_else(String::new, |m| m.as_str().to_owned()))
+                .collect();
+        }
+        state.matched = vec![hit];
+    }
+
     /// Evaluate inside a chain, threading `state` forward.
     ///
     /// Returns `false` as soon as no value satisfies the condition, so the
@@ -2174,6 +2382,20 @@ struct CompiledRule {
 }
 
 impl CompiledRule {
+    /// `true` when some value of the head's field satisfies the head **and**
+    /// carries the whole chain.
+    ///
+    /// The chain is evaluated **once per matching head value**, not once for
+    /// all of them together.  That is what `ARGS` means: upstream runs the rule
+    /// against one parameter at a time, so `MATCHED_VARS` and `TX:N` inside the
+    /// chain describe *that* parameter.  Evaluating the chain once against the
+    /// union is what broke CRS-942440's `^(?:JWT|token)$` exemption — the
+    /// exemption can only ever be true of a single parameter value, never of a
+    /// whole query string — and what made CRS-942130's capture equality read
+    /// the `name=value` separator of an unrelated parameter.
+    ///
+    /// For a single-valued head this is one iteration, i.e. exactly the old
+    /// behaviour.
     fn matches(&self, view: &RequestView<'_>) -> bool {
         // The cheap short-circuiting test runs first for every rule, chained or
         // not, so ordinary traffic pays exactly what it paid before chains
@@ -2185,11 +2407,11 @@ impl CompiledRule {
         if self.chain.is_empty() {
             return true;
         }
-        let mut state = ChainState::default();
-        if !self.head.advance(view, &mut state) {
-            return false;
-        }
-        self.chain.iter().all(|link| link.advance(view, &mut state))
+        self.head.hits(view).into_iter().any(|hit| {
+            let mut state = ChainState::default();
+            self.head.bind(hit, &mut state);
+            self.chain.iter().all(|link| link.advance(view, &mut state))
+        })
     }
 }
 
@@ -3473,7 +3695,10 @@ rules:
 
         assert!(summary.source_errors.is_empty(), "shipped rule set must parse cleanly");
         assert_eq!(summary.attempted, 328, "declared CRS rules");
-        assert_eq!(summary.compiled, 215, "enforceable CRS rules");
+        // 215 before per-parameter `ARGS`: CRS-942130 joins the set, because
+        // its `TX:1 @streq %{TX.2}` capture equality is only a tautology test
+        // when the head is evaluated one parameter at a time.
+        assert_eq!(summary.compiled, 216, "enforceable CRS rules");
         assert_eq!(checker.rule_count(), summary.compiled);
         assert_eq!(summary.attempted, summary.compiled + summary.rejected.len());
 
@@ -3514,12 +3739,14 @@ rules:
         // condition alone is "block any argument containing `scheme://`".
         assert_eq!(by_field("unmapped_chained_tx_variable"), 1, "CRS-931130");
         // CRS-942130's chained `TX:1 @streq %{TX.2}` asserts that two captures
-        // of one *parameter* are the same word.  The engine has no ARGS
-        // splitter, so it sees the whole query string, where the `name=value`
-        // separator forms that equality by itself: `?tab=tab` would read as a
-        // `1=1` tautology.
-        assert_eq!(by_field("unmapped_chained_args_self_equality"), 1, "CRS-942130");
-        assert_eq!(summary.rejected_field_count(), 112, "rules the engine cannot evaluate");
+        // of one *parameter* are the same word.  It used to be refused: without
+        // an ARGS splitter the rule saw the whole query string, where the
+        // `name=value` separator forms that equality by itself and `?tab=tab`
+        // reads as a `1=1` tautology.  Per-parameter `ARGS` makes it mean what
+        // upstream means, so it is enforced and the sentinel is gone.
+        assert_eq!(by_field("unmapped_chained_args_self_equality"), 0, "CRS-942130");
+        // 112 before per-parameter `ARGS` (CRS-942130 left the list).
+        assert_eq!(summary.rejected_field_count(), 111, "rules the engine cannot evaluate");
         assert!(
             summary
                 .rejected
@@ -3579,6 +3806,7 @@ rules:
                 "CRS-932240",
                 "CRS-943110",
                 "CRS-943120",
+                "CRS-942130",
                 "CRS-942131",
                 "CRS-942440",
                 "CRS-942521",
@@ -3596,10 +3824,15 @@ rules:
             .iter()
             .filter(|r| r.head.field == CondField::Request(Field::Multi(Surfaces::ALL)))
             .count();
-        // Was 6 before `REQUEST_URI_RAW` / `REQUEST_LINE` got their own field:
-        // CRS-944130 / CRS-944150 / CRS-944151 name `REQUEST_LINE`, which used
-        // to fold into `path` and complete the "whole request" set.
-        assert_eq!(catch_all, 3, "rules scanning the entire request");
+        // Was 6 before `REQUEST_URI_RAW` / `REQUEST_LINE` got their own field
+        // (CRS-944130 / CRS-944150 / CRS-944151 name `REQUEST_LINE`, which used
+        // to fold into `path`), then 3, and now none at all: `all` is the union
+        // of *whole* surfaces, and a variable list reaching `ARGS` no longer
+        // contributes the whole query string to it.  Those three rules now name
+        // `path+args+args_names+body+cookies+cookies_names+headers`, which is
+        // strictly more precise — the entire request minus the cross-parameter
+        // matching.
+        assert_eq!(catch_all, 0, "rules scanning the entire request");
 
         // No rule from the response-phase conversion may end up enforced: their
         // patterns describe server *output* and matching them against a request
@@ -5189,9 +5422,30 @@ rules:
     /// Paranoia 2 is not the default and is not clean, but its verdicts are
     /// pinned so decoding work cannot quietly add to the list.
     ///
-    /// Each entry below is a rule upstream scopes to a single `ARGS` member
-    /// that this engine can only run against a whole surface — the one defect
-    /// class left after transformations became per-rule.
+    /// Every entry is accounted for, and after per-parameter `ARGS` none of
+    /// them is the "rule scoped to one `ARGS` member, run against a whole
+    /// surface" defect any more:
+    ///
+    /// * **CRS-932240 on the JSON body** and **CRS-932236 on the multipart
+    ///   upload** are the remaining *whole-body* approximation: CRS reaches
+    ///   into a structured body through `XML:/*`, this engine has no body-node
+    ///   accessor and hands the rule the raw body, and both patterns match
+    ///   across the JSON / MIME framing rather than inside any one value.
+    ///   Splitting those bodies is Lane 2's `struct_extract`, not this check's.
+    /// * **CRS-942200 on `q=how+to+select+from+a+menu`** is genuinely upstream:
+    ///   the whole `select … from` pattern sits inside the single `q`
+    ///   parameter, so per-parameter evaluation reproduces it exactly.
+    /// * **CRS-942131 on the form POST** is new here and is also genuinely
+    ///   upstream. `msg=A & B < C` is a `word < word` disequality inside one
+    ///   parameter. It appears now only because `ARGS_POST` is finally read:
+    ///   the argument-only rules used to be scoped to the query string alone,
+    ///   so every one of them could be bypassed by moving the payload into a
+    ///   POST body.
+    ///
+    /// The entry that *did* disappear is the one this change was for: "encoded
+    /// array indices in the query" no longer trips CRS-932240, because the
+    /// shell-expression pattern was matching across the `&` and `=` separators
+    /// of neighbouring parameters.
     ///
     /// The three CRS-920230 entries that used to be here are gone: `@rx
     /// %[0-9a-fA-F]{2}` under `t:none` means "an escape survived the parser",
@@ -5203,8 +5457,8 @@ rules:
         let expected: &[(&str, Option<&str>)] = &[
             ("JSON body with escapes and a percent sign", Some("CRS-932240")),
             ("multipart upload", Some("CRS-932236")),
-            ("encoded array indices in the query", Some("CRS-932240")),
             ("search phrase using + as a space", Some("CRS-942200")),
+            ("plus-addressed email in a form POST", Some("CRS-942131")),
         ];
         for probe in benign_probes() {
             let want = expected
@@ -5406,17 +5660,31 @@ rules:
 
         // `t:lowercase` is what makes an all-lower-case CRS pattern meet real
         // mixed-case traffic; CRS-944120's chain needs both halves.
+        //
+        // Both halves have to be in **one** parameter.  The chain link reads
+        // `MATCHED_VARS`, i.e. the value the head matched, so upstream requires
+        // one `ARGS` member to carry the gadget name *and* the process-spawn
+        // word.  This test used to spread them over two parameters
+        // (`cls=InvokerTransformer&cmd=Runtime.exec`) and passed only because
+        // the engine handed the rule the whole query string — the very defect
+        // per-parameter `ARGS` removes.
         assert!(fires(
+            &checker,
+            "CRS-944120",
+            &query("payload=InvokerTransformer+Runtime.exec")
+        ));
+        assert!(fires(
+            &checker,
+            "CRS-944120",
+            &query("payload=%49nvokerTransformer+%52untime.exec")
+        ));
+        assert!(!fires(&checker, "CRS-944120", &query("payload=Harmless+Runtime")));
+        // Two parameters no longer satisfy the chain, exactly as upstream.
+        assert!(!fires(
             &checker,
             "CRS-944120",
             &query("cls=InvokerTransformer&cmd=Runtime.exec")
         ));
-        assert!(fires(
-            &checker,
-            "CRS-944120",
-            &query("cls=%49nvokerTransformer&cmd=%52untime.exec")
-        ));
-        assert!(!fires(&checker, "CRS-944120", &query("cls=Harmless&cmd=Runtime")));
     }
 
     /// A `t:` the engine cannot perform drops the rule and names itself in the
@@ -5633,5 +5901,353 @@ rules:
                 case.len()
             );
         }
+    }
+
+    // ── Per-parameter `ARGS` ─────────────────────────────────────────────────
+
+    /// The splitter's contract, including HTTP parameter pollution.
+    #[test]
+    fn args_are_split_before_they_are_decoded() {
+        let args = decode_args("a=1&b=2");
+        assert_eq!(
+            args,
+            vec![
+                Arg {
+                    name: "a".into(),
+                    value: "1".into()
+                },
+                Arg {
+                    name: "b".into(),
+                    value: "2".into()
+                },
+            ]
+        );
+
+        // An encoded separator is part of the value, not a new member.  The old
+        // decode-then-look approach turned `%26` into a `&` and `%3D` into an
+        // `=`, so the rules saw parameters the origin never parses.
+        assert_eq!(
+            decode_args("q=a%26b%3Dc"),
+            vec![Arg {
+                name: "q".into(),
+                value: "a&b=c".into()
+            }]
+        );
+
+        // `+` is a space on a form surface, in the name as well as the value.
+        assert_eq!(
+            decode_args("full+name=Ada+Lovelace"),
+            vec![Arg {
+                name: "full name".into(),
+                value: "Ada Lovelace".into()
+            }]
+        );
+
+        // A member with no `=` is a *name*: `?phpsessid` is what CRS-943110
+        // tests for, and reading it as an anonymous value would miss it.
+        assert_eq!(
+            decode_args("phpsessid"),
+            vec![Arg {
+                name: "phpsessid".into(),
+                value: String::new()
+            }]
+        );
+
+        // Empty members create no entry, as upstream.
+        assert_eq!(
+            decode_args("&&a=1&"),
+            vec![Arg {
+                name: "a".into(),
+                value: "1".into()
+            }]
+        );
+        assert!(decode_args("").is_empty());
+    }
+
+    /// HTTP parameter pollution: repeats are kept, in order, never merged.
+    ///
+    /// An origin may take the first, the last, or all of them; a WAF that keeps
+    /// only one has a bypass for whichever the origin picks.  PHP's `a[]=1&a[]=2`
+    /// array syntax is two members named `a[]` — the brackets are the
+    /// application's convention, not a parser construct, and `ModSecurity` does
+    /// not fold them either.
+    #[test]
+    fn repeated_parameters_are_all_kept() {
+        assert_eq!(
+            decode_args("id=1&id=2"),
+            vec![
+                Arg {
+                    name: "id".into(),
+                    value: "1".into()
+                },
+                Arg {
+                    name: "id".into(),
+                    value: "2".into()
+                },
+            ]
+        );
+        assert_eq!(
+            decode_args("a%5B%5D=1&a%5B%5D=2"),
+            vec![
+                Arg {
+                    name: "a[]".into(),
+                    value: "1".into()
+                },
+                Arg {
+                    name: "a[]".into(),
+                    value: "2".into()
+                },
+            ]
+        );
+
+        // Both values reach the rules: a payload hidden in the second copy of a
+        // polluted parameter is still detected.
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        let ctx = probe("GET", "/s", "id=1&id=1%27%20or%201%3D1--", &[], "", 1);
+        assert!(
+            checker.check(&ctx).is_some(),
+            "the payload in the second copy of a polluted parameter must be caught"
+        );
+    }
+
+    /// The member budget bounds the work without dropping bytes.
+    #[test]
+    fn the_arg_budget_hands_over_its_tail_instead_of_dropping_it() {
+        use waf_common::MAX_FORM_ARGS;
+        let surface = (0..MAX_FORM_ARGS + 500)
+            .map(|i| format!("k{i}=v{i}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let args = decode_args(&surface);
+        assert_eq!(args.len(), MAX_FORM_ARGS, "member count is bounded");
+
+        // Nothing is unscanned: the final member carries the whole unsplit
+        // remainder, so a payload parked at parameter 5000 is still inspected.
+        let last = args.last().expect("the budget produces a final member");
+        assert!(last.name.is_empty(), "the overflow tail is not a parameter name");
+        assert!(
+            last.value
+                .ends_with(&format!("k{}=v{}", MAX_FORM_ARGS + 499, MAX_FORM_ARGS + 499)),
+            "the overflow tail reaches the end of the surface"
+        );
+
+        let padded = format!("{surface}&q=1%27%20or%201%3D1--");
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        assert!(
+            checker.check(&probe("GET", "/s", &padded, &[], "", 1)).is_some(),
+            "a payload past the member budget must still be caught"
+        );
+    }
+
+    /// `ARGS_NAMES` reads names, `ARGS` reads values, and neither sees the
+    /// other's text.
+    #[test]
+    fn arg_names_and_values_are_separate_collections() {
+        let yaml = |field: &str| {
+            format!(
+                "version: \"1.0\"\nrules:\n  - id: TEST-A\n    name: t\n    category: test\n    \
+                 severity: critical\n    paranoia: 1\n    field: {field}\n    operator: contains\n    \
+                 value: needle\n    action: block\n"
+            )
+        };
+        let names = OWASPCheck::from_yaml(&yaml("args_names"));
+        let values = OWASPCheck::from_yaml(&yaml("args"));
+
+        let in_name = probe("GET", "/", "needle=1", &[], "", 1);
+        let in_value = probe("GET", "/", "k=needle", &[], "", 1);
+        assert!(names.check(&in_name).is_some());
+        assert!(names.check(&in_value).is_none(), "a value is not a name");
+        assert!(values.check(&in_value).is_some());
+        assert!(values.check(&in_name).is_none(), "a name is not a value");
+    }
+
+    /// `ARGS_GET` is the query, `ARGS_POST` is a urlencoded body, and `ARGS` is
+    /// both.
+    #[test]
+    fn get_and_post_arguments_are_distinguishable() {
+        let yaml = |field: &str| {
+            format!(
+                "version: \"1.0\"\nrules:\n  - id: TEST-A\n    name: t\n    category: test\n    \
+                 severity: critical\n    paranoia: 1\n    field: {field}\n    operator: contains\n    \
+                 value: needle\n    action: block\n"
+            )
+        };
+        let form = &[("content-type", "application/x-www-form-urlencoded")];
+        let get = probe("GET", "/", "k=needle", &[], "", 1);
+        let post = probe("POST", "/", "", form, "k=needle", 1);
+
+        let args_get = OWASPCheck::from_yaml(&yaml("args_get"));
+        assert!(args_get.check(&get).is_some());
+        assert!(args_get.check(&post).is_none());
+
+        let args_post = OWASPCheck::from_yaml(&yaml("args_post"));
+        assert!(args_post.check(&get).is_none());
+        assert!(args_post.check(&post).is_some());
+
+        let args = OWASPCheck::from_yaml(&yaml("args"));
+        assert!(args.check(&get).is_some());
+        assert!(args.check(&post).is_some());
+
+        // A JSON body is not a form: it produces no `ARGS_POST` members, and the
+        // rules that need to see it read the whole `body` surface instead.
+        let json = probe(
+            "POST",
+            "/",
+            "",
+            &[("content-type", "application/json")],
+            r#"{"k":"needle"}"#,
+            1,
+        );
+        assert!(args_post.check(&json).is_none(), "JSON leaves are not ARGS_POST");
+        assert!(OWASPCheck::from_yaml(&yaml("body")).check(&json).is_some());
+    }
+
+    /// A form body is handed over as parameters **or** as one blob, never both.
+    ///
+    /// Both at once is what would re-create the cross-parameter matching this
+    /// change removes.
+    #[test]
+    fn a_form_body_is_not_scanned_twice() {
+        let yaml = "version: \"1.0\"\nrules:\n  - id: TEST-A\n    name: t\n    category: test\n    \
+                    severity: critical\n    paranoia: 1\n    field: args_post+body\n    operator: regex\n    \
+                    value: '^tab=tab$'\n    action: block\n";
+        let checker = OWASPCheck::from_yaml(yaml);
+        let form = &[("content-type", "application/x-www-form-urlencoded")];
+        assert!(
+            checker.check(&probe("POST", "/", "", form, "tab=tab", 1)).is_none(),
+            "the blob must stand aside once the parameters carry the same bytes"
+        );
+        // A body the splitter cannot read keeps its blob.
+        let text = &[("content-type", "text/plain")];
+        assert!(checker.check(&probe("POST", "/", "", text, "tab=tab", 1)).is_some());
+    }
+
+    /// The four rules the missing splitter held back, each verified on its own
+    /// attack **and** on the ordinary traffic it used to blame.
+    #[test]
+    fn per_parameter_args_unblock_the_rules_that_needed_them() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+
+        // CRS-942130: `TX:1 @streq %{TX.2}` is a `1=1` tautology test *inside one
+        // parameter*.  It was refused outright because a whole query string
+        // supplies the equality through its own `name=value` separator.
+        assert!(
+            checker.rules.iter().any(|r| r.id == "CRS-942130"),
+            "CRS-942130 must be enforced"
+        );
+        for benign in ["tab=tab", "sort=sort&dir=asc", "view=view", "a=b&b=a"] {
+            assert!(
+                !fires(&checker, "CRS-942130", &probe("GET", "/s", benign, &[], "", 2)),
+                "CRS-942130 must not fire on ?{benign}"
+            );
+        }
+        for attack in ["id=1' or 1=1", "id=1%27%20or%201%3D1", "u=x' OR 'a'='a"] {
+            assert!(
+                fires(&checker, "CRS-942130", &probe("GET", "/s", attack, &[], "", 2)),
+                "CRS-942130 must fire on ?{attack}"
+            );
+        }
+
+        // CRS-942440: upstream exempts a value that *is* a bare token or a JWT.
+        // The exemption reads `MATCHED_VARS` with an anchored pattern, so it can
+        // only ever hold of a single parameter value.
+        let jwt = "token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert!(
+            !fires(&checker, "CRS-942440", &probe("GET", "/api", jwt, &[], "", 2)),
+            "a JWT must be exempt from the SQL-comment rule"
+        );
+        assert!(
+            !fires(
+                &checker,
+                "CRS-942440",
+                &probe("GET", "/api", "token=abc--def", &[], "", 2)
+            ),
+            "a bare token must be exempt"
+        );
+        assert!(
+            fires(
+                &checker,
+                "CRS-942440",
+                &probe("GET", "/s", "id=1%27%3B--%20", &[], "", 2)
+            ),
+            "a real comment sequence must still be caught"
+        );
+
+        // CRS-943110 / CRS-943120 are `^…$` anchored patterns on `ARGS_NAMES`;
+        // against a whole query string they could never match anything.
+        let off_domain = &[("referer", "https://evil.test/a"), ("host", "example.com")];
+        let no_referer = &[("host", "example.com")];
+        for query in ["PHPSESSID=abc123", "foo=1&jsessionid=xyz&bar=2"] {
+            assert!(
+                fires(&checker, "CRS-943110", &probe("GET", "/x", query, off_domain, "", 1)),
+                "CRS-943110 must fire on ?{query} with an off-domain Referer"
+            );
+            assert!(
+                fires(&checker, "CRS-943120", &probe("GET", "/x", query, no_referer, "", 1)),
+                "CRS-943120 must fire on ?{query} with no Referer"
+            );
+        }
+        // The anchor still holds: a parameter merely *containing* the token is
+        // not a session id parameter.
+        for query in ["my_phpsessid_backup=1", "q=phpsessid"] {
+            assert!(
+                !fires(&checker, "CRS-943110", &probe("GET", "/x", query, off_domain, "", 1)),
+                "CRS-943110 must not fire on ?{query}"
+            );
+            assert!(
+                !fires(&checker, "CRS-943120", &probe("GET", "/x", query, no_referer, "", 1)),
+                "CRS-943120 must not fire on ?{query}"
+            );
+        }
+    }
+
+    /// A chain sees the parameter its head matched, not the surface it came
+    /// from.
+    #[test]
+    fn a_chain_reads_the_parameter_its_head_matched() {
+        let yaml = "version: \"1.0\"\nrules:\n  - id: TEST-CHAIN\n    name: t\n    category: test\n    \
+                    severity: critical\n    paranoia: 1\n    field: args\n    operator: contains\n    \
+                    value: alpha\n    chain:\n      - field: matched_value\n        operator: contains\n        \
+                    value: beta\n    action: block\n";
+        let checker = OWASPCheck::from_yaml(yaml);
+        assert!(
+            checker.check(&probe("GET", "/", "x=alphabeta", &[], "", 1)).is_some(),
+            "one parameter carrying both halves fires"
+        );
+        assert!(
+            checker
+                .check(&probe("GET", "/", "x=alpha&y=beta", &[], "", 1))
+                .is_none(),
+            "two parameters must not be stitched together"
+        );
+        // Every member is tried, not just the first that matched the head.
+        assert!(
+            checker
+                .check(&probe("GET", "/", "x=alpha&y=alphabeta", &[], "", 1))
+                .is_some(),
+            "a later member that carries the whole chain still fires"
+        );
+    }
+
+    /// Cookie names are their own collection, as `REQUEST_COOKIES_NAMES`.
+    #[test]
+    fn cookie_names_are_readable_apart_from_cookie_values() {
+        let yaml = |field: &str| {
+            format!(
+                "version: \"1.0\"\nrules:\n  - id: TEST-C\n    name: t\n    category: test\n    \
+                 severity: critical\n    paranoia: 1\n    field: {field}\n    operator: equals\n    \
+                 value: needle\n    action: block\n"
+            )
+        };
+        // `equals` is scalar-only, so use `contains` for the collection fields.
+        let yaml = |field: &str| yaml(field).replace("operator: equals", "operator: contains");
+        let names = OWASPCheck::from_yaml(&yaml("cookies_names"));
+        let values = OWASPCheck::from_yaml(&yaml("cookies"));
+        let in_name = probe("GET", "/", "", &[("cookie", "needle=1; other=2")], "", 1);
+        let in_value = probe("GET", "/", "", &[("cookie", "k=needle; other=2")], "", 1);
+        assert!(names.check(&in_name).is_some());
+        assert!(names.check(&in_value).is_none());
+        assert!(values.check(&in_value).is_some());
+        assert!(values.check(&in_name).is_none());
     }
 }

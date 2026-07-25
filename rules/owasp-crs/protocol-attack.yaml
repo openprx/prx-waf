@@ -14,7 +14,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: query+body
+    field: args+args_names+body
     operator: regex
     value: |-
       (?:get|p(?:(?:os|u)t|atch|rop(?:find|atch))|head|options|co(?:nnect|py)|delete|trac[ek]|m(?:kcol|ove)|(?:un)?lock)[\s\x0b]+[^\s\x0b]+[\s\x0b]+http/[0-9]
@@ -32,7 +32,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: query+body+cookies
+    field: args+args_names+body+cookies+cookies_names
     operator: regex
     value: '[\n\r][^0-9A-Z_a-z]*?(?:content-(?:type|length)|set-cookie|location):[\s\x0b]*[0-9A-Z_a-z]'
     transform:
@@ -48,7 +48,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: query+body+cookies
+    field: args+args_names+body+cookies+cookies_names
     operator: regex
     value: (?:\bhttp/\d|<(?:html|meta)\b)
     transform:
@@ -81,7 +81,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: query
+    field: args_names
     operator: regex
     value: '[\n\r]'
     action: block
@@ -95,7 +95,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: query
+    field: args_get+args_get_names
     operator: regex
     value: |-
       [\n\r]+(?:[\s\x0b]|location|re(?:fresh|mote-(?:ip|addr))|(?:set-)?cookie|forwarded-(?:(?:fo|serve)r|host)|host|via|originating-IP|x-(?:forwarded-(?:(?:fo|serve)r|host)|host|via|remote-(?:ip|addr)|originating-IP))[\s\x0b]*:
@@ -128,7 +128,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: query+body+cookies
+    field: args+args_names+body+cookies+cookies_names
     operator: regex
     value: |-
       ^[^!&\(\):<>\|~]*\)[\s\x0b]*(?:\((?:[^!&\(\),<->\|~]+[<>~]?=|[\s\x0b]*[!&\|][\s\x0b]*[\(\)]?[\s\x0b]*)|\)[\s\x0b]*\([\s\x0b]*[!&\|][\s\x0b]*|[!&\|][\s\x0b]*\([^!&\(\),<->\|~]+[<>~]?=[^!&\(\):<>\|~]*)
@@ -193,7 +193,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 2
-    field: query
+    field: args_get
     operator: regex
     value: '[\n\r]'
     action: block
@@ -238,7 +238,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 3
-    field: query
+    field: args_names
     operator: regex
     value: (][^\]]+$|][^\]]+\[)
     action: block
@@ -252,7 +252,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 4
-    field: query
+    field: args_names
     operator: regex
     value: \[
     action: block

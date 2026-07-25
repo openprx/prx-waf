@@ -14,7 +14,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: query+body+cookies+user_agent
+    field: args+args_names+body+cookies+cookies_names+user_agent
     operator: detect_xss
     value: ''
     transform:
@@ -35,7 +35,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: all
+    field: path+args+args_names+body+cookies+cookies_names+headers
     operator: regex
     value: (?i)<script[^>]*>[\s\S]*?
     transform:
@@ -56,7 +56,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: all
+    field: path+args+args_names+body+cookies+cookies_names+headers
     operator: regex
     value: (?i)[\s\"'`;/0-9=\x0B\x09\x0C\x3B\x2C\x28\x3B]on[a-zA-Z]{3,50}[\s\x0B\x09\x0C\x3B\x2C\x28\x3B]*?=[^=]
     transform:
@@ -77,7 +77,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies+user_agent
+    field: path+args+args_names+body+cookies+cookies_names+user_agent
     operator: regex
     value: |-
       (?i).(?:\b(?:(?:x(?:link:href|html|mlns)|data:text/html|formaction)\b|pattern[\s\x0b]*=)|(?:!ENTITY[\s\x0b]+(?:%[\s\x0b]+)?[^\s\x0b]+[\s\x0b]+(?:SYSTEM|PUBLIC)|@import|;base64)\b)
@@ -99,7 +99,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies+user_agent+referer
+    field: path+args+args_names+body+cookies+cookies_names+user_agent+referer
     operator: regex
     value: (?i)[a-z]+=(?:[^:=]+:.+;)*?[^:=]+:url\(javascript
     transform:
@@ -121,7 +121,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies+user_agent+referer
+    field: path+args+args_names+body+cookies+cookies_names+user_agent+referer
     operator: regex
     value: |-
       (?i)<[^0-9<>A-Z_a-z]*(?:[^\s\x0b\"'<>]*:)?[^0-9<>A-Z_a-z]*[^0-9A-Z_a-z]*?(?:s[^0-9A-Z_a-z]*?(?:c[^0-9A-Z_a-z]*?r[^0-9A-Z_a-z]*?i[^0-9A-Z_a-z]*?p[^0-9A-Z_a-z]*?t|t[^0-9A-Z_a-z]*?y[^0-9A-Z_a-z]*?l[^0-9A-Z_a-z]*?e|v[^0-9A-Z_a-z]*?g|e[^0-9A-Z_a-z]*?t[^0-9>A-Z_a-z])|f[^0-9A-Z_a-z]*?o[^0-9A-Z_a-z]*?r[^0-9A-Z_a-z]*?m|d[^0-9A-Z_a-z]*?i[^0-9A-Z_a-z]*?a[^0-9A-Z_a-z]*?l[^0-9A-Z_a-z]*?o[^0-9A-Z_a-z]*?g|m[^0-9A-Z_a-z]*?(?:a[^0-9A-Z_a-z]*?r[^0-9A-Z_a-z]*?q[^0-9A-Z_a-z]*?u[^0-9A-Z_a-z]*?e[^0-9A-Z_a-z]*?e|e[^0-9A-Z_a-z]*?t[^0-9A-Z_a-z]*?a[^0-9>A-Z_a-z])|(?:l[^0-9A-Z_a-z]*?i[^0-9A-Z_a-z]*?n[^0-9A-Z_a-z]*?k|o[^0-9A-Z_a-z]*?b[^0-9A-Z_a-z]*?j[^0-9A-Z_a-z]*?e[^0-9A-Z_a-z]*?c[^0-9A-Z_a-z]*?t|e[^0-9A-Z_a-z]*?m[^0-9A-Z_a-z]*?b[^0-9A-Z_a-z]*?e[^0-9A-Z_a-z]*?d|a[^0-9A-Z_a-z]*?(?:p[^0-9A-Z_a-z]*?p[^0-9A-Z_a-z]*?l[^0-9A-Z_a-z]*?e[^0-9A-Z_a-z]*?t|u[^0-9A-Z_a-z]*?d[^0-9A-Z_a-z]*?i[^0-9A-Z_a-z]*?o|n[^0-9A-Z_a-z]*?i[^0-9A-Z_a-z]*?m[^0-9A-Z_a-z]*?a[^0-9A-Z_a-z]*?t[^0-9A-Z_a-z]*?e)|p[^0-9A-Z_a-z]*?a[^0-9A-Z_a-z]*?r[^0-9A-Z_a-z]*?a[^0-9A-Z_a-z]*?m|i?[^0-9A-Z_a-z]*?f[^0-9A-Z_a-z]*?r[^0-9A-Z_a-z]*?a[^0-9A-Z_a-z]*?m[^0-9A-Z_a-z]*?e|b[^0-9A-Z_a-z]*?(?:a[^0-9A-Z_a-z]*?s[^0-9A-Z_a-z]*?e|o[^0-9A-Z_a-z]*?d[^0-9A-Z_a-z]*?y|i[^0-9A-Z_a-z]*?n[^0-9A-Z_a-z]*?d[^0-9A-Z_a-z]*?i[^0-9A-Z_a-z]*?n[^0-9A-Z_a-z]*?g[^0-9A-Z_a-z]*?s)|i[^0-9A-Z_a-z]*?m[^0-9A-Z_a-z]*?a?[^0-9A-Z_a-z]*?g[^0-9A-Z_a-z]*?e?|v[^0-9A-Z_a-z]*?i[^0-9A-Z_a-z]*?d[^0-9A-Z_a-z]*?e[^0-9A-Z_a-z]*?o)[^0-9>A-Z_a-z])|(?:<[0-9A-Z_a-z][^\s\x0b/]*[\s\x0b/]|[\"'](?:[^\s\x0b/]*[\s\x0b/])?)(?:background|formaction|lowsrc|on(?:a(?:bort|ctivate|d(?:apteradded|dtrack)|fter(?:print|(?:scriptexecu|upda)te)|lerting|n(?:imation(?:cancel|end|iteration|start)|tennastatechange)|ppcommand|u(?:dio(?:end|process|start)|xclick))|b(?:e(?:fore(?:(?:(?:(?:de)?activa|scriptexecu)t|toggl)e|c(?:opy|ut)|editfocus|input|p(?:aste|rint)|u(?:nload|pdate))|gin(?:Event)?)|l(?:ocked|ur)|oun(?:ce|dary)|roadcast|usy)|c(?:a(?:(?:ch|llschang)ed|nplay(?:through)?|rdstatechange)|(?:ell|fstate)change|h(?:a(?:rging(?:time)?cha)?nge|ecking)|l(?:ick|ose)|o(?:m(?:mand(?:update)?|p(?:lete|osition(?:end|start|update)))|n(?:nect(?:ed|ing)|t(?:extmenu|rolselect))|py)|u(?:echange|t))|d(?:ata(?:(?:availabl|chang)e|error|setc(?:hanged|omplete))|blclick|e(?:activate|livery(?:error|success)|vice(?:found|light|(?:mo|orienta)tion|proximity))|i(?:aling|s(?:abled|c(?:hargingtimechange|onnect(?:ed|ing))))|o(?:m(?:a(?:ctivate|ttrmodified)|(?:characterdata|subtree)modified|focus(?:in|out)|mousescroll|node(?:inserted(?:intodocument)?|removed(?:fromdocument)?))|wnloading)|r(?:ag(?:drop|e(?:n(?:d|ter)|xit)|(?:gestur|leav)e|over|start)|op)|urationchange)|e(?:mptied|n(?:abled|d(?:ed|Event)?|ter)|rror(?:update)?|xit)|f(?:ailed|i(?:lterchange|nish)|o(?:cus(?:in|out)?|rm(?:change|input))|ullscreenchange)|g(?:amepad(?:axismove|button(?:down|up)|(?:dis)?connected)|et)|h(?:ashchange|e(?:adphoneschange|l[dp])|olding)|i(?:cc(?:cardlockerror|infochange)|n(?:coming|put|valid))|key(?:down|press|up)|l(?:evelchange|o(?:ad(?:e(?:d(?:meta)?data|nd)|start)?|secapture)|y)|m(?:ark|essage|o(?:use(?:down|enter|(?:lea|mo)ve|o(?:ut|ver)|up|wheel)|ve(?:end|start)?|z(?:a(?:fterpaint|udioavailable)|(?:beforeresiz|orientationchang|t(?:apgestur|imechang))e|(?:edgeui(?:c(?:ancel|omplet)|start)e|network(?:down|up)loa)d|fullscreen(?:change|error)|m(?:agnifygesture(?:start|update)?|ouse(?:hittest|pixelscroll))|p(?:ointerlock(?:change|error)|resstapgesture)|rotategesture(?:start|update)?|s(?:crolledareachanged|wipegesture(?:end|start|update)?))))|no(?:match|update)|o(?:(?:bsolet|(?:ff|n)lin)e|pen|verflow(?:changed)?)|p(?:a(?:ge(?:hide|show)|int|(?:st|us)e)|lay(?:ing)?|o(?:inter(?:down|enter|(?:(?:lea|mo)v|rawupdat)e|o(?:ut|ver)|up)|p(?:state|up(?:hid(?:den|ing)|show(?:ing|n))))|ro(?:gress|pertychange))|r(?:atechange|e(?:adystatechange|ceived|movetrack|peat(?:Event)?|quest|s(?:et|ize|u(?:lt|m(?:e|ing)))|trieving)|ow(?:e(?:nter|xit)|s(?:delete|inserted)))|s(?:croll(?:end)?|e(?:arch|ek(?:complete|ed|ing)|lect(?:ionchange|start)?|n(?:ding|t)|t)|how|(?:ound|peech)(?:end|start)|t(?:a(?:lled|rt|t(?:echange|uschanged))|k(?:comma|sessione)nd|op)|u(?:bmit|ccess|spend)|vg(?:abort|error|(?:un)?load|resize|scroll|zoom))|t(?:ext|ime(?:out|update)|o(?:ggle|uch(?:cancel|en(?:d|ter)|(?:lea|mo)ve|start))|ransition(?:cancel|end|run|start))|u(?:n(?:derflow|handledrejection|load)|p(?:dateready|gradeneeded)|s(?:erproximity|sdreceived))|v(?:ersion|o(?:ic|lum)e)change|w(?:a(?:it|rn)ing|ebkit(?:animation(?:end|iteration|start)|(?:playbacktargetavailabilitychange|transitionen)d)|heel)|zoom)|ping|s(?:rc|tyle))[\x08-\n\f\r ]*?=
@@ -143,7 +143,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies+user_agent+referer
+    field: path+args+args_names+body+cookies+cookies_names+user_agent+referer
     operator: regex
     value: |-
       (?i)(?:\W|^)(?:javascript:(?:[\s\S]+[=\x5c\(\[\.<]|[\s\S]*?(?:\bname\b|\x5c[ux]\d))|data:(?:(?:[a-z]\w+/\w[\w+-]+\w)?[;,]|[\s\S]*?;[\s\S]*?\b(?:base64|charset=)|[\s\S]*?,[\s\S]*?<[\s\S]*?\w[\s\S]*?>))|@\W*?i\W*?m\W*?p\W*?o\W*?r\W*?t\W*?(?:/\*[\s\S]*?)?(?:[\"']|\W*?u\W*?r\W*?l[\s\S]*?\()|[^-]*?-\W*?m\W*?o\W*?z\W*?-\W*?b\W*?i\W*?n\W*?d\W*?i\W*?n\W*?g[^:]*?:\W*?u\W*?r\W*?l[\s\S]*?\(
@@ -165,7 +165,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: contains_any
     value: |-
       document.cookie document.domain document.querySelector document.body.appendChild document.write .parentnode .innerhtml window.location -moz-binding <!-- <![cdata[
@@ -187,7 +187,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: (?i)<style.*?>.*?(?:@[\x5ci]|(?:[:=]|&#x?0*(?:58|3[AD]|61);?).*?(?:[\(\x5c]|&#x?0*(?:40|28|92|5C);?))
     transform:
@@ -208,7 +208,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: (?i:<.*[:]?vmlframe.*?[\s/+]*?src[\s/+]*=)
     transform:
@@ -229,7 +229,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: |-
       (?i)(?:j|&#(?:0*(?:74|106)|x0*[46]A);)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:a|&#(?:0*(?:65|97)|x0*[46]1);)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:v|&#(?:0*(?:86|118)|x0*[57]6);)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:a|&#(?:0*(?:65|97)|x0*[46]1);)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:s|&#(?:0*(?:115|83)|x0*[57]3);)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:c|&#(?:x0*[46]3|0*(?:99|67));)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:r|&#(?:x0*[57]2|0*(?:114|82));)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:i|&#(?:x0*[46]9|0*(?:105|73));)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:p|&#(?:x0*[57]0|0*(?:112|80));)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:t|&#(?:x0*[57]4|0*(?:116|84));)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?::|&(?:#(?:0*58|x0*3A);?|colon;)).
@@ -251,7 +251,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: |-
       (?i)(?:v|&#(?:0*(?:118|86)|x0*[57]6);)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:b|&#(?:0*(?:98|66)|x0*[46]2);)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:s|&#(?:0*(?:115|83)|x0*[57]3);)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:c|&#(?:x0*[46]3|0*(?:99|67));)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:r|&#(?:x0*[57]2|0*(?:114|82));)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:i|&#(?:x0*[46]9|0*(?:105|73));)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:p|&#(?:x0*[57]0|0*(?:112|80));)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?:t|&#(?:x0*[57]4|0*(?:116|84));)(?:[\t\n\r]|&(?:#(?:0*(?:9|1[03])|x0*[AD]);?|(?:tab|newline);))*(?::|&(?:#(?:0*58|x0*3A);?|colon;)).
@@ -273,7 +273,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: (?i)<EMBED[\s/+].*?(?:src|type).*?=
     transform:
@@ -294,7 +294,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: <[?]?import[\s/+\S]*?implementation[\s/+]*?=
     transform:
@@ -316,7 +316,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: (?i)<META[\s\x0b\+/].*?http-equiv[\s\x0b\+/]*=[\s\x0b\+/]*[\"'`]?(?:[crs]|&#x?0*(?:6[37]|43|99|[578][23]|11[45]);?)
     transform:
@@ -337,7 +337,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: (?i:<META[\s/+].*?charset[\s/+]*=)
     transform:
@@ -358,7 +358,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: (?i)<LINK[\s/+].*?href[\s/+]*=
     transform:
@@ -379,7 +379,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: (?i)<BASE[\s/+].*?href[\s/+]*=
     transform:
@@ -400,7 +400,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: (?i)<APPLET[\s/+>]
     transform:
@@ -421,7 +421,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: (?i)<OBJECT[\s\x0b\+/].*?(?:type|c(?:ode(?:type)?|lassid)|data)[\s\x0b\+/]*=
     transform:
@@ -442,7 +442,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: \xbc[^\xbe>]*[\xbe>]|<[^\xbe]*\xbe
     transform:
@@ -465,7 +465,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: \+ADw-.*(?:\+AD4-|>)|<.*\+AD4-
     transform:
@@ -483,7 +483,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: '![!+ ]\[\]'
     action: block
@@ -497,7 +497,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+body+cookies+cookies_names
     operator: regex
     value: (?:self|document|t(?:his|op)|window)[\s\x0b]*(?:/\*|[\)\[]).+?(?:\]|\*/)
     transform:
@@ -514,7 +514,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: |-
       (?i)\b(?:eval|set(?:timeout|interval)|new[\s\x0b]+Function|a(?:lert|tob)|btoa|(?:promp|impor)t|con(?:firm|sole\.(?:log|dir))|fetch)[\s\x0b]*[\(\{]
@@ -532,7 +532,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 1
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: ((?:\[[^\]]*\]|Reflect)[^\.]*\.).*(?:map|sort|apply)[^\.]*\..*call[^`]*`.*`
     transform:
@@ -570,7 +570,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 2
-    field: path+query+body+cookies+user_agent
+    field: path+args+args_names+body+cookies+cookies_names+user_agent
     operator: regex
     value: (?i)\b(?:s(?:tyle|rc)|href)\b[\s\S]*?=
     transform:
@@ -591,7 +591,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 2
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: contains
     value: -->
     transform:
@@ -613,7 +613,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 2
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: |-
       <(?:a(?:bbr|cronym|ddress|pplet|rea|udioscope)?|b(?:ase(?:front)?|do|gsound|ig|l(?:(?:ackfac|ockquot)e|ink)|ody|[qr]|utton)?|c(?:aption|enter|ite|o(?:de|l(?:group)?|mment))|d(?:[dt]|e?l|fn|i[rv])|em(?:bed)?|f(?:ieldset|n|o(?:nt|rm)|rame(?:set)?)|h(?:[1r]|ead|tml)|i(?:frame|layer|mg|n(?:put|s)|sindex)?|k(?:db|eygen)|l(?:a(?:bel|yer)|egend|i(?:mittext|nk|sting)?)|m(?:a(?:p|rquee)|e(?:nu|ta)|ulticol)|no(?:br|embed|frames|s(?:cript|martquotes))|o(?:bject|l|pt(?:group|ion))|p(?:aram|laintext|re)?|q|r(?:t|uby)|s(?:amp|cript|e(?:lect|rver)|hadow|idebar|mall|pa(?:cer|n)|t(?:r(?:ike|ong)|yle)|u[bp])?|t(?:(?:ab|it)le|body|[dr]|extarea|(?:foo)?t|h(?:ead)?)|ul?|(?:va|wb)r|xm[lp])[^0-9A-Z_a-z]
@@ -631,7 +631,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 2
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: |-
       (?i)[\"'] *(?:[^ '0-:_a-z~]|in).*?(?:(?:l|\x5cu006C)(?:o|\x5cu006F)(?:c|\x5cu0063)(?:a|\x5cu0061)(?:t|\x5cu0074)(?:i|\x5cu0069)(?:o|\x5cu006F)(?:n|\x5cu006E)|(?:n|\x5cu006E)(?:a|\x5cu0061)(?:m|\x5cu006D)(?:e|\x5cu0065)|(?:o|\x5cu006F)(?:n|\x5cu006E)(?:e|\x5cu0065)(?:r|\x5cu0072)(?:r|\x5cu0072)(?:o|\x5cu006F)(?:r|\x5cu0072)|(?:v|\x5cu0076)(?:a|\x5cu0061)(?:l|\x5cu006C)(?:u|\x5cu0075)(?:e|\x5cu0065)(?:O|\x5cu004F)(?:f|\x5cu0066)).*?=
@@ -649,7 +649,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 2
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: (?i)[\"\'][ ]*(?:[^a-z0-9~_:\' ]|in).+?[.].+?=
     transform:
@@ -666,7 +666,7 @@ rules:
     category: xss
     severity: critical
     paranoia: 2
-    field: path+query+body+cookies
+    field: path+args+args_names+body+cookies+cookies_names
     operator: regex
     value: \{\{.*?}}
     action: block
