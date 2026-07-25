@@ -1559,6 +1559,10 @@ fn retention_policies(storage: &waf_common::config::StorageConfig) -> Vec<waf_st
                 RetentionTable::AttackLogs => storage.attack_log_retention_days,
                 RetentionTable::AuditLog => storage.audit_log_retention_days,
                 RetentionTable::CrowdsecEvents => storage.crowdsec_event_retention_days,
+                RetentionTable::CrowdsecDecisions => storage.crowdsec_decision_retention_days,
+                RetentionTable::RefreshTokens => storage.refresh_token_retention_days,
+                RetentionTable::NotificationLog => storage.notification_log_retention_days,
+                RetentionTable::RequestStats => storage.request_stats_retention_days,
             };
             TableRetention::new(*table, days)
         })
@@ -2376,7 +2380,7 @@ mod tests {
             lines.iter().all(|l| l.level == BroadcastLevel::Info),
             "an all-enabled config must not warn: {text}"
         );
-        assert!(text.contains("Retention pruner ACTIVE: 5/5 tables"), "{text}");
+        assert!(text.contains("Retention pruner ACTIVE: 9/9 tables"), "{text}");
         // "when is the next sweep" must be answerable from the broadcast alone.
         assert!(text.contains("first sweep in 300s then every 6h"), "{text}");
         assert!(text.contains("up to 5000 rows per DELETE batch"), "{text}");
@@ -2417,9 +2421,9 @@ mod tests {
             "the warning must state the personal data retained: {warning}"
         );
 
-        // The four still-enabled tables are unaffected and still announced.
+        // The eight still-enabled tables are unaffected and still announced.
         let text = rendered(&lines);
-        assert!(text.contains("Retention pruner ACTIVE: 4/5 tables"), "{text}");
+        assert!(text.contains("Retention pruner ACTIVE: 8/9 tables"), "{text}");
         assert!(text.contains("security_events keeps 90 days"), "{text}");
     }
 
@@ -2432,7 +2436,7 @@ mod tests {
             ..waf_common::config::StorageConfig::default()
         };
         let enabled = waf_storage::retention::enabled_policies(&retention_policies(&storage));
-        assert_eq!(enabled.len(), 4, "the zeroed table must not be swept");
+        assert_eq!(enabled.len(), 8, "the zeroed table must not be swept");
         assert!(
             !enabled.iter().any(|p| p.table == waf_storage::RetentionTable::AuditLog),
             "audit_log was zeroed but is still in the sweep set"
@@ -2447,6 +2451,10 @@ mod tests {
             attack_log_retention_days: 0,
             audit_log_retention_days: 0,
             crowdsec_event_retention_days: 0,
+            crowdsec_decision_retention_days: 0,
+            refresh_token_retention_days: 0,
+            notification_log_retention_days: 0,
+            request_stats_retention_days: 0,
             ..waf_common::config::StorageConfig::default()
         };
         let lines = retention_broadcast(&storage);

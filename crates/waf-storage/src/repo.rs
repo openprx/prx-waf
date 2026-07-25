@@ -1429,13 +1429,13 @@ impl Database {
         })
     }
 
-    pub async fn delete_old_stats(&self, days: i64) -> Result<u64, StorageError> {
-        let r = sqlx::query("DELETE FROM request_stats WHERE period_start < NOW() - make_interval(days => $1::int)")
-            .bind(i32::try_from(days).unwrap_or(i32::MAX))
-            .execute(&self.pool)
-            .await?;
-        Ok(r.rows_affected())
-    }
+    // `request_stats` retention: previously a standalone, unbatched
+    // `delete_old_stats` helper existed here with zero call sites anywhere in
+    // the codebase — the exact "wrote a cleanup function, never wired it to a
+    // scheduler" bug this module exists to fix. It is superseded by
+    // `RetentionTable::RequestStats` through the shared, batched
+    // `prune_retention_table` below, rather than resurrected as a second,
+    // unbounded, single-statement way to delete from the same table.
 
     // ─── Phase 4: Notifications ───────────────────────────────────────────────
 

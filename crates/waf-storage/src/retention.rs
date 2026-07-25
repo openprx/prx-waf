@@ -1,19 +1,25 @@
 //! Background retention (TTL) enforcement for the observability / PII tables.
 //!
-//! Five tables accumulate rows on the request path or the admin path and every
-//! one of them stores a client or operator IP address:
+//! Nine tables accumulate rows on the request path, the admin path or a
+//! background sync, and every one of them holds either personal data or dead
+//! security material with no residual value:
 //!
-//! | table | written by | personal data |
-//! |---|---|---|
-//! | `semantic_observations` | Lane 2 semantic detection (shadow-enabled by default) | `client_ip`, `req_id` |
-//! | `security_events`       | every rule detection | `client_ip`, path, geo |
-//! | `attack_logs`           | every blocked / logged request | `client_ip`, path, request headers |
-//! | `audit_log`             | every mutating admin API call | `admin_username`, `ip_addr` |
-//! | `crowdsec_events`       | the `CrowdSec` bouncer worker | `client_ip`, scenario |
+//! | table | written by | personal data / risk | time column |
+//! |---|---|---|---|
+//! | `semantic_observations` | Lane 2 semantic detection (shadow-enabled by default) | `client_ip`, `req_id` | `created_at` |
+//! | `security_events`       | every rule detection | `client_ip`, path, geo | `created_at` |
+//! | `attack_logs`           | every blocked / logged request | `client_ip`, path, request headers | `created_at` |
+//! | `audit_log`             | every mutating admin API call | `admin_username`, `ip_addr` | `created_at` |
+//! | `crowdsec_events`       | the `CrowdSec` bouncer worker | `client_ip`, scenario | `created_at` |
+//! | `crowdsec_decisions`    | `CrowdSec` LAPI decision sync | `value` holds the banned IP when `scope='Ip'` | `expires_at` |
+//! | `refresh_tokens`        | JWT login / refresh | token hash; dead once expired or revoked | `expires_at` (or `revoked`) |
+//! | `notification_log`      | notification dispatch | `message`/`error_msg` may embed a `client_ip` | `created_at` |
+//! | `request_stats`         | stats aggregation job | none — aggregated counters only | `period_start` |
 //!
 //! None of them had a cleanup path, so a default deployment grew without bound
-//! and retained personal data indefinitely. This module is the scheduler that
-//! deletes expired rows; [`Database::prune_retention_table`] is the statement.
+//! and retained personal data (or dead auth material) indefinitely. This
+//! module is the scheduler that deletes expired rows;
+//! [`Database::prune_retention_table`] is the statement.
 //!
 //! Design notes:
 //!
@@ -24,6 +30,16 @@
 //! * **Per-table windows.** An admin audit trail and shadow telemetry have very
 //!   different retention requirements, so each table gets its own configured
 //!   window instead of one global number.
+//! * **Per-table time column.** Most tables are pruned on their own row's
+//!   insertion time (`created_at`), but that is not universal:
+//!   `crowdsec_decisions` is pruned on the *decision's own expiry*
+//!   (`expires_at`) because a decision has zero value once `CrowdSec` itself
+//!   stops enforcing it, independent of when the local echo row was inserted;
+//!   `request_stats` is pruned on the aggregation bucket's own timestamp
+//!   (`period_start`) for the same reason. [`RetentionTable::delete_batch_sql`]
+//!   hard-codes which column each table uses — see that method's doc comment
+//!   for why the column choice is a compile-time literal rather than a runtime
+//!   parameter.
 //! * **Batched deletes.** A single `DELETE` over millions of expired rows holds
 //!   row locks for minutes and inflates the WAL. Each table is drained in
 //!   bounded batches with a pause between them; see [`prune_in_batches`].
@@ -62,20 +78,33 @@ pub enum RetentionTable {
     SecurityEvents,
     /// Blocked / logged request records, including request headers.
     AttackLogs,
+    /// `CrowdSec` decision echoes (event log, not the decision cache).
+    CrowdsecEvents,
+    /// Cached `CrowdSec` LAPI decisions, pruned on the decision's own expiry.
+    CrowdsecDecisions,
+    /// Refresh token hashes, pruned once expired or revoked.
+    RefreshTokens,
+    /// Notification delivery records.
+    NotificationLog,
     /// Mutating admin API calls.
     AuditLog,
-    /// `CrowdSec` decision echoes.
-    CrowdsecEvents,
+    /// Aggregated per-host request/block counters, pruned on the bucket start.
+    RequestStats,
 }
 
 impl RetentionTable {
-    /// Every prunable table, in sweep order (cheapest / most volatile first).
-    pub const ALL: [Self; 5] = [
+    /// Every prunable table, in sweep order (cheapest / most volatile first;
+    /// `RequestStats` last since it holds no personal data and has no urgency).
+    pub const ALL: [Self; 9] = [
         Self::SemanticObservations,
         Self::SecurityEvents,
         Self::AttackLogs,
         Self::CrowdsecEvents,
+        Self::CrowdsecDecisions,
+        Self::RefreshTokens,
+        Self::NotificationLog,
         Self::AuditLog,
+        Self::RequestStats,
     ];
 
     /// The physical table name, used as the `table` log field.
@@ -87,6 +116,10 @@ impl RetentionTable {
             Self::AttackLogs => "attack_logs",
             Self::AuditLog => "audit_log",
             Self::CrowdsecEvents => "crowdsec_events",
+            Self::CrowdsecDecisions => "crowdsec_decisions",
+            Self::RefreshTokens => "refresh_tokens",
+            Self::NotificationLog => "notification_log",
+            Self::RequestStats => "request_stats",
         }
     }
 
@@ -100,6 +133,10 @@ impl RetentionTable {
             Self::AttackLogs => "storage.attack_log_retention_days",
             Self::AuditLog => "storage.audit_log_retention_days",
             Self::CrowdsecEvents => "storage.crowdsec_event_retention_days",
+            Self::CrowdsecDecisions => "storage.crowdsec_decision_retention_days",
+            Self::RefreshTokens => "storage.refresh_token_retention_days",
+            Self::NotificationLog => "storage.notification_log_retention_days",
+            Self::RequestStats => "storage.request_stats_retention_days",
         }
     }
 
@@ -112,7 +149,33 @@ impl RetentionTable {
             Self::SecurityEvents => "rule detections; client_ip, method, path, geo",
             Self::AttackLogs => "blocked/logged requests; client_ip, path, query, request headers",
             Self::AuditLog => "admin API mutations; admin_username, admin source ip_addr",
-            Self::CrowdsecEvents => "CrowdSec decisions; client_ip, scenario, request path",
+            Self::CrowdsecEvents => "CrowdSec decision events; client_ip, scenario, request path",
+            Self::CrowdsecDecisions => {
+                "cached CrowdSec LAPI decisions; value holds the banned client IP when scope='Ip'"
+            }
+            Self::RefreshTokens => "refresh token hashes; dead auth material once expired or revoked",
+            Self::NotificationLog => "notification delivery records; message/error_msg may embed a client_ip",
+            Self::RequestStats => "aggregated per-host request/block counters; no personal data",
+        }
+    }
+
+    /// The column each table is pruned on. Most tables use their own row's
+    /// insertion time; `crowdsec_decisions` and `request_stats` are pruned on
+    /// a domain timestamp instead (see the module doc comment), and
+    /// `refresh_tokens` adds an unconditional `revoked` branch on top of its
+    /// `expires_at` window. Exposed for tests; [`Self::delete_batch_sql`] is
+    /// still the single source of truth for the actual statement text.
+    #[must_use]
+    pub const fn time_column(self) -> &'static str {
+        match self {
+            Self::SemanticObservations
+            | Self::SecurityEvents
+            | Self::AttackLogs
+            | Self::AuditLog
+            | Self::CrowdsecEvents
+            | Self::NotificationLog => "created_at",
+            Self::CrowdsecDecisions | Self::RefreshTokens => "expires_at",
+            Self::RequestStats => "period_start",
         }
     }
 
@@ -120,15 +183,31 @@ impl RetentionTable {
     ///
     /// `$1` is the cutoff timestamp, `$2` the batch size. The `ctid IN
     /// (SELECT … LIMIT $2)` form is the standard Postgres bounded delete: the
-    /// subquery walks the `created_at` index, takes at most `$2` physical row
-    /// identifiers, and the outer `DELETE` touches exactly those rows. Every
-    /// table below has an index on `created_at` (`0001`, `0002`, `0005`, `0006`,
-    /// `0011`), so the subquery is an index range scan that stops at the LIMIT
-    /// rather than a full table scan.
+    /// subquery walks the index on [`Self::time_column`], takes at most `$2`
+    /// physical row identifiers, and the outer `DELETE` touches exactly those
+    /// rows. Every table below has an index on its time column (`0001`,
+    /// `0002`, `0004`, `0005`, `0006`, `0011`, `0014`), so the subquery is an
+    /// index range scan that stops at the LIMIT rather than a full table scan.
+    ///
+    /// The time column is a compile-time literal per variant, not a runtime
+    /// parameter, for the same reason the table name is: a column name cannot
+    /// be a bind parameter either, so building the predicate from anything
+    /// other than a fixed set of match arms would mean interpolating
+    /// operator- or config-reachable text into SQL. Every arm below is a
+    /// literal written by this crate; no configuration value reaches it.
     ///
     /// `audit_log` deliberately uses the same shape even though it has a
     /// `BIGSERIAL` key: keying on `created_at` keeps a single policy definition
     /// and stays correct if rows are ever backfilled out of id order.
+    ///
+    /// `crowdsec_decisions` and `request_stats` key on a domain timestamp
+    /// (`expires_at`, `period_start`) instead of `created_at` — see the module
+    /// doc comment for why.
+    ///
+    /// `refresh_tokens` ORs in `revoked = TRUE`: a revoked token is dead the
+    /// instant it is revoked, so it must not wait out the `expires_at` window
+    /// (which can still be far in the future for a token revoked right after
+    /// issuance, e.g. on logout).
     pub(crate) const fn delete_batch_sql(self) -> &'static str {
         match self {
             Self::SemanticObservations => {
@@ -150,6 +229,22 @@ impl RetentionTable {
             Self::CrowdsecEvents => {
                 "DELETE FROM crowdsec_events WHERE ctid IN \
                  (SELECT ctid FROM crowdsec_events WHERE created_at < $1 LIMIT $2)"
+            }
+            Self::CrowdsecDecisions => {
+                "DELETE FROM crowdsec_decisions WHERE ctid IN \
+                 (SELECT ctid FROM crowdsec_decisions WHERE expires_at < $1 LIMIT $2)"
+            }
+            Self::RefreshTokens => {
+                "DELETE FROM refresh_tokens WHERE ctid IN \
+                 (SELECT ctid FROM refresh_tokens WHERE (expires_at < $1 OR revoked = TRUE) LIMIT $2)"
+            }
+            Self::NotificationLog => {
+                "DELETE FROM notification_log WHERE ctid IN \
+                 (SELECT ctid FROM notification_log WHERE created_at < $1 LIMIT $2)"
+            }
+            Self::RequestStats => {
+                "DELETE FROM request_stats WHERE ctid IN \
+                 (SELECT ctid FROM request_stats WHERE period_start < $1 LIMIT $2)"
             }
         }
     }
@@ -496,7 +591,12 @@ mod tests {
                 "{} statement targets another table",
                 table.name()
             );
-            assert!(sql.contains("created_at < $1"), "{} is not time-bounded", table.name());
+            assert!(
+                sql.contains(&format!("{} < $1", table.time_column())),
+                "{} is not bounded on its own time column ({})",
+                table.name(),
+                table.time_column()
+            );
             assert!(sql.contains("LIMIT $2"), "{} delete is not batched", table.name());
             assert!(
                 table.config_key().starts_with("storage."),
@@ -507,19 +607,57 @@ mod tests {
     }
 
     #[test]
-    fn the_four_pii_tables_are_all_covered() {
+    fn every_shipped_table_is_covered_by_the_scheduler() {
         for expected in [
             "semantic_observations",
             "security_events",
             "attack_logs",
             "audit_log",
             "crowdsec_events",
+            "crowdsec_decisions",
+            "refresh_tokens",
+            "notification_log",
+            "request_stats",
         ] {
             assert!(
                 RetentionTable::ALL.iter().any(|t| t.name() == expected),
                 "{expected} is not covered by the retention scheduler"
             );
         }
+    }
+
+    #[test]
+    fn crowdsec_decisions_and_request_stats_key_on_their_own_domain_timestamp() {
+        // These two are pruned on a domain timestamp, not row insertion time —
+        // a stale `crowdsec_decisions` row is dead the moment the decision
+        // itself expires, and a `request_stats` bucket is dead the moment its
+        // period is old enough, independent of when either row was inserted.
+        assert_eq!(RetentionTable::CrowdsecDecisions.time_column(), "expires_at");
+        let cs_sql = RetentionTable::CrowdsecDecisions.delete_batch_sql();
+        assert!(cs_sql.contains("expires_at < $1"), "{cs_sql}");
+        assert!(
+            !cs_sql.contains("created_at"),
+            "crowdsec_decisions must not be gated on insertion time: {cs_sql}"
+        );
+
+        assert_eq!(RetentionTable::RequestStats.time_column(), "period_start");
+        let stats_sql = RetentionTable::RequestStats.delete_batch_sql();
+        assert!(stats_sql.contains("period_start < $1"), "{stats_sql}");
+        assert!(
+            !stats_sql.contains("created_at"),
+            "request_stats must not be gated on insertion time: {stats_sql}"
+        );
+    }
+
+    #[test]
+    fn refresh_tokens_deletes_expired_or_revoked_rows_unconditionally() {
+        let sql = RetentionTable::RefreshTokens.delete_batch_sql();
+        assert!(sql.contains("expires_at < $1"), "{sql}");
+        assert!(sql.contains("revoked = TRUE"), "{sql}");
+        assert!(
+            sql.contains("expires_at < $1 OR revoked = TRUE"),
+            "a revoked token must be deletable even if expires_at is still in the future: {sql}"
+        );
     }
 
     // ─── Config ───────────────────────────────────────────────────────────────

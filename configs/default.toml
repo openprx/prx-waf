@@ -10,11 +10,11 @@ database_url = "postgresql://prx_waf:prx_waf@postgres:5432/prx_waf"
 max_connections = 20
 
 # ── Retention (TTL) for the observability / PII tables ────────────────────────
-# Five tables accumulate rows on the request or admin path and every one of them
-# stores an IP address. One background task sweeps them all on the cadence below
-# and deletes rows older than each table's own window. Setting any window to 0
-# keeps that table's rows forever — the table then grows without bound and
-# startup logs a WARN naming the personal data being retained.
+# Nine tables accumulate rows on the request, admin or sync path and every one of
+# them holds either personal data or dead security material. One background task
+# sweeps them all on the cadence below and deletes rows older than each table's
+# own window. Setting any window to 0 keeps that table's rows forever — the table
+# then grows without bound and startup logs a WARN naming the data being retained.
 
 # Lane 2 semantic shadow telemetry (client_ip + req_id per detection). Exists to
 # tune detection / false-positive rates, a short-horizon activity, so it sits at
@@ -38,10 +38,32 @@ attack_log_retention_days = 90
 # what SOC 2 / ISO 27001 auditors sample). Grows with admin activity, not traffic.
 audit_log_retention_days = 365
 
-# CrowdSec decision echoes (client_ip, scenario). The CrowdSec LAPI keeps the
+# CrowdSec decision events (client_ip, scenario). The CrowdSec LAPI keeps the
 # authoritative history; these rows only answer "did the bouncer act on this IP?"
 # during integration checks or a block dispute.
 crowdsec_event_retention_days = 30
+
+# Cached CrowdSec LAPI decisions (value holds the banned client IP when
+# scope='Ip'). Keyed on the decision's own expiry, not row insertion time: a
+# decision is deleted once it has been expired for longer than this window. An
+# active decision (or one with no known expiry) is never touched regardless of
+# row age.
+crowdsec_decision_retention_days = 3
+
+# Refresh token hashes. Keyed on expires_at, but a revoked token is deleted on
+# the next sweep regardless of this window — it can never be redeemed again, so
+# there is no reason to wait out its natural expiry.
+refresh_token_retention_days = 7
+
+# Notification delivery records. message/error_msg are free text supplied by the
+# triggering event and may embed a client_ip, so the window matches
+# crowdsec_event_retention_days.
+notification_log_retention_days = 30
+
+# Aggregated per-host request/block counters — no personal data. Keyed on the
+# aggregation bucket's own period_start. Long window since there is no privacy
+# pressure, only storage cost, and the admin UI's trend views want it.
+request_stats_retention_days = 180
 
 retention_prune_interval_hours = 6      # sweep cadence; clamped to >= 1
 retention_prune_batch_size = 5000       # rows per DELETE; clamped to 1..=100000

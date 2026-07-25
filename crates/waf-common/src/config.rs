@@ -398,6 +398,32 @@ pub struct StorageConfig {
     /// warns at startup.
     #[serde(default = "default_crowdsec_event_retention_days")]
     pub crowdsec_event_retention_days: i64,
+    /// Retention window, in days, for `crowdsec_decisions` — cached `CrowdSec`
+    /// LAPI decisions, whose `value` column holds the banned client IP when
+    /// `scope='Ip'`. Unlike the other tables this is keyed on the decision's
+    /// own `expires_at`, not row insertion time: rows are deleted once they
+    /// have been expired for longer than this window. `0` keeps rows forever
+    /// and warns at startup.
+    #[serde(default = "default_crowdsec_decision_retention_days")]
+    pub crowdsec_decision_retention_days: i64,
+    /// Retention window, in days, for `refresh_tokens` — JWT refresh token
+    /// hashes. Keyed on `expires_at`, but a revoked token is deleted on the
+    /// next sweep regardless of this window since it can never be redeemed
+    /// again. `0` keeps rows forever (including revoked ones) and warns at
+    /// startup.
+    #[serde(default = "default_refresh_token_retention_days")]
+    pub refresh_token_retention_days: i64,
+    /// Retention window, in days, for `notification_log` — delivery records
+    /// whose `message`/`error_msg` free text may embed a `client_ip` from the
+    /// triggering event. `0` keeps rows forever and warns at startup.
+    #[serde(default = "default_notification_log_retention_days")]
+    pub notification_log_retention_days: i64,
+    /// Retention window, in days, for `request_stats` — aggregated per-host
+    /// request/block counters with no personal data. Keyed on the
+    /// aggregation bucket's own `period_start`, not row insertion time. `0`
+    /// keeps rows forever and warns at startup.
+    #[serde(default = "default_request_stats_retention_days")]
+    pub request_stats_retention_days: i64,
     /// How often the retention pruner runs, in hours. Clamped to at least 1.
     #[serde(default = "default_retention_prune_interval_hours")]
     pub retention_prune_interval_hours: u64,
@@ -473,6 +499,53 @@ const fn default_crowdsec_event_retention_days() -> i64 {
     30
 }
 
+/// Default `crowdsec_decisions` retention: 3 days *past expiry*.
+///
+/// This window does not gate row age — it gates how long an already-expired
+/// decision is kept around after `CrowdSec` itself stops enforcing it. An
+/// active decision (`expires_at` still in the future, or unset for a
+/// decision with no known expiry) is never touched by this policy regardless
+/// of how old the row is. Three days is enough for an operator to answer
+/// "was this IP blocked as of yesterday?" while reviewing a dispute, without
+/// indefinitely retaining a live client IP for a ban that `CrowdSec`'s own
+/// authoritative LAPI history has already superseded.
+const fn default_crowdsec_decision_retention_days() -> i64 {
+    3
+}
+
+/// Default `refresh_tokens` retention: 7 days past expiry.
+///
+/// Gates the "expired but never revoked" case; a revoked token is deleted on
+/// the very next sweep regardless of this window (`waf_storage`'s
+/// `RetentionTable::RefreshTokens` ORs in `revoked = TRUE` unconditionally).
+/// A week of grace past natural expiry gives an operator room to investigate
+/// "was an expired token replayed" without keeping authentication material
+/// that no longer authenticates anything.
+const fn default_refresh_token_retention_days() -> i64 {
+    7
+}
+
+/// Default `notification_log` retention: 30 days.
+///
+/// A delivery record's operational value is "did this alert fire, and did it
+/// succeed" while an integration is being set up or debugged — a
+/// days-to-weeks question, matching `crowdsec_events`. The `message` /
+/// `error_msg` free text can embed a `client_ip` from the event that
+/// triggered it, so the same short window applies.
+const fn default_notification_log_retention_days() -> i64 {
+    30
+}
+
+/// Default `request_stats` retention: 180 days.
+///
+/// No personal data and low row volume (one row per host per aggregation
+/// bucket), so the ceiling here is set by dashboard usefulness rather than
+/// privacy: half a year comfortably covers quarter-over-quarter trend
+/// comparisons in the admin UI without accumulating forever.
+const fn default_request_stats_retention_days() -> i64 {
+    180
+}
+
 /// Default retention sweep interval: every 6 hours.
 const fn default_retention_prune_interval_hours() -> u64 {
     6
@@ -493,6 +566,10 @@ impl Default for StorageConfig {
             attack_log_retention_days: default_attack_log_retention_days(),
             audit_log_retention_days: default_audit_log_retention_days(),
             crowdsec_event_retention_days: default_crowdsec_event_retention_days(),
+            crowdsec_decision_retention_days: default_crowdsec_decision_retention_days(),
+            refresh_token_retention_days: default_refresh_token_retention_days(),
+            notification_log_retention_days: default_notification_log_retention_days(),
+            request_stats_retention_days: default_request_stats_retention_days(),
             retention_prune_interval_hours: default_retention_prune_interval_hours(),
             retention_prune_batch_size: default_retention_prune_batch_size(),
         }
