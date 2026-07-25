@@ -258,20 +258,32 @@ cors_origins = []
 #
 # WHAT THIS DOES AND DOES NOT CHANGE. With `critical = 5` against a threshold of
 # 5, a single critical rule still blocks on its own — and 206 of the 216 enforced
-# rules in `rules/owasp-crs/` are critical. What changes is the remaining 10,
-# which are `warning` (+3): they now score and wait for a second rule instead of
-# blocking alone. That is upstream's own false-positive control, not a relaxation
-# of the rule set. The startup log prints the split.
+# REQUEST-phase rules in `rules/owasp-crs/` are critical. What changes is the
+# remaining 10, which are `warning` (+3): they now score and wait for a second
+# rule instead of blocking alone. That is upstream's own false-positive control,
+# not a relaxation of the rule set. The startup log prints the split.
+# (The other 58 enforced rules are response-phase; see below.)
 #
 # The paranoia level is per-host (`defense_json.owasp_paranoia`), not here. It
 # gates which rules are evaluated at all; a rule above the host's level
 # contributes nothing, exactly as upstream's tx.inbound_anomaly_score_pl1..pl4
 # buckets do.
 #
-# Response-phase (outbound) scoring has no entry here on purpose: the gateway
-# never hands the CRS check a response body, so every RESPONSE-* rule is rejected
-# at load time and an `outbound_anomaly_score_threshold` would be a dial wired to
-# nothing. Upstream's default for it is 4, for the record.
+# RESPONSE PHASE. The CRS response rules (950–956, `rules/owasp-crs/data-leakage*`
+# and `web-shells.yaml`) are evaluated against a SECOND, independent accumulator
+# with its OWN threshold, exactly as upstream does: those rules only ever
+# `setvar:tx.outbound_anomaly_score_plN=+…` and rule 959100 in
+# RESPONSE-959-BLOCKING-EVALUATION.conf compares the total against
+# `tx.outbound_anomaly_score_threshold`, which CRS initialises to **4** — not to
+# the inbound 5. With the weights below that means a single `error` response rule
+# acts on its own, which is upstream's posture and not a local decision.
+#
+# What "acts" means here is narrower than for a request, and structurally so: the
+# response status line is already on the wire by the time a body rule can fire, so
+# enforcement withholds bytes and aborts the stream rather than answering 403 (see
+# crates/gateway/src/response.rs). Because a truncated page is a visibly broken
+# one, the response phase DEFAULTS TO OBSERVE — it logs and delivers. Enforcement
+# is opt-in through `PRXWAF_RESPONSE_INSPECT_MODE=enforce`.
 [owasp]
 anomaly_scoring = true                # false → first matching rule blocks (STRICTER than upstream; FP source)
 critical_anomaly_score = 5            # tx.critical_anomaly_score
@@ -279,6 +291,7 @@ error_anomaly_score = 4               # tx.error_anomaly_score
 warning_anomaly_score = 3             # tx.warning_anomaly_score
 notice_anomaly_score = 2              # tx.notice_anomaly_score
 inbound_anomaly_score_threshold = 5   # tx.inbound_anomaly_score_threshold — CRS 949110 denies at >= this
+outbound_anomaly_score_threshold = 4  # tx.outbound_anomaly_score_threshold — CRS 959100 acts at >= this
 
 # ── Rule-hit audit log ────────────────────────────────────────────────────────
 # One line per CRS rule that matched, plus one line for the anomaly-score verdict,

@@ -89,6 +89,15 @@ const MAX_VALUE_LEN: usize = 512;
 /// id rather than inventing a private one.
 const BLOCKING_EVALUATION_ID: u32 = 949_110;
 
+/// The response-phase counterpart, `RESPONSE-959-BLOCKING-EVALUATION.conf` rule
+/// `959100`. Upstream spells its message
+/// `Outbound Anomaly Score Exceeded (Total Score: %{tx.blocking_outbound_anomaly_score})`,
+/// and the CRS regression corpus asserts on that exact wording
+/// (`RESPONSE-959-BLOCKING-EVALUATION/959100.yaml`, test 3 matches
+/// `Outbound Anomaly Score Exceeded \(Total Score: `), so the text below is a
+/// contract, not a phrasing choice.
+const OUTBOUND_BLOCKING_EVALUATION_ID: u32 = 959_100;
+
 /// One rule that matched, as the audit log needs it.
 ///
 /// Borrowed on purpose: the caller already holds these strings on the compiled
@@ -108,17 +117,54 @@ pub struct RuleHit<'a> {
     pub score: u32,
 }
 
+/// Which CRS blocking-evaluation rule a [`ScoreVerdict`] stands for.
+///
+/// CRS keeps two independent accumulators and two independent thresholds — the
+/// request one settled by `949110`, the response one by `959100` — so a verdict
+/// line has to say which of them it is reporting. Collapsing the two onto one id
+/// would make a response finding indistinguishable from a request finding to
+/// every reader of this file, `go-ftw` included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScorePhase {
+    /// Request phase (`REQUEST-949-BLOCKING-EVALUATION.conf`, id `949110`).
+    #[default]
+    Inbound,
+    /// Response phase (`RESPONSE-959-BLOCKING-EVALUATION.conf`, id `959100`).
+    Outbound,
+}
+
+impl ScorePhase {
+    /// The upstream rule id that settles this phase's threshold comparison.
+    const fn blocking_evaluation_id(self) -> u32 {
+        match self {
+            Self::Inbound => BLOCKING_EVALUATION_ID,
+            Self::Outbound => OUTBOUND_BLOCKING_EVALUATION_ID,
+        }
+    }
+
+    /// Upstream's `msg:` prefix for that rule, verbatim.
+    const fn verdict_message(self) -> &'static str {
+        match self {
+            Self::Inbound => "Inbound Anomaly Score Exceeded",
+            Self::Outbound => "Outbound Anomaly Score Exceeded",
+        }
+    }
+}
+
 /// The anomaly-score outcome for one request.
 #[derive(Debug, Clone, Copy)]
 pub struct ScoreVerdict {
-    /// Accumulated inbound anomaly score.
+    /// Accumulated anomaly score, in the phase named by [`Self::phase`].
     pub score: u32,
     /// Threshold the score was compared against.
     pub threshold: u32,
     /// Paranoia level the request was evaluated at.
     pub paranoia: u8,
-    /// Whether the threshold was reached (i.e. `949110` would fire upstream).
+    /// Whether the threshold was reached (i.e. `949110` / `959100` would fire
+    /// upstream).
     pub reached_threshold: bool,
+    /// Which accumulator this verdict reports.
+    pub phase: ScorePhase,
 }
 
 /// Hot-path handle: one bounded sender plus a drop counter. Held by the engine
@@ -258,11 +304,16 @@ impl AuditLogSink {
         if verdict.reached_threshold {
             let _ = writeln!(
                 block,
-                "{ts} prx-waf: Access denied. [id \"{BLOCKING_EVALUATION_ID}\"] \
-                 [msg \"Inbound Anomaly Score Exceeded (Total Score: {})\"] [score \"{}\"] \
+                "{ts} prx-waf: Access denied. [id \"{}\"] \
+                 [msg \"{} (Total Score: {})\"] [score \"{}\"] \
                  [threshold \"{}\"] [paranoia \"{}\"] [client {client}] [hostname \"{host}\"] \
                  [uri \"{uri}\"] [unique_id \"{req_id}\"]",
-                verdict.score, verdict.score, verdict.threshold, verdict.paranoia,
+                verdict.phase.blocking_evaluation_id(),
+                verdict.phase.verdict_message(),
+                verdict.score,
+                verdict.score,
+                verdict.threshold,
+                verdict.paranoia,
             );
         }
         self.enqueue(block);
@@ -554,12 +605,23 @@ mod tests {
         threshold: 5,
         paranoia: 1,
         reached_threshold: false,
+        phase: ScorePhase::Inbound,
     };
     const REACHED: ScoreVerdict = ScoreVerdict {
         score: 5,
         threshold: 5,
         paranoia: 1,
         reached_threshold: true,
+        phase: ScorePhase::Inbound,
+    };
+    /// The outbound counterpart of [`REACHED`]: one `ERROR` response rule (4)
+    /// against the outbound threshold (4).
+    const OUTBOUND_REACHED: ScoreVerdict = ScoreVerdict {
+        score: 4,
+        threshold: 4,
+        paranoia: 1,
+        reached_threshold: true,
+        phase: ScorePhase::Outbound,
     };
 
     #[test]
@@ -570,6 +632,23 @@ mod tests {
         assert!(out.contains("[id \"942100\"]"), "missing CRS id: {out}");
         assert!(out.contains("[id \"949110\"]"), "missing verdict line: {out}");
         assert!(out.contains("[uri \"/get\"]"), "query must not leak by default: {out}");
+    }
+
+    #[test]
+    fn an_outbound_verdict_carries_959100_and_upstreams_wording() {
+        // `RESPONSE-959-BLOCKING-EVALUATION/959100.yaml` test 3 asserts on this
+        // line with `match_regex: 'Outbound Anomaly Score Exceeded \(Total Score: '`,
+        // and test 1 on `expect_ids: [959100]`. Both are checked here so a
+        // reworded verdict line fails in `cargo test` rather than in go-ftw.
+        let sink = AuditLogSink::new(&enabled_config());
+        sink.record_rule_hits(&ctx_with(HashMap::new()), &[hit()], OUTBOUND_REACHED);
+        let out = drain(&sink);
+        assert!(out.contains("[id \"959100\"]"), "missing outbound verdict id: {out}");
+        assert!(
+            out.contains("Outbound Anomaly Score Exceeded (Total Score: 4)"),
+            "upstream wording changed: {out}"
+        );
+        assert!(!out.contains("949110"), "outbound verdict must not claim 949110: {out}");
     }
 
     #[test]

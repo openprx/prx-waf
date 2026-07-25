@@ -23,9 +23,10 @@
     "         log assertions restated as 403/200 by gen_overrides.py. Measures",
     "         the blocking decision a user experiences. Strictly noisier as a",
     "         detection measurement in BOTH directions: a negative test can only",
-    "         say 'nothing blocked' (so an unrelated rule fails it — 245 of the",
+    "         say 'nothing blocked' (so an unrelated rule fails it — 290 of the",
     "         PL4 over-blocks), and a positive test passes on any 403 at all (so",
-    "         a rule that never fired still scores — 182 free passes at PL4).",
+    "         a rule that never fired still scores). Both halves grew when the",
+    "         response phase landed, because the tests it now covers are counted.",
     "",
     "Numbers are only comparable at the same crs_version, the same go_ftw",
     "version, the same mode and the same paranoia level. Restate all four",
@@ -35,12 +36,29 @@
     "in the denominator. go-ftw aborts the entire run when one of them fails",
     "twice (runner/run.go, RunTest), so run.sh quarantines them out of the bulk",
     "run and re-runs each on its own; classify.py merges the individual verdicts",
-    "back in. Nothing is dropped and nothing is force-passed."
+    "back in. Nothing is dropped and nothing is force-passed.",
+    "",
+    "RESPONSE PHASE. The CRS 950–956 rules are evaluated as of this recording,",
+    "which is where the log-mode gain over the previous baseline (2671 / 3618 /",
+    "4093 at c3eb2dd) comes from: +68 / +78 / +78 at PL1 / PL2 / PL4, every one of",
+    "them a response-phase test. Cloud mode is unchanged (+0) BY CONSTRUCTION and",
+    "not by accident: response inspection defaults to observe",
+    "(PRXWAF_RESPONSE_INSPECT_MODE), so a leaking response is logged and then",
+    "delivered, and the status code cloud mode reads stays 200. Re-running cloud",
+    "PL4 with PRXWAF_RESPONSE_INSPECT_MODE=enforce scores 4020 (86.01%), +27 with",
+    "zero tests lost — noted here rather than recorded as the baseline, because",
+    "the default posture is what CI has to gate on.",
+    "",
+    "The bucket split moved for a second reason: classify.py no longer files every",
+    "response-phase failure under not-implemented ('the engine never feeds it a",
+    "response body'), because it now does. Response-phase failures are ordinary",
+    "missed detections / over-blocks / paranoia-scope exclusions and are counted",
+    "as such. Only the buckets are affected; passed and failed are not."
   ],
   "crs_version": "v4.25.0",
   "go_ftw_version": "v1.3.0",
   "recorded_at": "2026-07-25",
-  "recorded_from": "c3eb2dde91fd16f411aa91d95e142bc97e19b760",
+  "recorded_from": "5b37ce674bce03ce96bd07c29d86d6107621b837 + the response-phase wiring (working tree, uncommitted)",
   "tolerance": 5,
   "modes": {
     "log": {
@@ -48,41 +66,41 @@
       "results": {
         "PL1": {
           "run": 4674,
-          "passed": 2671,
-          "failed": 2003,
-          "pass_rate": 57.15,
+          "passed": 2739,
+          "failed": 1935,
+          "pass_rate": 58.6,
           "buckets": {
-            "not-implemented": 315,
-            "paranoia-scope": 1488,
+            "not-implemented": 242,
+            "paranoia-scope": 1507,
             "over-block": 26,
-            "missed-detection": 141,
-            "harness": 33
+            "missed-detection": 159,
+            "harness": 1
           }
         },
         "PL2": {
           "run": 4674,
-          "passed": 3618,
-          "failed": 1056,
-          "pass_rate": 77.41,
+          "passed": 3696,
+          "failed": 978,
+          "pass_rate": 79.08,
           "buckets": {
-            "not-implemented": 315,
-            "paranoia-scope": 493,
+            "not-implemented": 242,
+            "paranoia-scope": 494,
             "over-block": 32,
-            "missed-detection": 184,
-            "harness": 32
+            "missed-detection": 209,
+            "harness": 1
           }
         },
         "PL4": {
           "run": 4674,
-          "passed": 4093,
-          "failed": 581,
-          "pass_rate": 87.57,
+          "passed": 4171,
+          "failed": 503,
+          "pass_rate": 89.24,
           "buckets": {
-            "not-implemented": 315,
+            "not-implemented": 242,
             "paranoia-scope": 0,
             "over-block": 34,
-            "missed-detection": 200,
-            "harness": 32
+            "missed-detection": 226,
+            "harness": 1
           }
         }
       }
@@ -96,11 +114,11 @@
           "failed": 1490,
           "pass_rate": 68.12,
           "buckets": {
-            "not-implemented": 290,
-            "paranoia-scope": 954,
-            "over-block": 89,
-            "missed-detection": 118,
-            "harness": 39
+            "not-implemented": 233,
+            "paranoia-scope": 973,
+            "over-block": 95,
+            "missed-detection": 188,
+            "harness": 1
           }
         },
         "PL2": {
@@ -109,11 +127,11 @@
           "failed": 925,
           "pass_rate": 80.21,
           "buckets": {
-            "not-implemented": 249,
-            "paranoia-scope": 285,
-            "over-block": 216,
-            "missed-detection": 138,
-            "harness": 37
+            "not-implemented": 220,
+            "paranoia-scope": 286,
+            "over-block": 227,
+            "missed-detection": 191,
+            "harness": 1
           }
         },
         "PL4": {
@@ -122,11 +140,11 @@
           "failed": 681,
           "pass_rate": 85.43,
           "buckets": {
-            "not-implemented": 235,
+            "not-implemented": 207,
             "paranoia-scope": 0,
-            "over-block": 279,
-            "missed-detection": 130,
-            "harness": 37
+            "over-block": 290,
+            "missed-detection": 183,
+            "harness": 1
           }
         }
       }

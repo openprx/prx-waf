@@ -194,7 +194,11 @@ def missing_reason(rid: str, upstream: dict) -> str:
         return "no-upstream-secrule (test targets a rule that is not a plain SecRule)"
     variables, phase, fname = info["vars"], info["phase"], info["file"]
     if fname.startswith("RESPONSE") or phase in ("3", "4"):
-        return "response phase — the engine has no response-body inspection channel"
+        # The response-body channel exists and the RESPONSE-95x rules run
+        # through it; what is left in this bucket is upstream response-phase
+        # machinery with no converted counterpart — 980xxx correlation, which
+        # reads TX state this engine keeps no store for.
+        return f"response phase — no converted counterpart (upstream VARIABLES: {variables or 'n/a'})"
     if "FILES" in variables:
         return "FILES / upload metadata target is not modelled"
     if "MULTIPART_PART_HEADERS" in variables:
@@ -382,19 +386,17 @@ def main() -> int:
             buckets["harness"].append(entry)
             continue
 
+        # A response-phase rule that IS in the rule set gets no special bucket
+        # any more: it is fed a response body like any other rule, so its
+        # failures are ordinary missed detections, over-blocks or
+        # paranoia-scope exclusions and must be counted as such. The blanket
+        # "the engine never feeds it a response body" bucket that used to sit
+        # here would now hide exactly the regressions this harness exists to
+        # catch.
         up = upstream.get(rid, {})
-        response_phase = up.get("file", "").startswith("RESPONSE") or up.get("phase") in ("3", "4")
 
         if rule is None:
             entry["why"] = missing_reason(rid, upstream)
-            buckets["not-implemented"].append(entry)
-        elif response_phase:
-            # The converter emitted these, but the gateway has no response-body
-            # inspection channel, so they are dead weight in the rule set. A
-            # "missed detection" verdict would suggest a pattern problem when
-            # the rule is simply never given anything to look at.
-            entry["why"] = ("rule exists in rules/owasp-crs/ but is response-phase — "
-                            "the engine never feeds it a response body")
             buckets["not-implemented"].append(entry)
         elif meta["positive"] and (rule["paranoia"] or 1) > args.paranoia:
             entry["why"] = f"rule declares paranoia {rule['paranoia']} > PL{args.paranoia}"

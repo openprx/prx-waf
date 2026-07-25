@@ -33,10 +33,10 @@ use regex::Regex;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
-use waf_common::{DetectionResult, OwaspConfig, Phase, RequestCtx, is_form_urlencoded, split_form_args};
+use waf_common::{DetectionResult, OwaspConfig, Phase, RequestCtx, ResponseCtx, is_form_urlencoded, split_form_args};
 
-use super::Check;
-use crate::audit_log::{AuditLogSink, RuleHit, ScoreVerdict};
+use super::{Check, ResponseCheck};
+use crate::audit_log::{AuditLogSink, RuleHit, ScorePhase, ScoreVerdict};
 
 /// How many contributing rules are named in the `detail` of a score-triggered
 /// block before the list is elided.
@@ -741,6 +741,19 @@ enum Field {
     /// [`Loader::compile_condition`] rejects rather than silently never
     /// matching.
     HeaderCount(&'static str),
+    /// `ModSecurity` `RESPONSE_BODY` — one inspection window of the body the
+    /// origin sent back, as lossy UTF-8 and **undecoded**.
+    ///
+    /// Undecoded is not an omission. `RESPONSE_BODY` upstream is the bytes the
+    /// origin produced; the `RESPONSE-95x` rules match literal error text
+    /// (`ORA-00933`, `<?php`, `C:\inetpub`) that a percent-decode could only
+    /// corrupt, and none of them declares a `t:` chain beyond `t:none` /
+    /// `t:lowercase`, which the rule's own chain applies.
+    ResponseBody,
+    /// `ModSecurity` `RESPONSE_STATUS` — the upstream status code, rendered as
+    /// the three-digit string the CRS regexes are written against
+    /// (`^5\d{2}$` in `950100`).
+    ResponseStatus,
 }
 
 /// Headers `count_header_<name>` may name.
@@ -781,6 +794,8 @@ impl Field {
             "header_referer" => Self::HeaderReferer,
             "header_host" => Self::HeaderHost,
             "header_range" => Self::HeaderRange,
+            "response_body" => Self::ResponseBody,
+            "response_status" => Self::ResponseStatus,
             // `ARGS` and friends: collections evaluated one member at a time.
             // They have no dedicated `Field` variant because the surface bitset
             // already distinguishes GET from POST and names from values, and a
@@ -799,6 +814,17 @@ impl Field {
     /// (`equals` / `not_in` / `gt` / `lt`) are not meaningful on those.
     const fn is_scalar(self) -> bool {
         !matches!(self, Self::Multi(_) | Self::Headers | Self::Cookies)
+    }
+
+    /// `true` for the fields that can only be read once the origin has answered.
+    ///
+    /// This is what decides which pipeline a rule joins: a rule naming one of
+    /// these is a `phase:4` rule and is evaluated by [`ResponseCheck`], never by
+    /// [`Check`]. Splitting on the field rather than on a declared `phase:` key
+    /// keeps the two in agreement by construction — a rule cannot end up in the
+    /// request pipeline reading a surface that does not exist there.
+    const fn is_response(self) -> bool {
+        matches!(self, Self::ResponseBody | Self::ResponseStatus)
     }
 
     /// The single value of a scalar field, or `None` for multi-valued fields
@@ -827,6 +853,13 @@ impl Field {
                 Some(Cow::Owned(count.to_string()))
             }
             Self::HeaderCount(name) => Some(Cow::Borrowed(if ctx.headers.contains_key(name) { "1" } else { "0" })),
+            // `None` when the view has no response attached, which is every
+            // request-phase evaluation. That is the safety property that makes
+            // the split cheap: even if a response rule reached the request
+            // pipeline it would read nothing and could not match, rather than
+            // matching some unrelated request surface.
+            Self::ResponseBody => view.response.as_ref().map(|r| Cow::Borrowed(r.body.as_ref())),
+            Self::ResponseStatus => view.response.as_ref().map(|r| Cow::Borrowed(r.status.as_str())),
             Self::Multi(_) | Self::Headers | Self::Cookies => None,
         }
     }
@@ -995,6 +1028,26 @@ fn decode_args(surface: &str) -> Vec<Arg> {
 /// value, or `None` when the chain left it alone.
 type TransformMemo = HashMap<(u32, usize, usize), Option<Rc<str>>>;
 
+/// The response surfaces, attached to a [`RequestView`] for the response phase.
+///
+/// Kept as an `Option` on the view rather than as a second view type because a
+/// CRS response rule is routinely written against request variables too:
+/// upstream `954130` chains `RESPONSE_STATUS "!@rx ^404$"` onto a
+/// `RESPONSE_BODY` match, and CRS's own justification for `RESPONSE_STATUS`
+/// rules is that a response only means something next to the request that
+/// provoked it. The response pipeline therefore needs *both* halves under one
+/// lifetime, which is also why [`ResponseCtx`] owns its [`RequestCtx`]. `None`
+/// on every request-phase evaluation costs one pointer in a struct that is built
+/// once per request.
+struct ResponseSurfaces<'a> {
+    /// `RESPONSE_STATUS`, rendered once as the string the regexes match.
+    status: String,
+    /// `RESPONSE_BODY`: one inspection window, lossy UTF-8, undecoded. Borrows
+    /// the window when it is already valid UTF-8, which is the common case for
+    /// the text media types the gateway admits.
+    body: Cow<'a, str>,
+}
+
 /// The request as `ModSecurity`'s parser hands it to a rule, built once per
 /// request.
 ///
@@ -1018,6 +1071,8 @@ type TransformMemo = HashMap<(u32, usize, usize), Option<Rc<str>>>;
 ///   into CRS-932131's shell construct `/name[index]`.
 struct RequestView<'a> {
     ctx: &'a RequestCtx,
+    /// The response half, present only in the response phase.
+    response: Option<ResponseSurfaces<'a>>,
     /// `REQUEST_URI` / `REQUEST_FILENAME`: percent-decoded.  `+` is left alone
     /// — it is a literal plus in a path, not a space.
     path: Cow<'a, str>,
@@ -1068,6 +1123,7 @@ impl<'a> RequestView<'a> {
         };
         Self {
             ctx,
+            response: None,
             path: percent_decode(&ctx.path, Plus::IsLiteral),
             query: percent_decode(&ctx.query, Plus::IsSpace),
             body,
@@ -1076,6 +1132,21 @@ impl<'a> RequestView<'a> {
             args_post: OnceCell::new(),
             memo: RefCell::new(TransformMemo::new()),
         }
+    }
+
+    /// The same view, plus the response surfaces of `response`.
+    ///
+    /// The request half is built exactly as the request phase built it, so a
+    /// response rule that also reads a request variable sees the identical
+    /// normalisation — that is the whole reason [`ResponseCtx`] owns its
+    /// `RequestCtx`.
+    fn for_response(response: &'a ResponseCtx) -> Self {
+        let mut view = Self::new(&response.request);
+        view.response = Some(ResponseSurfaces {
+            status: response.status.to_string(),
+            body: String::from_utf8_lossy(&response.body_preview),
+        });
+        view
     }
 
     /// `ARGS_GET`: the query string's parameters, split then decoded.
@@ -2518,6 +2589,10 @@ struct AnomalyScoring {
     warning: u32,
     notice: u32,
     inbound_threshold: u32,
+    /// The response-phase threshold (`tx.outbound_anomaly_score_threshold`,
+    /// upstream 4). Deliberately a second number: see
+    /// [`OwaspConfig::outbound_anomaly_score_threshold`].
+    outbound_threshold: u32,
 }
 
 impl AnomalyScoring {
@@ -2534,6 +2609,15 @@ impl AnomalyScoring {
     const fn blocks_alone(self, severity: Severity) -> bool {
         self.score_for(severity) >= self.inbound_threshold
     }
+
+    /// The response-phase counterpart of [`Self::blocks_alone`].
+    ///
+    /// With the shipped numbers this is true of `error` and `critical` — which
+    /// is upstream's behaviour, not a local decision: the CRS response rules are
+    /// all `ERROR` or `CRITICAL` and the outbound threshold is 4.
+    const fn condemns_alone(self, severity: Severity) -> bool {
+        self.score_for(severity) >= self.outbound_threshold
+    }
 }
 
 impl From<&OwaspConfig> for AnomalyScoring {
@@ -2548,6 +2632,7 @@ impl From<&OwaspConfig> for AnomalyScoring {
             // type is also reachable from `Default`, so clamp rather than trust:
             // 0 would be reached by a request that matched nothing at all.
             inbound_threshold: cfg.inbound_anomaly_score_threshold.max(1),
+            outbound_threshold: cfg.outbound_anomaly_score_threshold.max(1),
         }
     }
 }
@@ -2587,6 +2672,21 @@ struct CompiledRule {
 }
 
 impl CompiledRule {
+    /// `true` when any condition of this rule reads a response surface.
+    ///
+    /// Such a rule belongs to the response pipeline and to nothing else: in the
+    /// request phase its response conditions read `None`, so it can neither
+    /// match nor be usefully evaluated there. The chain is inspected as well as
+    /// the head, because a rule whose head is `RESPONSE_STATUS`-free but which
+    /// chains a `RESPONSE_BODY` link is still a `phase:4` rule.
+    fn reads_response(&self) -> bool {
+        let reads = |condition: &Condition| match condition.field {
+            CondField::Request(field) => field.is_response(),
+            CondField::MatchedValue | CondField::Capture(_) => false,
+        };
+        reads(&self.head) || self.chain.iter().any(reads)
+    }
+
     /// `true` when some value of the head's field satisfies the head **and**
     /// carries the whole chain.
     ///
@@ -2933,10 +3033,27 @@ impl Loader {
         outcome.map_err(reject)
     }
 
+    /// Split the compiled rules into the request pipeline and the response
+    /// pipeline and hand both to the check.
+    ///
+    /// The partition happens once, at load time, so neither hot path ever walks
+    /// a rule it structurally cannot evaluate: the request phase does not pay
+    /// for the 58 `RESPONSE-95x` rules and the response phase does not pay for
+    /// the ~200 request ones.
     fn finish(self, origin: &str) -> OWASPCheck {
         self.summary.report(origin);
+        let mut rules = Vec::with_capacity(self.rules.len());
+        let mut response_rules = Vec::new();
+        for rule in self.rules {
+            if rule.reads_response() {
+                response_rules.push(rule);
+            } else {
+                rules.push(rule);
+            }
+        }
         OWASPCheck {
-            rules: self.rules,
+            rules,
+            response_rules,
             summary: self.summary,
             scoring: AnomalyScoring::default(),
             audit: None,
@@ -3018,7 +3135,12 @@ fn build_automaton(patterns: &[&str]) -> Result<Arc<AhoCorasick>, String> {
 
 /// WAF checker implementing a subset of the `OWASP` CRS.
 pub struct OWASPCheck {
+    /// Request-phase rules (`ModSecurity` `phase:1` / `phase:2`).
     rules: Vec<CompiledRule>,
+    /// Response-phase rules (`phase:3` / `phase:4`) — every rule that reads
+    /// `RESPONSE_BODY` or `RESPONSE_STATUS`. Held apart from [`Self::rules`] so
+    /// neither pipeline walks the other's rules; see [`Loader::finish`].
+    response_rules: Vec<CompiledRule>,
     summary: LoadSummary,
     /// Severity weights and the blocking threshold. Defaults to the upstream
     /// CRS v4.25.0 numbers; [`Self::with_config`] replaces them from the TOML.
@@ -3153,10 +3275,25 @@ impl OWASPCheck {
         }
     }
 
-    /// Number of rules that are actually enforced.  Rules declared in the
-    /// source but rejected at load time are **not** counted.
+    /// Number of rules that are actually enforced, across both phases.  Rules
+    /// declared in the source but rejected at load time are **not** counted.
     pub const fn rule_count(&self) -> usize {
+        self.rules.len().saturating_add(self.response_rules.len())
+    }
+
+    /// Number of enforced **request-phase** rules.
+    pub const fn request_rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Number of enforced **response-phase** rules.
+    ///
+    /// This is what the gateway wiring tests before it registers the check as a
+    /// [`ResponseCheck`]: with no response rule loaded there is nothing for the
+    /// response pipeline to do, and registering anyway would turn on response
+    /// buffering for no benefit.
+    pub const fn response_rule_count(&self) -> usize {
+        self.response_rules.len()
     }
 
     /// Full account of the last load — declared vs. enforced counts, rejection
@@ -3204,7 +3341,7 @@ impl OWASPCheck {
                 "OWASP CRS anomaly scoring DISABLED (owasp.anomaly_scoring=false): the first \
                  matching rule of {} blocks, regardless of its severity. This is STRICTER than \
                  upstream CRS and is a known false-positive source.",
-                self.rules.len()
+                self.rule_count()
             )];
         }
 
@@ -3225,7 +3362,7 @@ impl OWASPCheck {
             .collect::<Vec<_>>()
             .join(" ");
 
-        vec![
+        let mut lines = vec![
             format!(
                 "OWASP CRS anomaly scoring ACTIVE: block when the inbound score reaches {} \
                  (critical=+{} error=+{} warning=+{} notice=+{}), matching upstream CRS 949110.",
@@ -3236,12 +3373,38 @@ impl OWASPCheck {
                 self.scoring.notice,
             ),
             format!(
-                "OWASP CRS enforced rules: {} ({breakdown}). {alone} reach the threshold alone and \
-                 still block on a single match; {needs_help} now need corroboration from another \
-                 rule in the same request.",
+                "OWASP CRS enforced request rules: {} ({breakdown}). {alone} reach the threshold \
+                 alone and still block on a single match; {needs_help} now need corroboration from \
+                 another rule in the same request.",
                 self.rules.len(),
             ),
-        ]
+        ];
+
+        // The response half is stated separately, and only when it exists,
+        // because its threshold is a different number and an operator who reads
+        // "threshold 5" and assumes it governs both directions has been misled.
+        if self.response_rules.is_empty() {
+            lines.push(
+                "OWASP CRS response-phase rules: none loaded — the response inspection channel \
+                 stays closed and no response is buffered."
+                    .to_owned(),
+            );
+            return lines;
+        }
+        let condemn_alone = self
+            .response_rules
+            .iter()
+            .filter(|rule| rule.action == RuleAction::Deny || self.scoring.condemns_alone(rule.severity))
+            .count();
+        lines.push(format!(
+            "OWASP CRS response-phase rules: {} enforced, acting when the OUTBOUND score reaches \
+             {} (upstream CRS 959100 — a DIFFERENT threshold from the inbound {}). {condemn_alone} \
+             of them reach it on a single match.",
+            self.response_rules.len(),
+            self.scoring.outbound_threshold,
+            self.scoring.inbound_threshold,
+        ));
+        lines
     }
 
     /// Evaluate every in-scope rule and return the score plus the rules that
@@ -3268,10 +3431,21 @@ impl OWASPCheck {
         view: &RequestView<'_>,
         paranoia: u8,
     ) -> Result<(u32, Vec<Contribution<'r>>), &'r CompiledRule> {
+        self.evaluate_rules(&self.rules, view, paranoia)
+    }
+
+    /// [`Self::evaluate`] over an explicit rule list, so the request and
+    /// response pipelines share one scoring loop and cannot drift apart.
+    fn evaluate_rules<'r>(
+        &self,
+        rules: &'r [CompiledRule],
+        view: &RequestView<'_>,
+        paranoia: u8,
+    ) -> Result<(u32, Vec<Contribution<'r>>), &'r CompiledRule> {
         let mut score: u32 = 0;
         let mut contributions = Vec::new();
 
-        for rule in &self.rules {
+        for rule in rules {
             if rule.paranoia > paranoia || !rule.matches(view) {
                 continue;
             }
@@ -3347,6 +3521,20 @@ impl Default for OWASPCheck {
 }
 
 impl Check for OWASPCheck {
+    /// Forwards to the inherent [`OWASPCheck::check`].
+    ///
+    /// The decision lives on the inherent method rather than here because
+    /// `OWASPCheck` implements **both** [`Check`] and [`ResponseCheck`], and two
+    /// traits in scope offering `check` make every `owasp.check(&request_ctx)`
+    /// call site ambiguous. An inherent method wins method resolution outright,
+    /// so the request phase keeps reading the way it always did and the response
+    /// phase is reached explicitly through `ResponseCheck::check`.
+    fn check(&self, ctx: &RequestCtx) -> Option<DetectionResult> {
+        Self::check(self, ctx)
+    }
+}
+
+impl OWASPCheck {
     /// Decide the request the way upstream CRS decides it: accumulate an
     /// anomaly score across every rule that matches, then compare the total
     /// against the threshold (`REQUEST-949-BLOCKING-EVALUATION.conf`, rule
@@ -3370,7 +3558,7 @@ impl Check for OWASPCheck {
     /// strictly larger request, so its score is at least the header-phase
     /// score. Carrying a running total between the two would double-count every
     /// header-surface rule.
-    fn check(&self, ctx: &RequestCtx) -> Option<DetectionResult> {
+    pub fn check(&self, ctx: &RequestCtx) -> Option<DetectionResult> {
         if !ctx.host_config.defense_config.owasp_set {
             return None;
         }
@@ -3402,6 +3590,7 @@ impl Check for OWASPCheck {
                     threshold: 0,
                     paranoia,
                     reached_threshold: true,
+                    phase: ScorePhase::Inbound,
                 },
             );
             return Some(DetectionResult {
@@ -3428,6 +3617,7 @@ impl Check for OWASPCheck {
                         threshold: self.scoring.inbound_threshold,
                         paranoia,
                         reached_threshold: true,
+                        phase: ScorePhase::Inbound,
                     },
                 );
                 return Some(DetectionResult {
@@ -3453,6 +3643,7 @@ impl Check for OWASPCheck {
                 threshold,
                 paranoia,
                 reached_threshold: score >= threshold,
+                phase: ScorePhase::Inbound,
             },
         );
         if score < threshold {
@@ -3495,6 +3686,174 @@ impl Check for OWASPCheck {
             detail: format!(
                 "OWASP CRS inbound anomaly score {score} reached the threshold {threshold} at \
                  paranoia {paranoia} (CRS-949110); {} rule(s) contributed: {}",
+                contributions.len(),
+                render_contributions(&contributions)
+            ),
+        })
+    }
+}
+
+impl ResponseCheck for OWASPCheck {
+    /// Decide one response window the way upstream CRS decides it: accumulate an
+    /// **outbound** anomaly score across the `RESPONSE-95x` rules that match,
+    /// then compare the total against `tx.outbound_anomaly_score_threshold`
+    /// (`RESPONSE-959-BLOCKING-EVALUATION.conf`, rule `959100`).
+    ///
+    /// # Why this is not the inbound logic with a different rule list
+    ///
+    /// It is easy to reach for [`Check::check`]'s decision here and wrong twice
+    /// over.
+    ///
+    /// * **The threshold is a different number.** Upstream initialises
+    ///   `tx.inbound_anomaly_score_threshold` to 5 and
+    ///   `tx.outbound_anomaly_score_threshold` to 4
+    ///   (`REQUEST-901-INITIALIZATION.conf`), and `959100` compares against the
+    ///   latter. Reusing 5 would silently under-enforce every `ERROR` response
+    ///   rule, which is 15 of the 58.
+    /// * **The accumulator is separate.** Rules `950130`…`956110` only ever
+    ///   `setvar:'tx.outbound_anomaly_score_plN=+…'`; not one of them is
+    ///   `deny`. Treating each of them as its own verdict — which is what
+    ///   evaluating them under the request-phase first-match rule would do —
+    ///   would make prx-waf strictly more aggressive than upstream on exactly
+    ///   the phase where a false positive breaks a page the origin considers
+    ///   correct.
+    ///
+    /// # Scope of one call
+    ///
+    /// The gateway calls this once per inspection window, so the score is a
+    /// per-window total, not a per-response one. For a response inside the
+    /// 64 KiB window that is the same thing; for a larger one, two rules that
+    /// match in two different windows are not summed. Widening that would need
+    /// the trait to carry per-response state, and the alternative — summing
+    /// across windows without it — is not expressible. A single rule that
+    /// reaches the threshold alone (every `ERROR`/`CRITICAL` response rule, with
+    /// the shipped weights) is unaffected.
+    fn check(&self, ctx: &ResponseCtx) -> Option<DetectionResult> {
+        // Cheapest possible exits first: a build with no response rules, or a
+        // host that has CRS switched off, must cost one comparison.
+        if self.response_rules.is_empty() {
+            return None;
+        }
+        let request = &ctx.request;
+        if !request.host_config.defense_config.owasp_set {
+            return None;
+        }
+        let paranoia = request.host_config.defense_config.owasp_paranoia;
+        let view = RequestView::for_response(ctx);
+
+        if !self.scoring.enabled {
+            // Escape hatch, matching the request phase: first match wins.
+            let rule = self
+                .response_rules
+                .iter()
+                .find(|rule| rule.paranoia <= paranoia && rule.matches(&view))?;
+            self.record_audit(
+                request,
+                &[Contribution {
+                    id: &rule.id,
+                    crs_id: rule.crs_id,
+                    name: &rule.name,
+                    severity: rule.severity,
+                    score: 0,
+                }],
+                ScoreVerdict {
+                    score: 0,
+                    threshold: 0,
+                    paranoia,
+                    reached_threshold: true,
+                    phase: ScorePhase::Outbound,
+                },
+            );
+            return Some(DetectionResult {
+                rule_id: Some(rule.id.clone()),
+                rule_name: rule.name.clone(),
+                phase: Phase::Owasp,
+                detail: format!("OWASP response rule {} triggered ({})", rule.id, rule.name),
+            });
+        }
+
+        let (score, contributions) = match self.evaluate_rules(&self.response_rules, &view, paranoia) {
+            Err(rule) => {
+                self.record_audit(
+                    request,
+                    &[Contribution {
+                        id: &rule.id,
+                        crs_id: rule.crs_id,
+                        name: &rule.name,
+                        severity: rule.severity,
+                        score: 0,
+                    }],
+                    ScoreVerdict {
+                        score: 0,
+                        threshold: self.scoring.outbound_threshold,
+                        paranoia,
+                        reached_threshold: true,
+                        phase: ScorePhase::Outbound,
+                    },
+                );
+                return Some(DetectionResult {
+                    rule_id: Some(rule.id.clone()),
+                    rule_name: rule.name.clone(),
+                    phase: Phase::Owasp,
+                    detail: format!(
+                        "OWASP response rule {} triggered with action=deny ({}) — condemned \
+                         unconditionally, outside the anomaly score",
+                        rule.id, rule.name
+                    ),
+                });
+            }
+            Ok(evaluated) => evaluated,
+        };
+
+        let threshold = self.scoring.outbound_threshold;
+        self.record_audit(
+            request,
+            &contributions,
+            ScoreVerdict {
+                score,
+                threshold,
+                paranoia,
+                reached_threshold: score >= threshold,
+                phase: ScorePhase::Outbound,
+            },
+        );
+        if score < threshold {
+            if !contributions.is_empty() {
+                debug!(
+                    "OWASP CRS outbound anomaly score {score} is below the threshold {threshold} at \
+                     paranoia {paranoia}: response delivered. {} rule(s) contributed: {}",
+                    contributions.len(),
+                    render_contributions(&contributions)
+                );
+            }
+            return None;
+        }
+
+        // Same leader rule as the request phase, and the same tie-break: first
+        // in load order, so a verdict does not renumber itself between releases.
+        let leader = contributions
+            .iter()
+            .fold(None::<&Contribution<'_>>, |best, candidate| match best {
+                Some(best) if best.score >= candidate.score => Some(best),
+                _ => Some(candidate),
+            })
+            .map(|c| (c.id.to_owned(), c.name.to_owned()));
+        let (rule_id, rule_name) =
+            leader.unwrap_or_else(|| ("CRS-959100".to_owned(), "Outbound Anomaly Score Exceeded".to_owned()));
+
+        Some(DetectionResult {
+            rule_id: Some(rule_id),
+            rule_name,
+            phase: Phase::Owasp,
+            detail: format!(
+                "OWASP CRS outbound anomaly score {score} reached the threshold {threshold} at \
+                 paranoia {paranoia} (CRS-959100) on response status {}{}; {} rule(s) contributed: {}",
+                ctx.status,
+                if ctx.body_truncated {
+                    " (body truncated at the inspection ceiling)"
+                } else {
+                    ""
+                },
                 contributions.len(),
                 render_contributions(&contributions)
             ),
@@ -3830,7 +4189,12 @@ rules:
 
     #[test]
     fn unsupported_field_is_rejected_and_reported() {
-        let checker = OWASPCheck::from_yaml(&single_rule_yaml("response_body", "regex", "'.*'"));
+        // `response_headers` is what the converter emits for `RESPONSE_HEADERS`
+        // and for `RESPONSE_PROTOCOL`, neither of which the engine reads. It is
+        // deliberately a *response-side* name: the response pipeline knows two
+        // surfaces and must reject the rest as loudly as the request pipeline
+        // does, rather than admitting them because they look response-ish.
+        let checker = OWASPCheck::from_yaml(&single_rule_yaml("response_headers", "regex", "'.*'"));
         let summary = checker.load_summary();
 
         assert_eq!(checker.rule_count(), 0, "unsupported field must not be counted");
@@ -3841,7 +4205,7 @@ rules:
         assert!(summary.is_degraded());
         assert!(matches!(
             summary.rejected.first().map(|r| &r.reason),
-            Some(RejectReason::UnsupportedField(f)) if f == "response_body"
+            Some(RejectReason::UnsupportedField(f)) if f == "response_headers"
         ));
     }
 
@@ -3917,7 +4281,7 @@ rules:
     category: test
     severity: critical
     paranoia: 1
-    field: response_body
+    field: response_headers
     operator: contains
     value: evil
     action: block
@@ -4227,13 +4591,24 @@ rules:
         let summary = checker.load_summary();
 
         assert!(summary.source_errors.is_empty(), "shipped rule set must parse cleanly");
-        assert_eq!(summary.attempted, 328, "declared CRS rules");
+        assert_eq!(summary.attempted, 284, "declared CRS rules");
         // 215 before per-parameter `ARGS`: CRS-942130 joins the set, because
         // its `TX:1 @streq %{TX.2}` capture equality is only a tautology test
-        // when the head is evaluated one parameter at a time.
-        assert_eq!(summary.compiled, 216, "enforceable CRS rules");
+        // when the head is evaluated one parameter at a time. 216 before the
+        // response phase was wired: the 950–956 rules used to be rejected as
+        // `UnsupportedField(response_body)` and now compile.
+        assert_eq!(summary.compiled, 274, "enforceable CRS rules");
         assert_eq!(checker.rule_count(), summary.compiled);
         assert_eq!(summary.attempted, summary.compiled + summary.rejected.len());
+
+        // The split between the two pipelines, stated so a rule that quietly
+        // changes sides is a test failure rather than a coverage surprise.
+        assert_eq!(checker.request_rule_count(), 216, "request-phase rules");
+        assert_eq!(checker.response_rule_count(), 58, "response-phase rules");
+        assert_eq!(
+            checker.request_rule_count() + checker.response_rule_count(),
+            checker.rule_count()
+        );
 
         // Nothing is enforced in a form the upstream rule would not recognise.
         // Every rejection names the `ModSecurity` construct this engine cannot
@@ -4246,12 +4621,10 @@ rules:
                 .filter(|r| matches!(&r.reason, RejectReason::UnsupportedField(f) if f == name))
                 .count()
         };
-        // The CRS 95x block is response-phase in its entirety, and two
-        // conversions of it ship side by side (the `CRS-95xxxx` files produced
-        // by the current `modsec2yaml.py` and the older `CRS-RESP-95xxxx`
-        // `response-*.yaml` files), so most 95x rules appear twice.
-        assert_eq!(by_field("response_body"), 99, "RESPONSE_BODY");
-        assert_eq!(by_field("response_status"), 3, "RESPONSE_STATUS / RESPONSE_PROTOCOL");
+        // The CRS 95x block is response-phase in its entirety and is now
+        // evaluated rather than rejected, so nothing is left in this bucket.
+        assert_eq!(by_field("response_body"), 0, "RESPONSE_BODY is evaluated");
+        assert_eq!(by_field("response_status"), 0, "RESPONSE_STATUS is evaluated");
         // `FILES` / `FILES_NAMES` / `REQUEST_HEADERS:X-Filename`: uploaded file
         // names.  CRS-933110 and CRS-944140 test them with `.*\.php$` style
         // patterns, so running them over the whole request blocked every
@@ -4278,16 +4651,17 @@ rules:
         // reads as a `1=1` tautology.  Per-parameter `ARGS` makes it mean what
         // upstream means, so it is enforced and the sentinel is gone.
         assert_eq!(by_field("unmapped_chained_args_self_equality"), 0, "CRS-942130");
-        // 112 before per-parameter `ARGS` (CRS-942130 left the list).
-        assert_eq!(summary.rejected_field_count(), 111, "rules the engine cannot evaluate");
+        // 112 before per-parameter `ARGS` (CRS-942130 left the list), 111
+        // before the response phase was wired (the 950–956 rules left it).
+        assert_eq!(summary.rejected_field_count(), 9, "rules the engine cannot evaluate");
         assert!(
             summary
                 .rejected
                 .iter()
                 .filter(|r| r.reason.category() == RejectCategory::UnsupportedField)
                 .all(|r| matches!(&r.reason, RejectReason::UnsupportedField(f)
-                    if f.starts_with("response_") || f.starts_with("unmapped_"))),
-            "an unsupported field must be a response-phase or unmapped-variable marker"
+                    if f.starts_with("unmapped_"))),
+            "an unsupported field must be an unmapped-variable marker"
         );
         assert_eq!(
             summary.rejected_operator_count(),
@@ -4367,18 +4741,18 @@ rules:
         // matching.
         assert_eq!(catch_all, 0, "rules scanning the entire request");
 
-        // No rule from the response-phase conversion may end up enforced: their
-        // patterns describe server *output* and matching them against a request
-        // is a pure false positive.
+        // No response-phase rule may end up in the *request* pipeline: its
+        // patterns describe server output, and matching them against a request
+        // is a pure false positive. They live in `response_rules` instead.
         let leaked: Vec<&str> = checker
             .rules
             .iter()
+            .filter(|r| r.reads_response())
             .map(|r| r.id.as_str())
-            .filter(|id| id.starts_with("CRS-RESP-"))
             .collect();
         assert!(
             leaked.is_empty(),
-            "response-phase rules must not be enforced: {leaked:?}"
+            "response-phase rules must not be in the request pipeline: {leaked:?}"
         );
     }
 
@@ -4693,6 +5067,12 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
     /// is not on the load path today, but if it ever is, none of it may run
     /// against a request: MODSEC-RESP-006 alone would block every form POST
     /// carrying an `api_key=` parameter.
+    ///
+    /// Since the response phase was wired these rules *compile* — what must
+    /// stay true is that they compile into the response pipeline and nothing
+    /// puts them in front of a request. That is a stronger property than the
+    /// rejection this used to assert, and the request probes below are what
+    /// actually prove it.
     #[test]
     fn shipped_response_checks_are_inert_and_response_phase() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/modsecurity/response-checks.yaml");
@@ -4700,17 +5080,13 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
         let summary = checker.load_summary();
 
         assert_eq!(summary.attempted, 12, "declared response-phase rules");
+        assert_eq!(summary.compiled, 12, "every one of them is evaluable now");
         assert_eq!(
-            summary.compiled, 0,
+            checker.request_rule_count(),
+            0,
             "no response-phase rule may be enforced on a request"
         );
-        assert!(
-            summary
-                .rejected
-                .iter()
-                .all(|r| matches!(&r.reason, RejectReason::UnsupportedField(f) if f == "response_body")),
-            "every rejection must name the response field"
-        );
+        assert_eq!(checker.response_rule_count(), 12);
 
         for (label, ctx) in [
             (
@@ -4896,8 +5272,8 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
                 .unwrap_or_else(|| panic!("web-shell upload must still be detected: {body}"));
             let id = hit.rule_id.unwrap_or_default();
             assert!(
-                !id.starts_with("CRS-RESP-"),
-                "detection must come from a request-phase rule, got {id}"
+                !id.starts_with("CRS-955"),
+                "detection must come from a request-phase rule, not the 955 response set, got {id}"
             );
         }
     }
@@ -5437,7 +5813,7 @@ rules:
 
         // Unsupported field in a link.
         let bad_field = OWASPCheck::from_yaml(&rule(
-            "      - field: response_body\n        operator: contains\n        value: x\n",
+            "      - field: response_headers\n        operator: contains\n        value: x\n",
         ));
         assert_eq!(bad_field.rule_count(), 0);
         assert_eq!(bad_field.load_summary().count(RejectCategory::Chain), 1);
@@ -7107,8 +7483,8 @@ rules:
 
         assert_eq!(
             critical + warning,
-            checker.rule_count(),
-            "the enforced set is only critical and warning rules: {counts:?}"
+            checker.request_rule_count(),
+            "the enforced request set is only critical and warning rules: {counts:?}"
         );
         // 206 critical / 10 warning. The scoring model changes the verdict of a
         // lone match for the 10 only — 95% of the enforced set still blocks on a
@@ -7117,6 +7493,26 @@ rules:
         // be argued for in the diff.
         assert_eq!(warning, 10, "the rules that stop blocking alone: {counts:?}");
         assert_eq!(critical, 206, "the rules that still block alone: {counts:?}");
+
+        // The response set has its own shape and its own threshold, so it is
+        // counted separately. 43 critical + 15 error, all of which reach the
+        // outbound threshold of 4 on their own — which is upstream's posture
+        // for RESPONSE-95x, not a local escalation.
+        let mut response_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for rule in &checker.response_rules {
+            *response_counts.entry(rule.severity.label()).or_default() += 1;
+        }
+        assert_eq!(
+            response_counts.get("critical").copied().unwrap_or_default(),
+            43,
+            "{response_counts:?}"
+        );
+        assert_eq!(
+            response_counts.get("error").copied().unwrap_or_default(),
+            15,
+            "{response_counts:?}"
+        );
+        assert_eq!(response_counts.values().sum::<usize>(), checker.response_rule_count());
         assert!(
             checker.load_summary().severity_defaulted.is_empty(),
             "every shipped rule must declare a severity this engine understands: {:?}",
@@ -7189,5 +7585,206 @@ rules:
         };
         assert_eq!(by_id("CRS-931100"), Some(931_100));
         assert_eq!(by_id("LOCAL-1"), None);
+    }
+
+    // ── Response phase ────────────────────────────────────────────────────────
+
+    /// A response context around `body`/`status`, with the request that
+    /// provoked it carrying nothing a request-phase rule could match.
+    fn response_ctx(status: u16, body: &str, paranoia: u8) -> ResponseCtx {
+        let mut request = make_ctx("GET", "/report", 0);
+        request.host_config = Arc::new(HostConfig {
+            code: "test".into(),
+            host: "example.com".into(),
+            defense_config: DefenseConfig {
+                owasp_set: true,
+                owasp_paranoia: paranoia,
+                ..DefenseConfig::default()
+            },
+            ..HostConfig::default()
+        });
+        ResponseCtx {
+            request,
+            status,
+            headers: HashMap::from([("content-type".to_owned(), "text/html".to_owned())]),
+            body_preview: Bytes::copy_from_slice(body.as_bytes()),
+            body_truncated: false,
+        }
+    }
+
+    fn crs_checker() -> OWASPCheck {
+        OWASPCheck::from_directory(&crs_dir()).with_config(&OwaspConfig::default())
+    }
+
+    /// The wiring, end to end: an Oracle error in the body is a CRS-951120 hit,
+    /// the outbound score reaches the outbound threshold, and the verdict names
+    /// 959100 rather than the request-phase 949110.
+    #[test]
+    fn a_sql_error_in_the_response_body_is_caught_by_the_response_pipeline() {
+        let checker = crs_checker();
+        let ctx = response_ctx(200, "<html>ORA-00933: SQL command not properly ended</html>", 1);
+        let hit = ResponseCheck::check(&checker, &ctx).expect("CRS-951120 must fire on an Oracle error");
+        assert!(hit.detail.contains("CRS-959100"), "{}", hit.detail);
+        assert!(hit.detail.contains("CRS-951120"), "{}", hit.detail);
+        assert_eq!(hit.phase, Phase::Owasp);
+    }
+
+    /// The same body through the *request* pipeline must do nothing: a response
+    /// rule that leaked into the request phase would fire on every bug report
+    /// pasted into a form.
+    #[test]
+    fn a_response_rule_cannot_fire_on_a_request() {
+        let checker = crs_checker();
+        assert!(
+            checker
+                .check(&make_ctx_with_body("note=ORA-00933: SQL command not properly ended", 4))
+                .is_none(),
+            "an Oracle error in a REQUEST body is not a leak"
+        );
+    }
+
+    /// A clean response scores nothing, and — the part that matters for a proxy
+    /// — costs no verdict.
+    #[test]
+    fn an_ordinary_response_body_is_not_a_finding() {
+        let checker = crs_checker();
+        for body in [
+            "<html><body><h1>Welcome</h1><p>All systems normal.</p></body></html>",
+            "{\"status\":\"ok\",\"items\":[1,2,3]}",
+            "<html>Index of the documentation is on the wiki</html>",
+        ] {
+            assert!(
+                ResponseCheck::check(&checker, &response_ctx(200, body, 4)).is_none(),
+                "false positive on an ordinary response: {body}"
+            );
+        }
+    }
+
+    /// `950100` (`RESPONSE_STATUS ^5\d{2}$`) is a paranoia-2 rule, so a 500 is
+    /// clean at PL1 and a finding at PL2. This is also the only rule that reads
+    /// the status, so it is what proves `Field::ResponseStatus` is wired.
+    #[test]
+    fn the_status_code_is_a_response_surface_gated_by_paranoia() {
+        let checker = crs_checker();
+        assert!(
+            ResponseCheck::check(&checker, &response_ctx(500, "<html>oops</html>", 1)).is_none(),
+            "950100 is paranoia 2; a 500 must be clean at PL1"
+        );
+        let hit = ResponseCheck::check(&checker, &response_ctx(500, "<html>oops</html>", 2))
+            .expect("950100 must fire on a 5xx at PL2");
+        assert!(hit.detail.contains("CRS-950100"), "{}", hit.detail);
+        assert!(
+            ResponseCheck::check(&checker, &response_ctx(200, "<html>oops</html>", 2)).is_none(),
+            "a 200 is not a 5xx"
+        );
+    }
+
+    /// The threshold difference, stated as a test because it is the single
+    /// easiest thing to get wrong: the outbound comparison is against 4, and one
+    /// `error` rule (weight 4) therefore acts alone where the same rule would
+    /// not reach the inbound 5.
+    #[test]
+    fn one_error_response_rule_reaches_the_outbound_threshold_alone() {
+        let cfg = OwaspConfig::default();
+        assert_eq!(cfg.outbound_anomaly_score_threshold, 4, "upstream tx default");
+        assert_eq!(cfg.inbound_anomaly_score_threshold, 5, "and it is NOT the inbound one");
+        assert!(cfg.error_anomaly_score >= cfg.outbound_anomaly_score_threshold);
+        assert!(cfg.error_anomaly_score < cfg.inbound_anomaly_score_threshold);
+
+        // CRS-952110 (Java errors) is `severity: error`, i.e. exactly 4.
+        let checker = crs_checker();
+        let hit = ResponseCheck::check(
+            &checker,
+            &response_ctx(200, "<pre>java.lang.NullPointerException</pre>", 1),
+        )
+        .expect("a lone ERROR response rule must reach the outbound threshold");
+        assert!(hit.detail.contains("score 4 reached the threshold 4"), "{}", hit.detail);
+    }
+
+    /// Raising the outbound threshold must actually raise it — the dial is wired
+    /// to the response verdict and to nothing else.
+    #[test]
+    fn the_outbound_threshold_is_configurable_and_independent() {
+        let strict_inbound = OwaspConfig {
+            inbound_anomaly_score_threshold: 1,
+            outbound_anomaly_score_threshold: 99,
+            ..OwaspConfig::default()
+        };
+        let checker = OWASPCheck::from_directory(&crs_dir()).with_config(&strict_inbound);
+        assert!(
+            ResponseCheck::check(
+                &checker,
+                &response_ctx(200, "<pre>java.lang.NullPointerException</pre>", 1)
+            )
+            .is_none(),
+            "an unreachable outbound threshold must suppress the response verdict"
+        );
+        // …while the inbound one, set to 1, still blocks the request phase.
+        assert!(
+            checker.check(&make_ctx_with_query("id=1' or '1'='1")).is_some(),
+            "the inbound threshold must be unaffected by the outbound one"
+        );
+    }
+
+    /// Two response rules on one body sum into one verdict rather than each
+    /// producing its own — the accumulator, not first-match-wins.
+    #[test]
+    fn response_contributions_accumulate_into_one_verdict() {
+        let checker = crs_checker();
+        let ctx = response_ctx(
+            200,
+            "<html>ORA-00933: SQL command not properly ended<br>java.lang.NullPointerException</html>",
+            1,
+        );
+        let hit = ResponseCheck::check(&checker, &ctx).expect("both rules fire");
+        // 951120 critical (5) + 952110 error (4).
+        assert!(hit.detail.contains("score 9 reached the threshold 4"), "{}", hit.detail);
+        assert!(hit.detail.contains("2 rule(s) contributed"), "{}", hit.detail);
+    }
+
+    /// A host with CRS switched off must not be inspected, in either phase.
+    #[test]
+    fn a_host_with_owasp_off_is_not_inspected_in_the_response_phase() {
+        let checker = crs_checker();
+        let mut ctx = response_ctx(200, "<html>ORA-00933: SQL command not properly ended</html>", 4);
+        ctx.request.host_config = Arc::new(HostConfig {
+            defense_config: DefenseConfig {
+                owasp_set: false,
+                ..DefenseConfig::default()
+            },
+            ..HostConfig::default()
+        });
+        assert!(ResponseCheck::check(&checker, &ctx).is_none());
+    }
+
+    /// The startup broadcast has to name the outbound threshold: an operator who
+    /// reads only "threshold 5" and assumes it governs responses has been misled.
+    #[test]
+    fn the_broadcast_states_both_thresholds() {
+        let lines = crs_checker().scoring_broadcast().join("\n");
+        assert!(lines.contains("inbound score reaches 5"), "{lines}");
+        assert!(lines.contains("OUTBOUND score reaches 4"), "{lines}");
+        assert!(lines.contains("959100"), "{lines}");
+        assert!(lines.contains("58 enforced"), "{lines}");
+    }
+
+    /// With no response rule loaded the check must decline before it looks at
+    /// anything, because that is what keeps the gateway's response path off.
+    #[test]
+    fn a_rule_set_without_response_rules_registers_nothing() {
+        let checker = OWASPCheck::from_yaml(&single_rule_yaml("query", "contains", "evil"));
+        assert_eq!(checker.response_rule_count(), 0);
+        assert!(ResponseCheck::check(&checker, &response_ctx(500, "ORA-00933:", 4)).is_none());
+    }
+
+    /// A truncated body is reported as such: "no leak found" in a prefix is a
+    /// weaker statement than "no leak", and the verdict text has to say so.
+    #[test]
+    fn a_truncated_body_says_so_in_the_verdict() {
+        let checker = crs_checker();
+        let mut ctx = response_ctx(200, "<html>ORA-00933: SQL command not properly ended</html>", 1);
+        ctx.body_truncated = true;
+        let hit = ResponseCheck::check(&checker, &ctx).expect("the finding is inside the inspected prefix");
+        assert!(hit.detail.contains("body truncated"), "{}", hit.detail);
     }
 }

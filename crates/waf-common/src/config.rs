@@ -253,6 +253,25 @@ pub struct OwaspConfig {
     /// including one that matched nothing, and would deny all traffic.
     #[serde(default = "default_inbound_anomaly_score_threshold")]
     pub inbound_anomaly_score_threshold: u32,
+    /// Act on a response when the accumulated **outbound** score reaches this
+    /// value (`tx.outbound_anomaly_score_threshold`, upstream default 4).
+    ///
+    /// # Why this is not the inbound threshold
+    ///
+    /// It is a different number upstream and the difference is deliberate:
+    /// `REQUEST-901-INITIALIZATION.conf` sets `tx.inbound_anomaly_score_threshold`
+    /// to 5 and `tx.outbound_anomaly_score_threshold` to 4, and
+    /// `RESPONSE-959-BLOCKING-EVALUATION.conf` rule `959100` compares the
+    /// outbound total against the latter. With the shipped severity weights a
+    /// single `ERROR` response rule (4) therefore reaches the outbound threshold
+    /// on its own while it would not reach the inbound one — response-phase CRS
+    /// is trigger-happier than request-phase CRS by design, because a leaked
+    /// stack trace is a fact about the response rather than an inference about
+    /// intent.
+    ///
+    /// Must be at least 1, for the same reason as the inbound threshold.
+    #[serde(default = "default_outbound_anomaly_score_threshold")]
+    pub outbound_anomaly_score_threshold: u32,
 }
 
 const fn default_critical_anomaly_score() -> u32 {
@@ -270,6 +289,9 @@ const fn default_notice_anomaly_score() -> u32 {
 const fn default_inbound_anomaly_score_threshold() -> u32 {
     5
 }
+const fn default_outbound_anomaly_score_threshold() -> u32 {
+    4
+}
 
 impl Default for OwaspConfig {
     fn default() -> Self {
@@ -280,6 +302,7 @@ impl Default for OwaspConfig {
             warning_anomaly_score: default_warning_anomaly_score(),
             notice_anomaly_score: default_notice_anomaly_score(),
             inbound_anomaly_score_threshold: default_inbound_anomaly_score_threshold(),
+            outbound_anomaly_score_threshold: default_outbound_anomaly_score_threshold(),
         }
     }
 }
@@ -299,6 +322,13 @@ impl OwaspConfig {
             return Err(
                 "owasp.inbound_anomaly_score_threshold must be >= 1: a threshold of 0 is reached by \
                  every request, including one that matched no rule, and would deny all traffic"
+                    .to_owned(),
+            );
+        }
+        if self.outbound_anomaly_score_threshold == 0 {
+            return Err(
+                "owasp.outbound_anomaly_score_threshold must be >= 1: a threshold of 0 is reached by \
+                 every response, including one that matched no rule, and would condemn all traffic"
                     .to_owned(),
             );
         }

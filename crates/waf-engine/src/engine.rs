@@ -224,6 +224,17 @@ impl WafEngine {
         &self.geo_check
     }
 
+    /// The CRS check, so the gateway can register it as a response-phase
+    /// detector.
+    ///
+    /// The **same** instance the request phase uses, deliberately: it carries
+    /// the compiled rule set, the configured scoring model and the audit-log
+    /// sink, and a second load would give the response phase a private copy of
+    /// all three.
+    pub const fn owasp_check(&self) -> &Arc<OWASPCheck> {
+        &self.owasp
+    }
+
     /// Reload all rules from the database
     pub async fn reload_rules(&self) -> anyhow::Result<()> {
         // Reload IP/URL rules

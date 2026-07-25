@@ -1,0 +1,37 @@
+# Auto-generated from OWASP CRS
+# Source: OWASP CRS v4.25.0
+# Description: Ruby Data Leakage
+# License: Apache-2.0
+# DO NOT EDIT MANUALLY - use modsec2yaml.py to regenerate
+
+version: '1.0'
+description: Ruby Data Leakage
+source: OWASP CRS v4.25.0
+license: Apache-2.0
+rules:
+  - id: CRS-956100
+    name: RUBY Information Leakage
+    category: data-leakage
+    severity: error
+    paranoia: 1
+    field: response_body
+    operator: pm_from_file
+    value: ruby-errors.data
+    action: block
+    tags:
+      - owasp-crs
+      - data-leakage
+    crs_id: 956100
+  - id: CRS-956110
+    name: Ruby source code leakage
+    category: data-leakage
+    severity: error
+    paranoia: 2
+    field: response_body
+    operator: regex
+    value: (?i)(?:<%[=#\s]|#\{[^}]+\})
+    action: block
+    tags:
+      - owasp-crs
+      - data-leakage
+    crs_id: 956110

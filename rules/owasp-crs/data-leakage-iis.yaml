@@ -1,0 +1,64 @@
+# Auto-generated from OWASP CRS
+# Source: OWASP CRS v4.25.0
+# Description: IIS Data Leakage
+# License: Apache-2.0
+# DO NOT EDIT MANUALLY - use modsec2yaml.py to regenerate
+
+version: '1.0'
+description: IIS Data Leakage
+source: OWASP CRS v4.25.0
+license: Apache-2.0
+rules:
+  - id: CRS-954100
+    name: Disclosure of IIS install location
+    category: data-leakage
+    severity: error
+    paranoia: 1
+    field: response_body
+    operator: regex
+    value: (?i)[a-z]:[\x5c/]inetpub\b
+    action: block
+    tags:
+      - owasp-crs
+      - data-leakage
+    crs_id: 954100
+  - id: CRS-954110
+    name: Application Availability Error
+    category: data-leakage
+    severity: error
+    paranoia: 1
+    field: response_body
+    operator: regex
+    value: |-
+      (?:Microsoft OLE DB Provider for SQL Server(?:</font>.{1,20}?error '800(?:04005|40e31)'.{1,40}?Timeout expired| \(0x80040e31\)<br>Timeout expired<br>)|<h1>internal server error</h1>.*?<h2>part of the server has crashed or it has a configuration error\.</h2>|cannot connect to the server: timed out)
+    action: block
+    tags:
+      - owasp-crs
+      - data-leakage
+    crs_id: 954110
+  - id: CRS-954120
+    name: IIS Information Leakage
+    category: data-leakage
+    severity: error
+    paranoia: 1
+    field: response_body
+    operator: pm_from_file
+    value: iis-errors.data
+    action: block
+    tags:
+      - owasp-crs
+      - data-leakage
+    crs_id: 954120
+  - id: CRS-954101
+    name: Disclosure of IIS install location
+    category: data-leakage
+    severity: error
+    paranoia: 2
+    field: response_body
+    operator: regex
+    value: (?i)[\x5c/]inetpub\b
+    action: block
+    tags:
+      - owasp-crs
+      - data-leakage
+    crs_id: 954101

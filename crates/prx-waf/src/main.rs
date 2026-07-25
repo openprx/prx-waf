@@ -13,6 +13,7 @@ use gateway::{
 };
 use waf_api::{AppState, start_api_server};
 use waf_common::config::{ApiConfig, AppConfig, ConfigError, SecurityConfig, apply_env_overrides, load_config};
+use waf_engine::checks::ResponseCheckSet;
 use waf_engine::{
     CrowdSecClient, CrowdSecConfig, EnforcementMode, ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource,
     RuleManager, RuntimeContentSecurityConfig, WafEngine, WafEngineConfig, XdbUpdater, cache_policy_from_str,
@@ -1339,7 +1340,32 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     let mut server = Server::new(None)?;
     server.bootstrap();
 
+    // ── Response-phase detectors ──────────────────────────────────────────────
+    // The CRS check is registered here, and only when it actually has
+    // response-phase rules loaded. That condition is the whole contract of the
+    // response path: `ResponseCheckSet::is_empty()` gates every response-phase
+    // action in the gateway, so a deployment whose rule directory carries no
+    // `RESPONSE-95x` file keeps the exact response path it had before response
+    // inspection existed — nothing gated, nothing folded, nothing buffered.
+    let response_checks = {
+        let owasp = Arc::clone(engine.owasp_check());
+        let count = owasp.response_rule_count();
+        if count == 0 {
+            info!("Response-phase WAF: no CRS response rules loaded — response inspection stays off");
+            ResponseCheckSet::new()
+        } else {
+            let policy = gateway::response_inspection_policy();
+            info!(
+                "Response-phase WAF: {count} CRS response rule(s) armed in {:?} mode \
+                 (PRXWAF_RESPONSE_INSPECT_MODE), inspecting up to {} body bytes per response",
+                policy.mode, policy.max_total_bytes,
+            );
+            ResponseCheckSet::from_checks(vec![Box::new(owasp)])
+        }
+    };
+
     let mut proxy = WafProxy::new(router, engine);
+    proxy.response_checks = Arc::new(response_checks);
     proxy.acme_challenges = acme_challenges;
     proxy.lb_registry = lb_registry;
     proxy.cache = response_cache;

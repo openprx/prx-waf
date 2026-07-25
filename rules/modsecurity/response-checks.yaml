@@ -1,16 +1,16 @@
 # Response-phase rules.
 #
 # Every pattern here describes something the *origin* sent back, so the field
-# must name a response location.  `response_body` is deliberately a field the
-# OWASP loader rejects today: the engine has no response-inspection hook, so
-# these rules are inert and say so at startup instead of being silently run
-# against request bodies.  Running them against requests is not a weaker
-# version of the intended check, it is a different check that only ever fires
-# on innocent traffic — MODSEC-RESP-006 alone would block every form POST
-# carrying an `api_key=` parameter.
+# must name a response location.  `response_body` routes a rule into the engine's
+# response pipeline, where it is shown the response body and scored against the
+# OUTBOUND anomaly threshold; it is never run against a request.  That matters
+# more than it sounds: running these against requests is not a weaker version of
+# the intended check, it is a different check that only ever fires on innocent
+# traffic — MODSEC-RESP-006 alone would block every form POST carrying an
+# `api_key=` parameter.
 #
 # This directory is not currently loaded (`RuleManager::load_from_dir` does not
-# recurse), but the fields are correct for the day it is.
+# recurse), so nothing here is active; the fields are correct for the day it is.
 version: "1.0"
 description: "HTTP response inspection rules - web shell, error disclosure, security headers"
 source: "prx-waf community rules"

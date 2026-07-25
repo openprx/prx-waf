@@ -11,7 +11,7 @@ pub mod plugins;
 pub mod rules;
 pub mod semantic_sink;
 
-pub use audit_log::{AuditLogSink, RuleHit, ScoreVerdict};
+pub use audit_log::{AuditLogSink, RuleHit, ScorePhase, ScoreVerdict};
 pub use checker::RuleStore;
 pub use checks::{
     AntiHotlinkCheck, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict, EnforcementMode, GeoCheck,

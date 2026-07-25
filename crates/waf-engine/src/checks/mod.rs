@@ -67,15 +67,29 @@ pub trait ResponseCheck: Send + Sync {
     fn check(&self, ctx: &ResponseCtx) -> Option<DetectionResult>;
 }
 
+/// Forward through a shared handle, so a checker the engine already owns behind
+/// an [`Arc`] can be registered here without a second copy of its compiled rule
+/// set.
+///
+/// [`OWASPCheck`] is the case that matters: the request pipeline holds it as
+/// `Arc<OWASPCheck>` and the response pipeline needs the *same* instance —
+/// re-loading the rules would double the memory and, worse, let the two phases
+/// drift onto different rule files after a reload.
+impl<T: ResponseCheck + ?Sized> ResponseCheck for std::sync::Arc<T> {
+    fn check(&self, ctx: &ResponseCtx) -> Option<DetectionResult> {
+        (**self).check(ctx)
+    }
+}
+
 /// The registered response-phase checkers.
 ///
-/// Ships **empty**: this round lands the plumbing (context type, trait, gateway
-/// call site) and no detectors. An empty set is the load-bearing invariant of
-/// that state — [`Self::is_empty`] is what the gateway tests before it does any
-/// response-phase work at all, so with no registered checker the response path
-/// is byte-for-byte the one that shipped before. The CRS response rules attach
-/// here in the round that teaches `checks::owasp` to evaluate
-/// `RESPONSE_BODY` / `RESPONSE_STATUS`.
+/// **Empty unless something registers.** [`Self::is_empty`] is what the gateway
+/// tests before it does any response-phase work at all, so with no registered
+/// checker the response path is byte-for-byte the one that shipped before
+/// response inspection existed. `main.rs` registers the CRS check here exactly
+/// when it has response-phase rules loaded
+/// ([`OWASPCheck::response_rule_count`]), which keeps that invariant true for a
+/// deployment whose rule set contains no `RESPONSE-95x` file.
 #[derive(Default)]
 pub struct ResponseCheckSet {
     checks: Vec<Box<dyn ResponseCheck>>,

@@ -24,13 +24,23 @@ Converted: 2025
 | `sqli.yaml` | 942xxx | SQLi | SQL injection |
 | `session-fixation.yaml` | 943xxx | Session | Session fixation |
 | `java-injection.yaml` | 944xxx | Java | Java deserialization, EL injection |
-| `response-data-leakage.yaml` | 950xxx | Response | Generic data leakage |
-| `response-sql-errors.yaml` | 951xxx | Response | SQL error disclosure |
-| `response-java-errors.yaml` | 952xxx | Response | Java error disclosure |
-| `response-php-errors.yaml` | 953xxx | Response | PHP error disclosure |
-| `response-iis-errors.yaml` | 954xxx | Response | IIS error disclosure |
-| `response-web-shells.yaml` | 955xxx | Response | Web shell detection |
-| `response-ruby-errors.yaml` | 956xxx | Response | Ruby error disclosure |
+| `data-leakage.yaml` | 950xxx | Response | Generic data leakage |
+| `data-leakage-sql.yaml` | 951xxx | Response | SQL error disclosure |
+| `data-leakage-java.yaml` | 952xxx | Response | Java error disclosure |
+| `data-leakage-php.yaml` | 953xxx | Response | PHP error disclosure |
+| `data-leakage-iis.yaml` | 954xxx | Response | IIS error disclosure |
+| `web-shells.yaml` | 955xxx | Response | Web shell detection |
+| `data-leakage-ruby.yaml` | 956xxx | Response | Ruby error disclosure |
+
+The 950–956 files are **response-phase** (`ModSecurity` `phase:4`): every rule in
+them reads `response_body` or `response_status`. `OWASPCheck` partitions on that
+at load time and evaluates them through `ResponseCheck`, against the outbound
+anomaly score and `owasp.outbound_anomaly_score_threshold` (upstream default
+**4**, deliberately not the inbound 5 — see CRS `959100`).
+
+An earlier converter generation wrote the same rules a second time as
+`response-*.yaml` with `CRS-RESP-` ids. Those files were removed: loading both
+made every duplicated rule contribute its severity to the outbound score twice.
 
 ## Data Files
 

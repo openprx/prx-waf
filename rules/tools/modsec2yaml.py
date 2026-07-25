@@ -39,7 +39,10 @@ FILE_MAP = {
     "RESPONSE-950": ("data-leakage.yaml",       "Data Leakage",               "data-leakage",     "data-leakage"),
     "RESPONSE-951": ("data-leakage-sql.yaml",   "SQL Data Leakage",           "data-leakage",     "data-leakage-sql"),
     "RESPONSE-952": ("data-leakage-java.yaml",  "Java Data Leakage",          "data-leakage",     "data-leakage-java"),
+    "RESPONSE-953": ("data-leakage-php.yaml",   "PHP Data Leakage",           "data-leakage",     "data-leakage-php"),
+    "RESPONSE-954": ("data-leakage-iis.yaml",   "IIS Data Leakage",           "data-leakage",     "data-leakage-iis"),
     "RESPONSE-955": ("web-shells.yaml",         "Web Shells",                 "rce",              "web-shells"),
+    "RESPONSE-956": ("data-leakage-ruby.yaml",  "Ruby Data Leakage",          "data-leakage",     "data-leakage-ruby"),
 }
 
 # ── Attack tag → category ─────────────────────────────────────────────────────
@@ -353,11 +356,14 @@ def _single_var_map(v: str) -> str:
         return "cookies"
     if v.startswith("RESPONSE_BODY"):
         return "response_body"
-    # Response-phase variables keep a response-phase field name so the engine
-    # rejects them loudly instead of scanning the request.
-    if v.startswith("RESPONSE_STATUS") or v.startswith("RESPONSE_PROTOCOL"):
+    # Response-phase variables keep a response-phase field name.  The engine now
+    # reads both of these (`Field::ResponseBody` / `Field::ResponseStatus`) and
+    # routes any rule naming one of them into the response pipeline, scored
+    # against the outbound threshold.  Anything else response-side stays
+    # unmapped, so it is rejected loudly rather than run against the request.
+    if v.startswith("RESPONSE_STATUS"):
         return "response_status"
-    if v.startswith("RESPONSE_HEADERS"):
+    if v.startswith("RESPONSE_HEADERS") or v.startswith("RESPONSE_PROTOCOL"):
         return "response_headers"
     if v.startswith("TX:") or v.startswith("IP:") or v.startswith("GEO:"):
         return "tx"
@@ -1088,6 +1094,15 @@ def parse_conf_file(path: str, default_category: str) -> list[dict]:
 
         rule = extract_rule(variables, operator_str, opts, default_category)
         if rule is None:
+            # Say so. A SecRule that carries an id and is neither skipped for a
+            # stated reason nor converted is a *gap in this converter*, and the
+            # one thing it must not be is invisible — the previous generation
+            # silently dropped every `!@op` head (CRS-954130) and nobody could
+            # tell that from the output.
+            dropped_id = opts.get("id", "")
+            if dropped_id:
+                print(f"  [drop] {os.path.basename(path)} rule {dropped_id}: "
+                      f"variables={variables!r} operator={operator_str!r} not expressible")
             continue
 
         if "chain" in opts:
