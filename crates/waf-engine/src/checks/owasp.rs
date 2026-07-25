@@ -175,7 +175,8 @@ impl CompiledRule {
     /// For the `"all"` field, scans path, query, body, and header values
     /// (matching CRS behavior for libinjection rules).  Each value is tested
     /// in raw form, single-decoded form, and recursively-decoded form (up to
-    /// 3 passes) to catch `%`-encoded and double/triple-encoded evasion attempts.
+    /// [`super::MAX_DECODE_PASSES`] passes, currently 5) to catch `%`-encoded
+    /// and double/triple-encoded evasion attempts.
     /// For a specific field, only that field is tested in all three forms.
     fn detect_injection(&self, ctx: &RequestCtx, detector: impl Fn(&[u8]) -> bool) -> bool {
         // Helper: test raw, single-decoded, and recursively-decoded forms.

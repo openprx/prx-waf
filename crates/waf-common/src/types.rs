@@ -262,8 +262,12 @@ pub enum LoadBalanceStrategy {
 /// The single per-host kill switch for **both** lanes' blocking is the host's
 /// `log_only_mode`, which downgrades every Lane 1 veto AND every Lane 2 enforce
 /// Block to a `LogOnly` event. Runtime per-host, per-detector Lane 1 gating of
-/// Lane 2 is a backlog item (no runtime write path today). See the full A3 note
-/// in `configs/default.toml`.
+/// Lane 2 remains a backlog item — but these toggles themselves **do** have a
+/// runtime write path: the admin API persists them into `hosts.defense_json`
+/// and `host_runtime_config` projects them straight onto the live
+/// [`HostConfig`](crate::HostConfig) the router serves, so an API host
+/// create/update takes effect without a restart. See the full A3 note in
+/// `configs/default.toml`.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]

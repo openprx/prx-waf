@@ -14,9 +14,9 @@ use gateway::{
 use waf_api::{AppState, start_api_server};
 use waf_common::config::{AppConfig, ConfigError, apply_env_overrides, load_config};
 use waf_engine::{
-    CrowdSecClient, CrowdSecConfig, ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource, RuleManager,
-    RuntimeContentSecurityConfig, WafEngine, WafEngineConfig, XdbUpdater, cache_policy_from_str, init_community,
-    init_crowdsec, spawn_auto_updater, spawn_ip_feed_sync,
+    CrowdSecClient, CrowdSecConfig, EnforcementMode, ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource,
+    RuleManager, RuntimeContentSecurityConfig, WafEngine, WafEngineConfig, XdbUpdater, cache_policy_from_str,
+    init_community, init_crowdsec, spawn_auto_updater, spawn_ip_feed_sync,
 };
 use waf_storage::Database;
 
@@ -1376,6 +1376,172 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     server.run_forever();
 }
 
+/// Severity a [`BroadcastLine`] must be logged at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BroadcastLevel {
+    Info,
+    Warn,
+}
+
+/// One line of the Lane 2 enforcement startup broadcast.
+#[derive(Debug, Clone)]
+struct BroadcastLine {
+    level: BroadcastLevel,
+    text: String,
+}
+
+impl BroadcastLine {
+    fn info(text: impl Into<String>) -> Self {
+        Self {
+            level: BroadcastLevel::Info,
+            text: text.into(),
+        }
+    }
+
+    fn warn(text: impl Into<String>) -> Self {
+        Self {
+            level: BroadcastLevel::Warn,
+            text: text.into(),
+        }
+    }
+}
+
+/// Render a family list for the broadcast: `a, b, c`, or `none` when empty.
+fn render_family_list(items: &[&str]) -> String {
+    if items.is_empty() {
+        "none".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+/// Build the Lane 2 semantic content-security startup broadcast.
+///
+/// This is the operator-facing answer to the only question that matters at boot:
+/// **will this process return a 403 from the semantic lane, or not?** It reports
+/// the real conditions the request path applies in
+/// `ContentSecuritySubsystem::resolve_enforced_action`, all of which must hold
+/// for a semantic verdict to become a Block:
+///
+/// 1. the lane is enabled and the global `enforcement_mode` is not `off`
+///    (a global `off` short-circuits the lane before detection, so per-family
+///    overrides are inert);
+/// 2. the verdict's primary family resolves to `enforce` — either from the
+///    global mode or from an `enforcement_overrides` entry — and that family is
+///    enabled in `[content_security.attacks.*]`;
+/// 3. `rollout_bps > 0` and the request's client-IP canary bucket falls inside
+///    it (`rollout_bps = 0` therefore closes the gate for every request);
+/// 4. the restart warmup latch has lifted — enforcement is held to shadow for
+///    `breaker.window` after process start;
+/// 5. the anomaly-rate circuit breaker is not open;
+/// 6. the host is not in `log_only_mode`;
+/// 7. the verdict is `enforce_safe` — a Block carried solely by blind/synthetic
+///    views (base64/hex/comment-strip/HPP/parse-error) is held to shadow.
+///
+/// Conditions 5–7 are per-request/per-host and cannot be decided at startup, so
+/// they are stated as caveats on the "WILL BLOCK" verdict. Conditions 1–4 are
+/// static configuration and are decided here.
+///
+/// `rt` is the compiled config the engine actually runs on; `cfg` supplies the
+/// stably ordered, string-keyed family and override maps (the compiled runtime
+/// form uses unordered `HashMap`s keyed by a non-exported enum).
+fn content_security_startup_broadcast(
+    rt: &RuntimeContentSecurityConfig,
+    cfg: &waf_common::content_security_config::ContentSecurityConfig,
+) -> Vec<BroadcastLine> {
+    if !rt.enabled {
+        return vec![BroadcastLine::info(
+            "Lane 2 semantic content-security engine DISABLED (content_security.enabled=false): no semantic detection, no shadow logging, no observation rows. WILL NOT BLOCK. Lane 1 legacy checkers are unaffected.",
+        )];
+    }
+
+    let global = match rt.enforcement_mode {
+        EnforcementMode::Off => "off",
+        EnforcementMode::LogOnly => "log_only",
+        EnforcementMode::Enforce => "enforce",
+    };
+    let rendered_overrides = if cfg.enforcement_overrides.is_empty() {
+        "none".to_string()
+    } else {
+        cfg.enforcement_overrides
+            .iter()
+            .map(|(family, mode)| format!("{family}={mode}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if rt.enforcement_mode == EnforcementMode::Off {
+        return vec![BroadcastLine::info(format!(
+            "Lane 2 semantic content-security engine enabled but enforcement_mode=off — the lane does NO work (no preprocessing, no detection, no shadow log, no observation row) and per-family overrides are inert (overrides: {rendered_overrides}). WILL NOT BLOCK."
+        ))];
+    }
+
+    // Effective per-family mode: an `enforcement_overrides` entry wins over the
+    // global mode. A family disabled in `[content_security.attacks.*]` is never
+    // scored, so it can never block whatever its mode says.
+    let mut enforcing: Vec<&str> = Vec::new();
+    let mut shadow: Vec<&str> = Vec::new();
+    let mut no_action: Vec<&str> = Vec::new();
+    let mut disabled: Vec<&str> = Vec::new();
+    for (family, attack) in &cfg.attacks {
+        if !attack.enabled {
+            disabled.push(family.as_str());
+            continue;
+        }
+        match cfg.enforcement_overrides.get(family).map_or(global, String::as_str) {
+            "enforce" => enforcing.push(family.as_str()),
+            "off" => no_action.push(family.as_str()),
+            _ => shadow.push(family.as_str()),
+        }
+    }
+
+    let warmup_secs = rt.breaker.window.as_secs();
+    let rollout_pct = f64::from(rt.rollout_bps) / 100.0;
+
+    let mut lines = vec![
+        BroadcastLine::info(format!(
+            "Lane 2 semantic content-security engine ACTIVE: global enforcement_mode={global}, per-family enforcement_overrides: {rendered_overrides}"
+        )),
+        BroadcastLine::info(format!(
+            "Lane 2 families — enforce (a match may return 403): {}; log_only (detect + log + persist, never block): {}",
+            render_family_list(&enforcing),
+            render_family_list(&shadow)
+        )),
+    ];
+    if !no_action.is_empty() || !disabled.is_empty() {
+        lines.push(BroadcastLine::info(format!(
+            "Lane 2 families — off (still detected + persisted as an observation, but no security event and no block): {}; disabled in [content_security.attacks.*] (never scored at all): {}",
+            render_family_list(&no_action),
+            render_family_list(&disabled)
+        )));
+    }
+    lines.push(BroadcastLine::info(format!(
+        "Lane 2 block gates: rollout_bps={}/10000 (~{rollout_pct:.2}% of client IPs, canary bucketed by client IP), restart warmup latch={warmup_secs}s from process start, breaker window={warmup_secs}s min_samples={} anomaly_rate_threshold={} cooldown={}s",
+        rt.rollout_bps,
+        rt.breaker.min_samples,
+        rt.breaker.anomaly_rate_threshold,
+        rt.breaker.cooldown.as_secs()
+    )));
+
+    if enforcing.is_empty() {
+        lines.push(BroadcastLine::info(
+            "Lane 2 VERDICT: WILL NOT BLOCK — no enabled attack family resolves to enforce. Every Lane 2 detection becomes a LogOnly security event plus a semantic_observations row.",
+        ));
+        return lines;
+    }
+    let enforcing_list = render_family_list(&enforcing);
+    if rt.rollout_bps == 0 {
+        lines.push(BroadcastLine::warn(format!(
+            "Lane 2 VERDICT: WILL NOT BLOCK — families [{enforcing_list}] are configured to enforce, but rollout_bps=0 closes the canary gate for every request, so every would-be Block is downgraded to a shadow LogOnly. Raise content_security.rollout_bps above 0 to make enforcement take effect."
+        )));
+        return lines;
+    }
+    lines.push(BroadcastLine::warn(format!(
+        "Lane 2 VERDICT: WILL BLOCK once warmed up — {warmup_secs}s after process start, a request matching [{enforcing_list}] from a client IP inside the ~{rollout_pct:.2}% canary can be answered with a 403. Before the warmup latch lifts, while the circuit breaker is open, for hosts with log_only_mode=true, and for verdicts that are not enforce_safe (carried solely by blind/synthetic base64/hex/comment-strip/HPP/parse-error views), the Block is still downgraded to a shadow LogOnly."
+    )));
+    lines
+}
+
 /// Shutdown guards that keep background-task sender halves alive.
 ///
 /// Each field is a `tokio::sync::watch::Sender<bool>`.  Dropping this struct
@@ -1386,6 +1552,9 @@ struct ShutdownGuards {
     _crowdsec: Option<tokio::sync::watch::Sender<bool>>,
     /// Keeps the Community background worker alive while the server runs.
     _community: Option<tokio::sync::watch::Sender<bool>>,
+    /// Keeps the `semantic_observations` retention pruner alive while the server
+    /// runs.
+    _retention: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 /// Async initialization: database, engine, rules, Phases 5 & 6
@@ -1412,25 +1581,10 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
     // detector-id strings and is a hard failure if it somehow fails.
     let content_security = RuntimeContentSecurityConfig::compile(&config.content_security)
         .map_err(|e| anyhow::anyhow!("invalid content_security config: {e}"))?;
-    if content_security.enabled {
-        match content_security.enforcement_mode {
-            waf_engine::EnforcementMode::Off => {
-                info!(
-                    "Lane 2 semantic content-security engine enabled but enforcement_mode=off — the lane does no work (no detection/log/observation)"
-                );
-            }
-            waf_engine::EnforcementMode::LogOnly => {
-                info!(
-                    "Lane 2 semantic content-security engine enabled in SHADOW mode (log_only): detections are logged + persisted, never blocked"
-                );
-            }
-            waf_engine::EnforcementMode::Enforce => {
-                // P1b does NOT wire the scorer to the block path. `enforce` is
-                // accepted for forward-compatibility but behaves like `log_only`.
-                tracing::warn!(
-                    "Lane 2 enforcement_mode=enforce is configured but NOT yet wired in P1b (shadow only): the lane will LOG + PERSIST but NEVER block. Treating it as log_only."
-                );
-            }
+    for line in content_security_startup_broadcast(&content_security, &config.content_security) {
+        match line.level {
+            BroadcastLevel::Info => info!("{}", line.text),
+            BroadcastLevel::Warn => tracing::warn!("{}", line.text),
         }
     }
 
@@ -1708,9 +1862,44 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         None
     };
 
+    // Retention / TTL enforcement for the Lane 2 `semantic_observations` shadow
+    // telemetry table. Those rows carry `client_ip` + `req_id` and the semantic
+    // lane ships shadow-enabled, so without this the table grows without bound
+    // and holds personal data forever. The sender is returned to the caller so
+    // it lives until the server exits; dropping it stops the pruner.
+    let retention_shutdown_guard = {
+        let retention = waf_storage::RetentionConfig::from_settings(
+            config.storage.semantic_observation_retention_days,
+            config.storage.retention_prune_interval_hours,
+        );
+        let (retention_shutdown_tx, retention_shutdown_rx) = tokio::sync::watch::channel(false);
+        waf_storage::spawn_semantic_observation_pruner(Arc::clone(&db), retention, retention_shutdown_rx).map_or_else(
+            || {
+                tracing::warn!(
+                    "semantic_observations retention DISABLED (storage.semantic_observation_retention_days={}): the table grows without bound and keeps client_ip / req_id indefinitely",
+                    config.storage.semantic_observation_retention_days
+                );
+                None
+            },
+            |handle| {
+                // Keep the task alive for the process lifetime; shutdown is
+                // driven by the watch sender held in `ShutdownGuards`.
+                std::mem::forget(handle);
+                info!(
+                    "semantic_observations retention active: {} day window, swept every {}h (first sweep in {}s)",
+                    retention.retention_days,
+                    retention.interval.as_secs() / 3600,
+                    retention.initial_delay.as_secs()
+                );
+                Some(retention_shutdown_tx)
+            },
+        )
+    };
+
     let guards = ShutdownGuards {
         _crowdsec: crowdsec_shutdown_guard,
         _community: community_shutdown_guard,
+        _retention: retention_shutdown_guard,
     };
 
     // ACME / Let's Encrypt automatic TLS (M-3). Returns the shared challenge
@@ -1858,7 +2047,158 @@ async fn setup_acme(config: &AppConfig, db: Arc<Database>, router: Arc<HostRoute
 #[cfg(test)]
 mod tests {
     use super::*;
+    use waf_common::content_security_config::ContentSecurityConfig;
     use waf_engine::crowdsec::config::FallbackAction;
+
+    /// The shipped `configs/default.toml` Lane 2 section — the posture a real
+    /// deployment boots with unless the operator edits it.
+    fn shipped_content_security() -> ContentSecurityConfig {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/default.toml");
+        load_config(path)
+            .expect("shipped default.toml must load")
+            .content_security
+    }
+
+    /// Compile a config and render the startup broadcast, as `init_async` does.
+    fn broadcast(cfg: &ContentSecurityConfig) -> Vec<BroadcastLine> {
+        let rt = RuntimeContentSecurityConfig::compile(cfg).expect("config must compile");
+        content_security_startup_broadcast(&rt, cfg)
+    }
+
+    /// The verdict is always the last line.
+    fn verdict(lines: &[BroadcastLine]) -> &BroadcastLine {
+        lines.last().expect("broadcast is never empty")
+    }
+
+    #[test]
+    fn shipped_default_broadcast_says_it_will_not_block() {
+        // Shipped posture: lane enabled, global log_only, no overrides. The
+        // operator must be told plainly that nothing is blocked.
+        let lines = broadcast(&shipped_content_security());
+        let v = verdict(&lines);
+        assert_eq!(v.level, BroadcastLevel::Info, "shadow posture is not a warning");
+        assert!(
+            v.text.contains("WILL NOT BLOCK") && v.text.contains("no enabled attack family resolves to enforce"),
+            "unexpected shipped verdict: {}",
+            v.text
+        );
+        assert!(
+            lines.iter().all(|l| l.level == BroadcastLevel::Info),
+            "the shipped shadow posture must not warn"
+        );
+    }
+
+    #[test]
+    fn disabled_lane_broadcast_is_a_single_line() {
+        let cfg = ContentSecurityConfig::default();
+        let lines = broadcast(&cfg);
+        assert_eq!(lines.len(), 1);
+        let only = verdict(&lines);
+        assert!(only.text.contains("DISABLED"), "{}", only.text);
+        assert!(only.text.contains("WILL NOT BLOCK"), "{}", only.text);
+    }
+
+    #[test]
+    fn global_off_reports_that_per_family_overrides_are_inert() {
+        // A global `off` short-circuits the lane before detection, so even an
+        // `enforce` override cannot block. The broadcast must say so rather than
+        // list the override as enforcing.
+        let mut cfg = shipped_content_security();
+        cfg.enforcement_mode = "off".to_string();
+        cfg.enforcement_overrides
+            .insert("sql_injection".to_string(), "enforce".to_string());
+        let lines = broadcast(&cfg);
+        assert_eq!(lines.len(), 1);
+        let only = verdict(&lines);
+        assert_eq!(only.level, BroadcastLevel::Info);
+        assert!(only.text.contains("does NO work"), "{}", only.text);
+        assert!(only.text.contains("per-family overrides are inert"), "{}", only.text);
+        assert!(only.text.contains("WILL NOT BLOCK"), "{}", only.text);
+    }
+
+    #[test]
+    fn enforce_with_zero_rollout_warns_that_the_canary_gate_is_shut() {
+        // The exact trap the old "not yet wired" WARN papered over: enforce is
+        // real now, but the shipped rollout_bps=0 keeps it in shadow.
+        let mut cfg = shipped_content_security();
+        cfg.enforcement_mode = "enforce".to_string();
+        cfg.rollout_bps = 0;
+        let lines = broadcast(&cfg);
+        let v = verdict(&lines);
+        assert_eq!(v.level, BroadcastLevel::Warn, "an inert enforce config must warn");
+        assert!(v.text.contains("WILL NOT BLOCK"), "{}", v.text);
+        assert!(v.text.contains("rollout_bps=0"), "{}", v.text);
+        assert!(
+            !v.text.contains("NOT yet wired"),
+            "the stale P1b shadow-only claim must be gone: {}",
+            v.text
+        );
+    }
+
+    #[test]
+    fn enforce_with_rollout_warns_that_it_will_block() {
+        let mut cfg = shipped_content_security();
+        cfg.enforcement_mode = "enforce".to_string();
+        cfg.rollout_bps = 1000;
+        let lines = broadcast(&cfg);
+        let v = verdict(&lines);
+        assert_eq!(v.level, BroadcastLevel::Warn);
+        assert!(v.text.contains("WILL BLOCK once warmed up"), "{}", v.text);
+        // Warmup window == breaker.window (300s in the shipped config).
+        assert!(v.text.contains("300s after process start"), "{}", v.text);
+        // 1000 bps == 10% of client IPs.
+        assert!(v.text.contains("10.00% canary"), "{}", v.text);
+        // The per-request guardrails that startup cannot decide.
+        assert!(v.text.contains("log_only_mode=true"), "{}", v.text);
+        assert!(v.text.contains("enforce_safe"), "{}", v.text);
+    }
+
+    #[test]
+    fn per_family_override_is_reported_as_the_only_enforcing_family() {
+        let mut cfg = shipped_content_security();
+        cfg.rollout_bps = 10_000;
+        cfg.enforcement_overrides
+            .insert("sql_injection".to_string(), "enforce".to_string());
+        let lines = broadcast(&cfg);
+        let families = lines
+            .iter()
+            .find(|l| l.text.contains("Lane 2 families — enforce"))
+            .map(|l| l.text.clone())
+            .expect("family breakdown line must be present");
+        assert!(
+            families.contains("enforce (a match may return 403): sql_injection;"),
+            "{families}"
+        );
+        assert!(
+            families.contains("rce"),
+            "non-overridden families stay shadow: {families}"
+        );
+        let v = verdict(&lines);
+        assert_eq!(v.level, BroadcastLevel::Warn);
+        assert!(v.text.contains("WILL BLOCK once warmed up"), "{}", v.text);
+        assert!(v.text.contains("[sql_injection]"), "{}", v.text);
+        assert!(v.text.contains("100.00% canary"), "{}", v.text);
+    }
+
+    #[test]
+    fn a_family_disabled_in_attacks_is_never_listed_as_enforcing() {
+        // `[content_security.attacks.<family>].enabled = false` means the family
+        // is never scored, so an `enforce` mode on it cannot block.
+        let mut cfg = shipped_content_security();
+        cfg.enforcement_mode = "enforce".to_string();
+        cfg.rollout_bps = 10_000;
+        for attack in cfg.attacks.values_mut() {
+            attack.enabled = false;
+        }
+        let lines = broadcast(&cfg);
+        let v = verdict(&lines);
+        assert_eq!(v.level, BroadcastLevel::Info);
+        assert!(
+            v.text.contains("no enabled attack family resolves to enforce"),
+            "{}",
+            v.text
+        );
+    }
 
     #[test]
     fn appsec_failure_action_is_independent_of_fallback_action() {

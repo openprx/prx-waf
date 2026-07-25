@@ -9,6 +9,17 @@ listen_addr = "0.0.0.0:9527"
 database_url = "postgresql://prx_waf:prx_waf@postgres:5432/prx_waf"
 max_connections = 20
 
+# Retention (TTL) for the Lane 2 `semantic_observations` shadow-telemetry table.
+# Those rows carry client_ip + req_id for every semantic detection and the lane
+# is shadow-enabled by default, so a background pruner deletes rows older than
+# the window below. 30 days is deliberately at the low end of the usual 30–90 day
+# security-log range: the table exists to tune detection / false-positive rates
+# (a short-horizon activity) and holding client IPs longer buys nothing.
+# 0 disables pruning entirely — the table then grows without bound and startup
+# logs a warning. Values above 2160 (90 days) are clamped by the storage layer.
+semantic_observation_retention_days = 30
+retention_prune_interval_hours = 6      # sweep cadence; clamped to >= 1
+
 # ── Phase 5: Response Caching ─────────────────────────────────────────────────
 [cache]
 enabled = true
@@ -234,8 +245,10 @@ rollout_salt = ""                     # stable salt for deterministic canary buc
 # The single per-host total kill switch for BOTH lanes' blocking is the host's
 # `log_only_mode`: when a host is in log_only_mode, every Lane 1 veto AND every
 # Lane 2 enforce Block is downgraded to a LogOnly event for that host. (Runtime
-# per-host, per-detector Lane 1 gating of Lane 2 is a backlog item — DefenseConfig
-# has no runtime write path today; contract ② applies until then.)
+# per-host, per-detector Lane 1 gating of Lane 2 is still a backlog item, but the
+# Lane 1 toggles themselves DO have a runtime write path: the admin API persists
+# them to hosts.defense_json and projects them onto the live HostConfig without a
+# restart. Contract ② — the two switch sets stay independent — applies either way.)
 [content_security.enforcement_overrides]
 
 [content_security.budget]             # deterministic DoS work caps (conservative)

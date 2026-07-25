@@ -15,5 +15,10 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# Test-only: `#[tokio::test(start_paused = true)]` drives the retention
+# scheduler's multi-hour timers deterministically without real sleeps.
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true

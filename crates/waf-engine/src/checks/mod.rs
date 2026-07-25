@@ -125,7 +125,8 @@ fn header_decoded_label(name: &str) -> &'static str {
 /// indicate where the pattern was found.
 ///
 /// Path / query / cookie / body are included in three forms: raw,
-/// single-decoded, and recursively-decoded (up to 3 passes) so that
+/// single-decoded, and recursively-decoded (up to [`MAX_DECODE_PASSES`]
+/// passes, currently 5) so that
 /// double/triple-encoded evasion attempts are caught alongside the plain
 /// variants.  A curated set of request headers ([`SCANNED_HEADERS`]) is
 /// additionally scanned in raw + single-decoded form.

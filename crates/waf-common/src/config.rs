@@ -367,6 +367,38 @@ impl Default for ApiConfig {
 pub struct StorageConfig {
     pub database_url: String,
     pub max_connections: u32,
+    /// Retention window, in days, for the Lane 2 `semantic_observations`
+    /// shadow-telemetry table.
+    ///
+    /// That table carries `client_ip` and `req_id` for every semantic
+    /// detection and the lane is shadow-enabled by default, so without a TTL it
+    /// grows without bound and holds personal data indefinitely. A background
+    /// pruner deletes rows older than this window.
+    ///
+    /// `0` disables pruning entirely (rows are kept forever); startup logs a
+    /// warning in that case so the choice is never silent. Values above
+    /// 2160 (90 days) are clamped by the repository layer.
+    #[serde(default = "default_semantic_observation_retention_days")]
+    pub semantic_observation_retention_days: i64,
+    /// How often the retention pruner runs, in hours. Clamped to at least 1.
+    #[serde(default = "default_retention_prune_interval_hours")]
+    pub retention_prune_interval_hours: u64,
+}
+
+/// Default `semantic_observations` retention: 30 days.
+///
+/// The table is shadow telemetry for tuning detection / false-positive rates,
+/// which is a short-horizon activity — a month of history already spans several
+/// tuning cycles. It is deliberately at the low end of the 30–90 day range
+/// common for security logs because these rows carry `client_ip` (personal
+/// data) with no operational need for long-term retention.
+const fn default_semantic_observation_retention_days() -> i64 {
+    30
+}
+
+/// Default retention sweep interval: every 6 hours.
+const fn default_retention_prune_interval_hours() -> u64 {
+    6
 }
 
 impl Default for StorageConfig {
@@ -374,6 +406,8 @@ impl Default for StorageConfig {
         Self {
             database_url: "postgresql://prx_waf:prx_waf@127.0.0.1:5432/prx_waf".to_string(),
             max_connections: 20,
+            semantic_observation_retention_days: default_semantic_observation_retention_days(),
+            retention_prune_interval_hours: default_retention_prune_interval_hours(),
         }
     }
 }
