@@ -45,7 +45,16 @@ services:
     ports:
       - "16880:80"    # HTTP proxy
       - "16843:443"   # HTTPS proxy
-      - "16827:9527"  # Management API + Admin UI
+      # Management API + Admin UI — host-side bind is intentionally restricted
+      # to loopback by default (ADMIN_BIND_ADDR, see .env.example). The admin
+      # API can rewrite WAF rules, upload WASM plugins, mint cluster-join
+      # tokens and replace TLS certificates; its only gate is a JWT bootstrapped
+      # from a once-printed password, so publishing it to every host interface
+      # by default would expose that whole surface to the network. To allow
+      # remote access, either set ADMIN_BIND_ADDR=0.0.0.0 in .env (and then
+      # configure [security] admin_ip_allowlist in configs/default.toml), or
+      # put a tunnel / reverse proxy in front of this port instead.
+      - "${ADMIN_BIND_ADDR:-127.0.0.1}:16827:9527"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9527/health || exit 1"]
       interval: 30s

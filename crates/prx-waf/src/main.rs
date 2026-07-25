@@ -12,7 +12,7 @@ use gateway::{
     spawn_health_checker,
 };
 use waf_api::{AppState, start_api_server};
-use waf_common::config::{AppConfig, ConfigError, apply_env_overrides, load_config};
+use waf_common::config::{ApiConfig, AppConfig, ConfigError, SecurityConfig, apply_env_overrides, load_config};
 use waf_engine::{
     CrowdSecClient, CrowdSecConfig, EnforcementMode, ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource,
     RuleManager, RuntimeContentSecurityConfig, WafEngine, WafEngineConfig, XdbUpdater, cache_policy_from_str,
@@ -1190,6 +1190,16 @@ fn app_config_to_crowdsec(config: &AppConfig) -> CrowdSecConfig {
 fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     use pingora_core::server::Server;
 
+    // Report the admin-API reachable surface before anything else binds, so
+    // the very first thing an operator sees is whether the management API is
+    // exposed and what to do about it.
+    for line in admin_exposure_startup_broadcast(&config.api, &config.security) {
+        match line.level {
+            BroadcastLevel::Info => info!("{}", line.text),
+            BroadcastLevel::Warn => tracing::warn!("{}", line.text),
+        }
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 
     // `_shutdown_guards` holds the watch senders that signal background workers
@@ -1540,6 +1550,109 @@ fn content_security_startup_broadcast(
         "Lane 2 VERDICT: WILL BLOCK once warmed up — {warmup_secs}s after process start, a request matching [{enforcing_list}] from a client IP inside the ~{rollout_pct:.2}% canary can be answered with a 403. Before the warmup latch lifts, while the circuit breaker is open, for hosts with log_only_mode=true, and for verdicts that are not enforce_safe (carried solely by blind/synthetic base64/hex/comment-strip/HPP/parse-error views), the Block is still downgraded to a shadow LogOnly."
     )));
     lines
+}
+
+/// Bind scope of the management API's `[api] listen_addr`, classified from
+/// the configured socket address alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminBindScope {
+    /// `127.0.0.0/8` or `::1` — reachable only from processes on this host
+    /// (this container, if containerized).
+    Loopback,
+    /// A single non-wildcard, non-loopback address — reachable from whatever
+    /// network that one interface sits on.
+    Interface,
+    /// `0.0.0.0` — reachable on every IPv4 interface of this host/container.
+    WildcardV4,
+    /// `::` — reachable on every interface of this host/container (IPv4 and
+    /// IPv6 alike on most kernels, which default to a dual-stack wildcard).
+    WildcardV6,
+}
+
+/// Classify `[api] listen_addr`. Returns `None` when it does not parse as
+/// `host:port` — the process will fail to bind on that value later; this
+/// broadcast just cannot assess a scope for it ahead of time.
+fn classify_admin_bind_scope(listen_addr: &str) -> Option<AdminBindScope> {
+    let ip = listen_addr.parse::<std::net::SocketAddr>().ok()?.ip();
+    Some(if ip.is_loopback() {
+        AdminBindScope::Loopback
+    } else if ip.is_unspecified() {
+        if ip.is_ipv4() {
+            AdminBindScope::WildcardV4
+        } else {
+            AdminBindScope::WildcardV6
+        }
+    } else {
+        AdminBindScope::Interface
+    })
+}
+
+/// Render `[security] admin_ip_allowlist` for the broadcast.
+fn render_admin_allowlist(allowlist: &[String]) -> String {
+    if allowlist.is_empty() {
+        "empty".to_string()
+    } else {
+        format!(
+            "{} entr{} ({})",
+            allowlist.len(),
+            if allowlist.len() == 1 { "y" } else { "ies" },
+            allowlist.join(", ")
+        )
+    }
+}
+
+/// Build the admin-management-API exposure startup broadcast.
+///
+/// Answers the operator's other boot-time question, alongside Lane 2's "will
+/// this block?": **who can reach the management API, and what can they do if
+/// they get there?** The management API can rewrite WAF rules, upload WASM
+/// plugins, mint cluster-join tokens, and replace TLS certificates; its only
+/// gate is a JWT bootstrapped from a password printed once at first startup,
+/// plus whatever `[security] admin_ip_allowlist` restricts. This combines
+/// that with the actual bind scope of `[api] listen_addr` — the two settings
+/// that jointly decide the real reachable surface. It cannot see a Docker
+/// host port publish or an external firewall, so it says so whenever the bind
+/// is wider than loopback.
+fn admin_exposure_startup_broadcast(api: &ApiConfig, security: &SecurityConfig) -> Vec<BroadcastLine> {
+    let allowlist_desc = render_admin_allowlist(&security.admin_ip_allowlist);
+    let addr = &api.listen_addr;
+
+    let Some(scope) = classify_admin_bind_scope(addr) else {
+        return vec![BroadcastLine::warn(format!(
+            "Admin API exposure UNKNOWN: [api] listen_addr={addr:?} does not parse as host:port, so its bind scope cannot be assessed here. The server will fail to bind on startup if this value is invalid; if it is valid but unusual, verify manually that it does not expose the management API wider than intended (admin_ip_allowlist: {allowlist_desc})."
+        ))];
+    };
+
+    match scope {
+        AdminBindScope::Loopback if security.admin_ip_allowlist.is_empty() => vec![BroadcastLine::info(format!(
+            "Admin API bind: {addr} is loopback-only — reachable only from processes on this host (this container, if containerized). [security] admin_ip_allowlist is empty, but that adds no exposure here since the bind itself already blocks every off-host source. If this runs under Docker, the host-side port publish in docker-compose.yml decides what's reachable from outside the container (\"127.0.0.1:16827:9527\" keeps it host-local; publishing it as \"0.0.0.0:...\" or unqualified \"16827:9527\" would re-expose it network-wide even though this bind stays loopback)."
+        ))],
+        AdminBindScope::Loopback => vec![BroadcastLine::info(format!(
+            "Admin API bind: {addr} is loopback-only, and [security] admin_ip_allowlist additionally restricts to {allowlist_desc}. The allowlist is redundant given the loopback bind (harmless) — it only matters if something reaches this port over a non-loopback path, e.g. a Docker port publish wider than 127.0.0.1."
+        ))],
+        AdminBindScope::Interface if security.admin_ip_allowlist.is_empty() => vec![BroadcastLine::warn(format!(
+            "Admin API exposure: [api] listen_addr={addr} binds to a specific non-loopback interface, and [security] admin_ip_allowlist is empty — every host that can route to that interface's network can reach the management API (WAF rule edits, WASM plugin upload, cluster-join tokens, TLS certificate changes), gated only by the JWT login (bootstrapped from the once-printed admin password). Fix by setting [security] admin_ip_allowlist to the trusted admin IP(s)/CIDR(s), or bind [api] listen_addr to 127.0.0.1 and put a tunnel/reverse proxy in front for remote access."
+        ))],
+        AdminBindScope::Interface => vec![BroadcastLine::info(format!(
+            "Admin API exposure: [api] listen_addr={addr} binds to a specific non-loopback interface; [security] admin_ip_allowlist restricts application-level access to {allowlist_desc}. Connections from other sources are rejected with 403 before reaching business logic, but the TCP port itself is still open on that interface's network (reachable for health checks / port probing). Narrow further by binding [api] listen_addr to 127.0.0.1 if remote admin access is not needed."
+        ))],
+        AdminBindScope::WildcardV4 | AdminBindScope::WildcardV6 => {
+            let scope_desc = if scope == AdminBindScope::WildcardV4 {
+                "every IPv4 interface of this host/container"
+            } else {
+                "every interface of this host/container (IPv4 and IPv6 alike on most kernels)"
+            };
+            if security.admin_ip_allowlist.is_empty() {
+                vec![BroadcastLine::warn(format!(
+                    "Admin API exposure: CRITICAL — [api] listen_addr={addr} binds to {scope_desc}, and [security] admin_ip_allowlist is empty, so ANY host that can reach this port (directly, or via a Docker port publish such as \"0.0.0.0:16827:9527\" in docker-compose.yml) can reach the management API. That API can rewrite WAF rules, upload WASM plugins, mint cluster-join tokens, and replace TLS certificates. The only gate is a JWT login (bootstrapped from the admin password printed once at first startup) — nothing stops every reachable IP from attempting to brute-force or exploit it. Fix by doing at least one of: set [security] admin_ip_allowlist to your trusted admin IP(s)/CIDR(s); bind [api] listen_addr to 127.0.0.1 for host-local-only access (pair with an SSH tunnel or reverse proxy for remote admin use); or, in Docker, keep the host port publish bound to 127.0.0.1 (see docker-compose.yml / .env ADMIN_BIND_ADDR) instead of publishing it on every host interface."
+                ))]
+            } else {
+                vec![BroadcastLine::warn(format!(
+                    "Admin API exposure: [api] listen_addr={addr} binds to {scope_desc}, but [security] admin_ip_allowlist restricts application-level access to {allowlist_desc}. Requests from any other source are rejected with 403 before reaching business logic, so the WAF-rule/plugin/cluster-token/certificate surface is gated. The TCP port itself is still open network-wide though (health checks, port scans, and the rate limiter's per-IP bucket can still be probed by anyone who can route to this host) — if those allowlist entries are not a hard perimeter (e.g. broad CIDRs, a shared NAT gateway), also consider binding [api] listen_addr to 127.0.0.1 or a specific admin-only interface."
+                ))]
+            }
+        }
+    }
 }
 
 /// Map `[storage]` into one retention policy per prunable table.
@@ -2313,6 +2426,119 @@ mod tests {
             FallbackAction::Allow,
             "default AppSec failure_action must remain Allow regardless of fallback_action"
         );
+    }
+
+    // ── admin API exposure startup broadcast ─────────────────────────────────
+
+    fn api_cfg(listen_addr: &str) -> ApiConfig {
+        ApiConfig {
+            listen_addr: listen_addr.to_string(),
+        }
+    }
+
+    fn security_cfg(allowlist: &[&str]) -> SecurityConfig {
+        SecurityConfig {
+            admin_ip_allowlist: allowlist.iter().map(|s| (*s).to_string()).collect(),
+            ..SecurityConfig::default()
+        }
+    }
+
+    /// Shipped `configs/default.toml` posture: `0.0.0.0:9527` + empty
+    /// allowlist. This is the most dangerous combination and must WARN with
+    /// enough detail that an operator understands both the exposure and the
+    /// fix, not just "admin API is exposed".
+    #[test]
+    fn factory_default_wildcard_empty_allowlist_warns_critical() {
+        let lines = admin_exposure_startup_broadcast(&api_cfg("0.0.0.0:9527"), &security_cfg(&[]));
+        assert_eq!(lines.len(), 1);
+        let l = lines.first().expect("broadcast is never empty");
+        assert_eq!(l.level, BroadcastLevel::Warn, "{}", l.text);
+        assert!(l.text.contains("CRITICAL"), "{}", l.text);
+        assert!(l.text.contains("0.0.0.0:9527"), "{}", l.text);
+        assert!(l.text.contains("admin_ip_allowlist"), "{}", l.text);
+        assert!(l.text.contains("WAF rule"), "{}", l.text);
+        assert!(l.text.contains("cluster-join tokens"), "{}", l.text);
+        assert!(l.text.contains("TLS certificate"), "{}", l.text);
+        assert!(l.text.contains("JWT"), "{}", l.text);
+        assert!(l.text.contains("127.0.0.1"), "fix must name loopback bind: {}", l.text);
+        assert!(
+            l.text.contains("admin_ip_allowlist to your trusted admin"),
+            "fix must name the allowlist config key: {}",
+            l.text
+        );
+    }
+
+    /// `0.0.0.0` with a populated allowlist: still open at the TCP level, but
+    /// application access is gated. Must warn, but not with "CRITICAL".
+    #[test]
+    fn wildcard_with_allowlist_warns_but_notes_the_gate() {
+        let lines =
+            admin_exposure_startup_broadcast(&api_cfg("0.0.0.0:9527"), &security_cfg(&["10.0.0.5", "10.0.0.6"]));
+        assert_eq!(lines.len(), 1);
+        let l = lines.first().expect("broadcast is never empty");
+        assert_eq!(l.level, BroadcastLevel::Warn, "{}", l.text);
+        assert!(!l.text.contains("CRITICAL"), "{}", l.text);
+        assert!(l.text.contains("2 entries"), "{}", l.text);
+        assert!(l.text.contains("10.0.0.5"), "{}", l.text);
+        assert!(l.text.contains("10.0.0.6"), "{}", l.text);
+        assert!(l.text.contains("rejected with 403"), "{}", l.text);
+    }
+
+    /// `127.0.0.1` with an empty allowlist: the safe default posture. Must
+    /// stay INFO and explain why the empty allowlist is not itself a problem,
+    /// while flagging the Docker port-publish caveat.
+    #[test]
+    fn loopback_empty_allowlist_is_informational() {
+        let lines = admin_exposure_startup_broadcast(&api_cfg("127.0.0.1:9527"), &security_cfg(&[]));
+        assert_eq!(lines.len(), 1);
+        let l = lines.first().expect("broadcast is never empty");
+        assert_eq!(l.level, BroadcastLevel::Info, "{}", l.text);
+        assert!(l.text.contains("loopback-only"), "{}", l.text);
+        assert!(l.text.contains("docker-compose.yml"), "{}", l.text);
+    }
+
+    /// `127.0.0.1` with a populated allowlist: safe and the allowlist is
+    /// redundant, but not misleading — say so.
+    #[test]
+    fn loopback_with_allowlist_notes_redundancy() {
+        let lines = admin_exposure_startup_broadcast(&api_cfg("127.0.0.1:9527"), &security_cfg(&["10.0.0.5"]));
+        assert_eq!(lines.len(), 1);
+        let l = lines.first().expect("broadcast is never empty");
+        assert_eq!(l.level, BroadcastLevel::Info, "{}", l.text);
+        assert!(l.text.contains("redundant"), "{}", l.text);
+        assert!(l.text.contains("1 entry"), "{}", l.text);
+    }
+
+    /// A single-interface bind (neither loopback nor wildcard) with an empty
+    /// allowlist must still warn: any host on that interface's network can
+    /// reach the admin API.
+    #[test]
+    fn specific_interface_empty_allowlist_warns() {
+        let lines = admin_exposure_startup_broadcast(&api_cfg("10.0.0.5:9527"), &security_cfg(&[]));
+        assert_eq!(lines.len(), 1);
+        let l = lines.first().expect("broadcast is never empty");
+        assert_eq!(l.level, BroadcastLevel::Warn, "{}", l.text);
+        assert!(l.text.contains("10.0.0.5:9527"), "{}", l.text);
+    }
+
+    /// An IPv6 wildcard bind is treated the same as the IPv4 wildcard case.
+    #[test]
+    fn ipv6_wildcard_empty_allowlist_warns_critical() {
+        let lines = admin_exposure_startup_broadcast(&api_cfg("[::]:9527"), &security_cfg(&[]));
+        let l = lines.first().expect("broadcast is never empty");
+        assert_eq!(l.level, BroadcastLevel::Warn);
+        assert!(l.text.contains("CRITICAL"), "{}", l.text);
+    }
+
+    /// An unparseable `listen_addr` cannot be classified: warn rather than
+    /// silently assuming a safe default.
+    #[test]
+    fn unparseable_listen_addr_warns_unknown() {
+        let lines = admin_exposure_startup_broadcast(&api_cfg("not-a-valid-addr"), &security_cfg(&[]));
+        assert_eq!(lines.len(), 1);
+        let l = lines.first().expect("broadcast is never empty");
+        assert_eq!(l.level, BroadcastLevel::Warn, "{}", l.text);
+        assert!(l.text.contains("UNKNOWN"), "{}", l.text);
     }
 
     // ── retention startup broadcast ──────────────────────────────────────────

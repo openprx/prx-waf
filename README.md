@@ -20,7 +20,7 @@ PRX-WAF is a production-ready Web Application Firewall proxy built on [Pingora](
 - **libinjection-based SQLi/XSS detection** — battle-tested libinjection fingerprint engine for accurate SQL injection and XSS detection with low false-positive rates
 - **SSRF protection** — URL validation with public-IP enforcement and scheme-allowlist modes; blocks requests to RFC-1918 / loopback / link-local addresses
 - **DNS rebinding guard** — IP pinning after initial DNS resolution prevents mid-request DNS rebinding attacks
-- **Iterative URL decoding** — up to 3 rounds of percent-decoding before analysis, preventing double/triple-encoding bypass techniques
+- **Iterative URL decoding** — up to 5 rounds of percent-decoding before analysis, preventing double/triple-encoding bypass techniques
 - **Remote rule source loading** — async fetch of rule sources with configurable size limits and timeouts; fails safe on unreachable sources
 - **CC/DDoS protection** — sliding-window rate limiting per IP with configurable thresholds
 - **Rhai scripting engine** — write custom detection rules in a sandboxed scripting language
@@ -59,7 +59,7 @@ cp .env.example .env
 
 docker compose up -d
 
-# Admin UI: http://localhost:9527
+# Admin UI: http://localhost:16827  (docker-compose.yml maps host 16827 -> container 9527)
 # Default credentials: admin / <ADMIN_PASSWORD, or the random one printed to the
 # logs on first start>  (change immediately)
 ```
@@ -106,7 +106,7 @@ Options:
 Commands:
   run          Start proxy + management API (blocks forever)
   migrate      Run database migrations only
-  seed-admin   Create default admin user (admin/admin123)
+  seed-admin   Create default admin user (username: admin, password: $ADMIN_PASSWORD if set, else a random 24-char password printed once to stdout)
   crowdsec     CrowdSec integration management
   rules        Rule management (list, load, validate, hot-reload)
   sources      Rule source management (add, remove, sync)
@@ -325,7 +325,7 @@ prx-waf/
 │   ├── waf-api/        Axum REST API, JWT/TOTP auth, WebSocket, static UI
 │   ├── waf-common/     Shared types: RequestCtx, WafDecision, HostConfig, config
 │   └── waf-cluster/    Cluster consensus, QUIC transport, rule sync, certificates
-├── migrations/         SQL migration files (0001–0008)
+├── migrations/         SQL migration files (0001–0014)
 ├── configs/            Example TOML config files
 ├── rules/              Rule files directory (YAML, ModSec, JSON)
 └── web/admin-ui/       Vue 3 admin SPA (served embedded in waf-api)
@@ -340,7 +340,7 @@ Client Request
 Pingora Listener (TCP/TLS/QUIC)
     │
     ▼
-WafEngine Pipeline (16 phases)
+WafEngine Pipeline (18 phases)
     ├── Phase 1-4:  IP/URL whitelist + blacklist (CIDR)
     ├── Phase 5:    CC/DDoS rate limiting
     ├── Phase 6:    Scanner detection
@@ -353,7 +353,9 @@ WafEngine Pipeline (16 phases)
     ├── Phase 13:   OWASP CRS
     ├── Phase 14:   Sensitive data detection
     ├── Phase 15:   Anti-hotlinking
-    └── Phase 16:   CrowdSec bouncer + AppSec
+    ├── Phase 16:   CrowdSec bouncer + AppSec
+    ├── Phase 17:   GeoIP access control
+    └── Phase 18:   Community threat-intelligence blocklist
     │
     ▼
 HostRouter → Upstream (with load balancing)
@@ -363,7 +365,7 @@ HostRouter → Upstream (with load balancing)
 
 ## API Reference
 
-The management API listens on `127.0.0.1:9527` by default. All endpoints (except `/api/auth/login`) require a JWT Bearer token.
+The management API listens on `0.0.0.0:9527` by default (as shipped in `configs/default.toml`; the code-level struct default is `127.0.0.1:9527`, but every documented run path here loads `configs/default.toml`, which overrides it — see `[security] admin_ip_allowlist` to restrict access). All endpoints (except `/api/auth/login`) require a JWT Bearer token.
 
 ### Authentication
 
@@ -371,7 +373,7 @@ The management API listens on `127.0.0.1:9527` by default. All endpoints (except
 POST /api/auth/login
 Content-Type: application/json
 
-{"username": "admin", "password": "admin123", "totp_code": "123456"}
+{"username": "admin", "password": "<admin-password>", "totp_code": "123456"}
 
 → {"token": "eyJ...", "refresh_token": "..."}
 ```
@@ -469,6 +471,10 @@ cargo build
 # Build admin UI
 cd web/admin-ui && npm install && npm run build
 ```
+
+### Fuzzing
+
+Every parser reachable from a request is fuzzed with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz); the harnesses, seed corpora and target rationale live in [`fuzz/`](fuzz/README.md), and `.github/workflows/fuzz.yml` runs a short regression on each PR plus a weekly soak. If you touch a parser or a detector, run `cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=60` before opening the PR.
 
 ### Code Structure
 
