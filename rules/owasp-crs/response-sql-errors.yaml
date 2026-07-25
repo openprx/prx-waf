@@ -8,7 +8,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: (?i)(?:JET|Access) Database Engine|\[Microsoft\]\[ODBC Microsoft Access Driver\]
   action: block
@@ -21,7 +21,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '(?i)\bORA-[0-9][0-9][0-9][0-9][0-9]:|java\.sql\.SQLException|Oracle(?: erro|[^\(\)]{0,20}Drive)r|Warning.{1,10}o(?:ci_.{1,30}|ra_.{1,20})'
   action: block
@@ -34,7 +34,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: (?i)DB2 SQL error|\[IBM\]\[CLI Driver\]\[DB2/6000\]|CLI Driver.*DB2|db2_[0-9A-Z_a-z]+\(\)
   action: block
@@ -47,7 +47,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '(?i)\[DM_QUERY_E_SYNTAX\]|has occurred in the vicinity of:'
   action: block
@@ -60,7 +60,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: (?i)Dynamic SQL Error
   action: block
@@ -73,7 +73,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: (?i)Exception (?:condition )?\d+\. Transaction rollback\.
   action: block
@@ -86,7 +86,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: (?i)org\.hsqldb\.jdbc
   action: block
@@ -99,7 +99,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: (?i)An illegal character has been found in the statement|com\.informix\.jdbc|Exception.*Informix
   action: block
@@ -112,7 +112,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '(?i)Warning.*ingres_|Ingres(?: SQLSTATE|[^0-9A-Z_a-z].*Driver)'
   action: block
@@ -125,7 +125,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '(?i)<b>Warning</b>: ibase_|Unexpected end of command in statement'
   action: block
@@ -138,7 +138,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '(?i)Warning.{1,10}maxdb[\(\):_a-z]{1,26}:'
   action: block
@@ -151,7 +151,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: (?i)S(?:y(?:stem\.Data\.(?:OleDb\.OleDb|SqlClient\.Sql)Except|ntax error (?:in string|.*) in query express)ion|intaxis
     incorrecta cerca de)|\[(?:SqlException|M(?:icrosoft\]\[ODBC SQL Server|acromedia\]\[SQLServer JDBC) Driver\])|(?:Exception.*[^0-9A-Z_a-z]System\.Data\.SqlClie|Conversion
@@ -169,7 +169,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '(?i)(?:supplied argument is not a valid |SQL syntax.*)MySQL|Column count doesn''t match(?: value count at row)?|mysql_fetch_array\(\)|on
     MySQL result index|You have an error in your SQL syntax(?:;| near)|MyS(?:QL server version for the right syntax to use|qlClient\.)|\[MySQL\]\[ODBC|(?:Table
@@ -185,7 +185,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '(?i)P(?:ostgreSQL(?: query failed:|.{1,20}ERROR)|G::[a-z]*Error)|(?:pg_(?:query|exec)\(\) \[|org\.postgresql\.util\.PSQLException):|Warning.{1,20}\bpg_.*|valid
     PostgreSQL result|Npgsql\.|Supplied argument is not a valid PostgreSQL .*? resource|(?:Unable to connect to PostgreSQL
@@ -200,7 +200,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: (?i)Warning.*(?:sqlite_|SQLite3::)|S(?:QLite(?:/JDBCDriver|\.Exception)|ystem\.Data\.SQLite\.SQLiteException)
   action: block
@@ -213,7 +213,7 @@ rules:
   category: data-leakage
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '(?i)Sybase(?: message:|.*Server message)|Warning.{2,20}sybase'
   action: block

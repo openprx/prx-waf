@@ -8,7 +8,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: pm_from_file
   value: web-shells-php.data
   action: block
@@ -21,7 +21,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: <title>r57 Shell Version [0-9.]+</title>|<title>r57 shell</title>
   action: block
@@ -34,7 +34,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '^<html><head><meta http-equiv=''Content-Type'' content=''text/html; charset=(?:Windows-1251|UTF-8)?''><title>.*?(?:
     -)? W[Ss][Oo] [0-9.]+</title>'
@@ -48,7 +48,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: B4TM4N SH3LL</title>[^<]*<meta name='author' content='k4mpr3t'/>
   action: block
@@ -61,7 +61,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: <title>Mini Shell</title>[^D]*Developed By LameHacker
   action: block
@@ -74,7 +74,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '<title>\.:: [^~]*~ Ashiyane V [0-9.]+ ::\.</title>'
   action: block
@@ -87,7 +87,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: <title>Symlink_Sa [0-9.]+</title>
   action: block
@@ -100,7 +100,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: <title>CasuS [0-9.]+ by MafiABoY</title>
   action: block
@@ -113,7 +113,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: ^<html>\r\n<head>\r\n<title>GRP WebShell [0-9.]+
   action: block
@@ -126,7 +126,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: <small>NGHshell [0-9.]+ by Cr4sh</body></html>\n$
   action: block
@@ -139,7 +139,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '<title>SimAttacker - (?:Version|Vrsion) : [0-9.]+ -'
   action: block
@@ -152,7 +152,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: ^<!DOCTYPE html>\n<html>\n<!-- By Artyum [^<]*<title>Web Shell</title>
   action: block
@@ -165,7 +165,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: <title>lama's'hell v. [0-9.]+</title>
   action: block
@@ -178,7 +178,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: ^ *<html>\n[ ]+<head>\n[ ]+<title>lostDC -
   action: block
@@ -191,7 +191,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: ^<title>PHP Web Shell</title>\r\n<html>\r\n<body>\r\n    <!-- Replaces command with Base64-encoded Data -->
   action: block
@@ -204,7 +204,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: ^<html>\n<head>\n<title>Ru24PostWebShell
   action: block
@@ -217,7 +217,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: <title>s72 Shell v[0-9.]+ Codinf by Cr@zy_King</title>
   action: block
@@ -230,7 +230,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: ^ <html>\n\n<head>\n\n<title>g00nshell v[0-9.]+
   action: block
@@ -243,7 +243,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: contains
   value: <title>punkholicshell</title>
   action: block
@@ -256,7 +256,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: ^<html>\n      <head>\n             <title>azrail [0-9.]+ by C-W-M</title>
   action: block
@@ -269,7 +269,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '>SmEvK_PaThAn Shell v[0-9]+ coded by <a href='
   action: block
@@ -282,7 +282,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: ^<html>\n<title>[^~]*~ Shell I</title>\n<head>\n<style>
   action: block
@@ -295,7 +295,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: '^ <html><head><title>:: b374k m1n1 [0-9.]+ ::</title>'
   action: block
@@ -308,7 +308,7 @@ rules:
   category: web-shell
   severity: critical
   paranoia: 1
-  field: body
+  field: response_body
   operator: pm_from_file
   value: web-shells-asp.data
   action: block

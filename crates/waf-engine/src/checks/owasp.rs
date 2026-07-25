@@ -1087,6 +1087,24 @@ mod tests {
         ctx
     }
 
+    /// A `POST` carrying `body` as the request body, evaluated at `paranoia`.
+    fn make_ctx_with_body(body: &str, paranoia: u8) -> RequestCtx {
+        let mut ctx = make_ctx("POST", "/api/save", body.len() as u64);
+        ctx.body_preview = Bytes::copy_from_slice(body.as_bytes());
+        let dc = DefenseConfig {
+            owasp_set: true,
+            owasp_paranoia: paranoia,
+            ..DefenseConfig::default()
+        };
+        ctx.host_config = Arc::new(HostConfig {
+            code: "test".into(),
+            host: "example.com".into(),
+            defense_config: dc,
+            ..HostConfig::default()
+        });
+        ctx
+    }
+
     /// A context carrying a single header (and nothing else that could match).
     fn make_ctx_with_header(name: &str, value: &str) -> RequestCtx {
         let mut ctx = make_ctx("GET", "/", 0);
@@ -1742,21 +1760,37 @@ rules:
 
         assert!(summary.source_errors.is_empty(), "shipped rule set must parse cleanly");
         assert_eq!(summary.attempted, 328, "declared CRS rules");
-        assert_eq!(summary.compiled, 279, "enforceable CRS rules");
+        assert_eq!(summary.compiled, 224, "enforceable CRS rules");
         assert_eq!(checker.rule_count(), summary.compiled);
         assert_eq!(summary.attempted, summary.compiled + summary.rejected.len());
 
         // Everything not enforced is either a response-phase rule (needs a
-        // response-body inspection hook this architecture does not have) or a
+        // response inspection hook this architecture does not have) or a
         // scalar operator applied to a collection field.
-        assert_eq!(summary.rejected_field_count(), 47, "response_body rules");
+        //
+        // 99 `response_body` + 3 `response_status`: the CRS 95x block is
+        // response-phase in its entirety.  Two conversions of that block ship
+        // side by side (the `CRS-95xxxx` files produced by the current
+        // `modsec2yaml.py`, and the older `CRS-RESP-95xxxx` `response-*.yaml`
+        // files), so most 95x rules appear twice.
+        assert_eq!(summary.rejected_field_count(), 102, "response-phase rules");
         assert!(
             summary
                 .rejected
                 .iter()
                 .filter(|r| r.reason.category() == RejectCategory::UnsupportedField)
-                .all(|r| matches!(&r.reason, RejectReason::UnsupportedField(f) if f == "response_body")),
-            "the only unsupported field left is response_body"
+                .all(|r| matches!(&r.reason, RejectReason::UnsupportedField(f)
+                    if f == "response_body" || f == "response_status")),
+            "the only unsupported fields left are the response-phase ones"
+        );
+        assert_eq!(
+            summary
+                .rejected
+                .iter()
+                .filter(|r| matches!(&r.reason, RejectReason::UnsupportedField(f) if f == "response_status"))
+                .count(),
+            3,
+            "CRS-950100 / CRS-RESP-950100 / CRS-RESP-954130 test RESPONSE_STATUS"
         );
         assert_eq!(
             summary.rejected_operator_count(),
@@ -1766,6 +1800,90 @@ rules:
         assert_eq!(summary.count(RejectCategory::FieldOperatorMismatch), 2);
         assert_eq!(summary.count(RejectCategory::InvalidValue), 0);
         assert_eq!(summary.count(RejectCategory::DataFile), 0, "every wordlist must load");
+
+        // No rule from the response-phase conversion may end up enforced: their
+        // patterns describe server *output* and matching them against a request
+        // is a pure false positive.
+        let leaked: Vec<&str> = checker
+            .rules
+            .iter()
+            .map(|r| r.id.as_str())
+            .filter(|id| id.starts_with("CRS-RESP-"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "response-phase rules must not be enforced: {leaked:?}"
+        );
+    }
+
+    /// Regression guard for the response-phase mislabelling: these bodies are
+    /// ordinary application traffic (bug reports, error-reporting payloads,
+    /// CMS content) that the `response-*.yaml` rules used to block outright
+    /// because they were tagged `field: body`.
+    #[test]
+    fn response_phase_patterns_do_not_block_ordinary_request_bodies() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+
+        // Paranoia 1 (the shipped default).
+        for body in [
+            // php-errors.data phrases — short strings that occur in prose.
+            "note=we call SQLBindCol here",
+            "report=Got chunk while reading",
+            // asp-dotnet-errors.data phrase.
+            "msg=Invalid XBM file",
+            // web-shells-php.data phrase that is the name of legitimate
+            // open-source software.
+            "html=<title>Tiny File Manager</title>",
+            // A stack trace POSTed to an error-reporting endpoint.
+            "err=java.sql.SQLException: connection refused",
+            // CRS-950140 `^#!\s?/` — any script or config upload.
+            "#!/x",
+        ] {
+            assert!(
+                checker.check(&make_ctx_with_body(body, 1)).is_none(),
+                "PL1 must not block ordinary request body: {body}"
+            );
+        }
+
+        // Paranoia 2 additionally enabled the Ruby and IIS leakage rules.
+        for body in ["tpl=hello #{name}", "path=c:/inetpub/logs"] {
+            assert!(
+                checker.check(&make_ctx_with_body(body, 2)).is_none(),
+                "PL2 must not block ordinary request body: {body}"
+            );
+        }
+
+        // CRS-950100 tests RESPONSE_STATUS `^5\d{2}$`; while it carried
+        // `field: all` it matched the request's own `Content-Length` header,
+        // so every PL2 request with a 500..599-byte body was blocked.
+        let mut ctx = make_ctx_with_body("hello", 2);
+        ctx.headers.insert("content-length".into(), "512".into());
+        assert!(
+            checker.check(&ctx).is_none(),
+            "a 512-byte request body is not a 5xx response status"
+        );
+    }
+
+    /// Disabling the response-phase web-shell rules must not lose request-phase
+    /// web-shell *upload* detection: the CRS 933 PHP-injection rules already
+    /// cover it, and they run against the request body.
+    #[test]
+    fn php_webshell_upload_is_still_detected_in_the_request_phase() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+
+        for body in [
+            "<?php\n$auth_pass=\"\";\necho \"<title>r57 shell</title>\";\n@eval($_POST['cmd']);\n",
+            "<?php system($_GET['c']); ?>",
+        ] {
+            let hit = checker
+                .check(&make_ctx_with_body(body, 1))
+                .unwrap_or_else(|| panic!("web-shell upload must still be detected: {body}"));
+            let id = hit.rule_id.unwrap_or_default();
+            assert!(
+                !id.starts_with("CRS-RESP-"),
+                "detection must come from a request-phase rule, got {id}"
+            );
+        }
     }
 
     /// A representative `pm_from_file` rule from the shipped set actually fires.

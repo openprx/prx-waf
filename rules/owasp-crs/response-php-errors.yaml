@@ -8,7 +8,7 @@ rules:
   category: data-leakage
   severity: high
   paranoia: 1
-  field: body
+  field: response_body
   operator: pm_from_file
   value: php-errors.data
   action: block
@@ -21,7 +21,7 @@ rules:
   category: data-leakage
   severity: high
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: (?:\b(?:f(?:tp_(?:nb_)?f?(?:ge|pu)t|get(?:s?s|c)|scanf|write|open|read)|gz(?:(?:encod|writ)e|compress|open|read)|s(?:ession_start|candir)|read(?:(?:gz)?file|dir)|move_uploaded_file|(?:proc_|bz)open|call_user_func)|\$_(?:(?:pos|ge)t|session))\b
   action: block
@@ -34,7 +34,7 @@ rules:
   category: data-leakage
   severity: high
   paranoia: 1
-  field: body
+  field: response_body
   operator: regex
   value: (?i)<\?(?:=|php)?\s+
   action: block

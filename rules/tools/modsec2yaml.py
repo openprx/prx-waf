@@ -104,6 +104,8 @@ def map_variables(var_str: str) -> str:
         return "body"
     if categories == {"response_body"}:
         return "response_body"
+    if categories == {"response_status"}:
+        return "response_status"
     # Mixed → all
     return "all"
 
@@ -130,8 +132,12 @@ def _var_category(v: str) -> str:
         return "path"
     if v.startswith("RESPONSE_BODY"):
         return "response_body"
+    # Response-phase variables must never fall through to a request field:
+    # scanning a *request* with a response-phase pattern is pure false positive.
+    if v.startswith("RESPONSE_STATUS") or v.startswith("RESPONSE_PROTOCOL"):
+        return "response_status"
     if v.startswith("RESPONSE_HEADERS"):
-        return "headers"
+        return "response_headers"
     if v.startswith("TX:") or v.startswith("IP:") or v.startswith("GEO:"):
         return "tx"
     return "other"
@@ -161,8 +167,12 @@ def _single_var_map(v: str) -> str:
         return "cookies"
     if v.startswith("RESPONSE_BODY"):
         return "response_body"
+    # See _var_category: response-phase variables keep a response-phase field
+    # name so the engine rejects them loudly instead of scanning the request.
+    if v.startswith("RESPONSE_STATUS") or v.startswith("RESPONSE_PROTOCOL"):
+        return "response_status"
     if v.startswith("RESPONSE_HEADERS"):
-        return "headers"
+        return "response_headers"
     if v.startswith("TX:") or v.startswith("IP:") or v.startswith("GEO:"):
         return "tx"
     return "all"

@@ -8,7 +8,7 @@ rules:
   category: data-leakage
   severity: high
   paranoia: 1
-  field: body
+  field: response_body
   operator: pm_from_file
   value: ruby-errors.data
   action: block
@@ -21,7 +21,7 @@ rules:
   category: data-leakage
   severity: high
   paranoia: 2
-  field: body
+  field: response_body
   operator: regex
   value: (?i)(?:<%[=#\s]|#\{[^}]+\})
   action: block
