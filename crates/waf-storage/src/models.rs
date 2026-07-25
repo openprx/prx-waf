@@ -773,3 +773,69 @@ pub struct CrowdSecEventQuery {
     pub page: Option<i64>,
     pub page_size: Option<i64>,
 }
+
+/// One row of `crowdsec_decisions` — the durable mirror of the in-memory
+/// `CrowdSec` decision cache.
+///
+/// The table is a *cache of active decisions* (its own schema comment), not an
+/// audit trail: `crowdsec_events` is the append-only history. Its purpose is to
+/// let a restarting process repopulate the bouncer cache from local storage
+/// before the first LAPI pull completes, so a LAPI that is unreachable at boot
+/// no longer means "every previously banned IP is allowed through".
+///
+/// `expires_at` is the decision's own expiry (start + duration), not a cache
+/// TTL: a row is worthless once `CrowdSec` itself stops enforcing the decision,
+/// which is also why the retention pruner keys on this column.
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct CrowdSecDecisionRow {
+    /// Upstream LAPI decision id. Primary key: it is the identity upstream
+    /// assigns, so an id reused after a LAPI database reset correctly
+    /// *replaces* the stale row instead of coexisting with it.
+    pub id: i64,
+    /// Origin: "crowdsec", "cscli", "CAPI", …
+    pub origin: String,
+    /// Scope: "Ip", "Range", "Country", "AS", …
+    pub scope: String,
+    /// The banned value: IP address, CIDR, country code, AS number, …
+    pub value: String,
+    /// Decision type: "ban", "captcha", "throttle", …
+    #[sqlx(rename = "type")]
+    pub type_: String,
+    /// Scenario that produced the decision.
+    pub scenario: String,
+    /// The decision's duration in seconds, as parsed from LAPI's duration
+    /// string. `None` when the string was absent or unparseable.
+    pub duration_secs: Option<i64>,
+    /// Absolute expiry of the decision itself.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Column widths declared by migration `0006_crowdsec.sql`. A value longer than
+/// its column makes Postgres reject the whole batch, so the writer filters
+/// oversized rows out (and counts them) rather than letting one malformed
+/// upstream decision drop every decision in the same statement.
+impl CrowdSecDecisionRow {
+    /// `origin VARCHAR(50)`
+    pub const MAX_ORIGIN_LEN: usize = 50;
+    /// `scope VARCHAR(50)`
+    pub const MAX_SCOPE_LEN: usize = 50;
+    /// `value VARCHAR(500)`
+    pub const MAX_VALUE_LEN: usize = 500;
+    /// `type VARCHAR(50)`
+    pub const MAX_TYPE_LEN: usize = 50;
+    /// `scenario VARCHAR(255)`
+    pub const MAX_SCENARIO_LEN: usize = 255;
+
+    /// Whether every text field fits its declared column width.
+    ///
+    /// Counted in characters, not bytes: Postgres `VARCHAR(n)` bounds
+    /// characters, so a byte-length check would reject valid multi-byte values.
+    #[must_use]
+    pub fn fits_schema(&self) -> bool {
+        self.origin.chars().count() <= Self::MAX_ORIGIN_LEN
+            && self.scope.chars().count() <= Self::MAX_SCOPE_LEN
+            && self.value.chars().count() <= Self::MAX_VALUE_LEN
+            && self.type_.chars().count() <= Self::MAX_TYPE_LEN
+            && self.scenario.chars().count() <= Self::MAX_SCENARIO_LEN
+    }
+}

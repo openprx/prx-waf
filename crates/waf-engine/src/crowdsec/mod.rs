@@ -5,6 +5,7 @@ pub mod client;
 pub mod config;
 pub mod models;
 pub mod pusher;
+pub mod store;
 pub mod sync;
 
 pub use appsec::{AppSecClient, AppSecResult, appsec_to_detection};
@@ -14,6 +15,7 @@ pub use client::CrowdSecClient;
 pub use config::{AppSecConfig, CrowdSecConfig, CrowdSecMode, FallbackAction, PusherConfig};
 pub use models::{CacheStats, CachedDecision, Decision, DecisionStream};
 pub use pusher::CrowdSecPusher;
+pub use store::{DecisionStore, RestoreOutcome};
 
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -31,6 +33,9 @@ pub struct CrowdSecComponents {
     pub pusher: Option<Arc<CrowdSecPusher>>,
     /// LAPI client (shared with API handlers for delete/test)
     pub lapi_client: Arc<CrowdSecClient>,
+    /// What the startup restore from the durable decision mirror did, so the
+    /// caller can broadcast where this process's decisions came from.
+    pub restore: RestoreOutcome,
     /// Background sync task handle
     pub sync_handle: tokio::task::JoinHandle<()>,
 }
@@ -38,7 +43,20 @@ pub struct CrowdSecComponents {
 /// Initialise the `CrowdSec` integration from config.
 ///
 /// Returns `None` when `config.enabled == false`.
-pub async fn init_crowdsec(config: CrowdSecConfig, shutdown_rx: watch::Receiver<bool>) -> Option<CrowdSecComponents> {
+///
+/// `store` is the durable decision mirror (`crowdsec_decisions`). When present
+/// it is read **synchronously, before this function returns** — that is the
+/// whole point: the sync task is spawned and not awaited, so a LAPI that is
+/// unreachable at boot would otherwise leave the bouncer with an empty cache,
+/// matching no IP and allowing every previously banned client through until a
+/// poll finally succeeds. Restoring first means the process starts serving with
+/// the decisions it already knew about. Pass `None` to run without a mirror
+/// (the pre-existing behaviour, and the fail-open window that comes with it).
+pub async fn init_crowdsec(
+    config: CrowdSecConfig,
+    store: Option<Arc<dyn DecisionStore>>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Option<CrowdSecComponents> {
     if !config.enabled {
         return None;
     }
@@ -60,6 +78,20 @@ pub async fn init_crowdsec(config: CrowdSecConfig, shutdown_rx: watch::Receiver<
 
     // Decision cache
     let cache = Arc::new(DecisionCache::new(config.cache_ttl_secs));
+
+    // Warm the cache from the durable mirror BEFORE returning, so the proxy
+    // never binds a listener with an empty decision set (see the doc comment).
+    let restore = match store.as_deref() {
+        Some(store) => store::restore_cache(&cache, store, &config).await,
+        None => RestoreOutcome::default(),
+    };
+    if let Some(ref error) = restore.error {
+        warn!(
+            error = %error,
+            "CrowdSec decision mirror could not be read; starting with an EMPTY decision cache. \
+             Until the first LAPI pull succeeds the bouncer matches no IP (fail-open)",
+        );
+    }
 
     // Bouncer checker
     let checker = Arc::new(CrowdSecChecker::new(Arc::clone(&cache), config.clone()));
@@ -93,8 +125,9 @@ pub async fn init_crowdsec(config: CrowdSecConfig, shutdown_rx: watch::Receiver<
     // Start decision sync task
     let client_sync = Arc::clone(&lapi_client);
     let cache_sync = Arc::clone(&cache);
+    let restored = restore.restored;
     let sync_handle = tokio::spawn(async move {
-        sync::run_decision_sync(client_sync, cache_sync, config, shutdown_rx).await;
+        sync::run_decision_sync(client_sync, cache_sync, store, config, restored, shutdown_rx).await;
     });
 
     Some(CrowdSecComponents {
@@ -103,6 +136,7 @@ pub async fn init_crowdsec(config: CrowdSecConfig, shutdown_rx: watch::Receiver<
         appsec_client,
         pusher,
         lapi_client,
+        restore,
         sync_handle,
     })
 }

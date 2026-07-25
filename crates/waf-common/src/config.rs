@@ -555,6 +555,24 @@ pub struct CrowdSecConfig {
     pub appsec_failure_action: String,
     pub pusher_login: Option<String>,
     pub pusher_password: Option<String>,
+    /// Mirror every cached LAPI decision into the `crowdsec_decisions` table and
+    /// restore from it at startup.
+    ///
+    /// The bouncer's decision cache is in-memory and starts empty on every
+    /// process start. With the mirror off, a process that comes up while LAPI is
+    /// unreachable matches **no** IP at all — every previously banned client is
+    /// allowed through — until a poll finally succeeds. With it on, the still
+    /// valid decisions are loaded from the local database before the proxy
+    /// starts serving, and the first successful full pull immediately reconciles
+    /// them against upstream so a ban lifted while the process was down cannot
+    /// be resurrected.
+    ///
+    /// Defaults to on. Turn it off only when banned client IPs must not be
+    /// written to the database at all (they are personal data; the
+    /// `storage.crowdsec_decision_retention_days` window bounds how long they
+    /// are kept), or when the database is read-only.
+    #[serde(default = "default_true")]
+    pub persist_decisions: bool,
 }
 
 impl Default for CrowdSecConfig {
@@ -575,6 +593,7 @@ impl Default for CrowdSecConfig {
             appsec_failure_action: default_appsec_failure_action(),
             pusher_login: None,
             pusher_password: None,
+            persist_decisions: true,
         }
     }
 }

@@ -1762,6 +1762,86 @@ fn retention_startup_broadcast(
     lines
 }
 
+/// Build the `CrowdSec` bouncer startup broadcast.
+///
+/// The operator-facing question at boot is: **where do this process's `CrowdSec`
+/// decisions come from right now, and is anything being enforced yet?** The
+/// bouncer's decision cache is in-memory and starts empty, and the first LAPI
+/// pull happens on a background task *after* the proxy starts serving — so
+/// between process start and that pull, the only thing standing between a known
+/// bad IP and the origin is what was restored from the durable
+/// `crowdsec_decisions` mirror. These lines say exactly how many that is.
+///
+/// Every state where the cache starts empty is a WARN, because every one of them
+/// is a fail-open window: the bouncer matches no IP at all, so previously banned
+/// clients are allowed through until a pull succeeds. The pull's own outcome
+/// cannot be reported here (it has not happened yet); the sync task logs it at
+/// `error!` when it fails with an empty cache.
+fn crowdsec_startup_broadcast(
+    config: &waf_engine::CrowdSecConfig,
+    persist_enabled: bool,
+    restore: &waf_engine::RestoreOutcome,
+) -> Vec<BroadcastLine> {
+    use waf_engine::crowdsec::config::CrowdSecMode;
+
+    if config.mode == CrowdSecMode::Appsec {
+        return vec![BroadcastLine::info(
+            "CrowdSec mode=appsec: the local decision cache is not consulted on the request path, so the decision mirror is \
+             not used. Every request is judged by the AppSec engine instead.",
+        )];
+    }
+
+    let first_pull_note = format!(
+        "The first LAPI pull runs on a background task after the proxy starts serving and is retried every {}s until it \
+         succeeds; a failure with an empty cache is logged at ERROR.",
+        config.update_frequency_secs.max(5)
+    );
+
+    if !persist_enabled {
+        return vec![BroadcastLine::warn(format!(
+            "CrowdSec decision mirror DISABLED (crowdsec.persist_decisions=false): the bouncer starts with an EMPTY \
+             decision cache, so until the first LAPI pull at {} succeeds it matches no IP and every previously banned \
+             client is allowed through. {first_pull_note} Set crowdsec.persist_decisions=true to restore known decisions \
+             from the local database at startup instead.",
+            config.lapi_url
+        ))];
+    }
+
+    if let Some(ref error) = restore.error {
+        return vec![BroadcastLine::warn(format!(
+            "CrowdSec decision mirror UNREADABLE ({error}): the bouncer starts with an EMPTY decision cache, so until the \
+             first LAPI pull at {} succeeds it matches no IP and every previously banned client is allowed through. \
+             {first_pull_note}",
+            config.lapi_url
+        ))];
+    }
+
+    if restore.restored == 0 {
+        return vec![BroadcastLine::warn(format!(
+            "CrowdSec decision mirror is EMPTY (0 unexpired rows in crowdsec_decisions; skipped {} expired, {} filtered \
+             out by the configured scenario filters). Normal on a first run, otherwise it means nothing was mirrored. The \
+             bouncer starts with an empty decision cache and matches no IP until the first LAPI pull at {} succeeds. \
+             {first_pull_note}",
+            restore.skipped_expired, restore.skipped_filtered, config.lapi_url
+        ))];
+    }
+
+    vec![
+        BroadcastLine::info(format!(
+            "CrowdSec decision cache RESTORED from the local mirror: {} decisions enforced from the very first request, \
+             before any LAPI contact (skipped {} already expired, {} filtered out by the configured scenario filters). \
+             This is what closes the restart fail-open window when LAPI is unreachable at boot.",
+            restore.restored, restore.skipped_expired, restore.skipped_filtered
+        )),
+        BroadcastLine::info(format!(
+            "CrowdSec restored decisions are provisional until confirmed: the first successful FULL pull from {} replaces \
+             the mirror wholesale and evicts every restored entry it does not confirm, so a ban lifted while this process \
+             was down survives at most until then. {first_pull_note}",
+            config.lapi_url
+        )),
+    ]
+}
+
 /// Shutdown guards that keep background-task sender halves alive.
 ///
 /// Each field is a `tokio::sync::watch::Sender<bool>`.  Dropping this struct
@@ -2015,11 +2095,28 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         // exits; dropping it signals the background worker to shut down.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        if let Some(components) = init_crowdsec(cs_config.clone(), shutdown_rx).await {
+        // The durable decision mirror (`crowdsec_decisions`). Supplied here so
+        // `init_crowdsec` can repopulate the bouncer cache from it *before*
+        // returning; see `crowdsec_startup_broadcast` for what the operator is
+        // told about the result.
+        let decision_store: Option<Arc<dyn waf_engine::DecisionStore>> = if config.crowdsec.persist_decisions {
+            Some(Arc::clone(&db) as Arc<dyn waf_engine::DecisionStore>)
+        } else {
+            None
+        };
+
+        if let Some(components) = init_crowdsec(cs_config.clone(), decision_store, shutdown_rx).await {
             info!(
                 lapi_url = %cs_config.lapi_url,
                 "CrowdSec integration active"
             );
+
+            for line in crowdsec_startup_broadcast(&cs_config, config.crowdsec.persist_decisions, &components.restore) {
+                match line.level {
+                    BroadcastLevel::Info => info!("{}", line.text),
+                    BroadcastLevel::Warn => tracing::warn!("{}", line.text),
+                }
+            }
 
             // Plug bouncer checker and AppSec client into the WAF engine
             engine.set_crowdsec(Arc::clone(&components.checker), components.appsec_client.clone());
@@ -2979,6 +3076,111 @@ mod tests {
         assert!(
             matches!(action, WafAction::Block { status: 403, .. }),
             "sqli-enabled host reloaded at startup must BLOCK the SQLi request, got {action:?}"
+        );
+    }
+
+    // ── CrowdSec bouncer startup broadcast ───────────────────────────────────
+    //
+    // Every state in which the decision cache starts empty is a fail-open
+    // window, and the broadcast is the only place an operator learns about it
+    // at boot. These pin each of those states to a WARN and to wording that
+    // names the consequence, so a future refactor cannot quietly downgrade one
+    // of them to a reassuring INFO.
+
+    fn bouncer_config() -> waf_engine::CrowdSecConfig {
+        waf_engine::CrowdSecConfig {
+            enabled: true,
+            lapi_url: "http://127.0.0.1:8080".to_string(),
+            ..waf_engine::CrowdSecConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_restored_cache_is_reported_as_the_source_of_the_decisions() {
+        let restore = waf_engine::RestoreOutcome {
+            enabled: true,
+            restored: 42,
+            skipped_expired: 3,
+            skipped_filtered: 1,
+            error: None,
+        };
+        let lines = crowdsec_startup_broadcast(&bouncer_config(), true, &restore);
+        assert!(
+            lines.iter().all(|l| l.level == BroadcastLevel::Info),
+            "a populated cache is not a warning"
+        );
+        let first = lines.first().expect("broadcast is never empty");
+        assert!(
+            first.text.contains("RESTORED") && first.text.contains("42"),
+            "the restored count must be stated: {}",
+            first.text
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.text.contains("evicts every restored entry it does not confirm")),
+            "the operator must be told restored entries are provisional"
+        );
+    }
+
+    #[test]
+    fn a_disabled_mirror_warns_that_the_fail_open_window_is_back() {
+        let lines = crowdsec_startup_broadcast(&bouncer_config(), false, &waf_engine::RestoreOutcome::default());
+        let line = lines.first().expect("broadcast is never empty");
+        assert_eq!(line.level, BroadcastLevel::Warn);
+        assert!(
+            line.text.contains("persist_decisions=false") && line.text.contains("allowed through"),
+            "unexpected disabled-mirror line: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn an_unreadable_mirror_warns_with_the_underlying_error() {
+        let restore = waf_engine::RestoreOutcome {
+            enabled: true,
+            error: Some("connection refused".to_string()),
+            ..waf_engine::RestoreOutcome::default()
+        };
+        let lines = crowdsec_startup_broadcast(&bouncer_config(), true, &restore);
+        let line = lines.first().expect("broadcast is never empty");
+        assert_eq!(line.level, BroadcastLevel::Warn);
+        assert!(
+            line.text.contains("UNREADABLE") && line.text.contains("connection refused"),
+            "unexpected unreadable-mirror line: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn an_empty_mirror_warns_that_nothing_is_enforced_yet() {
+        let restore = waf_engine::RestoreOutcome {
+            enabled: true,
+            ..waf_engine::RestoreOutcome::default()
+        };
+        let lines = crowdsec_startup_broadcast(&bouncer_config(), true, &restore);
+        let line = lines.first().expect("broadcast is never empty");
+        assert_eq!(line.level, BroadcastLevel::Warn);
+        assert!(
+            line.text.contains("EMPTY") && line.text.contains("matches no IP"),
+            "unexpected empty-mirror line: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn appsec_only_mode_does_not_claim_a_bouncer_fail_open_window() {
+        let config = waf_engine::CrowdSecConfig {
+            mode: waf_engine::crowdsec::config::CrowdSecMode::Appsec,
+            ..bouncer_config()
+        };
+        let lines = crowdsec_startup_broadcast(&config, false, &waf_engine::RestoreOutcome::default());
+        let line = lines.first().expect("broadcast is never empty");
+        assert_eq!(line.level, BroadcastLevel::Info);
+        assert!(
+            line.text.contains("mode=appsec"),
+            "unexpected appsec line: {}",
+            line.text
         );
     }
 }

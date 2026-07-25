@@ -40,6 +40,17 @@ pub struct DecisionStream {
 pub struct CachedDecision {
     pub decision: Decision,
     pub expires_at: Instant,
+    /// `true` while this entry came from the durable local mirror
+    /// (`crowdsec_decisions`) and has not yet been re-confirmed by a full LAPI
+    /// pull.
+    ///
+    /// Restored entries close the fail-open window at startup, but they are a
+    /// *guess* about upstream state: a ban lifted while this process was down
+    /// would still be in the mirror. The flag lets
+    /// [`crate::crowdsec::DecisionCache::drop_unconfirmed_restored`] evict
+    /// exactly those entries the moment a full pull establishes the real set,
+    /// so a revoked ban lives at most until the first successful pull.
+    pub restored: bool,
 }
 
 impl CachedDecision {

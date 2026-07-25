@@ -9,6 +9,41 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The CrowdSec bouncer no longer starts fail-open when LAPI is unreachable.**
+  The decision cache is in-memory and starts empty on every process start, and
+  `init_crowdsec` handed the first pull to `tokio::spawn` and returned. When
+  that pull failed — container start order, a network blip, CrowdSec not up yet
+  — the only trace was a `warn!`, the cache stayed empty, and `CrowdSecChecker`
+  answered `None` for *every* IP: all previously banned clients allowed
+  through, for as long as LAPI stayed down.
+
+  Decisions are now mirrored into `crowdsec_decisions` (created by migration
+  `0006`, written by nothing until now) and the still-valid rows are restored
+  **before `init_crowdsec` returns**, i.e. before the proxy binds its
+  listeners — restoring from the spawned task would leave the same race.
+  Verified end to end against a real Postgres and a killed LAPI: same process,
+  same database, `persist_decisions = true` answers **403 CrowdSec Ban**,
+  `false` answers **200 from the origin**.
+
+  A restored decision cannot resurrect a ban lifted while the process was
+  down. Deletions in the LAPI stream are removed from the mirror by
+  `(scope, value)` — the key the cache itself removes on — and every successful
+  *full* pull replaces the mirror inside one transaction and evicts every
+  restored cache entry the pull did not confirm.
+
+  Also fixed in the same path: after a failed startup pull the sync loop fell
+  through to *incremental* pulls, so the first success carried only the deltas
+  of the last few seconds and established an incomplete baseline as if it were
+  complete. Every pull is now retried as a full pull until one succeeds. A
+  failed pull with an empty cache is logged at `error!` naming the fail-open
+  consequence, rather than at `warn!` alongside routine polling noise.
+
+  `crowdsec.persist_decisions` (default on) turns the mirror off for read-only
+  databases or when banned client IPs must not be stored;
+  `storage.crowdsec_decision_retention_days` already bounds retention.
+
 ### Added
 
 - **Negated CRS rule heads are converted instead of dropped.**

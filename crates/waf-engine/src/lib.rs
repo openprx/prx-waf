@@ -24,7 +24,7 @@ pub use community::{
 };
 pub use crowdsec::{
     CacheStats, CrowdSecChecker, CrowdSecClient, CrowdSecComponents, CrowdSecConfig, Decision, DecisionCache,
-    init_crowdsec,
+    DecisionStore, RestoreOutcome, init_crowdsec,
 };
 pub use engine::{WafEngine, WafEngineConfig};
 pub use geoip::{GeoIpService, cache_policy_from_str};

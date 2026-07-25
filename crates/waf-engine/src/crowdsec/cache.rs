@@ -80,6 +80,10 @@ impl DecisionCache {
                 let cached = CachedDecision {
                     decision: decision.clone(),
                     expires_at,
+                    // Straight from LAPI: this entry *is* confirmed upstream
+                    // state, and it also confirms (overwrites) any restored
+                    // entry for the same value.
+                    restored: false,
                 };
                 self.insert_decision(&decision, cached);
             }
@@ -92,6 +96,69 @@ impl DecisionCache {
         }
 
         self.update_total();
+    }
+
+    /// Load decisions restored from the durable mirror (`crowdsec_decisions`).
+    ///
+    /// Called **before** the proxy starts serving, so a process that comes up
+    /// while LAPI is unreachable still knows which IPs are banned instead of
+    /// allowing every one of them through until the next successful poll.
+    ///
+    /// Each entry carries its own remaining TTL (computed by the caller from
+    /// the decision's stored expiry), and every entry is marked
+    /// [`CachedDecision::restored`] so the first full LAPI pull can evict the
+    /// ones upstream no longer holds. Returns the number of entries inserted.
+    pub fn insert_restored(&self, restored: Vec<(Decision, Duration)>) -> usize {
+        let now = Instant::now();
+        let mut inserted = 0usize;
+        for (decision, ttl) in restored {
+            let cached = CachedDecision {
+                decision: decision.clone(),
+                expires_at: now + ttl,
+                restored: true,
+            };
+            self.insert_decision(&decision, cached);
+            inserted += 1;
+        }
+        self.update_total();
+        inserted
+    }
+
+    /// Evict every entry still marked [`CachedDecision::restored`].
+    ///
+    /// Run immediately after a **full** LAPI pull has been applied: that pull
+    /// carries the complete active decision set, so anything the pull did not
+    /// overwrite is a decision upstream no longer holds — typically a ban
+    /// lifted while this process was down. Without this, a restored entry would
+    /// keep blocking until its stored expiry, i.e. the mirror would resurrect a
+    /// revoked ban.
+    ///
+    /// Returns the number of evicted entries.
+    pub fn drop_unconfirmed_restored(&self) -> usize {
+        let mut dropped = 0usize;
+        self.ip_decisions.retain(|_, v| {
+            if v.restored {
+                dropped += 1;
+            }
+            !v.restored
+        });
+        {
+            let mut ranges = self.range_decisions.write();
+            ranges.retain(|(_, v)| {
+                if v.restored {
+                    dropped += 1;
+                }
+                !v.restored
+            });
+        }
+        self.other_decisions.retain(|_, v| {
+            if v.restored {
+                dropped += 1;
+            }
+            !v.restored
+        });
+        self.update_total();
+        dropped
     }
 
     /// Remove all expired entries from the cache.
@@ -153,9 +220,32 @@ impl DecisionCache {
         }
     }
 
+    /// The TTL to give a decision restored from the durable mirror.
+    ///
+    /// `remaining` is how much of the decision's own lifetime is left. When
+    /// `cache_ttl_secs` overrides the decision duration it is applied as a
+    /// *ceiling*, never an extension: a cache TTL longer than what upstream
+    /// still enforces would keep blocking an IP `CrowdSec` has already
+    /// released.
+    #[must_use]
+    pub const fn restore_ttl(&self, remaining: Duration) -> Duration {
+        if self.cache_ttl_secs > 0 {
+            let override_ttl = Duration::from_secs(self.cache_ttl_secs);
+            if override_ttl.as_secs() < remaining.as_secs() {
+                return override_ttl;
+            }
+        }
+        remaining
+    }
+
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    fn should_cache(decision: &Decision, config: &CrowdSecConfig) -> bool {
+    /// Whether the configured scenario filters admit this decision.
+    ///
+    /// Visible to the `crowdsec` module so the durable mirror applies exactly
+    /// the same filter as the in-memory cache — the mirror must never hold a
+    /// decision the cache would have rejected, in either direction.
+    pub(super) fn should_cache(decision: &Decision, config: &CrowdSecConfig) -> bool {
         if !config.scenarios_containing.is_empty() {
             let matches = config
                 .scenarios_containing
@@ -177,13 +267,7 @@ impl DecisionCache {
         if self.cache_ttl_secs > 0 {
             return Instant::now() + Duration::from_secs(self.cache_ttl_secs);
         }
-        if let Some(ref dur_str) = decision.duration
-            && let Some(secs) = parse_cs_duration(dur_str)
-        {
-            return Instant::now() + Duration::from_secs(secs);
-        }
-        // Default fallback: 4 hours
-        Instant::now() + Duration::from_hours(4)
+        Instant::now() + Duration::from_secs(decision_lifetime_secs(decision))
     }
 
     fn insert_decision(&self, decision: &Decision, cached: CachedDecision) {
@@ -233,6 +317,25 @@ impl DecisionCache {
     }
 }
 
+/// Lifetime assumed for a decision whose LAPI duration string is missing or
+/// unparseable.
+pub const DEFAULT_DECISION_LIFETIME_SECS: u64 = 4 * 3600;
+
+/// The decision's own lifetime in seconds, independent of any cache TTL
+/// override: its LAPI duration string, or [`DEFAULT_DECISION_LIFETIME_SECS`].
+///
+/// Shared by the in-memory expiry calculation and the durable mirror, so a
+/// restored decision expires at the same wall-clock moment the live one would
+/// have.
+#[must_use]
+pub fn decision_lifetime_secs(decision: &Decision) -> u64 {
+    decision
+        .duration
+        .as_deref()
+        .and_then(parse_cs_duration)
+        .unwrap_or(DEFAULT_DECISION_LIFETIME_SECS)
+}
+
 /// Parse a `CrowdSec` duration string like "4h35m6.571762785s" into total seconds.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn parse_cs_duration(s: &str) -> Option<u64> {
@@ -253,4 +356,81 @@ fn parse_cs_duration(s: &str) -> Option<u64> {
         }
     }
     Some(total)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn decision(id: i64, value: &str) -> Decision {
+        Decision {
+            id,
+            origin: "crowdsec".to_string(),
+            scope: if value.contains('/') { "Range" } else { "Ip" }.to_string(),
+            value: value.to_string(),
+            type_: "ban".to_string(),
+            scenario: "crowdsecurity/ssh-bf".to_string(),
+            duration: Some("1h".to_string()),
+            created_at: None,
+        }
+    }
+
+    /// The reconciliation guarantee: a ban lifted upstream while this process
+    /// was down must not survive the first full pull, even though the restore
+    /// put it in the cache.
+    #[test]
+    fn a_restored_entry_the_full_pull_does_not_confirm_is_evicted() {
+        let cache = DecisionCache::new(0);
+        let config = CrowdSecConfig::default();
+
+        cache.insert_restored(vec![
+            (decision(1, "203.0.113.20"), Duration::from_hours(1)),
+            (decision(2, "203.0.113.21"), Duration::from_hours(1)),
+            (decision(3, "198.51.100.0/24"), Duration::from_hours(1)),
+        ]);
+        assert_eq!(cache.stats().total_cached, 3);
+
+        // The full pull confirms only .20; .21 and the range were revoked.
+        cache.apply_stream(
+            DecisionStream {
+                new: Some(vec![decision(1, "203.0.113.20")]),
+                deleted: None,
+            },
+            &config,
+        );
+        let dropped = cache.drop_unconfirmed_restored();
+
+        assert_eq!(dropped, 2, "both unconfirmed restored entries must go");
+        assert!(cache.check_ip(&"203.0.113.20".parse().unwrap()).is_some());
+        assert!(
+            cache.check_ip(&"203.0.113.21".parse().unwrap()).is_none(),
+            "a revoked ban must not be resurrected by the restore"
+        );
+        assert!(
+            cache.check_ip(&"198.51.100.7".parse().unwrap()).is_none(),
+            "a revoked range must not be resurrected by the restore"
+        );
+        assert_eq!(cache.stats().total_cached, 1);
+    }
+
+    /// A confirmed entry is no longer "restored", so a second reconciliation
+    /// (or a later one after a reconnect) must not evict it.
+    #[test]
+    fn a_confirmed_entry_survives_reconciliation() {
+        let cache = DecisionCache::new(0);
+        let config = CrowdSecConfig::default();
+        cache.insert_restored(vec![(decision(1, "203.0.113.22"), Duration::from_hours(1))]);
+        cache.apply_stream(
+            DecisionStream {
+                new: Some(vec![decision(1, "203.0.113.22")]),
+                deleted: None,
+            },
+            &config,
+        );
+
+        assert_eq!(cache.drop_unconfirmed_restored(), 0);
+        assert_eq!(cache.drop_unconfirmed_restored(), 0);
+        assert!(cache.check_ip(&"203.0.113.22".parse().unwrap()).is_some());
+    }
 }

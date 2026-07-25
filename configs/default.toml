@@ -242,6 +242,29 @@ cors_origins = []
 # update_frequency_secs = 10
 # fallback_action = "allow"          # allow | block | log (LAPI bouncer)
 # appsec_failure_action = "allow"    # allow | block | log (AppSec, independent)
+# persist_decisions = true           # mirror decisions to the DB; see below
+#
+# RESTART FAIL-OPEN AND `persist_decisions`. The bouncer enforces from an
+# in-memory decision cache that starts EMPTY on every process start, and the
+# first LAPI pull runs on a background task *after* the proxy starts serving. If
+# LAPI is unreachable at that moment — container start order, a network blip, the
+# CrowdSec container not up yet — the pull fails, the cache stays empty, and the
+# bouncer matches no IP at all: every previously banned client is allowed
+# through, for as long as LAPI stays down.
+#
+# `persist_decisions = true` (the default) mirrors every cached decision into the
+# `crowdsec_decisions` table and reloads the still-valid ones BEFORE the proxy
+# starts serving, so a restart with a dead LAPI keeps enforcing what it already
+# knew. Restored decisions are provisional: the first successful FULL pull
+# replaces the mirror wholesale and evicts every restored entry it does not
+# confirm, so a ban lifted while the process was down cannot be resurrected. The
+# startup log states how many decisions were restored, and a failed pull with an
+# empty cache is logged at ERROR naming the fail-open consequence.
+#
+# Set it to false only when banned client IPs must not be written to the database
+# at all (they are personal data — `storage.crowdsec_decision_retention_days`
+# bounds how long they are kept), or when the database is read-only. The startup
+# log then WARNs that the fail-open window is back.
 
 # ── OWASP CRS anomaly scoring ─────────────────────────────────────────────────
 #

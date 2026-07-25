@@ -8,11 +8,11 @@ use crate::models::{
     AdminUser, AllowIp, AllowUrl, AttackLog, AttackLogQuery, AuditLogEntry, AuditLogQuery, BlockIp, BlockUrl,
     Certificate, CreateAdminUser, CreateCertificate, CreateCrowdSecEvent, CreateCustomRule, CreateHost, CreateIpRule,
     CreateLbBackend, CreateNotificationConfig, CreateSecurityEvent, CreateSemanticObservation, CreateSensitivePattern,
-    CreateTunnel, CreateUrlRule, CreateWasmPlugin, CrowdSecConfigRow, CrowdSecEventQuery, CrowdSecEventRow, CustomRule,
-    GeoDistEntry, GeoStats, Host, HotlinkConfig, LabeledCount, LbBackend, NotificationConfig, NotificationLog,
-    RefreshToken, SecurityEvent, SecurityEventQuery, SemanticObservation, SemanticObservationFilter,
-    SemanticObservationQuery, SensitivePattern, StatsOverview, TimeSeriesPoint, TopEntry, TunnelRow,
-    UpdateCertificatePem, UpdateHost, UpdateNotificationConfig, UpsertCrowdSecConfig, UpsertHotlinkConfig,
+    CreateTunnel, CreateUrlRule, CreateWasmPlugin, CrowdSecConfigRow, CrowdSecDecisionRow, CrowdSecEventQuery,
+    CrowdSecEventRow, CustomRule, GeoDistEntry, GeoStats, Host, HotlinkConfig, LabeledCount, LbBackend,
+    NotificationConfig, NotificationLog, RefreshToken, SecurityEvent, SecurityEventQuery, SemanticObservation,
+    SemanticObservationFilter, SemanticObservationQuery, SensitivePattern, StatsOverview, TimeSeriesPoint, TopEntry,
+    TunnelRow, UpdateCertificatePem, UpdateHost, UpdateNotificationConfig, UpsertCrowdSecConfig, UpsertHotlinkConfig,
     WasmPluginRow,
 };
 use crate::retention::{DEFAULT_DELETE_BATCH_SIZE, RetentionTable, prune_in_batches};
@@ -1919,4 +1919,162 @@ impl Database {
 
         Ok((rows, total))
     }
+
+    // ── crowdsec_decisions: durable mirror of the bouncer decision cache ──────
+    //
+    // `crowdsec_decisions` is a *cache of active decisions*, not a history log
+    // (`crowdsec_events` is the history). Nothing read or wrote it before, so a
+    // restart with an unreachable LAPI left the in-memory cache empty and the
+    // bouncer fail-open until the next successful poll. These four statements
+    // are the durable side: the sync task mirrors every decision it caches, and
+    // startup restores the still-valid ones before the proxy serves traffic.
+    //
+    // Conflict key is `id`, the identity LAPI itself assigns. `CrowdSec` reuses
+    // decision ids after a LAPI database reset, so keying on `id` makes the
+    // reused id *replace* the stale row instead of failing on the primary key.
+    // Removal, in contrast, is keyed on `(scope, value)` — the same key the
+    // in-memory cache removes on — so a revoked ban can never survive in the
+    // mirror and be resurrected by the next restart.
+
+    /// Every decision in the mirror that has not expired yet.
+    ///
+    /// Filtered in SQL so a mirror holding days of expired rows (the retention
+    /// window deliberately keeps them for a while) costs one index range scan
+    /// instead of a full table read. Rows with an unknown expiry
+    /// (`expires_at IS NULL`, only reachable by hand-inserted rows — the writer
+    /// below always supplies one) are skipped: an unknown lifetime cannot be
+    /// proven still active, and restoring it would be the resurrection this
+    /// mirror exists to avoid.
+    pub async fn load_active_crowdsec_decisions(&self) -> Result<Vec<CrowdSecDecisionRow>, StorageError> {
+        let rows = sqlx::query_as::<_, CrowdSecDecisionRow>(
+            "SELECT id, origin, scope, value, type, scenario, duration_secs, expires_at \
+               FROM crowdsec_decisions \
+              WHERE expires_at IS NOT NULL AND expires_at > NOW()",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        debug!("Loaded {} active CrowdSec decisions from the local mirror", rows.len());
+        Ok(rows)
+    }
+
+    /// Insert or refresh `rows`, keyed on the upstream decision id.
+    pub async fn upsert_crowdsec_decisions(&self, rows: &[CrowdSecDecisionRow]) -> Result<u64, StorageError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.pool.acquire().await?;
+        let mut affected = 0u64;
+        for chunk in rows.chunks(CROWDSEC_DECISION_CHUNK) {
+            affected += upsert_crowdsec_decision_chunk(&mut *conn, chunk).await?;
+        }
+        Ok(affected)
+    }
+
+    /// Remove every mirrored decision whose `(scope, value)` appears in `keys`.
+    ///
+    /// Keyed on the banned value rather than the decision id so the mirror
+    /// tracks the in-memory cache exactly: the cache also removes by value, and
+    /// a value the cache has released must not come back on the next restart.
+    pub async fn delete_crowdsec_decisions(&self, keys: &[(String, String)]) -> Result<u64, StorageError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.pool.acquire().await?;
+        let mut affected = 0u64;
+        for chunk in keys.chunks(CROWDSEC_DECISION_CHUNK) {
+            let scopes: Vec<&str> = chunk.iter().map(|(scope, _)| scope.as_str()).collect();
+            let values: Vec<&str> = chunk.iter().map(|(_, value)| value.as_str()).collect();
+            affected += sqlx::query(
+                "DELETE FROM crowdsec_decisions \
+                  WHERE (scope, value) IN (SELECT * FROM UNNEST($1::text[], $2::text[]))",
+            )
+            .bind(&scopes)
+            .bind(&values)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+        }
+        Ok(affected)
+    }
+
+    /// Make the mirror hold exactly `rows` and nothing else, atomically.
+    ///
+    /// Called after a **full** LAPI pull (`startup=true`), which returns the
+    /// complete active decision set. Rows absent from that set were revoked
+    /// while this process was down or was not listening, so they are deleted in
+    /// the same transaction that upserts the survivors — the guarantee that a
+    /// lifted ban is never resurrected by a later restart.
+    ///
+    /// An empty `rows` therefore empties the table: "LAPI has no active
+    /// decisions" is a real answer, not a missing one.
+    pub async fn replace_crowdsec_decisions(&self, rows: &[CrowdSecDecisionRow]) -> Result<u64, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        for chunk in rows.chunks(CROWDSEC_DECISION_CHUNK) {
+            upsert_crowdsec_decision_chunk(&mut *tx, chunk).await?;
+        }
+        let keep: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        let removed = sqlx::query("DELETE FROM crowdsec_decisions WHERE NOT (id = ANY($1::bigint[]))")
+            .bind(&keep)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(removed)
+    }
+}
+
+/// Rows per `crowdsec_decisions` statement.
+///
+/// A full LAPI pull can carry tens of thousands of decisions (CAPI blocklists
+/// alone are that large). One statement per chunk keeps each parameter array —
+/// and each row lock hold — bounded, while still costing only a handful of
+/// round-trips for a realistic decision set.
+const CROWDSEC_DECISION_CHUNK: usize = 1_000;
+
+/// One bulk upsert of `chunk` into `crowdsec_decisions`.
+///
+/// Columns are passed as parallel arrays through `UNNEST`, so the statement
+/// text is fixed and every value is a bind parameter regardless of batch size.
+///
+/// The caller must have de-duplicated `chunk` by `id`: Postgres rejects an
+/// `ON CONFLICT DO UPDATE` that would touch the same row twice in one
+/// statement.
+async fn upsert_crowdsec_decision_chunk<'e, E>(executor: E, chunk: &[CrowdSecDecisionRow]) -> Result<u64, StorageError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let ids: Vec<i64> = chunk.iter().map(|row| row.id).collect();
+    let origins: Vec<&str> = chunk.iter().map(|row| row.origin.as_str()).collect();
+    let scopes: Vec<&str> = chunk.iter().map(|row| row.scope.as_str()).collect();
+    let values: Vec<&str> = chunk.iter().map(|row| row.value.as_str()).collect();
+    let types: Vec<&str> = chunk.iter().map(|row| row.type_.as_str()).collect();
+    let scenarios: Vec<&str> = chunk.iter().map(|row| row.scenario.as_str()).collect();
+    let durations: Vec<Option<i64>> = chunk.iter().map(|row| row.duration_secs).collect();
+    let expiries: Vec<DateTime<Utc>> = chunk.iter().map(|row| row.expires_at).collect();
+
+    let affected = sqlx::query(
+        "INSERT INTO crowdsec_decisions (id, origin, scope, value, type, scenario, duration_secs, expires_at) \
+         SELECT * FROM UNNEST($1::bigint[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], \
+                              $7::bigint[], $8::timestamptz[]) \
+         ON CONFLICT (id) DO UPDATE SET \
+             origin = EXCLUDED.origin, \
+             scope = EXCLUDED.scope, \
+             value = EXCLUDED.value, \
+             type = EXCLUDED.type, \
+             scenario = EXCLUDED.scenario, \
+             duration_secs = EXCLUDED.duration_secs, \
+             expires_at = EXCLUDED.expires_at",
+    )
+    .bind(&ids)
+    .bind(&origins)
+    .bind(&scopes)
+    .bind(&values)
+    .bind(&types)
+    .bind(&scenarios)
+    .bind(&durations)
+    .bind(&expiries)
+    .execute(executor)
+    .await?
+    .rows_affected();
+    Ok(affected)
 }
