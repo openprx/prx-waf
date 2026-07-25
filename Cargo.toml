@@ -32,7 +32,7 @@ pingora-timeout = { version = "0.8" }
 # API framework
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
