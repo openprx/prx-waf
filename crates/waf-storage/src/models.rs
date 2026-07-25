@@ -565,6 +565,13 @@ pub struct NotificationConfig {
     pub host_code: Option<String>,
     pub event_type: String,
     pub channel_type: String,
+    /// Channel credentials and endpoint settings.
+    ///
+    /// Secret members (SMTP password, webhook secret/headers, Telegram bot
+    /// token) are stored encrypted at rest and must never reach an API client,
+    /// so this field is skipped during serialization. Handlers that need to
+    /// expose a channel build an explicit, redacted view instead.
+    #[serde(skip_serializing)]
     pub config_json: serde_json::Value,
     pub enabled: bool,
     pub rate_limit_secs: i32,
@@ -594,6 +601,26 @@ pub struct CreateNotificationConfig {
     pub event_type: String,
     pub channel_type: String,
     pub config_json: serde_json::Value,
+    pub enabled: Option<bool>,
+    pub rate_limit_secs: Option<i32>,
+}
+
+/// Update notification config request.
+///
+/// Every field is optional: omitted fields keep their stored value. The channel
+/// type is intentionally not updatable — switching channels would leave secrets
+/// encrypted for a schema that no longer applies; delete and recreate instead.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateNotificationConfig {
+    pub name: Option<String>,
+    pub host_code: Option<String>,
+    pub event_type: Option<String>,
+    /// Rejected when it disagrees with the stored channel type; accepted (and
+    /// ignored) when it matches, so clients can echo back a full object.
+    pub channel_type: Option<String>,
+    /// Partial channel config. Secret members left out or sent as an empty
+    /// string keep the value already stored.
+    pub config_json: Option<serde_json::Value>,
     pub enabled: Option<bool>,
     pub rate_limit_secs: Option<i32>,
 }

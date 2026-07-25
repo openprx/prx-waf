@@ -12,7 +12,8 @@ use crate::models::{
     GeoDistEntry, GeoStats, Host, HotlinkConfig, LabeledCount, LbBackend, NotificationConfig, NotificationLog,
     RefreshToken, SecurityEvent, SecurityEventQuery, SemanticObservation, SemanticObservationFilter,
     SemanticObservationQuery, SensitivePattern, StatsOverview, TimeSeriesPoint, TopEntry, TunnelRow,
-    UpdateCertificatePem, UpdateHost, UpsertCrowdSecConfig, UpsertHotlinkConfig, WasmPluginRow,
+    UpdateCertificatePem, UpdateHost, UpdateNotificationConfig, UpsertCrowdSecConfig, UpsertHotlinkConfig,
+    WasmPluginRow,
 };
 
 /// Column projection for every `hosts` read.
@@ -1454,6 +1455,40 @@ impl Database {
         .bind(req.rate_limit_secs.unwrap_or(300))
         .bind(now)
         .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Update a notification config in place.
+    ///
+    /// `config_json` is the already-merged, already-encrypted channel config
+    /// produced by the API layer (secrets the caller left blank have been
+    /// carried over from the stored row); pass `None` to leave it untouched.
+    /// Returns `None` when no row with `id` exists.
+    pub async fn update_notification_config(
+        &self,
+        id: Uuid,
+        req: &UpdateNotificationConfig,
+        config_json: Option<&serde_json::Value>,
+    ) -> Result<Option<NotificationConfig>, StorageError> {
+        Ok(sqlx::query_as::<_, NotificationConfig>(
+            r"UPDATE notification_configs SET
+                 name            = COALESCE($2::varchar, name),
+                 host_code       = COALESCE($3::varchar, host_code),
+                 event_type      = COALESCE($4::varchar, event_type),
+                 config_json     = COALESCE($5::jsonb, config_json),
+                 enabled         = COALESCE($6::boolean, enabled),
+                 rate_limit_secs = COALESCE($7::integer, rate_limit_secs),
+                 updated_at      = NOW()
+               WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(req.name.as_deref())
+        .bind(req.host_code.as_deref())
+        .bind(req.event_type.as_deref())
+        .bind(config_json)
+        .bind(req.enabled)
+        .bind(req.rate_limit_secs)
+        .fetch_optional(&self.pool)
         .await?)
     }
 

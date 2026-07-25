@@ -15,41 +15,34 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use waf_storage::models::CreateTunnel;
 
+use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use gateway::{TunnelConfig, TunnelConnection, generate_token, hash_token};
 
 // ─── REST handlers ─────────────────────────────────────────────────────────────
 
 /// GET /api/tunnels
-pub async fn list_tunnels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match state.db.list_tunnels().await {
-        Ok(rows) => {
-            let live = state.tunnel_registry.list_status().await;
-            let list: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|r| {
-                    let status = live.iter().find(|s| s.id == r.id);
-                    let connected = status.is_some_and(|s| s.connected);
-                    json!({
-                        "id": r.id,
-                        "name": r.name,
-                        "target_host": r.target_host,
-                        "target_port": r.target_port,
-                        "enabled": r.enabled,
-                        "connected": connected,
-                        "last_seen": r.last_seen,
-                        "created_at": r.created_at,
-                    })
-                })
-                .collect();
-            (StatusCode::OK, Json(json!({ "tunnels": list }))).into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
+pub async fn list_tunnels(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let rows = state.db.list_tunnels().await?;
+    let live = state.tunnel_registry.list_status().await;
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let status = live.iter().find(|s| s.id == r.id);
+            let connected = status.is_some_and(|s| s.connected);
+            json!({
+                "id": r.id,
+                "name": r.name,
+                "target_host": r.target_host,
+                "target_port": r.target_port,
+                "enabled": r.enabled,
+                "connected": connected,
+                "last_seen": r.last_seen,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "tunnels": list })))
 }
 
 /// POST /api/tunnels — create a new tunnel
@@ -59,24 +52,20 @@ pub async fn list_tunnels(State(state): State<Arc<AppState>>) -> impl IntoRespon
 pub async fn create_tunnel(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let Some(name) = body
         .get("name")
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string)
     else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "name is required" }))).into_response();
+        return Err(ApiError::BadRequest("name is required".to_owned()));
     };
     let Some(target_host) = body
         .get("target_host")
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string)
     else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "target_host is required" })),
-        )
-            .into_response();
+        return Err(ApiError::BadRequest("target_host is required".to_owned()));
     };
     #[allow(clippy::cast_possible_truncation)]
     let Some(target_port) = body
@@ -85,11 +74,7 @@ pub async fn create_tunnel(
         .filter(|&p| p > 0 && p < 65536)
         .map(|p| p as i32)
     else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "target_port must be 1-65535" })),
-        )
-            .into_response();
+        return Err(ApiError::BadRequest("target_port must be 1-65535".to_owned()));
     };
 
     let token = generate_token();
@@ -103,16 +88,7 @@ pub async fn create_tunnel(
         enabled: body.get("enabled").and_then(serde_json::Value::as_bool),
     };
 
-    let row = match state.db.create_tunnel(&req, &token_hash).await {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
+    let row = state.db.create_tunnel(&req, &token_hash).await?;
 
     // Register in the in-memory registry
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -130,7 +106,7 @@ pub async fn create_tunnel(
         .await;
 
     info!(tunnel = %name, "Tunnel created");
-    (
+    Ok((
         StatusCode::CREATED,
         Json(json!({
             "id": row.id,
@@ -140,21 +116,16 @@ pub async fn create_tunnel(
             "enabled": row.enabled,
             "token": token,   // shown once — client must save this
         })),
-    )
-        .into_response()
+    ))
 }
 
 /// DELETE /api/tunnels/:id
-pub async fn delete_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> impl IntoResponse {
+pub async fn delete_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
     state.tunnel_registry.unregister(id).await;
-    match state.db.delete_tunnel(id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "tunnel not found" }))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+    if state.db.delete_tunnel(id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound(format!("Tunnel {id} not found")))
     }
 }
 

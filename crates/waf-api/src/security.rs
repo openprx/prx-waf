@@ -21,6 +21,7 @@ use axum::{
 };
 use serde_json::json;
 
+use crate::error::ApiResult;
 use crate::state::AppState;
 use axum::{extract::Query, extract::State};
 use waf_storage::models::AuditLogQuery;
@@ -175,22 +176,12 @@ pub fn is_admin_ip_allowed(ip: &IpAddr, allowlist: &[String]) -> bool {
 pub async fn list_audit_log(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AuditLogQuery>,
-) -> impl IntoResponse {
-    match state.db.list_audit_log(&query).await {
-        Ok((entries, total)) => (
-            StatusCode::OK,
-            Json(json!({
-                "entries": entries,
-                "total": total,
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
+) -> ApiResult<Json<serde_json::Value>> {
+    let (entries, total) = state.db.list_audit_log(&query).await?;
+    Ok(Json(json!({
+        "entries": entries,
+        "total": total,
+    })))
 }
 
 // ─── Admin IP allowlist middleware ────────────────────────────────────────────

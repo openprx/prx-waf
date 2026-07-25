@@ -33,6 +33,7 @@ use crate::health::health_check;
 use crate::middleware::{require_admin, require_auth};
 use crate::notifications::{
     create_notification, delete_notification, list_notifications, notification_log, test_notification,
+    update_notification,
 };
 use crate::observations::{list_observations, observation_stats};
 use crate::plugins::{WASM_UPLOAD_MAX, delete_plugin, disable_plugin, enable_plugin, list_plugins, upload_plugin};
@@ -105,8 +106,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/stats/overview", get(stats_overview))
         .route("/api/stats/timeseries", get(stats_timeseries))
         .route("/api/stats/geo", get(stats_geo))
-        .route("/api/notifications", get(list_notifications))
-        .route("/api/notifications/log", get(notification_log))
         .route("/api/plugins", get(list_plugins))
         .route("/api/tunnels", get(list_tunnels))
         .route("/api/cache/stats", get(cache_stats))
@@ -155,9 +154,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Certificates
         .route("/api/certificates", post(upload_certificate))
         .route("/api/certificates/{id}", delete(delete_certificate))
-        // Notifications
-        .route("/api/notifications", post(create_notification))
-        .route("/api/notifications/{id}", delete(delete_notification))
+        // Notifications — reads are admin-only too: even with credentials
+        // redacted, a channel row exposes the alerting topology (webhook
+        // endpoints, Telegram chat IDs, SMTP relays and recipients), which is
+        // reconnaissance material for anyone planning to evade or flood alerts.
+        .route(
+            "/api/notifications",
+            get(list_notifications).post(create_notification),
+        )
+        .route("/api/notifications/log", get(notification_log))
+        .route(
+            "/api/notifications/{id}",
+            put(update_notification).delete(delete_notification),
+        )
         .route("/api/notifications/{id}/test", post(test_notification))
         // WASM Plugins — upload route gets a dedicated, larger body limit.
         .route(

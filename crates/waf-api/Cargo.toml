@@ -40,6 +40,12 @@ parking_lot = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 base64 = { workspace = true }
 bytes = { workspace = true }
+# Test-only: build a real `sqlx::Error` to prove database detail never reaches
+# an API response body.
+sqlx = { workspace = true }
+# Test-only: reqwest is built with `rustls-no-provider`, so a test that needs a
+# live `reqwest::Client` must install the crypto provider the binary installs.
+rustls = { workspace = true }
 
 [lints]
 workspace = true

@@ -15,7 +15,6 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +23,7 @@ use waf_common::url_validator::validate_scheme_only;
 use waf_engine::{CacheStats, Decision};
 use waf_storage::models::{CrowdSecEventQuery, UpsertCrowdSecConfig};
 
+use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 // ── Response types ─────────────────────────────────────────────────────────────
@@ -108,28 +108,33 @@ pub async fn list_crowdsec_decisions(State(state): State<Arc<AppState>>) -> Json
 pub async fn delete_crowdsec_decision(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if let Some(ref client) = state.crowdsec_client {
-        match client.delete_decision(id).await {
-            Ok(()) => Ok(Json(serde_json::json!({ "success": true }))),
-            Err(e) => Err((
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )),
-        }
-    } else {
-        Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "CrowdSec not enabled" })),
-        ))
-    }
+) -> ApiResult<Json<serde_json::Value>> {
+    let client = state
+        .crowdsec_client
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("CrowdSec not enabled".to_owned()))?;
+    // The LAPI error text embeds the (internal) LAPI URL and connection
+    // diagnostics — log it, return a generic 502.
+    client.delete_decision(id).await.map_err(ApiError::Upstream)?;
+    Ok(Json(serde_json::json!({ "success": true })))
 }
+
+/// Generic outcome for a failed connection test.
+///
+/// The underlying error carries the LAPI endpoint plus DNS/TLS/socket detail;
+/// it is logged server-side instead of being handed to the caller.
+const TEST_FAILED_MSG: &str = "connection test failed — see server logs for details";
 
 /// POST /api/crowdsec/test
 pub async fn test_crowdsec_connection(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    fn failed(context: &str, e: &anyhow::Error) -> Json<serde_json::Value> {
+        tracing::error!(error = %e, "crowdsec {context} failed");
+        Json(serde_json::json!({ "success": false, "message": TEST_FAILED_MSG }))
+    }
+
     // Allow ad-hoc test with custom url/key from body
     let lapi_url = body
         .get("lapi_url")
@@ -144,15 +149,16 @@ pub async fn test_crowdsec_connection(
             // or private addresses in on-premise deployments, so we only reject
             // non-HTTP(S) schemes (file://, ftp://, etc.) to block protocol-level
             // SSRF vectors while preserving normal local/private deployments.
+            // The message describes the caller's own input, so it is returned.
             if let Err(e) = validate_scheme_only(&url) {
                 return Json(serde_json::json!({ "success": false, "message": e.to_string() }));
             }
             match waf_engine::CrowdSecClient::new(url, key) {
                 Ok(client) => match client.test_connection().await {
                     Ok(msg) => Json(serde_json::json!({ "success": true, "message": msg })),
-                    Err(e) => Json(serde_json::json!({ "success": false, "message": e.to_string() })),
+                    Err(e) => failed("connection test", &e),
                 },
-                Err(e) => Json(serde_json::json!({ "success": false, "message": e.to_string() })),
+                Err(e) => failed("client construction", &e),
             }
         }
         _ => {
@@ -160,7 +166,7 @@ pub async fn test_crowdsec_connection(
             if let Some(ref client) = state.crowdsec_client {
                 match client.test_connection().await {
                     Ok(msg) => Json(serde_json::json!({ "success": true, "message": msg })),
-                    Err(e) => Json(serde_json::json!({ "success": false, "message": e.to_string() })),
+                    Err(e) => failed("connection test", &e),
                 }
             } else {
                 Json(serde_json::json!({
@@ -216,54 +222,27 @@ pub struct UpdateCrowdSecConfig {
 pub async fn update_crowdsec_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateCrowdSecConfig>,
-) -> Result<Json<CrowdSecConfigResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult<Json<CrowdSecConfigResponse>> {
     // Validate lapi_url scheme before persisting to prevent storing a URL with
     // a dangerous protocol (file://, ftp://, etc.).  Private/loopback addresses
     // are intentionally allowed because CrowdSec LAPI commonly runs locally.
+    // The message describes the caller's own input, so it is returned as-is.
     if let Some(ref url) = body.lapi_url {
-        validate_scheme_only(url).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("invalid lapi_url: {e}") })),
-            )
-        })?;
+        validate_scheme_only(url).map_err(|e| ApiError::BadRequest(format!("invalid lapi_url: {e}")))?;
     }
 
-    let key = master_key().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-    })?;
+    // A missing/short MASTER_KEY is an operator misconfiguration: logged
+    // server-side, generic 500 to the client.
+    let key = master_key().map_err(ApiError::Internal)?;
 
-    let api_key_enc = if let Some(ref k) = body.api_key {
-        if k.is_empty() {
-            None
-        } else {
-            Some(encrypt_field(&key, k).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-            })?)
-        }
-    } else {
-        None
+    let api_key_enc = match body.api_key.as_deref().filter(|k| !k.is_empty()) {
+        Some(k) => Some(encrypt_field(&key, k).map_err(ApiError::Internal)?),
+        None => None,
     };
 
-    let appsec_key_enc = if let Some(ref k) = body.appsec_key {
-        if k.is_empty() {
-            None
-        } else {
-            Some(encrypt_field(&key, k).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-            })?)
-        }
-    } else {
-        None
+    let appsec_key_enc = match body.appsec_key.as_deref().filter(|k| !k.is_empty()) {
+        Some(k) => Some(encrypt_field(&key, k).map_err(ApiError::Internal)?),
+        None => None,
     };
 
     let req = UpsertCrowdSecConfig {
@@ -278,23 +257,21 @@ pub async fn update_crowdsec_config(
         fallback_action: body.fallback_action,
     };
 
-    match state.db.upsert_crowdsec_config(&req, api_key_enc, appsec_key_enc).await {
-        Ok(row) => Ok(Json(CrowdSecConfigResponse {
-            id: Some(row.id),
-            enabled: row.enabled,
-            mode: row.mode,
-            lapi_url: row.lapi_url,
-            api_key_set: row.api_key_encrypted.is_some(),
-            appsec_endpoint: row.appsec_endpoint,
-            appsec_key_set: row.appsec_key_encrypted.is_some(),
-            update_frequency_secs: row.update_frequency_secs,
-            fallback_action: row.fallback_action,
-        })),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )),
-    }
+    let row = state
+        .db
+        .upsert_crowdsec_config(&req, api_key_enc, appsec_key_enc)
+        .await?;
+    Ok(Json(CrowdSecConfigResponse {
+        id: Some(row.id),
+        enabled: row.enabled,
+        mode: row.mode,
+        lapi_url: row.lapi_url,
+        api_key_set: row.api_key_encrypted.is_some(),
+        appsec_endpoint: row.appsec_endpoint,
+        appsec_key_set: row.appsec_key_encrypted.is_some(),
+        update_frequency_secs: row.update_frequency_secs,
+        fallback_action: row.fallback_action,
+    }))
 }
 
 /// GET /api/crowdsec/stats
@@ -334,17 +311,11 @@ pub async fn crowdsec_stats(State(state): State<Arc<AppState>>) -> Json<serde_js
 }
 
 /// GET /api/crowdsec/events
-pub async fn list_crowdsec_events(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+pub async fn list_crowdsec_events(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
     let query = CrowdSecEventQuery::default();
-    match state.db.list_crowdsec_events(&query).await {
-        Ok((events, total)) => Json(serde_json::json!({
-            "events": events,
-            "total": total,
-        })),
-        Err(e) => Json(serde_json::json!({
-            "error": e.to_string(),
-            "events": [],
-            "total": 0,
-        })),
-    }
+    let (events, total) = state.db.list_crowdsec_events(&query).await?;
+    Ok(Json(serde_json::json!({
+        "events": events,
+        "total": total,
+    })))
 }
