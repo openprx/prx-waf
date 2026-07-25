@@ -17,6 +17,8 @@ rules:
     field: query+body+cookies+headers
     operator: regex
     value: java\.lang\.(?:runtime|processbuilder)
+    transform:
+      - lowercase
     action: block
     tags:
       - owasp-crs
@@ -31,6 +33,8 @@ rules:
     field: query+body+cookies+headers
     operator: regex
     value: (?:runtime|processbuilder)
+    transform:
+      - lowercase
     chain:
       - field: matched_value
         operator: regex
@@ -50,6 +54,8 @@ rules:
     operator: regex
     value: |-
       (?:clonetransform|xmldecod)er|f(?:orclosure|ilewriter)|in(?:stantiate(?:factory|transformer)|vokertransformer)|(?:prototype(?:clone|serialization)factor|getpropert)y|whileclosure
+    transform:
+      - lowercase
     chain:
       - field: matched_value
         operator: regex
@@ -82,6 +88,9 @@ rules:
     field: unmapped_files
     operator: regex
     value: .*\.(?:jsp|jspx)\.*$
+    transform:
+      - lowercase
+      - removeWhitespace
     action: block
     tags:
       - owasp-crs
@@ -92,9 +101,13 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 1
-    field: all
+    field: path_raw+query+body+cookies+headers
     operator: regex
     value: (?i)(?:\$|&dollar;?)(?:\{|&l(?:brace|cub);?)(?:[^\}]{0,15}(?:\$|&dollar;?)(?:\{|&l(?:brace|cub);?)|jndi|ctx)
+    transform:
+      - urlDecodeUni
+      - jsDecode
+      - htmlEntityDecode
     action: block
     tags:
       - owasp-crs
@@ -106,9 +119,13 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 2
-    field: all
+    field: path_raw+query+body+cookies+headers
     operator: regex
     value: (?i)(?:\$|&dollar;?)(?:\{|&l(?:brace|cub);?)(?:[^\}]*(?:\$|&dollar;?)(?:\{|&l(?:brace|cub);?)|jndi|ctx)
+    transform:
+      - urlDecodeUni
+      - jsDecode
+      - htmlEntityDecode
     action: block
     tags:
       - owasp-crs
@@ -152,6 +169,8 @@ rules:
     operator: regex
     value: |-
       (?:clonetransform|xmldecod)er|f(?:orclosure|ilewriter)|in(?:stantiate(?:factory|transformer)|vokertransformer)|(?:prototype(?:clone|serialization)factor|getpropert)y|whileclosure
+    transform:
+      - lowercase
     action: block
     tags:
       - owasp-crs
@@ -166,6 +185,8 @@ rules:
     field: query+body+cookies+headers
     operator: regex
     value: java\b.+(?:runtime|processbuilder)
+    transform:
+      - lowercase
     action: block
     tags:
       - owasp-crs
@@ -181,6 +202,8 @@ rules:
     operator: regex
     value: |-
       class\.module\.classLoader\.resources\.context\.parent\.pipeline|springframework\.context\.support\.FileSystemXmlApplicationContext
+    transform:
+      - urlDecodeUni
     action: block
     tags:
       - owasp-crs
@@ -207,9 +230,13 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 4
-    field: all
+    field: path_raw+query+body+cookies+headers
     operator: regex
     value: (?i)(?:\$|&dollar;?)(?:\{|&l(?:brace|cub);?)
+    transform:
+      - urlDecodeUni
+      - jsDecode
+      - htmlEntityDecode
     action: block
     tags:
       - owasp-crs

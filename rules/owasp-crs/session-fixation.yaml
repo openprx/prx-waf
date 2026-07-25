@@ -17,6 +17,8 @@ rules:
     field: query+body+cookies
     operator: regex
     value: (?i)\.cookie\b.*?;[^0-9A-Z_a-z]*?(?:expires|domain)[^0-9A-Z_a-z]*?=|\bhttp-equiv[^0-9A-Z_a-z]+set-cookie\b
+    transform:
+      - urlDecodeUni
     action: block
     tags:
       - owasp-crs
@@ -31,6 +33,8 @@ rules:
     operator: regex
     value: |-
       ^(?:j(?:se(?:ssionid|rvsession)|wsession)|(?:asp(?:\.net_)?session|zend_session_)id|p(?:hpsessi(?:on|d)|lay_session)|(?:(?:w(?:eblogic|l)|rack\.|laravel_)sessio|(?:next-auth\.session-|meteor_login_)toke)n|s(?:(?:ession[\-_]?|ails\.s)id|hiny-token)|_(?:session_id|(?:(?:flask|rails)_sessio|_(?:secure|host)-next-auth\.session-toke)n)|c(?:f(?:s?id|token)|onnect\.sid|akephp|i_session)|koa[\.:]sess)$
+    transform:
+      - lowercase
     chain:
       - field: header_referer
         operator: regex
@@ -54,6 +58,8 @@ rules:
     operator: regex
     value: |-
       ^(?:j(?:se(?:ssionid|rvsession)|wsession)|(?:asp(?:\.net_)?session|session[\-_]?)id|phpsessi(?:on|d)|(?:weblogic|laravel_)session|_(?:session_id|flask_session)|c(?:f(?:s?id|token)|onnect\.sid))$
+    transform:
+      - lowercase
     chain:
       - field: count_header_referer
         operator: equals

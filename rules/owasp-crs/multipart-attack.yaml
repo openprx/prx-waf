@@ -17,6 +17,8 @@ rules:
     field: unmapped_multipart_part_headers
     operator: regex
     value: content-transfer-encoding:(.*)
+    transform:
+      - lowercase
     action: block
     tags:
       - owasp-crs
@@ -30,6 +32,8 @@ rules:
     field: unmapped_multipart_part_headers
     operator: regex
     value: '[^\x21-\x7E][\x21-\x39\x3B-\x7E]*:'
+    transform:
+      - lowercase
     action: block
     tags:
       - owasp-crs

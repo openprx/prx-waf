@@ -14,7 +14,7 @@ rules:
     category: lfi
     severity: critical
     paranoia: 1
-    field: path+query+body+headers
+    field: path_raw+query+body+headers
     operator: regex
     value: |-
       (?i)(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))(?:\.(?:%0[01]|\?)?|\?\.?|%(?:2(?:(?:5(?:2|c0%25a))?e|%45)|c0(?:\.|%[256aef]e)|u(?:(?:ff0|002)e|2024)|%32(?:%(?:%6|4)5|E)|(?:e|f(?:(?:8|c%80)%8)?0%8)0%80%ae)|0x2e){2,3}(?:[/\x5c]|%(?:2(?:f|5(?:2f|5c|c(?:1%259c|0%25af))|%46)|5c|c(?:0%(?:[2aq]f|5c|9v)|1%(?:[19p]c|8s|af))|(?:bg%q|(?:e|f(?:8%8)?0%8)0%80%a)f|u(?:221[56]|EFC8|F025|002f)|%3(?:2(?:%(?:%6|4)6|F)|5%%63)|1u)|0x(?:2f|5c))
@@ -29,9 +29,14 @@ rules:
     category: lfi
     severity: critical
     paranoia: 1
-    field: path+query+body+headers
+    field: path_raw+query+body+headers
     operator: regex
     value: (?:^|[/;\x5c])\.{2,3}[/;\x5c]
+    transform:
+      - utf8toUnicode
+      - urlDecodeUni
+      - removeNulls
+      - cmdLine
     action: block
     tags:
       - owasp-crs
@@ -46,6 +51,10 @@ rules:
     field: query+body+cookies
     operator: pm_from_file
     value: lfi-os-files.data
+    transform:
+      - utf8toUnicode
+      - urlDecodeUni
+      - normalizePathWin
     action: block
     tags:
       - owasp-crs
@@ -60,6 +69,10 @@ rules:
     field: path
     operator: pm_from_file
     value: restricted-files.data
+    transform:
+      - utf8toUnicode
+      - urlDecodeUni
+      - normalizePathWin
     action: block
     tags:
       - owasp-crs
@@ -74,6 +87,10 @@ rules:
     field: path
     operator: pm_from_file
     value: ai-critical-artifacts.data
+    transform:
+      - utf8toUnicode
+      - urlDecodeUni
+      - normalizePathWin
     action: block
     tags:
       - owasp-crs
@@ -88,6 +105,10 @@ rules:
     field: user_agent+referer
     operator: pm_from_file
     value: lfi-os-files.data
+    transform:
+      - utf8toUnicode
+      - urlDecodeUni
+      - normalizePathWin
     action: block
     tags:
       - owasp-crs

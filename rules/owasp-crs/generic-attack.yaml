@@ -18,6 +18,14 @@ rules:
     operator: regex
     value: |-
       _(?:\$\$ND_FUNC\$\$_|_js_function)|(?:\beval|new[\s\x0b]+Function[\s\x0b]*)\(|(?:String\.fromCharCod|Module:prototyp)e|function\(\)\{|this\.constructor|module\.exports=|\([\s\x0b]*[^0-9A-Z_a-z]child_process[^0-9A-Z_a-z][\s\x0b]*\)|cons(?:tructor:constructor|ole(?:\.(?:(?:debu|lo)g|error|info|trace|warn)(?:\.call)?\(|\[[\"'`](?:(?:debu|lo)g|error|info|trace|warn)[\"'`]\]))|process(?:\.(?:(?:a(?:ccess|ppendfile|rgv|vailability)|c(?:aveats|h(?:mod|own)|(?:los|opyfil)e|p|reate(?:read|write)stream)|ex(?:ec(?:file)?|ists)|f(?:ch(?:mod|own)|data(?:sync)?|s(?:tat|ync)|utimes)|inodes|l(?:chmod|ink|stat|utimes)|mkd(?:ir|temp)|open(?:dir)?|r(?:e(?:ad(?:dir|file|link|v)?|name)|m)|s(?:pawn(?:file)?|tat|ymlink)|truncate|u(?:n(?:link|watchfile)|times)|w(?:atchfile|rite(?:file|v)?))(?:sync)?(?:\.call)?\(|binding|constructor|env|global|main(?:Module)?|process|require)|\[[\"'`](?:(?:a(?:ccess|ppendfile|rgv|vailability)|c(?:aveats|h(?:mod|own)|(?:los|opyfil)e|p|reate(?:read|write)stream)|ex(?:ec(?:file)?|ists)|f(?:ch(?:mod|own)|data(?:sync)?|s(?:tat|ync)|utimes)|inodes|l(?:chmod|ink|stat|utimes)|mkd(?:ir|temp)|open(?:dir)?|r(?:e(?:ad(?:dir|file|link|v)?|name)|m)|s(?:pawn(?:file)?|tat|ymlink)|truncate|u(?:n(?:link|watchfile)|times)|w(?:atchfile|rite(?:file|v)?))(?:sync)?|binding|constructor|env|global|main(?:Module)?|process|require)[\"'`]\])|(?:binding|constructor|env|global|main(?:Module)?|process|require)\[|require(?:\.(?:resolve(?:\.call)?\(|main|extensions|cache)|\[[\"'`](?:(?:resolv|cach)e|main|extensions)[\"'`]\])
+    transform:
+      - urlDecodeUni
+      - jsDecode
+      - removeWhitespace
+      - base64Decode
+      - urlDecodeUni
+      - jsDecode
+      - removeWhitespace
     action: block
     tags:
       - owasp-crs
@@ -59,6 +67,9 @@ rules:
     field: query+body+cookies
     operator: regex
     value: __proto__|constructor[\s\x0b]*(?:\.|\]?\[)[\s\x0b]*prototype
+    transform:
+      - urlDecodeUni
+      - jsDecode
     action: block
     tags:
       - owasp-crs
@@ -90,6 +101,13 @@ rules:
     operator: regex
     value: |-
       while[\s\x0b]*\([\s\x0b\(]*(?:!+(?:false|null|undefined|NaN|[\+\-]?0|\"{2}|'{2}|`{2})|(?:!!)*(?:(?:t(?:rue|his)|[\+\-]?(?:Infinity|[1-9][0-9]*)|new [A-Za-z][0-9A-Z_a-z]*|window|String|(?:Boolea|Functio)n|Object|Array)\b|\{[^\}]*\}|\[[^\]]*\]|\"[^\"]+\"|'[^']+'|`[^`]+`)).*\)
+    transform:
+      - urlDecodeUni
+      - jsDecode
+      - base64Decode
+      - urlDecodeUni
+      - jsDecode
+      - replaceComments
     action: block
     tags:
       - owasp-crs
@@ -106,6 +124,8 @@ rules:
     operator: regex
     value: |-
       ^data:(?:(?:\*|[^!\"\(\),/:-\?\[-\]\{\}]+)/(?:\*|[^!\"\(\),/:-\?\[-\]\{\}]+)|\*)(?:[\s\x0b]*;[\s\x0b]*(?:charset[\s\x0b]*=[\s\x0b]*\"?(?:iso-8859-15?|utf-8|windows-1252)\b\"?|(?:[^\s\x0b-\"\(\),/:-\?\[-\]c\{\}]|c(?:[^!\"\(\),/:-\?\[-\]h\{\}]|h(?:[^!\"\(\),/:-\?\[-\]a\{\}]|a(?:[^!\"\(\),/:-\?\[-\]r\{\}]|r(?:[^!\"\(\),/:-\?\[-\]s\{\}]|s(?:[^!\"\(\),/:-\?\[-\]e\{\}]|e[^!\"\(\),/:-\?\[-\]t\{\}]))))))[^!\"\(\),/:-\?\[-\]\{\}]*[\s\x0b]*=[\s\x0b]*[^!\(\),/:-\?\[-\]\{\}]+);?)*(?:[\s\x0b]*,[\s\x0b]*(?:(?:\*|[^!\"\(\),/:-\?\[-\]\{\}]+)/(?:\*|[^!\"\(\),/:-\?\[-\]\{\}]+)|\*)(?:[\s\x0b]*;[\s\x0b]*(?:charset[\s\x0b]*=[\s\x0b]*\"?(?:iso-8859-15?|utf-8|windows-1252)\b\"?|(?:[^\s\x0b-\"\(\),/:-\?\[-\]c\{\}]|c(?:[^!\"\(\),/:-\?\[-\]h\{\}]|h(?:[^!\"\(\),/:-\?\[-\]a\{\}]|a(?:[^!\"\(\),/:-\?\[-\]r\{\}]|r(?:[^!\"\(\),/:-\?\[-\]s\{\}]|s(?:[^!\"\(\),/:-\?\[-\]e\{\}]|e[^!\"\(\),/:-\?\[-\]t\{\}]))))))[^!\"\(\),/:-\?\[-\]\{\}]*[\s\x0b]*=[\s\x0b]*[^!\(\),/:-\?\[-\]\{\}]+);?)*)*
+    transform:
+      - urlDecodeUni
     action: block
     tags:
       - owasp-crs
@@ -119,6 +139,12 @@ rules:
     field: path+query+body+cookies
     operator: regex
     value: (?:close|exists|fork|(?:ope|spaw)n|re(?:ad|quire)|w(?:atch|rite))[\s\x0b]*\(
+    transform:
+      - urlDecodeUni
+      - jsDecode
+      - base64Decode
+      - urlDecodeUni
+      - jsDecode
     action: block
     tags:
       - owasp-crs

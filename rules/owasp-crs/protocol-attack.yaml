@@ -18,6 +18,9 @@ rules:
     operator: regex
     value: |-
       (?:get|p(?:(?:os|u)t|atch|rop(?:find|atch))|head|options|co(?:nnect|py)|delete|trac[ek]|m(?:kcol|ove)|(?:un)?lock)[\s\x0b]+[^\s\x0b]+[\s\x0b]+http/[0-9]
+    transform:
+      - htmlEntityDecode
+      - lowercase
     action: block
     tags:
       - owasp-crs
@@ -32,6 +35,8 @@ rules:
     field: query+body+cookies
     operator: regex
     value: '[\n\r][^0-9A-Z_a-z]*?(?:content-(?:type|length)|set-cookie|location):[\s\x0b]*[0-9A-Z_a-z]'
+    transform:
+      - lowercase
     action: block
     tags:
       - owasp-crs
@@ -46,6 +51,9 @@ rules:
     field: query+body+cookies
     operator: regex
     value: (?:\bhttp/\d|<(?:html|meta)\b)
+    transform:
+      - htmlEntityDecode
+      - lowercase
     action: block
     tags:
       - owasp-crs
@@ -60,6 +68,8 @@ rules:
     field: headers
     operator: regex
     value: '[\n\r]'
+    transform:
+      - urlDecodeUni
     action: block
     tags:
       - owasp-crs
@@ -89,6 +99,8 @@ rules:
     operator: regex
     value: |-
       [\n\r]+(?:[\s\x0b]|location|re(?:fresh|mote-(?:ip|addr))|(?:set-)?cookie|forwarded-(?:(?:fo|serve)r|host)|host|via|originating-IP|x-(?:forwarded-(?:(?:fo|serve)r|host)|host|via|remote-(?:ip|addr)|originating-IP))[\s\x0b]*:
+    transform:
+      - lowercase
     action: block
     tags:
       - owasp-crs
@@ -103,6 +115,8 @@ rules:
     field: path
     operator: regex
     value: '[\n\r]'
+    transform:
+      - urlDecodeUni
     action: block
     tags:
       - owasp-crs
@@ -118,6 +132,8 @@ rules:
     operator: regex
     value: |-
       ^[^!&\(\):<>\|~]*\)[\s\x0b]*(?:\((?:[^!&\(\),<->\|~]+[<>~]?=|[\s\x0b]*[!&\|][\s\x0b]*[\(\)]?[\s\x0b]*)|\)[\s\x0b]*\([\s\x0b]*[!&\|][\s\x0b]*|[!&\|][\s\x0b]*\([^!&\(\),<->\|~]+[<>~]?=[^!&\(\):<>\|~]*)
+    transform:
+      - htmlEntityDecode
     action: block
     tags:
       - owasp-crs
@@ -131,6 +147,8 @@ rules:
     field: content_type
     operator: regex
     value: ^[^\s\x0b,;]+[\s\x0b,;].*?(?:application/(?:.+\+)?json|(?:application/(?:soap\+)?|text/)xml)
+    transform:
+      - lowercase
     action: block
     tags:
       - owasp-crs
@@ -142,9 +160,12 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: path
+    field: path_raw
     operator: regex
     value: unix:[^|]*\|
+    transform:
+      - urlDecodeUni
+      - lowercase
     action: block
     tags:
       - owasp-crs
@@ -159,6 +180,8 @@ rules:
     field: cookies
     operator: equals
     value: '1'
+    transform:
+      - lowercase
     action: block
     tags:
       - owasp-crs
@@ -188,6 +211,8 @@ rules:
     operator: regex
     value: |-
       ^[^\s\x0b,;]+[\s\x0b,;].*?\b(?:((?:tex|multipar)t|application)|((?:audi|vide)o|image|cs[sv]|(?:vn|relate)d|p(?:df|lain)|json|(?:soa|cs)p|x(?:ml|-www-form-urlencoded)|form-data|x-amf|(?:octe|repor)t|stream)|([\+/]))\b
+    transform:
+      - lowercase
     action: block
     tags:
       - owasp-crs

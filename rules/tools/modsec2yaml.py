@@ -92,6 +92,7 @@ ENGINE_FIELDS = {
     "all",
     "method",
     "path",
+    "path_raw",
     "query",
     "body",
     "content_length",
@@ -113,13 +114,14 @@ UNMAPPED_PREFIX = "unmapped_"
 # Request surfaces an engine field reads.  Mirrors `Surfaces` in
 # crates/waf-engine/src/checks/owasp.rs; the order below is the canonical order
 # surface names appear in a composite field name.
-SURFACE_ORDER = ["path", "query", "body", "cookies", "headers", "user_agent", "referer"]
+SURFACE_ORDER = ["path", "path_raw", "query", "body", "cookies", "headers", "user_agent", "referer"]
 
 # `headers` here means "every header value"; a field naming one specific header
 # contributes only that header's surface.  Scalar/derived fields (`method`,
 # `content_length`, ...) never take part in a composite and are absent.
 FIELD_SURFACES = {
     "path":              ("path",),
+    "path_raw":          ("path_raw",),
     "query":             ("query",),
     "body":              ("body",),
     "cookies":           ("cookies",),
@@ -243,9 +245,18 @@ def _single_var_map(v: str) -> str:
             return "tx"
         return _sentinel(v)
 
-    if v in ("REQUEST_URI", "REQUEST_FILENAME", "REQUEST_BASENAME",
-             "REQUEST_URI_RAW", "PATH_INFO", "REQUEST_LINE"):
+    # `REQUEST_URI` / `REQUEST_FILENAME` / `REQUEST_BASENAME` / `PATH_INFO` are
+    # the *decoded* URI: ModSecurity percent-decodes and path-normalises them
+    # before a rule runs.  `REQUEST_URI_RAW` and `REQUEST_LINE` are the bytes
+    # off the wire, and CRS relies on the difference — CRS-920610 flags a raw
+    # `#` in `REQUEST_URI_RAW` precisely because a properly escaped `%23` is
+    # legal, and CRS-930100's pattern is a catalogue of `%2f` / `%c0%af`
+    # spellings that only exist before decoding.  Mapping both onto one field
+    # forced the engine to pick a single answer for two opposite requirements.
+    if v in ("REQUEST_URI", "REQUEST_FILENAME", "REQUEST_BASENAME", "PATH_INFO"):
         return "path"
+    if v in ("REQUEST_URI_RAW", "REQUEST_LINE"):
+        return "path_raw"
     if v in ("ARGS", "ARGS_NAMES", "ARGS_GET", "ARGS_POST",
              "ARGS_GET_NAMES", "ARGS_POST_NAMES", "QUERY_STRING"):
         return "query"
@@ -374,9 +385,26 @@ SECRULE_RE = re.compile(
 
 
 def parse_options(opts_str: str) -> dict:
-    """Parse comma-separated ModSecurity action/option string into a dict."""
+    """Parse comma-separated ModSecurity action/option string into a dict.
+
+    `t:` is accumulated into `_transforms` instead of going through the plain
+    `opts[key] = val` path.  Two `ModSecurity` properties make that mandatory:
+
+      * `t:` may appear many times and the list is **ordered** —
+        `t:urlDecodeUni,t:lowercase` and `t:lowercase,t:urlDecodeUni` are
+        different rules.  A dict entry keeps only the last one, which is how
+        every transformation but one used to be dropped on the floor.
+      * `t:none` **clears** whatever has accumulated so far (including anything
+        a `SecDefaultAction` contributed) rather than being a transformation of
+        its own.
+
+    `SecDefaultAction` is checked for completeness: CRS v4 sets only
+    `phase`/`log`/`auditlog`/`pass` in `crs-setup.conf.example`, no `t:`, so a
+    rule's own list is the whole list and there is nothing to prepend.
+    """
     opts = {}
     tags = []
+    transforms: list[str] = []
 
     # Normalize: remove backslash-space sequences, collapse whitespace
     opts_str = re.sub(r'\\\s+', '', opts_str)
@@ -412,10 +440,17 @@ def parse_options(opts_str: str) -> dict:
             tags.append(val)
         elif key == "setvar":
             opts.setdefault("setvars", []).append(val)
+        elif key == "t":
+            name = val.strip() if isinstance(val, str) else ""
+            if name.lower() == "none":
+                transforms.clear()
+            elif name:
+                transforms.append(name)
         else:
             opts[key] = val
 
     opts["_tags"] = tags
+    opts["_transforms"] = transforms
     return opts
 
 
@@ -735,6 +770,13 @@ def build_chain(head_operator: str, head_value: str, head_opts: dict,
             used_providers.add(bound_source)
 
         condition = {"field": field, "operator": operator, "value": value}
+        # A chain child carries its own `t:` list; `ModSecurity` does not
+        # propagate the chain starter's transformations to the links, and CRS
+        # relies on that (CRS-920200's starter is untransformed while its link
+        # is `t:none,t:length`).
+        transforms = child["opts"].get("_transforms") or []
+        if transforms:
+            condition["transform"] = list(transforms)
         if negate:
             condition["negate"] = True
         conditions.append(condition)
@@ -849,6 +891,10 @@ def extract_rule(variables: str, operator_str: str, opts: dict,
         "field":    field,
         "operator": operator,
         "value":    value,
+        # Ordered `t:` chain, `t:none` already applied.  Absent when the rule
+        # declares no transformation, which in `ModSecurity` means the value is
+        # matched exactly as the parser produced it.
+        "transform": list(opts.get("_transforms") or []) or None,
         "capture":  None,
         "chain":    None,
         "action":   action,

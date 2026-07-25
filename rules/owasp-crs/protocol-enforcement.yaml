@@ -51,7 +51,9 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: path
+    # Upstream reads REQUEST_URI_RAW with t:none: the rule exists to flag a
+    # fragment that was *not* escaped, so a legitimate %23 must stay escaped.
+    field: path_raw
     operator: contains
     value: '#'
     action: block
@@ -101,6 +103,9 @@ rules:
     field: path+query+headers
     operator: regex
     value: (?:^|[^\x5c])\x5c[cdeghijklmpqwxyz123456789]
+    transform:
+      - htmlEntityDecode
+      - lowercase
     action: block
     tags:
       - owasp-crs

@@ -20,10 +20,12 @@
 //! rule set.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -33,7 +35,7 @@ use tracing::{debug, error, info, warn};
 
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
-use super::{Check, url_decode, url_decode_recursive};
+use super::Check;
 
 /// Default on-disk location of the converted CRS rule set.
 const DEFAULT_RULES_DIR: &str = "rules/owasp-crs";
@@ -125,6 +127,12 @@ struct YamlRule {
     field: String,
     operator: String,
     value: YamlValue,
+    /// `ModSecurity` `t:` chain, in declaration order, with `t:none` already
+    /// applied by the converter.  Empty means "match the value exactly as the
+    /// request parser produced it", which is what a `SecRule` with no `t:`
+    /// (or with only `t:none`) means upstream.
+    #[serde(default)]
+    transform: Vec<String>,
     /// `!@op` in `ModSecurity`: the condition holds for a value the matcher
     /// does *not* accept.
     #[serde(default)]
@@ -150,6 +158,11 @@ struct YamlCondition {
     operator: String,
     #[serde(default)]
     value: YamlValue,
+    /// This link's own `t:` chain.  `ModSecurity` does not propagate the chain
+    /// starter's transformations to the links; each `SecRule` line carries its
+    /// own list.
+    #[serde(default)]
+    transform: Vec<String>,
     #[serde(default)]
     negate: bool,
     #[serde(default)]
@@ -180,6 +193,10 @@ pub enum RejectCategory {
     UnsupportedField,
     /// The rule's `operator` is not implemented by this engine.
     UnsupportedOperator,
+    /// One of the rule's `ModSecurity` `t:` transformations is not implemented
+    /// by this engine, so the value the pattern was written against cannot be
+    /// produced.
+    UnsupportedTransformation,
     /// Field and operator are individually supported but their combination is
     /// not representable (a scalar comparison against a multi-valued
     /// collection).
@@ -198,6 +215,7 @@ impl fmt::Display for RejectCategory {
         let s = match self {
             Self::UnsupportedField => "unsupported-field",
             Self::UnsupportedOperator => "unsupported-operator",
+            Self::UnsupportedTransformation => "unsupported-transformation",
             Self::FieldOperatorMismatch => "field-operator-mismatch",
             Self::InvalidValue => "invalid-value",
             Self::DataFile => "data-file",
@@ -215,6 +233,20 @@ pub enum RejectReason {
     UnsupportedField(String),
     /// `operator` is not one of the implemented matchers.
     UnsupportedOperator(String),
+    /// A `t:` transformation this engine does not implement.
+    ///
+    /// The rule is dropped rather than run against a value that skipped the
+    /// step: a CRS pattern is written against the *output* of its
+    /// transformation chain, so evaluating it one transformation short is
+    /// either a silent miss (`t:lowercase` omitted in front of an all-lowercase
+    /// pattern) or a silent false positive.  Naming the transformation in the
+    /// startup WARN keeps the gap visible.
+    UnsupportedTransformation {
+        /// Which condition declared it, e.g. `head` or `chain[1]`.
+        position: String,
+        /// The `ModSecurity` transformation name as written in the rule.
+        name: String,
+    },
     /// A scalar operator (`equals` / `not_in` / `gt` / `lt`) was applied to a
     /// multi-valued field (`all` / `headers` / `cookies`).
     NonScalarField {
@@ -274,6 +306,7 @@ impl RejectReason {
         match self {
             Self::UnsupportedField(_) => RejectCategory::UnsupportedField,
             Self::UnsupportedOperator(_) => RejectCategory::UnsupportedOperator,
+            Self::UnsupportedTransformation { .. } => RejectCategory::UnsupportedTransformation,
             Self::NonScalarField { .. } => RejectCategory::FieldOperatorMismatch,
             Self::InvalidValueType { .. } | Self::InvalidRegex(_) | Self::PatternSet(_) => RejectCategory::InvalidValue,
             Self::DataFile { .. } => RejectCategory::DataFile,
@@ -293,6 +326,11 @@ impl fmt::Display for RejectReason {
             Self::UnsupportedOperator(op) => {
                 write!(f, "unsupported operator '{op}' (no matcher implemented)")
             }
+            Self::UnsupportedTransformation { position, name } => write!(
+                f,
+                "{position}: unsupported transformation 't:{name}' (no implementation; the rule's \
+                 pattern is written against its output)"
+            ),
             Self::NonScalarField { operator, field } => write!(
                 f,
                 "operator '{operator}' needs a single-valued field but '{field}' is a collection"
@@ -437,14 +475,15 @@ impl LoadSummary {
 
         warn!(
             "OWASP CRS load summary for {origin}: {} of {} declared rules are ACTIVE — {} rejected \
-             ({} unsupported-field, {} unsupported-operator, {} field-operator-mismatch, \
-             {} invalid-value, {} data-file, {} chain-condition), {} unreadable source(s). \
-             Rejected rules are NOT enforced.",
+             ({} unsupported-field, {} unsupported-operator, {} unsupported-transformation, \
+             {} field-operator-mismatch, {} invalid-value, {} data-file, {} chain-condition), \
+             {} unreadable source(s). Rejected rules are NOT enforced.",
             self.compiled,
             self.attempted,
             self.rejected.len(),
             self.count(RejectCategory::UnsupportedField),
             self.count(RejectCategory::UnsupportedOperator),
+            self.count(RejectCategory::UnsupportedTransformation),
             self.count(RejectCategory::FieldOperatorMismatch),
             self.count(RejectCategory::InvalidValue),
             self.count(RejectCategory::DataFile),
@@ -505,10 +544,14 @@ impl Surfaces {
     const HEADER_VALUES: u8 = 1 << 4;
     const USER_AGENT: u8 = 1 << 5;
     const REFERER: u8 = 1 << 6;
+    /// `REQUEST_URI_RAW` / `REQUEST_LINE`: the URI as received, before the
+    /// parser percent-decodes it.
+    const PATH_RAW: u8 = 1 << 7;
 
     /// Canonical order — also the order surface names appear in a field name.
-    const NAMED: [(&'static str, u8); 7] = [
+    const NAMED: [(&'static str, u8); 8] = [
         ("path", Self::PATH),
+        ("path_raw", Self::PATH_RAW),
         ("query", Self::QUERY),
         ("body", Self::BODY),
         ("cookies", Self::COOKIES),
@@ -552,7 +595,16 @@ enum Field {
     /// Several request surfaces at once; `all` is the full set.
     Multi(Surfaces),
     Method,
+    /// `REQUEST_URI` / `REQUEST_FILENAME` / `REQUEST_BASENAME` / `PATH_INFO` —
+    /// the path as the parser decoded it.
     Path,
+    /// `REQUEST_URI_RAW` / `REQUEST_LINE` — the path exactly as received.
+    ///
+    /// Kept apart from [`Self::Path`] because CRS depends on the difference:
+    /// CRS-920610 flags a raw `#` in the URI and must not see a legitimately
+    /// escaped `%23` as one, while CRS-930100's traversal pattern is a
+    /// catalogue of `%2f` / `%c0%af` spellings that only exist before decoding.
+    PathRaw,
     Query,
     /// Request body preview (lossy UTF-8).
     Body,
@@ -616,6 +668,7 @@ impl Field {
             "all" => Self::Multi(Surfaces::ALL),
             "method" => Self::Method,
             "path" => Self::Path,
+            "path_raw" => Self::PathRaw,
             "query" => Self::Query,
             "body" => Self::Body,
             "content_length" => Self::ContentLength,
@@ -642,45 +695,17 @@ impl Field {
         !matches!(self, Self::Multi(_) | Self::Headers | Self::Cookies)
     }
 
-    /// Whether this field's value reaches a rule percent-decoded upstream.
-    ///
-    /// Only meaningful for the scalar variants; composite fields decide per
-    /// surface in [`Self::any_value`] / [`Self::collect_values`].
-    const fn scalar_decoding(self) -> Decoding {
-        match self {
-            // ModSecurity normalises and percent-decodes the URI before
-            // exposing it (`REQUEST_FILENAME` / `REQUEST_URI`), and parses
-            // `ARGS` / `REQUEST_BODY` out of the escaped forms.
-            Self::Path | Self::Query | Self::Body => Decoding::Escaped,
-            // `REQUEST_HEADERS` is handed to rules exactly as received, and so
-            // are the engine-synthesised integers.
-            Self::Method
-            | Self::ContentLength
-            | Self::ContentType
-            | Self::UserAgent
-            | Self::PathLength
-            | Self::QueryArgCount
-            | Self::HeaderReferer
-            | Self::HeaderHost
-            | Self::HeaderRange
-            | Self::HeaderCount(_)
-            // Unreachable for the multi-valued variants, which never route
-            // through `scalar`; `Verbatim` is the conservative answer.
-            | Self::Multi(_)
-            | Self::Headers
-            | Self::Cookies => Decoding::Verbatim,
-        }
-    }
-
     /// The single value of a scalar field, or `None` for multi-valued fields
     /// and for scalar fields absent from the request.
-    fn scalar(self, ctx: &RequestCtx) -> Option<Cow<'_, str>> {
+    fn scalar<'v>(self, view: &'v RequestView<'_>) -> Option<Cow<'v, str>> {
+        let ctx = view.ctx;
         let header = |name: &str| ctx.headers.get(name).map(|v| Cow::Borrowed(v.as_str()));
         match self {
             Self::Method => Some(Cow::Borrowed(ctx.method.as_str())),
-            Self::Path => Some(Cow::Borrowed(ctx.path.as_str())),
-            Self::Query => Some(Cow::Borrowed(ctx.query.as_str())),
-            Self::Body => Some(String::from_utf8_lossy(&ctx.body_preview)),
+            Self::Path => Some(Cow::Borrowed(view.path.as_ref())),
+            Self::PathRaw => Some(Cow::Borrowed(ctx.path.as_str())),
+            Self::Query => Some(Cow::Borrowed(view.query.as_ref())),
+            Self::Body => Some(Cow::Borrowed(view.body.as_ref())),
             Self::ContentLength => Some(Cow::Owned(ctx.content_length.to_string())),
             Self::ContentType => header("content-type"),
             Self::UserAgent => header("user-agent"),
@@ -708,31 +733,33 @@ impl Field {
     /// `matched_value` (`ModSecurity` `MATCHED_VARS`) condition can be applied
     /// to them, so the whole expansion is collected — but only after the head
     /// condition has already matched, so this never runs on ordinary traffic.
-    fn collect_values<'a>(self, ctx: &'a RequestCtx) -> Vec<(Cow<'a, str>, Decoding)> {
-        let escaped = Decoding::Escaped;
-        let verbatim = Decoding::Verbatim;
+    fn collect_values<'v>(self, view: &'v RequestView<'_>) -> Vec<Cow<'v, str>> {
+        let ctx = view.ctx;
         match self {
             Self::Multi(s) => {
-                let mut out: Vec<(Cow<'a, str>, Decoding)> = Vec::new();
-                let header = |name: &str, out: &mut Vec<(Cow<'a, str>, Decoding)>| {
+                let mut out: Vec<Cow<'v, str>> = Vec::new();
+                let header = |name: &str, out: &mut Vec<Cow<'v, str>>| {
                     if let Some(value) = ctx.headers.get(name) {
-                        out.push((Cow::Borrowed(value.as_str()), verbatim));
+                        out.push(Cow::Borrowed(value.as_str()));
                     }
                 };
                 if s.has(Surfaces::PATH) {
-                    out.push((Cow::Borrowed(ctx.path.as_str()), escaped));
+                    out.push(Cow::Borrowed(view.path.as_ref()));
+                }
+                if s.has(Surfaces::PATH_RAW) {
+                    out.push(Cow::Borrowed(ctx.path.as_str()));
                 }
                 if s.has(Surfaces::QUERY) {
-                    out.push((Cow::Borrowed(ctx.query.as_str()), escaped));
+                    out.push(Cow::Borrowed(view.query.as_ref()));
                 }
                 if s.has(Surfaces::BODY) {
-                    out.push((String::from_utf8_lossy(&ctx.body_preview), escaped));
+                    out.push(Cow::Borrowed(view.body.as_ref()));
                 }
                 if s.has(Surfaces::COOKIES) {
-                    out.extend(cookie_values(ctx).map(|v| (Cow::Borrowed(v), escaped)));
+                    out.extend(cookie_values(ctx).map(Cow::Borrowed));
                 }
                 if s.has(Surfaces::HEADER_VALUES) {
-                    out.extend(ctx.headers.values().map(|v| (Cow::Borrowed(v.as_str()), verbatim)));
+                    out.extend(ctx.headers.values().map(|v| Cow::Borrowed(v.as_str())));
                 }
                 if s.has(Surfaces::USER_AGENT) {
                     header("user-agent", &mut out);
@@ -745,52 +772,35 @@ impl Field {
             Self::Headers => ctx
                 .headers
                 .iter()
-                .flat_map(|(name, value)| {
-                    [
-                        (Cow::Borrowed(name.as_str()), verbatim),
-                        (Cow::Borrowed(value.as_str()), verbatim),
-                    ]
-                })
+                .flat_map(|(name, value)| [Cow::Borrowed(name.as_str()), Cow::Borrowed(value.as_str())])
                 .collect(),
-            Self::Cookies => cookie_values(ctx).map(|v| (Cow::Borrowed(v), escaped)).collect(),
-            _ => self
-                .scalar(ctx)
-                .map(|v| (v, self.scalar_decoding()))
-                .into_iter()
-                .collect(),
+            Self::Cookies => cookie_values(ctx).map(Cow::Borrowed).collect(),
+            _ => self.scalar(view).into_iter().collect(),
         }
     }
 
     /// Apply `f` to every value this field expands to, short-circuiting on the
     /// first `true`.
     ///
-    /// `f` is told, per value, whether the surface it came from is one
-    /// `ModSecurity` would have percent-decoded before a rule saw it.
-    fn any_value(self, ctx: &RequestCtx, mut f: impl FnMut(&str, Decoding) -> bool) -> bool {
-        let escaped = Decoding::Escaped;
-        let verbatim = Decoding::Verbatim;
+    /// Values arrive as the request parser produced them; the caller applies
+    /// the rule's own `t:` chain on top.
+    fn any_value(self, view: &RequestView<'_>, mut f: impl FnMut(&str) -> bool) -> bool {
+        let ctx = view.ctx;
         match self {
             Self::Multi(s) => {
-                let header = |name: &str, f: &mut dyn FnMut(&str, Decoding) -> bool| {
-                    ctx.headers.get(name).is_some_and(|v| f(v, verbatim))
-                };
-                (s.has(Surfaces::PATH) && f(&ctx.path, escaped))
-                    || (s.has(Surfaces::QUERY) && f(&ctx.query, escaped))
-                    || (s.has(Surfaces::BODY) && f(&String::from_utf8_lossy(&ctx.body_preview), escaped))
-                    || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(|v| f(v, escaped)))
-                    || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| f(v, verbatim)))
+                let header = |name: &str, f: &mut dyn FnMut(&str) -> bool| ctx.headers.get(name).is_some_and(|v| f(v));
+                (s.has(Surfaces::PATH) && f(&view.path))
+                    || (s.has(Surfaces::PATH_RAW) && f(&ctx.path))
+                    || (s.has(Surfaces::QUERY) && f(&view.query))
+                    || (s.has(Surfaces::BODY) && f(&view.body))
+                    || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(&mut f))
+                    || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| f(v)))
                     || (s.has(Surfaces::USER_AGENT) && header("user-agent", &mut f))
                     || (s.has(Surfaces::REFERER) && header("referer", &mut f))
             }
-            Self::Headers => ctx
-                .headers
-                .iter()
-                .any(|(name, value)| f(name, verbatim) || f(value, verbatim)),
-            Self::Cookies => cookie_values(ctx).any(|v| f(v, escaped)),
-            _ => self
-                .scalar(ctx)
-                .as_deref()
-                .is_some_and(|v| f(v, self.scalar_decoding())),
+            Self::Headers => ctx.headers.iter().any(|(name, value)| f(name) || f(value)),
+            Self::Cookies => cookie_values(ctx).any(&mut f),
+            _ => self.scalar(view).as_deref().is_some_and(f),
         }
     }
 }
@@ -808,47 +818,182 @@ fn cookie_values(ctx: &RequestCtx) -> impl Iterator<Item = &str> + '_ {
         .filter(|value| !value.is_empty())
 }
 
-/// Whether a value arrives at a rule percent-decoded upstream.
+// ── Request view ──────────────────────────────────────────────────────────────
+
+/// `(chain id, value address, value length)` → that chain's output for that
+/// value, or `None` when the chain left it alone.
+type TransformMemo = HashMap<(u32, usize, usize), Option<Rc<str>>>;
+
+/// The request as `ModSecurity`'s parser hands it to a rule, built once per
+/// request.
 ///
-/// `ModSecurity` does not hand CRS the bytes off the wire.  `ARGS`,
-/// `REQUEST_COOKIES` and the normalised `REQUEST_URI` / `REQUEST_FILENAME` are
-/// percent-decoded by the parser before any rule runs, and most CRS rules for
-/// those surfaces additionally carry `t:urlDecodeUni`; the patterns are written
-/// accordingly.  `REQUEST_HEADERS` is the deliberate exception — a header value
-/// is delivered to the origin exactly as sent, so CRS leaves it alone, and its
-/// header rules are written against raw text.  Decoding a header anyway
-/// manufactures false positives: CRS-932131 looks for the shell construct
-/// `/name[index]`, which any ordinary `Referer` carrying `%5B0%5D` would
-/// produce once decoded.
+/// `ModSecurity` does not give CRS the bytes off the wire.  Before any rule
+/// runs, its parser percent-decodes the URI into `REQUEST_URI` /
+/// `REQUEST_FILENAME` and the query/body into the `ARGS` collection; the `t:`
+/// chain a rule declares then runs on *that*.  Reproducing the two steps in the
+/// right order is what makes a CRS pattern mean the same thing here as
+/// upstream, and doing the first step once per request instead of once per rule
+/// is what keeps encoded traffic at the cost of unencoded traffic — 200+ rules
+/// share these three strings.
 ///
-/// Carried alongside each value so one matcher can serve both kinds of surface
-/// — a composite field such as `path+query+body+cookies+headers` mixes them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Decoding {
-    /// Percent-encoded surface: test the raw and decoded forms.
-    Escaped,
-    /// Verbatim surface: test exactly what was received.
-    Verbatim,
+/// What is deliberately **not** decoded:
+///
+/// * `REQUEST_URI_RAW` / `REQUEST_LINE` ([`Field::PathRaw`]) — the surface
+///   CRS-920610 and CRS-930100 are written against.
+/// * `REQUEST_HEADERS`, including `Cookie` — neither `ModSecurity` v2 nor v3
+///   percent-decodes a header or a cookie value; the CRS rules that need it
+///   attach `t:urlDecodeUni` themselves (CRS-941100, CRS-941181), and decoding
+///   headers unasked is what turns an ordinary `Referer` carrying `%5B0%5D`
+///   into CRS-932131's shell construct `/name[index]`.
+struct RequestView<'a> {
+    ctx: &'a RequestCtx,
+    /// `REQUEST_URI` / `REQUEST_FILENAME`: percent-decoded.  `+` is left alone
+    /// — it is a literal plus in a path, not a space.
+    path: Cow<'a, str>,
+    /// `ARGS` / `ARGS_NAMES` from the query string: percent- and `+`-decoded.
+    ///
+    /// The engine has no per-parameter splitter, so a rule is handed the whole
+    /// `a=1&b=2` string with every parameter decoded in place, rather than one
+    /// decoded value at a time.
+    query: Cow<'a, str>,
+    /// `ARGS_POST` / `REQUEST_BODY`: the body preview as lossy UTF-8, then
+    /// percent- and `+`-decoded, on the same whole-surface approximation as
+    /// [`Self::query`].
+    body: Cow<'a, str>,
+    /// `(chain id, value address, value length)` → what that chain made of that
+    /// value, for the current request.
+    ///
+    /// Two hundred-odd rules read the same handful of surfaces through 39
+    /// distinct chains, so without this the same `t:lowercase` of the same 2 KB
+    /// query runs 35 times.  Keying on the address is sound because the only
+    /// values memoised are the ones that live for the whole request — the
+    /// surfaces owned by this view and the header/cookie text owned by the
+    /// context.  Chain links transform short-lived temporaries and take the
+    /// uncached path.
+    memo: RefCell<TransformMemo>,
 }
 
-/// `true` when percent-decoding `s` could possibly change it.
+impl<'a> RequestView<'a> {
+    fn new(ctx: &'a RequestCtx) -> Self {
+        let lossy = String::from_utf8_lossy(&ctx.body_preview);
+        let boundary = ctx.headers.get("content-type").and_then(|ct| multipart_boundary(ct));
+        let body = match (boundary, lossy) {
+            // A multipart envelope is not `ARGS`; see `multipart_payloads`.
+            (Some(boundary), envelope) => Cow::Owned(multipart_payloads(&envelope, boundary)),
+            (None, Cow::Borrowed(text)) => percent_decode(text, Plus::IsSpace),
+            (None, Cow::Owned(text)) => Cow::Owned(percent_decoded(&text, Plus::IsSpace).unwrap_or(text)),
+        };
+        Self {
+            ctx,
+            path: percent_decode(&ctx.path, Plus::IsLiteral),
+            query: percent_decode(&ctx.query, Plus::IsSpace),
+            body,
+            memo: RefCell::new(TransformMemo::new()),
+        }
+    }
+
+    /// `value` with `chain` applied, reusing this request's earlier answer for
+    /// the same chain and the same value.
+    ///
+    /// `None` means the chain left the value alone, which is the answer for an
+    /// identity chain and for the many chains that are no-ops on ordinary
+    /// traffic — the caller then matches against `value` itself and nothing is
+    /// allocated at all.
+    fn transformed(&self, chain: &TransformChain, value: &str) -> Option<Rc<str>> {
+        if chain.is_identity() {
+            return None;
+        }
+        if chain.id == TransformChain::UNINTERNED {
+            return chain.apply(value).map(Rc::from);
+        }
+        let key = (chain.id, value.as_ptr() as usize, value.len());
+        if let Some(hit) = self.memo.borrow().get(&key) {
+            return hit.clone();
+        }
+        let produced = chain.apply(value).map(Rc::from);
+        self.memo.borrow_mut().insert(key, produced.clone());
+        produced
+    }
+}
+
+/// The `boundary=` parameter of a `multipart/*` content type.
+fn multipart_boundary(content_type: &str) -> Option<&str> {
+    let lower = content_type.to_ascii_lowercase();
+    if !lower.trim_start().starts_with("multipart/") {
+        return None;
+    }
+    let at = lower.find("boundary=")?;
+    let rest = content_type.get(at.saturating_add("boundary=".len())..)?;
+    let value = rest.split(';').next().unwrap_or(rest).trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(value);
+    (!value.is_empty()).then_some(value)
+}
+
+/// What `ModSecurity` would put in `ARGS_POST` / `ARGS_NAMES` / `FILES_NAMES`
+/// for a `multipart/form-data` body: each part's payload, plus the quoted
+/// parameter values (`name="x"`, `filename="y"`) from its headers.
 ///
-/// `%` starts an escape and `+` is the form-encoded space; a value holding
-/// neither is its own decoded form, so the caller can skip the decode and the
-/// allocation it needs.  This guard is what keeps ordinary unencoded traffic at
-/// the cost it had before decoded matching existed.
+/// The MIME envelope itself — boundary lines and the `Content-Disposition:` /
+/// `Content-Type:` header *names* — never reaches an `ARGS` rule upstream, and
+/// handing it over anyway is a false-positive generator: CRS-921120 hunts
+/// `\r\n...content-type:` as a response-splitting payload, which every ordinary
+/// file upload contains verbatim.  (It stayed hidden only while the engine
+/// skipped the rule's `t:lowercase` and so never matched `Content-Type`.)
+fn multipart_payloads(body: &str, boundary: &str) -> String {
+    let delimiter = format!("--{boundary}");
+    let mut out = String::with_capacity(body.len());
+    let mut push = |text: &str| {
+        if text.is_empty() {
+            return;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+    };
+    for part in body.split(delimiter.as_str()).skip(1) {
+        let Some((headers, payload)) = part.split_once("\r\n\r\n").or_else(|| part.split_once("\n\n")) else {
+            // Preamble, epilogue, or the closing `--` delimiter.
+            continue;
+        };
+        // Quoted parameter values are the part's name and file name; upstream
+        // exposes those as collection members, so they stay in scope.
+        for (index, chunk) in headers.split('"').enumerate() {
+            if index % 2 == 1 {
+                push(chunk);
+            }
+        }
+        push(payload.strip_suffix("\r\n").unwrap_or(payload));
+    }
+    out
+}
+
+/// Whether `+` decodes to a space on the surface being decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plus {
+    /// Form encoding (query string, urlencoded body).
+    IsSpace,
+    /// Path components, where `+` is an ordinary character.
+    IsLiteral,
+}
+
+/// `true` when `bytes` holds `first` or `second`, scanned a word at a time.
 ///
-/// It runs once per rule per escaped surface — hundreds of times per request —
-/// so it scans a word at a time.  A plain `bytes().any(..)` loop measured
-/// ~125 us on a 2 KB unencoded query string, more than the CRS regexes the
-/// guard exists to skip.
-fn may_be_encoded(s: &str) -> bool {
+/// Every transformation is fronted by a "can this possibly change anything"
+/// test, and on a clean request that test *is* the cost: 133 of the shipped
+/// conditions carry `t:urlDecodeUni` and each one asks whether a 2 KB query
+/// holds a `%`.  A plain `bytes().any(..)` loop measured ~125 us per pass on
+/// that input — more than the CRS regexes the guard exists to skip.
+///
+/// Pass the same byte twice to look for one marker.
+fn contains_marker(bytes: &[u8], first: u8, second: u8) -> bool {
     /// `0x01` in every byte lane.
     const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
     /// `0x80` in every byte lane.
     const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
-    const PERCENTS: u64 = u64::from_ne_bytes([b'%'; 8]);
-    const PLUSES: u64 = u64::from_ne_bytes([b'+'; 8]);
 
     /// `true` when any byte lane of `word` is zero.
     ///
@@ -859,64 +1004,862 @@ fn may_be_encoded(s: &str) -> bool {
         word.wrapping_sub(ONES) & !word & HIGHS != 0
     }
 
-    let bytes = s.as_bytes();
+    let firsts = u64::from_ne_bytes([first; 8]);
+    let seconds = u64::from_ne_bytes([second; 8]);
     let mut chunks = bytes.chunks_exact(8);
     for chunk in &mut chunks {
         let Ok(lanes) = <[u8; 8]>::try_from(chunk) else {
             // `chunks_exact(8)` yields nothing but 8-byte chunks; fall back to
             // the byte scan rather than assume it.
-            return bytes.iter().any(|&b| b == b'%' || b == b'+');
+            return bytes.iter().any(|&b| b == first || b == second);
         };
         let word = u64::from_ne_bytes(lanes);
-        if has_zero_lane(word ^ PERCENTS) || has_zero_lane(word ^ PLUSES) {
+        if has_zero_lane(word ^ firsts) || has_zero_lane(word ^ seconds) {
             return true;
         }
     }
-    chunks.remainder().iter().any(|&b| b == b'%' || b == b'+')
+    chunks.remainder().iter().any(|&b| b == first || b == second)
 }
 
-/// Apply `f` to `raw` and, on a [`Decoding::Escaped`] surface that looks
-/// percent/plus-encoded, to its single- and recursively-decoded forms,
-/// reporting *which* form matched.
+/// `true` when percent-decoding `bytes` could possibly change them.
 ///
-/// `ModSecurity` hands CRS patterns an already-decoded value: `ARGS`,
-/// `REQUEST_COOKIES` and `REQUEST_FILENAME` are percent-decoded by the parser
-/// before a rule ever sees them, and most CRS rules additionally attach
-/// `t:urlDecodeUni`.  A matcher that only inspected the raw bytes off the wire
-/// would therefore be evaded by writing the payload percent-encoded, which is
-/// the default way every HTTP client sends it anyway.
+/// `%` starts an escape and `+` is the form-encoded space; a value holding
+/// neither is its own decoded form, so the caller can skip the decode and the
+/// allocation it needs.
+fn may_be_encoded(bytes: &[u8]) -> bool {
+    contains_marker(bytes, b'%', b'+')
+}
+
+/// Percent-decode `input`, returning `None` when nothing changed.
 ///
-/// The matched form is reported rather than a bare `bool` because
-/// `ModSecurity` `MATCHED_VARS` holds the *transformed* value: a follow-up
-/// condition in a chain must see the decoded text the first condition actually
-/// matched, not the raw bytes off the wire.
+/// Non-strict, as `ModSecurity`'s parser is: a `%` that does not introduce two
+/// hex digits is kept verbatim rather than rejecting the request.
+fn percent_decoded(input: &str, plus: Plus) -> Option<String> {
+    let bytes = input.as_bytes();
+    if !may_be_encoded(bytes) {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).copied().and_then(hex_value),
+                bytes.get(i + 2).copied().and_then(hex_value),
+            )
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+            continue;
+        }
+        if b == b'+' && plus == Plus::IsSpace {
+            out.push(b' ');
+        } else {
+            out.push(b);
+        }
+        i += 1;
+    }
+    (out.as_slice() != bytes).then(|| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Percent-decode `input`, borrowing when nothing changed.
+fn percent_decode(input: &str, plus: Plus) -> Cow<'_, str> {
+    percent_decoded(input, plus).map_or(Cow::Borrowed(input), Cow::Owned)
+}
+
+/// Numeric value of one ASCII hex digit.
+const fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+// ── ModSecurity transformations ───────────────────────────────────────────────
+
+/// One `ModSecurity` `t:` transformation.
 ///
-/// Generic rather than `&mut dyn FnMut` so the matcher — a regex step or a
-/// single `str` comparison — inlines into the raw-value test that answers
-/// almost every call.
-fn matching_form<F: FnMut(&str) -> bool>(raw: &str, decoding: Decoding, mut f: F) -> Outcome {
-    if f(raw) {
-        return Outcome::Match(MatchForm::Same);
+/// A CRS pattern is written against the *output* of the rule's transformation
+/// chain, so the chain is part of the rule, not an optimisation: CRS-944120's
+/// pattern is `invokertransformer` in lower case and only ever matches real
+/// traffic because `t:lowercase` ran first, while CRS-920230's `%[0-9a-fA-F]{2}`
+/// only means "double encoding" because *no* transformation ran.  A
+/// transformation this engine cannot perform therefore rejects the rule
+/// ([`RejectReason::UnsupportedTransformation`]) rather than being skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Transform {
+    Lowercase,
+    UrlDecodeUni,
+    HtmlEntityDecode,
+    JsDecode,
+    CssDecode,
+    EscapeSeqDecode,
+    Utf8ToUnicode,
+    RemoveNulls,
+    RemoveWhitespace,
+    CompressWhitespace,
+    ReplaceComments,
+    RemoveCommentsChar,
+    NormalizePath,
+    NormalizePathWin,
+    CmdLine,
+    Base64Decode,
+    Length,
+}
+
+/// Whitespace as `ModSecurity`'s whitespace transformations define it — the
+/// ASCII set plus the Latin-1 non-breaking space.
+const fn is_modsec_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c | 0xa0)
+}
+
+impl Transform {
+    /// Resolve a `ModSecurity` transformation name.  Case-insensitive, as the
+    /// `SecRule` parser is.
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            // `t:none` clears the chain and is applied by the converter, so it
+            // never reaches the engine as a step of its own.
+            "lowercase" => Self::Lowercase,
+            // `t:urlDecode` is `t:urlDecodeUni` minus the `%uXXXX` form.  CRS
+            // v4.25.0 uses only the latter; the plain spelling is accepted so a
+            // hand-written rule can ask for it, and resolves to the same step —
+            // percent decoding is identical and no CRS pattern distinguishes a
+            // value that had no `%uXXXX` in it to begin with.
+            "urldecodeuni" | "urldecode" => Self::UrlDecodeUni,
+            "htmlentitydecode" => Self::HtmlEntityDecode,
+            "jsdecode" => Self::JsDecode,
+            "cssdecode" => Self::CssDecode,
+            "escapeseqdecode" => Self::EscapeSeqDecode,
+            "utf8tounicode" => Self::Utf8ToUnicode,
+            "removenulls" => Self::RemoveNulls,
+            "removewhitespace" => Self::RemoveWhitespace,
+            "compresswhitespace" => Self::CompressWhitespace,
+            "replacecomments" => Self::ReplaceComments,
+            "removecommentschar" => Self::RemoveCommentsChar,
+            "normalizepath" => Self::NormalizePath,
+            "normalizepathwin" => Self::NormalizePathWin,
+            "cmdline" => Self::CmdLine,
+            "base64decode" => Self::Base64Decode,
+            "length" => Self::Length,
+            _ => return None,
+        })
     }
-    if decoding == Decoding::Verbatim || !may_be_encoded(raw) {
-        return Outcome::NoMatch;
+
+    /// Apply the transformation.  `None` means "output identical to input", so
+    /// a chain of no-ops on ordinary traffic allocates nothing.
+    ///
+    /// Every step is guarded by the cheapest test that can prove it a no-op —
+    /// `t:lowercase` on lower-case text, `t:urlDecodeUni` on a value with no
+    /// escapes — because on a clean request that is what almost every step is,
+    /// and a copy per rule per surface is exactly the cost this rewrite exists
+    /// to remove.
+    fn apply(self, input: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            Self::Lowercase => input
+                .iter()
+                .any(u8::is_ascii_uppercase)
+                .then(|| input.iter().map(u8::to_ascii_lowercase).collect::<Vec<u8>>()),
+            Self::UrlDecodeUni => url_decode_uni(input),
+            Self::HtmlEntityDecode => html_entity_decode(input),
+            Self::JsDecode => js_decode(input),
+            Self::CssDecode => css_decode(input),
+            Self::EscapeSeqDecode => escape_seq_decode(input),
+            Self::Utf8ToUnicode => utf8_to_unicode(input),
+            Self::RemoveNulls => {
+                contains_marker(input, 0, 0).then(|| input.iter().copied().filter(|b| *b != 0).collect::<Vec<u8>>())
+            }
+            Self::RemoveWhitespace => input.iter().any(|b| is_modsec_space(*b)).then(|| {
+                input
+                    .iter()
+                    .copied()
+                    .filter(|b| !is_modsec_space(*b))
+                    .collect::<Vec<u8>>()
+            }),
+            Self::CompressWhitespace => input
+                .iter()
+                .any(|b| is_modsec_space(*b))
+                .then(|| compress_whitespace(input))
+                .filter(|out| out.as_slice() != input),
+            Self::ReplaceComments => contains_marker(input, b'*', b'*')
+                .then(|| replace_comments(input))
+                .filter(|out| out.as_slice() != input),
+            Self::RemoveCommentsChar => input
+                .iter()
+                .any(|b| matches!(b, b'/' | b'*' | b'-' | b'#' | b'<'))
+                .then(|| remove_comments_char(input))
+                .filter(|out| out.as_slice() != input),
+            Self::NormalizePath => normalize_path(input, false),
+            Self::NormalizePathWin => normalize_path(input, true),
+            Self::CmdLine => changed(input, || cmd_line(input)),
+            Self::Base64Decode => changed(input, || base64_decode(input)),
+            // `t:length` replaces the value with its length; the only input it
+            // leaves alone is one that already spells its own length.
+            Self::Length => changed(input, || input.len().to_string().into_bytes()),
+        }
     }
-    let decoded = url_decode(raw);
-    if decoded != raw && f(&decoded) {
-        return Outcome::Match(MatchForm::Transformed(decoded));
+}
+
+/// Value of up to three octal digits at `start`.
+fn octal_value(input: &[u8], start: usize, digits: usize) -> u8 {
+    let mut value: u32 = 0;
+    for offset in 0..digits {
+        let digit = input.get(start + offset).copied().unwrap_or(b'0');
+        value = value * 8 + u32::from(digit.saturating_sub(b'0'));
     }
-    // A second pass can only differ when the first one left an escape behind,
-    // which is what a double-encoded payload does and ordinary traffic does
-    // not.  Checking that before recursing keeps the singly-encoded case — the
-    // overwhelmingly common one — down to a single decode allocation.
-    if !may_be_encoded(&decoded) {
-        return Outcome::NoMatch;
+    #[allow(clippy::cast_possible_truncation)]
+    let byte = (value & 0xff) as u8;
+    byte
+}
+
+/// Run `build` and report the result only when it differs from `input`.
+fn changed(input: &[u8], build: impl FnOnce() -> Vec<u8>) -> Option<Vec<u8>> {
+    let out = build();
+    (out.as_slice() != input).then_some(out)
+}
+
+/// `ModSecurity` `t:urlDecodeUni`: percent decoding plus the IIS `%uXXXX` form.
+///
+/// Non-strict: an escape that does not parse is copied through. `%uXXXX` keeps
+/// the low byte, and a full-width ASCII code point (`U+FF01`..`U+FF5E`) folds to
+/// its ASCII twin, both as `urldecode_uni_nonstrict` does.
+fn url_decode_uni(input: &[u8]) -> Option<Vec<u8>> {
+    if !may_be_encoded(input) {
+        return None;
     }
-    let recursive = url_decode_recursive(raw);
-    if recursive != decoded && f(&recursive) {
-        return Outcome::Match(MatchForm::Transformed(recursive));
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while let Some(&b) = input.get(i) {
+        if b == b'%' {
+            if matches!(input.get(i + 1), Some(b'u' | b'U')) {
+                let digits = (input.get(i + 2), input.get(i + 3), input.get(i + 4), input.get(i + 5));
+                if let (Some(&h3), Some(&h2), Some(&h1), Some(&h0)) = digits
+                    && hex_value(h3).is_some()
+                    && hex_value(h2).is_some()
+                    && let (Some(hi), Some(lo)) = (hex_value(h1), hex_value(h0))
+                {
+                    let mut byte = hi * 16 + lo;
+                    if byte > 0x00 && byte < 0x5f && h3.eq_ignore_ascii_case(&b'f') && h2.eq_ignore_ascii_case(&b'f') {
+                        byte += 0x20;
+                    }
+                    out.push(byte);
+                    i += 6;
+                    continue;
+                }
+            } else if let (Some(hi), Some(lo)) = (
+                input.get(i + 1).copied().and_then(hex_value),
+                input.get(i + 2).copied().and_then(hex_value),
+            ) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+            out.push(b'%');
+        } else if b == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(b);
+        }
+        i += 1;
     }
-    Outcome::NoMatch
+    (out.as_slice() != input).then_some(out)
+}
+
+/// The named HTML entities `ModSecurity` implements, longest first so that
+/// `&amp` is not read as `&am`.
+const HTML_ENTITIES: [(&[u8], u8); 5] = [
+    (b"quot", b'"'),
+    (b"nbsp", 0xa0),
+    (b"amp", b'&'),
+    (b"lt", b'<'),
+    (b"gt", b'>'),
+];
+
+/// `ModSecurity` `t:htmlEntityDecode`.
+///
+/// Handles `&#nn;`, `&#xhh;` and the five named entities `ModSecurity`
+/// implements (`quot`, `amp`, `lt`, `gt`, `nbsp`), case-insensitively and with
+/// the trailing semicolon optional.  A numeric entity above `U+00FF` keeps its
+/// low byte, matching the byte-oriented upstream implementation.
+fn html_entity_decode(input: &[u8]) -> Option<Vec<u8>> {
+    if !contains_marker(input, b'&', b'&') {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while let Some(&b) = input.get(i) {
+        if b != b'&' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let mut cursor = i + 1;
+        let mut value: Option<u8> = None;
+        if input.get(cursor) == Some(&b'#') {
+            cursor += 1;
+            let hex = matches!(input.get(cursor), Some(b'x' | b'X'));
+            if hex {
+                cursor += 1;
+            }
+            let radix: u32 = if hex { 16 } else { 10 };
+            let start = cursor;
+            let mut number: u32 = 0;
+            while let Some(digit) = input.get(cursor).copied().and_then(|c| char::from(c).to_digit(radix)) {
+                number = number.saturating_mul(radix).saturating_add(digit);
+                cursor += 1;
+            }
+            if cursor > start {
+                // Keep the low byte, as the byte-oriented upstream does.
+                #[allow(clippy::cast_possible_truncation)]
+                let byte = (number & 0xff) as u8;
+                value = Some(byte);
+            }
+        } else {
+            for (name, byte) in HTML_ENTITIES {
+                let end = cursor + name.len();
+                if input
+                    .get(cursor..end)
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+                {
+                    value = Some(byte);
+                    cursor = end;
+                    break;
+                }
+            }
+        }
+        if let Some(byte) = value {
+            out.push(byte);
+            if input.get(cursor) == Some(&b';') {
+                cursor += 1;
+            }
+            i = cursor;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    (out.as_slice() != input).then_some(out)
+}
+
+/// `ModSecurity` `t:jsDecode`: JavaScript escape sequences.
+///
+/// `\uHHHH` keeps the low byte with the same full-width ASCII fold as
+/// `t:urlDecodeUni`; `\xHH` and `\OOO` decode; the single-character escapes
+/// `\a \b \f \n \r \t \v` become their control character; any other `\C` drops
+/// the backslash, which is exactly how an attacker hides a keyword.
+fn js_decode(input: &[u8]) -> Option<Vec<u8>> {
+    if !contains_marker(input, b'\\', b'\\') {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while let Some(&b) = input.get(i) {
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let next = input.get(i + 1).copied();
+        if next == Some(b'u')
+            && let (Some(h3), Some(h2), Some(h1), Some(h0)) = (
+                input.get(i + 2).copied(),
+                input.get(i + 3).copied(),
+                input.get(i + 4).copied(),
+                input.get(i + 5).copied(),
+            )
+            && hex_value(h3).is_some()
+            && hex_value(h2).is_some()
+            && let (Some(hi), Some(lo)) = (hex_value(h1), hex_value(h0))
+        {
+            let mut byte = hi * 16 + lo;
+            if byte > 0x00 && byte < 0x5f && h3.eq_ignore_ascii_case(&b'f') && h2.eq_ignore_ascii_case(&b'f') {
+                byte += 0x20;
+            }
+            out.push(byte);
+            i += 6;
+            continue;
+        }
+        if next == Some(b'x')
+            && let (Some(hi), Some(lo)) = (
+                input.get(i + 2).copied().and_then(hex_value),
+                input.get(i + 3).copied().and_then(hex_value),
+            )
+        {
+            out.push(hi * 16 + lo);
+            i += 4;
+            continue;
+        }
+        if let Some(first) = next
+            && (b'0'..=b'7').contains(&first)
+        {
+            let mut digits = 0usize;
+            while digits < 3
+                && let Some(&d) = input.get(i + 1 + digits)
+                && (b'0'..=b'7').contains(&d)
+            {
+                digits += 1;
+            }
+            // Three digits only fit in one byte when the first is 0-3; upstream
+            // drops the third rather than overflowing.
+            if digits == 3 && first > b'3' {
+                digits = 2;
+            }
+            let value = octal_value(input, i + 1, digits);
+            out.push(value);
+            i += 1 + digits;
+            continue;
+        }
+        if let Some(c) = next {
+            out.push(match c {
+                b'a' => 0x07,
+                b'b' => 0x08,
+                b'f' => 0x0c,
+                b'n' => b'\n',
+                b'r' => b'\r',
+                b't' => b'\t',
+                b'v' => 0x0b,
+                other => other,
+            });
+            i += 2;
+        } else {
+            // A trailing backslash escapes nothing and stands for itself.
+            out.push(b);
+            i += 1;
+        }
+    }
+    (out.as_slice() != input).then_some(out)
+}
+
+/// `ModSecurity` `t:cssDecode`: CSS `\hhhhhh` escapes.
+///
+/// One to six hex digits after a backslash form an escape; the last two digits
+/// give the byte, a four-or-more-digit escape whose leading digits are `ff`
+/// folds full-width ASCII to its twin, and one following space is consumed.  A
+/// backslash before anything else simply disappears, which is how `ex\pression`
+/// hides a keyword.
+fn css_decode(input: &[u8]) -> Option<Vec<u8>> {
+    if !contains_marker(input, b'\\', b'\\') {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while let Some(&b) = input.get(i) {
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut digits = 0usize;
+        while digits < 6 && input.get(start + digits).copied().and_then(hex_value).is_some() {
+            digits += 1;
+        }
+        if digits == 0 {
+            match input.get(start) {
+                // A backslash-newline is a CSS line continuation: both go.
+                Some(b'\n') => i = start + 1,
+                Some(&other) => {
+                    out.push(other);
+                    i = start + 1;
+                }
+                None => {
+                    out.push(b);
+                    i = start;
+                }
+            }
+            continue;
+        }
+        let value = if digits == 1 {
+            input.get(start).copied().and_then(hex_value).unwrap_or(0)
+        } else {
+            let hi = input.get(start + digits - 2).copied().and_then(hex_value).unwrap_or(0);
+            let lo = input.get(start + digits - 1).copied().and_then(hex_value).unwrap_or(0);
+            hi * 16 + lo
+        };
+        // Full-width ASCII fold, on the two hex digits preceding the byte.
+        let full_width = digits >= 4
+            && value > 0x00
+            && value < 0x5f
+            && input
+                .get(start + digits - 4)
+                .is_some_and(|c| c.eq_ignore_ascii_case(&b'f'))
+            && input
+                .get(start + digits - 3)
+                .is_some_and(|c| c.eq_ignore_ascii_case(&b'f'));
+        out.push(if full_width { value + 0x20 } else { value });
+        i = start + digits;
+        if input.get(i) == Some(&b' ') {
+            i += 1;
+        }
+    }
+    (out.as_slice() != input).then_some(out)
+}
+
+/// `ModSecurity` `t:escapeSeqDecode`: ANSI C escape sequences.
+fn escape_seq_decode(input: &[u8]) -> Option<Vec<u8>> {
+    if !contains_marker(input, b'\\', b'\\') {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while let Some(&b) = input.get(i) {
+        let Some(next) = input.get(i + 1).copied().filter(|_| b == b'\\') else {
+            out.push(b);
+            i += 1;
+            continue;
+        };
+        let simple = match next {
+            b'a' => Some(0x07),
+            b'b' => Some(0x08),
+            b'f' => Some(0x0c),
+            b'n' => Some(b'\n'),
+            b'r' => Some(b'\r'),
+            b't' => Some(b'\t'),
+            b'v' => Some(0x0b),
+            b'\\' => Some(b'\\'),
+            b'?' => Some(b'?'),
+            b'\'' => Some(b'\''),
+            b'"' => Some(b'"'),
+            _ => None,
+        };
+        if let Some(c) = simple {
+            out.push(c);
+            i += 2;
+            continue;
+        }
+        if next == b'x'
+            && let (Some(hi), Some(lo)) = (
+                input.get(i + 2).copied().and_then(hex_value),
+                input.get(i + 3).copied().and_then(hex_value),
+            )
+        {
+            out.push(hi * 16 + lo);
+            i += 4;
+            continue;
+        }
+        if (b'0'..=b'3').contains(&next) {
+            let mut digits = 0usize;
+            while digits < 3
+                && let Some(&d) = input.get(i + 1 + digits)
+                && (b'0'..=b'7').contains(&d)
+            {
+                digits += 1;
+            }
+            out.push(octal_value(input, i + 1, digits));
+            i += 1 + digits;
+            continue;
+        }
+        // Not an escape sequence: the backslash stands for itself.
+        out.push(b);
+        i += 1;
+    }
+    (out.as_slice() != input).then_some(out)
+}
+
+/// `ModSecurity` `t:utf8toUnicode`: rewrite each valid multi-byte UTF-8
+/// sequence as `%uXXXX`, so that `t:urlDecodeUni` can then fold it.
+///
+/// Bytes that are not a valid sequence are copied through, as upstream does.
+fn utf8_to_unicode(input: &[u8]) -> Option<Vec<u8>> {
+    if input.is_ascii() {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while let Some(&b) = input.get(i) {
+        let (len, seed) = if b & 0xe0 == 0xc0 {
+            (2usize, u32::from(b & 0x1f))
+        } else if b & 0xf0 == 0xe0 {
+            (3, u32::from(b & 0x0f))
+        } else if b & 0xf8 == 0xf0 {
+            (4, u32::from(b & 0x07))
+        } else {
+            (0, 0)
+        };
+        let mut code = seed;
+        let mut valid = len > 0;
+        if valid {
+            for offset in 1..len {
+                match input.get(i + offset) {
+                    Some(&cont) if cont & 0xc0 == 0x80 => code = (code << 6) | u32::from(cont & 0x3f),
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if valid {
+            out.extend_from_slice(format!("%u{code:04x}").as_bytes());
+            i += len;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    (out.as_slice() != input).then_some(out)
+}
+
+/// `ModSecurity` `t:compressWhitespace`: runs of whitespace become one space.
+fn compress_whitespace(input: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    let mut in_space = false;
+    for &b in input {
+        if is_modsec_space(b) {
+            if !in_space {
+                out.push(b' ');
+                in_space = true;
+            }
+        } else {
+            in_space = false;
+            out.push(b);
+        }
+    }
+    out
+}
+
+/// `ModSecurity` `t:replaceComments`: each `/* ... */` becomes one space, and an
+/// unterminated `/*` swallows the rest of the value.
+fn replace_comments(input: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    let mut in_comment = false;
+    while let Some(&b) = input.get(i) {
+        if in_comment {
+            if b == b'*' && input.get(i + 1) == Some(&b'/') {
+                in_comment = false;
+                out.push(b' ');
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if b == b'/' && input.get(i + 1) == Some(&b'*') {
+            in_comment = true;
+            i += 2;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    if in_comment {
+        out.push(b' ');
+    }
+    out
+}
+
+/// `ModSecurity` `t:removeCommentsChar`: delete comment markers without
+/// touching what they surround.
+fn remove_comments_char(input: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while let Some(&b) = input.get(i) {
+        let two = |a: u8, c: u8| b == a && input.get(i + 1) == Some(&c);
+        if two(b'/', b'*') || two(b'*', b'/') || two(b'-', b'-') {
+            i += 2;
+        } else if b == b'<' && input.get(i + 1..i + 4) == Some(b"!--".as_slice()) {
+            i += 4;
+        } else if b == b'#' {
+            i += 1;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `ModSecurity` `t:normalizePath` / `t:normalizePathWin`.
+///
+/// Implements the documented semantics — collapse repeated slashes, drop `.`
+/// segments, resolve `..` against the preceding segment, and (for the `Win`
+/// form) treat `\` as a separator.  A leading `..` on a relative path is kept:
+/// there is no segment above it to cancel.  An absolute path cannot be walked
+/// above its root, which is what stops `/../../etc` becoming `/etc` here while
+/// upstream leaves it at the root.
+fn normalize_path(input: &[u8], windows: bool) -> Option<Vec<u8>> {
+    let separators = windows && contains_marker(input, b'\\', b'\\');
+    if !separators && !contains_marker(input, b'.', b'/') {
+        // Nothing to collapse and no reference to resolve.
+        return None;
+    }
+    let source: Cow<'_, [u8]> = if separators {
+        Cow::Owned(input.iter().map(|&b| if b == b'\\' { b'/' } else { b }).collect())
+    } else {
+        Cow::Borrowed(input)
+    };
+    let absolute = source.first() == Some(&b'/');
+    let trailing = source.len() > 1 && source.last() == Some(&b'/');
+
+    let mut segments: Vec<&[u8]> = Vec::new();
+    for segment in source.split(|&b| b == b'/') {
+        match segment {
+            // Repeated separators and self-references contribute nothing.
+            b"" | b"." => {}
+            b".." => match segments.last() {
+                Some(&last) if last != b".." => {
+                    segments.pop();
+                }
+                _ => {
+                    if !absolute {
+                        segments.push(b"..");
+                    }
+                }
+            },
+            other => segments.push(other),
+        }
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(source.len());
+    if absolute {
+        out.push(b'/');
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(segment);
+    }
+    if trailing && !segments.is_empty() {
+        out.push(b'/');
+    }
+    (out.as_slice() != input).then_some(out)
+}
+
+/// `ModSecurity` `t:cmdLine`: fold the shell-quoting tricks that let
+/// `n"e"t` mean `net`.
+///
+/// The documented steps, in order: delete `\ " ' ^`, turn `,` and `;` into
+/// spaces, collapse runs of whitespace into one space, delete a space before
+/// `/` or `(`, and lower-case the rest.
+fn cmd_line(input: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    for &b in input {
+        match b {
+            // Shell quoting characters simply disappear: `n"e"t` is `net`.
+            b'\\' | b'"' | b'\'' | b'^' => {}
+            // `,` and `;` become spaces, and runs of whitespace collapse to one.
+            b',' | b';' => {
+                if out.last() != Some(&b' ') {
+                    out.push(b' ');
+                }
+            }
+            _ if is_modsec_space(b) => {
+                if out.last() != Some(&b' ') {
+                    out.push(b' ');
+                }
+            }
+            b'/' | b'(' => {
+                if out.last() == Some(&b' ') {
+                    out.pop();
+                }
+                out.push(b);
+            }
+            other => out.push(other.to_ascii_lowercase()),
+        }
+    }
+    out
+}
+
+/// `ModSecurity` `t:base64Decode`: decode the leading run of base64, stopping
+/// at padding or at the first character outside the alphabet.
+fn base64_decode(input: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(input.len() / 4 * 3 + 3);
+    let mut accumulator: u32 = 0;
+    let mut bits = 0u32;
+    for &b in input {
+        let Some(value) = base64_value(b) else { break };
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            #[allow(clippy::cast_possible_truncation)]
+            out.push(((accumulator >> bits) & 0xff) as u8);
+        }
+    }
+    out
+}
+
+/// Value of one base64 alphabet character; `None` for padding and anything else.
+const fn base64_value(b: u8) -> Option<u8> {
+    match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// A rule's ordered `t:` chain.
+///
+/// `id` identifies the *step list*, not the rule: the shipped CRS declares 181
+/// transformed conditions but only 39 distinct chains, and 70 of those
+/// conditions are the same single `t:urlDecodeUni`.  Interning them lets one
+/// request transform a surface once per chain instead of once per rule
+/// ([`RequestView::transformed`]).
+struct TransformChain {
+    /// Index into the load's chain table, or [`Self::UNINTERNED`].
+    id: u32,
+    steps: Box<[Transform]>,
+}
+
+impl TransformChain {
+    /// A chain built outside a load (unit tests): never memoised, because its
+    /// id is not a table index.
+    const UNINTERNED: u32 = u32::MAX;
+
+    /// Resolve the names a rule declared, refusing the first one this engine
+    /// cannot perform.
+    fn parse_steps(position: &str, names: &[String]) -> Result<Vec<Transform>, RejectReason> {
+        let mut steps = Vec::with_capacity(names.len());
+        for name in names {
+            let step = Transform::parse(name).ok_or_else(|| RejectReason::UnsupportedTransformation {
+                position: position.to_owned(),
+                name: name.clone(),
+            })?;
+            steps.push(step);
+        }
+        Ok(steps)
+    }
+
+    #[cfg(test)]
+    fn compile(position: &str, names: &[String]) -> Result<Self, RejectReason> {
+        Ok(Self {
+            id: Self::UNINTERNED,
+            steps: Self::parse_steps(position, names)?.into_boxed_slice(),
+        })
+    }
+
+    /// `true` for a rule that declared no transformation (or only `t:none`).
+    fn is_identity(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// Run the chain.  `None` means the value came out unchanged, which is the
+    /// answer for an empty chain and for the many chains that are no-ops on
+    /// ordinary traffic (`t:urlDecodeUni` on a value with no escapes,
+    /// `t:lowercase` on lower-case text), so the hot path allocates nothing.
+    fn apply(&self, value: &str) -> Option<String> {
+        let mut current: Option<Vec<u8>> = None;
+        for step in &self.steps {
+            let next = current
+                .as_ref()
+                .map_or_else(|| step.apply(value.as_bytes()), |buffer| step.apply(buffer));
+            if let Some(next) = next {
+                current = Some(next);
+            }
+        }
+        let bytes = current?;
+        // Byte-level transformations can produce sequences that are not valid
+        // UTF-8 (`t:urlDecodeUni` on `%e4` is one byte of a truncated character).
+        // The matchers work on `str`, so the same lossy conversion the request
+        // body already goes through is applied here.
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (text != value).then_some(text)
+    }
 }
 
 // ── Operands ──────────────────────────────────────────────────────────────────
@@ -1016,19 +1959,9 @@ impl Operand {
 
 // ── Chain evaluation state ────────────────────────────────────────────────────
 
-/// Which form of a value satisfied a matcher.
-///
-/// `Same` means the value as supplied; `Transformed` carries the decoded text
-/// so it, not the raw input, becomes the `matched_value` a later condition
-/// sees.
-enum MatchForm {
-    Same,
-    Transformed(String),
-}
-
 /// Result of testing one value.
 enum Outcome {
-    Match(MatchForm),
+    Match,
     NoMatch,
     /// The comparison could not be made at all — a `%{...}` operand names
     /// something this request does not have.
@@ -1040,28 +1973,19 @@ enum Outcome {
 }
 
 /// Carried between the conditions of one chained rule, for one request.
+///
+/// Both collections hold **transformed** values, as `ModSecurity` does: a
+/// chain link reading `MATCHED_VARS` or `TX:N` sees the text its predecessor's
+/// `t:` chain produced, not the bytes off the wire, and then applies its own
+/// `t:` chain on top of that.
+#[derive(Default)]
 struct ChainState<'a> {
     /// The values the most recent condition matched — `ModSecurity`
-    /// `MATCHED_VAR` / `MATCHED_VARS` — each with the [`Decoding`] of the
-    /// surface it came from.
-    matched: Vec<(Cow<'a, str>, Decoding)>,
+    /// `MATCHED_VAR` / `MATCHED_VARS`.
+    matched: Vec<Cow<'a, str>>,
     /// `tx:0`..`tx:N` from the most recent condition that declared `capture`;
     /// index 0 is the whole match, as in `ModSecurity`.
     captures: Vec<String>,
-    /// The [`Decoding`] of the value those captures were taken from.
-    capture_decoding: Decoding,
-}
-
-impl Default for ChainState<'_> {
-    fn default() -> Self {
-        Self {
-            matched: Vec::new(),
-            captures: Vec::new(),
-            // Nothing has been captured yet; the conservative surface class is
-            // the one that decodes nothing.
-            capture_decoding: Decoding::Verbatim,
-        }
-    }
 }
 
 // ── Compiled rule ─────────────────────────────────────────────────────────────
@@ -1089,28 +2013,16 @@ enum CompiledMatcher {
 }
 
 impl CompiledMatcher {
-    /// Test one value.  `Some` carries the form that matched, which becomes the
-    /// `matched_value` seen by the next condition of a chain.
+    /// Test one value, already transformed by the rule's `t:` chain.
     ///
-    /// `decoding` says whether the surface `value` came from is one upstream
-    /// would have percent-decoded; on a [`Decoding::Verbatim`] surface every
-    /// matcher tests the received bytes and nothing else.
-    fn test(&self, value: &str, decoding: Decoding, ctx: &RequestCtx, state: &ChainState<'_>) -> Outcome {
-        let plain = |hit: bool| {
-            if hit {
-                Outcome::Match(MatchForm::Same)
-            } else {
-                Outcome::NoMatch
-            }
-        };
-        // Test the raw value, plus its decoded forms when the surface is one
-        // upstream decodes.  A macro rather than a closure so each matcher's
-        // test is monomorphised and inlines into the raw-value comparison.
-        macro_rules! forms {
-            ($f:expr) => {
-                matching_form(value, decoding, $f)
-            };
-        }
+    /// Nothing is decoded here: what a value looks like when a matcher sees it
+    /// is decided by the surface's parser normalisation and by the rule's
+    /// declared transformations, both of which have already run.  That is the
+    /// whole point — CRS-920610 (`@contains #`, `t:none`, `REQUEST_URI_RAW`)
+    /// and CRS-941181 (`@contains -->`, `t:urlDecodeUni`, `ARGS`) are the same
+    /// operator on opposite requirements, and only the rule can say which.
+    fn test(&self, value: &str, ctx: &RequestCtx, state: &ChainState<'_>) -> Outcome {
+        let plain = |hit: bool| if hit { Outcome::Match } else { Outcome::NoMatch };
         macro_rules! operand {
             ($operand:expr) => {
                 match $operand.resolve(ctx, state) {
@@ -1120,49 +2032,17 @@ impl CompiledMatcher {
             };
         }
         match self {
-            // The CRS patterns are written against ModSecurity's decoded
-            // `ARGS` / `REQUEST_COOKIES` / `REQUEST_FILENAME`, so a raw-only
-            // test is bypassed by percent-encoding the payload.
-            Self::Regex(re) => forms!(|v: &str| re.is_match(v)),
-            // Deliberately raw-only.  The one shipped `contains` condition on a
-            // request surface is CRS-920610, which reads `REQUEST_URI_RAW` to
-            // flag an *unencoded* `#` in the URI — decoding it would turn every
-            // legitimately escaped `%23` into a block.  See the module test
-            // `contains_stays_raw_so_an_escaped_hash_is_not_a_raw_fragment`.
+            Self::Regex(re) => plain(re.is_match(value)),
             Self::Contains(operand) => plain(value.contains(operand!(operand).as_ref())),
-            Self::Equals(operand) => {
-                let needle = operand!(operand);
-                forms!(|v: &str| v == needle.as_ref())
-            }
-            Self::StartsWith(operand) => {
-                let needle = operand!(operand);
-                forms!(|v: &str| v.starts_with(needle.as_ref()))
-            }
-            Self::EndsWith(operand) => {
-                let needle = operand!(operand);
-                forms!(|v: &str| v.ends_with(needle.as_ref()))
-            }
-            // Raw-only, and a no-op if it were not: `not_in` backs CRS-911100's
-            // method allow-list, upstream reads `REQUEST_METHOD` untransformed,
-            // and a method token cannot legally carry `%` or `+`.  Decoding a
-            // deny-by-default list can only ever widen what it rejects.
+            Self::Equals(operand) => plain(value == operand!(operand).as_ref()),
+            Self::StartsWith(operand) => plain(value.starts_with(operand!(operand).as_ref())),
+            Self::EndsWith(operand) => plain(value.ends_with(operand!(operand).as_ref())),
             Self::NotIn(list) => plain(!list.iter().any(|allowed| allowed.eq_ignore_ascii_case(value))),
-            // Raw-only: both operands read engine-synthesised integers
-            // (`content_length`, header counts) that no client can encode.
             Self::Gt(n) => plain(value.parse::<i64>().is_ok_and(|v| v > *n)),
             Self::Lt(n) => plain(value.parse::<i64>().is_ok_and(|v| v < *n)),
-            Self::MultiPattern(ac) => forms!(|v: &str| ac.is_match(v)),
-            Self::DetectSqli => forms!(|v: &str| libinjectionrs::detect_sqli(v.as_bytes()).is_injection()),
-            Self::DetectXss => forms!(|v: &str| libinjectionrs::detect_xss(v.as_bytes()).is_injection()),
-        }
-    }
-
-    /// The libinjection detector this matcher runs, if any.
-    fn detector(&self) -> Option<fn(&[u8]) -> bool> {
-        match self {
-            Self::DetectSqli => Some(|input| libinjectionrs::detect_sqli(input).is_injection()),
-            Self::DetectXss => Some(|input| libinjectionrs::detect_xss(input).is_injection()),
-            _ => None,
+            Self::MultiPattern(ac) => plain(ac.is_match(value)),
+            Self::DetectSqli => plain(libinjectionrs::detect_sqli(value.as_bytes()).is_injection()),
+            Self::DetectXss => plain(libinjectionrs::detect_xss(value.as_bytes()).is_injection()),
         }
     }
 }
@@ -1198,6 +2078,9 @@ fn parse_cond_field(name: &str) -> Option<CondField> {
 struct Condition {
     field: CondField,
     matcher: CompiledMatcher,
+    /// `ModSecurity` `t:` chain for this condition, applied to every value
+    /// before the matcher sees it.
+    transform: TransformChain,
     /// `!@op`: the condition holds for values the matcher rejects.
     negate: bool,
     /// Bind this condition's regex groups to `tx:0..` for later conditions.
@@ -1207,23 +2090,22 @@ struct Condition {
 impl Condition {
     /// Short-circuiting test used for the head of every rule.
     ///
-    /// Allocation-free on the hot path: an ordinary request is answered by the
-    /// first surface that fails, and nothing about the match is recorded.
-    fn matches_any(&self, ctx: &RequestCtx) -> bool {
+    /// Allocation-free on the hot path: the surfaces are already normalised in
+    /// the [`RequestView`], the transformation chain borrows when it changes
+    /// nothing, and an ordinary request is answered by the first surface that
+    /// fails without recording anything about the match.
+    fn matches_any(&self, view: &RequestView<'_>) -> bool {
         let CondField::Request(field) = self.field else {
             // A bare `matched_value` / `tx:N` head has nothing to read; the
             // loader rejects it, so this is unreachable in a loaded rule set.
             return false;
         };
-        if !self.negate
-            && let Some(detector) = self.matcher.detector()
-        {
-            return detect_injection(field, ctx, detector);
-        }
         let empty = ChainState::default();
-        field.any_value(ctx, |value, decoding| {
-            match self.matcher.test(value, decoding, ctx, &empty) {
-                Outcome::Match(_) => !self.negate,
+        field.any_value(view, |value| {
+            let transformed = view.transformed(&self.transform, value);
+            let subject = transformed.as_deref().unwrap_or(value);
+            match self.matcher.test(subject, view.ctx, &empty) {
+                Outcome::Match => !self.negate,
                 Outcome::NoMatch => self.negate,
                 Outcome::Unresolvable => false,
             }
@@ -1235,34 +2117,33 @@ impl Condition {
     /// Returns `false` as soon as no value satisfies the condition, so the
     /// remaining links are never evaluated.
     ///
-    /// Each subject carries the [`Decoding`] of the surface it originated from,
-    /// and a `matched_value` / `tx:N` link inherits it: re-testing the text a
-    /// previous condition matched must not start decoding a header value just
-    /// because it passed through a chain.
-    fn advance<'a>(&self, ctx: &'a RequestCtx, state: &mut ChainState<'a>) -> bool {
-        let subjects: Vec<(Cow<'a, str>, Decoding)> = match self.field {
-            CondField::Request(field) => field.collect_values(ctx),
+    /// What is recorded in `state` is the **transformed** text, because that is
+    /// what `ModSecurity` puts in `MATCHED_VARS` and `TX:N`: a later link must
+    /// see what its predecessor actually matched.
+    fn advance<'v>(&self, view: &'v RequestView<'_>, state: &mut ChainState<'v>) -> bool {
+        let subjects: Vec<Cow<'v, str>> = match self.field {
+            CondField::Request(field) => field.collect_values(view),
             CondField::MatchedValue => std::mem::take(&mut state.matched),
             CondField::Capture(n) => state
                 .captures
                 .get(usize::from(n))
                 .cloned()
-                .map(|text| (Cow::Owned(text), state.capture_decoding))
+                .map(Cow::Owned)
                 .into_iter()
                 .collect(),
         };
 
-        let mut hits: Vec<(Cow<'a, str>, Decoding)> = Vec::new();
-        for (value, decoding) in subjects {
-            match (self.matcher.test(&value, decoding, ctx, state), self.negate) {
-                (Outcome::Match(MatchForm::Same), false) | (Outcome::NoMatch, true) => hits.push((value, decoding)),
-                (Outcome::Match(MatchForm::Transformed(decoded)), false) => {
-                    hits.push((Cow::Owned(decoded), decoding));
-                }
+        let mut hits: Vec<Cow<'v, str>> = Vec::new();
+        for value in subjects {
+            // `apply` yields an owned `String` or nothing, so the untransformed
+            // subject can be moved into `hits` without keeping a borrow alive.
+            let subject: Cow<'v, str> = self.transform.apply(&value).map_or(value, Cow::Owned);
+            match (self.matcher.test(&subject, view.ctx, state), self.negate) {
+                (Outcome::Match, false) | (Outcome::NoMatch, true) => hits.push(subject),
                 _ => {}
             }
         }
-        let Some((first, first_decoding)) = hits.first() else {
+        let Some(first) = hits.first() else {
             return false;
         };
 
@@ -1270,7 +2151,6 @@ impl Condition {
             && let CompiledMatcher::Regex(re) = &self.matcher
             && let Some(groups) = re.captures(first)
         {
-            state.capture_decoding = *first_decoding;
             state.captures = groups
                 .iter()
                 .map(|group| group.map_or_else(String::new, |m| m.as_str().to_owned()))
@@ -1294,68 +2174,23 @@ struct CompiledRule {
 }
 
 impl CompiledRule {
-    fn matches(&self, ctx: &RequestCtx) -> bool {
+    fn matches(&self, view: &RequestView<'_>) -> bool {
         // The cheap short-circuiting test runs first for every rule, chained or
         // not, so ordinary traffic pays exactly what it paid before chains
         // existed.  Only a request that already satisfies the head is walked a
         // second time to record which values matched.
-        if !self.head.matches_any(ctx) {
+        if !self.head.matches_any(view) {
             return false;
         }
         if self.chain.is_empty() {
             return true;
         }
         let mut state = ChainState::default();
-        if !self.head.advance(ctx, &mut state) {
+        if !self.head.advance(view, &mut state) {
             return false;
         }
-        self.chain.iter().all(|link| link.advance(ctx, &mut state))
+        self.chain.iter().all(|link| link.advance(view, &mut state))
     }
-}
-
-/// Run a libinjection detector against the values of `field`.
-///
-/// For a composite field, scans exactly the surfaces it names (`all` being the
-/// whole request, matching CRS behavior for libinjection rules).  Each value is
-/// tested in raw form, single-decoded form, and recursively-decoded form (up to
-/// [`super::MAX_DECODE_PASSES`] passes, currently 5) to catch `%`-encoded and
-/// double/triple-encoded evasion attempts.  For any other field, every value it
-/// expands to is tested in all three forms.
-///
-/// This path decodes *every* surface, including the header values that
-/// [`Decoding::Verbatim`] holds back from the pattern matchers.  That is
-/// deliberate and predates surface-scoped decoding: libinjection is a semantic
-/// tokeniser rather than a text pattern, so feeding it a decoded header cannot
-/// produce the class of false positive a decoded header produces for a CRS
-/// regex, and the extra coverage is worth keeping.
-fn detect_injection(field: Field, ctx: &RequestCtx, detector: impl Fn(&[u8]) -> bool) -> bool {
-    // Helper: test raw, single-decoded, and recursively-decoded forms.
-    let detect_with_decode = |raw: &str| -> bool {
-        if detector(raw.as_bytes()) {
-            return true;
-        }
-        let decoded = url_decode(raw);
-        if decoded != raw && detector(decoded.as_bytes()) {
-            return true;
-        }
-        let recursive = url_decode_recursive(raw);
-        recursive != decoded && detector(recursive.as_bytes())
-    };
-
-    if let Field::Multi(s) = field {
-        // The raw byte body is additionally tested unmodified, because the
-        // lossy UTF-8 conversion can destroy a binary payload.
-        let header = |name: &str| ctx.headers.get(name).is_some_and(|v| detect_with_decode(v));
-        return (s.has(Surfaces::PATH) && detect_with_decode(&ctx.path))
-            || (s.has(Surfaces::QUERY) && detect_with_decode(&ctx.query))
-            || (s.has(Surfaces::BODY)
-                && (detector(&ctx.body_preview) || detect_with_decode(&String::from_utf8_lossy(&ctx.body_preview))))
-            || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(detect_with_decode))
-            || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| detect_with_decode(v)))
-            || (s.has(Surfaces::USER_AGENT) && header("user-agent"))
-            || (s.has(Surfaces::REFERER) && header("referer"));
-    }
-    field.any_value(ctx, |value, _decoding| detect_with_decode(value))
 }
 
 // ── Loader ────────────────────────────────────────────────────────────────────
@@ -1372,6 +2207,9 @@ struct Loader {
     /// rather than silently skipped).
     data_dir: Option<PathBuf>,
     wordlists: HashMap<String, WordlistResult>,
+    /// Distinct `t:` chains seen so far, so equal chains share one id and one
+    /// memo slot per request.
+    chain_ids: HashMap<Vec<Transform>, u32>,
 }
 
 impl Loader {
@@ -1381,7 +2219,19 @@ impl Loader {
             summary: LoadSummary::default(),
             data_dir,
             wordlists: HashMap::new(),
+            chain_ids: HashMap::new(),
         }
+    }
+
+    /// Resolve a declared `t:` list to an interned chain.
+    fn transform_chain(&mut self, position: &str, names: &[String]) -> Result<TransformChain, RejectReason> {
+        let steps = TransformChain::parse_steps(position, names)?;
+        let next = u32::try_from(self.chain_ids.len()).unwrap_or(TransformChain::UNINTERNED);
+        let id = *self.chain_ids.entry(steps.clone()).or_insert(next);
+        Ok(TransformChain {
+            id,
+            steps: steps.into_boxed_slice(),
+        })
     }
 
     fn push_source_error(&mut self, source: String, error: String) {
@@ -1428,6 +2278,7 @@ impl Loader {
             &rule.field,
             &rule.operator,
             &rule.value,
+            &rule.transform,
             rule.negate,
             rule.capture,
             &mut bound_captures,
@@ -1442,6 +2293,7 @@ impl Loader {
                     &link.field,
                     &link.operator,
                     &link.value,
+                    &link.transform,
                     link.negate,
                     link.capture,
                     &mut bound_captures,
@@ -1449,6 +2301,7 @@ impl Loader {
                 .map_err(|reason| match reason {
                     already @ (RejectReason::Chain { .. }
                     | RejectReason::CaptureWithoutRegex { .. }
+                    | RejectReason::UnsupportedTransformation { .. }
                     | RejectReason::UnresolvedCapture { .. }) => already,
                     inner => RejectReason::Chain {
                         position: position.clone(),
@@ -1480,6 +2333,7 @@ impl Loader {
         field_name: &str,
         operator: &str,
         value: &YamlValue,
+        transform: &[String],
         negate: bool,
         capture: bool,
         bound_captures: &mut usize,
@@ -1496,6 +2350,11 @@ impl Loader {
                 index,
             });
         }
+
+        // The transformation chain is resolved before the matcher: a rule whose
+        // pattern was written against a value this engine cannot produce is not
+        // a rule this engine can enforce, whatever its operator.
+        let transform = self.transform_chain(position, transform)?;
 
         // Scalar comparisons stay restricted to single-valued request fields:
         // the schema cannot express the CRS collection-member selector, so
@@ -1595,6 +2454,7 @@ impl Loader {
         Ok(Condition {
             field,
             matcher,
+            transform,
             negate,
             capture,
         })
@@ -1865,11 +2725,15 @@ impl Check for OWASPCheck {
         // Use paranoia level from defense config (default 1)
         let paranoia = ctx.host_config.defense_config.owasp_paranoia;
 
+        // Normalise each request surface once, not once per rule: every rule
+        // that reads the query reads the same decoded query.
+        let view = RequestView::new(ctx);
+
         for rule in &self.rules {
             if rule.paranoia > paranoia {
                 continue;
             }
-            if rule.matches(ctx) {
+            if rule.matches(&view) {
                 return Some(DetectionResult {
                     rule_id: Some(rule.id.clone()),
                     rule_name: rule.name.clone(),
@@ -2670,6 +3534,19 @@ rules:
             0,
             "all CRS operators are implemented"
         );
+        // Every `t:` the shipped conversion declares is implemented.  CRS
+        // v4.25.0's request-phase files use 17 distinct transformations —
+        // `urlDecodeUni`, `jsDecode`, `lowercase`, `htmlEntityDecode`,
+        // `utf8toUnicode`, `removeNulls`, `cssDecode`, `cmdLine`,
+        // `removeWhitespace`, `replaceComments`, `normalizePath`,
+        // `escapeSeqDecode`, `compressWhitespace`, `normalizePathWin`,
+        // `base64Decode`, `length`, `removeCommentsChar` — and a rule naming
+        // one this engine lacks is dropped, not approximated.
+        assert_eq!(
+            summary.count(RejectCategory::UnsupportedTransformation),
+            0,
+            "every declared transformation must be implemented"
+        );
         // CRS-921250 applies `@streq` to `REQUEST_COOKIES`, a collection.
         assert_eq!(summary.count(RejectCategory::FieldOperatorMismatch), 1);
         assert_eq!(summary.count(RejectCategory::InvalidValue), 0);
@@ -2719,7 +3596,10 @@ rules:
             .iter()
             .filter(|r| r.head.field == CondField::Request(Field::Multi(Surfaces::ALL)))
             .count();
-        assert_eq!(catch_all, 6, "rules scanning the entire request");
+        // Was 6 before `REQUEST_URI_RAW` / `REQUEST_LINE` got their own field:
+        // CRS-944130 / CRS-944150 / CRS-944151 name `REQUEST_LINE`, which used
+        // to fold into `path` and complete the "whole request" set.
+        assert_eq!(catch_all, 3, "rules scanning the entire request");
 
         // No rule from the response-phase conversion may end up enforced: their
         // patterns describe server *output* and matching them against a request
@@ -3281,7 +4161,7 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
             .iter()
             .find(|r| r.id == id)
             .unwrap_or_else(|| panic!("{id} must be an enforced rule"))
-            .matches(ctx)
+            .matches(&RequestView::new(ctx))
     }
 
     /// Ordinary traffic that every chained rule used to block, because only
@@ -4309,20 +5189,21 @@ rules:
     /// Paranoia 2 is not the default and is not clean, but its verdicts are
     /// pinned so decoding work cannot quietly add to the list.
     ///
-    /// Each entry below is a *pre-existing* converter defect unrelated to
-    /// decoding — CRS-920230 is `@rx %[0-9a-fA-F]{2}` (upstream: "an escape
-    /// survived `t:urlDecodeUni`", i.e. double encoding) evaluated against the
-    /// raw query, and the rest are rules upstream scopes to a single `ARGS`
-    /// member that this engine can only run against a whole surface.
+    /// Each entry below is a rule upstream scopes to a single `ARGS` member
+    /// that this engine can only run against a whole surface — the one defect
+    /// class left after transformations became per-rule.
+    ///
+    /// The three CRS-920230 entries that used to be here are gone: `@rx
+    /// %[0-9a-fA-F]{2}` under `t:none` means "an escape survived the parser",
+    /// i.e. double encoding, and now that the query reaches the rule decoded it
+    /// says exactly that instead of firing on every singly-encoded value.
     #[test]
     fn paranoia_2_false_positives_stay_at_the_recorded_baseline() {
         let checker = OWASPCheck::from_directory(&crs_dir());
         let expected: &[(&str, Option<&str>)] = &[
             ("JSON body with escapes and a percent sign", Some("CRS-932240")),
-            ("encoded redirect_uri in the query", Some("CRS-920230")),
-            ("escaped percent sign (q=100%25)", Some("CRS-920230")),
-            ("multipart upload", Some("CRS-942180")),
-            ("encoded array indices in the query", Some("CRS-920230")),
+            ("multipart upload", Some("CRS-932236")),
+            ("encoded array indices in the query", Some("CRS-932240")),
             ("search phrase using + as a space", Some("CRS-942200")),
         ];
         for probe in benign_probes() {
@@ -4339,12 +5220,15 @@ rules:
         }
     }
 
-    /// `contains` is the one pattern operator deliberately left raw.
+    /// The pair of `@contains` rules that no operator-level or surface-level
+    /// rule could ever satisfy at the same time.
     ///
-    /// CRS-920610 reads `REQUEST_URI_RAW` and fires on a literal `#` in the
-    /// URI; the whole point is that a *properly escaped* `%23` is fine.
-    /// Decoding this operator would turn every URL carrying an escaped hash
-    /// into a paranoia-1 block.
+    /// CRS-920610 reads `REQUEST_URI_RAW` under `t:none` and fires on a literal
+    /// `#`; a *properly escaped* `%23` must stay legal.  CRS-941181 reads
+    /// `ARGS` under `t:urlDecodeUni` and must catch `-->` however it is
+    /// spelled.  Same operator, opposite requirements — only the rule's own
+    /// surface and transformation chain can tell them apart, which is why
+    /// `@contains` is no longer special-cased as "raw".
     #[test]
     fn contains_stays_raw_so_an_escaped_hash_is_not_a_raw_fragment() {
         let checker = OWASPCheck::from_directory(&crs_dir());
@@ -4465,6 +5349,249 @@ rules:
         assert!(checker.check(&make_ctx("GET", "/", 1024)).is_none());
     }
 
+    /// The three defects that no surface-level or operator-level approximation
+    /// could fix at the same time, now that each rule carries its own `t:`.
+    ///
+    /// * CRS-920610 — `REQUEST_URI_RAW`, `t:none`: a raw `#` is a fragment, an
+    ///   escaped `%23` is an ordinary URL.
+    /// * CRS-941181 — `ARGS`, `t:...urlDecodeUni...`: `-->` must be caught
+    ///   however it is spelled.  `--%3E` used to sail straight through.
+    /// * CRS-920230 — `ARGS`, `t:none`: `%[0-9a-fA-F]{2}` in a value the parser
+    ///   has already decoded means *double* encoding.  Run against the raw
+    ///   query it fired on every ordinary escape instead.
+    #[test]
+    fn declared_transformations_decide_what_a_pattern_sees() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        let query = |q: &'static str| {
+            let mut ctx = make_ctx_with_query(q);
+            ctx.headers.insert("host".to_owned(), "shop.example.com".to_owned());
+            ctx
+        };
+
+        // CRS-920610: raw surface, no transformation.
+        let raw_probe = |path: &'static str| Probe {
+            label: "hash",
+            method: "GET",
+            path,
+            query: "",
+            body: "",
+            headers: BROWSER,
+        };
+        assert_eq!(verdict(&checker, &raw_probe("/docs/chapter%231.html"), 1), None);
+        assert_eq!(
+            verdict(&checker, &raw_probe("/docs/chapter#1.html"), 1).as_deref(),
+            Some("CRS-920610")
+        );
+
+        // CRS-941181: `@contains -->` behind a decode chain.
+        for spelling in ["c=-->", "c=--%3E", "c=%2D%2D%3E"] {
+            assert!(
+                fires(&checker, "CRS-941181", &query(spelling)),
+                "CRS-941181 must see through {spelling}"
+            );
+        }
+        assert!(!fires(&checker, "CRS-941181", &query("c=safe")));
+
+        // CRS-920230: double encoding, not "any encoding".
+        assert!(
+            fires(&checker, "CRS-920230", &query("x=%2525")),
+            "a surviving escape is double encoding"
+        );
+        for ordinary in ["x=100%25", "x=a%20b", "x=%E4%B8%AD%E6%96%87", "x=50%"] {
+            assert!(
+                !fires(&checker, "CRS-920230", &query(ordinary)),
+                "CRS-920230 must not fire on {ordinary}"
+            );
+        }
+
+        // `t:lowercase` is what makes an all-lower-case CRS pattern meet real
+        // mixed-case traffic; CRS-944120's chain needs both halves.
+        assert!(fires(
+            &checker,
+            "CRS-944120",
+            &query("cls=InvokerTransformer&cmd=Runtime.exec")
+        ));
+        assert!(fires(
+            &checker,
+            "CRS-944120",
+            &query("cls=%49nvokerTransformer&cmd=%52untime.exec")
+        ));
+        assert!(!fires(&checker, "CRS-944120", &query("cls=Harmless&cmd=Runtime")));
+    }
+
+    /// A `t:` the engine cannot perform drops the rule and names itself in the
+    /// startup diagnostics.  Silently skipping the step would run the pattern
+    /// against a value it was not written for.
+    #[test]
+    fn an_unimplemented_transformation_rejects_the_rule() {
+        let yaml = concat!(
+            "version: \"1.0\"\nrules:\n  - id: TEST-T\n    name: t\n    category: test\n",
+            "    severity: critical\n    paranoia: 1\n    field: query\n    operator: regex\n",
+            "    value: abc\n    transform:\n      - lowercase\n      - sha1\n    action: block\n"
+        );
+        let checker = OWASPCheck::from_yaml(yaml);
+        assert_eq!(checker.rule_count(), 0, "the rule must not be enforced");
+        let summary = checker.load_summary();
+        assert_eq!(summary.count(RejectCategory::UnsupportedTransformation), 1);
+        let rendered = summary
+            .rejected
+            .first()
+            .map(|r| r.reason.to_string())
+            .unwrap_or_default();
+        assert!(rendered.contains("t:sha1"), "the WARN must name the gap: {rendered}");
+        assert!(rendered.contains("head"), "and where it is: {rendered}");
+    }
+
+    /// `t:` is an ordered list, not a set.
+    #[test]
+    fn transformation_order_is_preserved() {
+        let rule = |steps: &str| {
+            format!(
+                concat!(
+                    "version: \"1.0\"\nrules:\n  - id: TEST-ORDER\n    name: t\n    category: test\n",
+                    "    severity: critical\n    paranoia: 1\n    field: header_referer\n",
+                    "    operator: regex\n    value: '^ab$'\n    transform:\n{}    action: block\n"
+                ),
+                steps
+            )
+        };
+        // `%41` is `A`.  Decoding first and then lower-casing yields `ab`;
+        // lower-casing first leaves `%41b`, which the decode turns into `Ab`.
+        let ctx = make_ctx_with_header("referer", "%41b");
+        let decode_then_lower = OWASPCheck::from_yaml(&rule("      - urlDecodeUni\n      - lowercase\n"));
+        let lower_then_decode = OWASPCheck::from_yaml(&rule("      - lowercase\n      - urlDecodeUni\n"));
+        assert_eq!(decode_then_lower.rule_count(), 1);
+        assert_eq!(lower_then_decode.rule_count(), 1);
+        assert!(decode_then_lower.check(&ctx).is_some(), "urlDecodeUni then lowercase");
+        assert!(lower_then_decode.check(&ctx).is_none(), "lowercase then urlDecodeUni");
+    }
+
+    /// Each transformation against the behaviour `ModSecurity` documents for it.
+    #[test]
+    fn transformations_match_their_modsecurity_definitions() {
+        let chain = |name: &str| {
+            TransformChain::compile("test", &[name.to_owned()]).unwrap_or_else(|e| panic!("t:{name}: {e}"))
+        };
+        let cases: &[(&str, &str, &str)] = &[
+            ("lowercase", "AbC", "abc"),
+            ("urlDecodeUni", "%3Cscript%3E", "<script>"),
+            ("urlDecodeUni", "a+b", "a b"),
+            // IIS `%uXXXX`: low byte, with the full-width ASCII fold.
+            ("urlDecodeUni", "%u003Cscript", "<script"),
+            ("urlDecodeUni", "%uff1cscript", "<script"),
+            // Non-strict: a broken escape survives.
+            ("urlDecodeUni", "100%25 and 50%", "100% and 50%"),
+            ("htmlEntityDecode", "&lt;script&gt;", "<script>"),
+            ("htmlEntityDecode", "&#60;&#x3e;", "<>"),
+            ("htmlEntityDecode", "&amp&quot", "&\""),
+            ("jsDecode", r"\x3cscript\x3e", "<script>"),
+            ("jsDecode", r"<b>", "<b>"),
+            ("jsDecode", r"al\ert", "alert"),
+            ("jsDecode", r"\101\102", "AB"),
+            ("cssDecode", r"ex\70 ression", "expression"),
+            ("cssDecode", r"\3c script", "<script"),
+            // A backslash before a non-hex character simply disappears; before a
+            // hex one it starts an escape, so `\e` is `\x0e`, not the letter.
+            ("cssDecode", r"ex\pression", "expression"),
+            ("cssDecode", r"al\ert", "al\u{0e}rt"),
+            ("escapeSeqDecode", r"a\tb\x41", "a\tbA"),
+            ("escapeSeqDecode", r"\101", "A"),
+            ("utf8toUnicode", "中", "%u4e2d"),
+            ("removeNulls", "a\u{0}b", "ab"),
+            ("removeWhitespace", " a\tb\nc ", "abc"),
+            ("compressWhitespace", "a  \t\n b", "a b"),
+            ("replaceComments", "sel/*x*/ect", "sel ect"),
+            ("replaceComments", "sel/*unterminated", "sel "),
+            ("removeCommentsChar", "sel/*ect--x#y", "selectxy"),
+            ("normalizePath", "/a/./b//c", "/a/b/c"),
+            ("normalizePath", "/a/b/../c", "/a/c"),
+            ("normalizePath", "../a", "../a"),
+            ("normalizePathWin", r"\a\.\b\..\c", "/a/c"),
+            ("cmdLine", "N\"e\"T   use", "net use"),
+            ("cmdLine", "cat ,;/etc/passwd", "cat/etc/passwd"),
+            ("base64Decode", "PHNjcmlwdD4=", "<script>"),
+            ("length", "abcd", "4"),
+        ];
+        for (name, input, want) in cases {
+            let got = chain(name).apply(input).unwrap_or_else(|| (*input).to_owned());
+            assert_eq!(&got, want, "t:{name} on {input:?}");
+        }
+        // A no-op must stay a no-op: that is what keeps the hot path allocation
+        // free, and reporting a change that was not made would defeat it.
+        for (name, input) in [
+            ("lowercase", "already lower"),
+            ("urlDecodeUni", "nothing to decode"),
+            ("htmlEntityDecode", "plain text"),
+            ("jsDecode", "plain text"),
+            ("cssDecode", "plain text"),
+            ("normalizePath", "/plain/path"),
+            ("removeNulls", "plain"),
+            ("compressWhitespace", "a b"),
+            ("escapeSeqDecode", "plain text"),
+            ("utf8toUnicode", "plain ascii"),
+            ("replaceComments", "no comments here"),
+        ] {
+            assert!(chain(name).apply(input).is_none(), "t:{name} must borrow for {input:?}");
+        }
+    }
+
+    /// A `multipart/form-data` envelope is not `ARGS`.
+    ///
+    /// Upstream parses it into `ARGS_POST` / `FILES`; the per-part
+    /// `Content-Type:` header never reaches an `ARGS` rule, and handing it over
+    /// makes CRS-921120 (`[\n\r]...content-type:`, `t:lowercase`) read every
+    /// file upload as a response-splitting attack.
+    #[test]
+    fn a_multipart_envelope_is_parsed_into_its_parts() {
+        let boundary = "----WebKitFormBoundaryABC";
+        let upload = |body: &str, paranoia: u8| {
+            let mut ctx = make_ctx_with_body(body, paranoia);
+            ctx.headers.insert(
+                "content-type".to_owned(),
+                format!("multipart/form-data; boundary={boundary}"),
+            );
+            ctx
+        };
+        let benign = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"report.pdf\"\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4 hello\r\n\
+             --{boundary}--\r\n"
+        );
+        let ctx = upload(&benign, 2);
+        let view = RequestView::new(&ctx);
+        assert_eq!(
+            view.body.as_ref(),
+            "file\nreport.pdf\n%PDF-1.4 hello",
+            "part payloads and the quoted parameter values, not the envelope"
+        );
+
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        assert!(
+            !fires(&checker, "CRS-921120", &ctx),
+            "an ordinary upload is not a response-splitting attack"
+        );
+
+        // A payload really inside a part is still seen.
+        let hostile = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"c\"\r\n\r\n\
+             <?php system($_GET['c']); ?>\r\n--{boundary}--\r\n"
+        );
+        assert!(
+            checker.check(&upload(&hostile, 1)).is_some(),
+            "a web shell in a part payload must still be caught"
+        );
+        // So is one hidden in a part's file name, which upstream reads through
+        // `FILES_NAMES`.
+        let traversal = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"f\"; \
+             filename=\"../../etc/passwd\"\r\n\r\nx\r\n--{boundary}--\r\n"
+        );
+        assert!(
+            checker.check(&upload(&traversal, 1)).is_some(),
+            "a traversal file name must still be caught"
+        );
+    }
+
     /// The word-at-a-time encoded-ness guard must agree with a plain byte scan
     /// for every input — it decides whether a value is decoded at all, so a
     /// false negative is a silent bypass.
@@ -4500,7 +5627,7 @@ rules:
         }
         for case in &cases {
             assert_eq!(
-                may_be_encoded(case),
+                may_be_encoded(case.as_bytes()),
                 naive(case),
                 "word scan disagrees for {case:?} (len {})",
                 case.len()

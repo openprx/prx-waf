@@ -300,6 +300,9 @@ rules:
     field: response_body
     operator: contains
     value: <title>punkholicshell</title>
+    transform:
+      - removeWhitespace
+      - lowercase
     action: block
     tags:
       - owasp-crs
