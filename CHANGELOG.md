@@ -9,164 +9,511 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Security hardening pass following a full-codebase audit (7 crates, ~27K LOC).
-The headline fix is C-1: the core WAF detection pipeline was not running at
-all for GET/bodyless requests. See "Breaking Changes" below before upgrading
-— four conditions now refuse to start the process.
+---
+
+## [0.2.28] — 2026-07-25
+
+### Fixed
+
+- Fixed a clean-checkout build failure in `waf-api`: the embedded admin-UI
+  asset directory was entirely excluded by `.gitignore`, so a fresh clone
+  failed to compile before the frontend was built. CI now builds the
+  frontend before `cargo build`, so release binaries embed the real Admin UI
+  instead of a placeholder.
+
+---
+
+## [0.2.27] — 2026-07-25
+
+### Fixed
+
+- Fixed a clippy lint failure (`question_mark`) introduced by a newer Rust
+  toolchain that could block CI's lint gate from ever reaching the
+  test/build/db-parity jobs. No runtime behavior change.
+
+---
+
+## [0.2.26] — 2026-07-24
+
+### Security
+
+- Closed false-negative gaps in the structural SSTI and LDAP-injection
+  detectors, and a reflected-XSS gap involving window-scoped event-handler
+  payloads reparsed inside an HTML frameset.
+- Request bodies encoded as UTF-16 with a byte-order mark are now
+  transcoded to UTF-8 before inspection — previously such bodies (including
+  XXE payloads) could bypass detection entirely.
+
+---
+
+## [0.2.25] — 2026-07-24
+
+### Added
+
+- A read-only Admin UI panel for Lane 2 semantic-detection telemetry
+  (shadow-mode observations), so operators can review what the semantic
+  engine would have detected or blocked before switching an attack family
+  from shadow to enforce.
+
+---
+
+## [0.2.24] — 2026-07-24
+
+### Changed
+
+- Internal quality hardening for the Lane 2 semantic engine: fixed edge
+  cases in the confidence-scoring boundary math and added a large
+  blind-negative regression corpus and table-driven detector tests. No
+  detection behavior change for previously-passing traffic.
+
+---
+
+## [0.2.23] — 2026-07-24
+
+### Security
+
+- Closed detection gaps (false negatives) in the structural deserialization,
+  XPath-injection, and LDAP-injection detectors, and widened the SQLi
+  information-disclosure rule to recognize probes against any database
+  catalog view, not just `information_schema`.
+- base64-wrapped deserialization and XXE payloads were previously held back
+  from detection by an over-cautious confidence gate; they now surface
+  correctly.
+
+### Fixed
+
+- Reduced false positives in the same batch of deserialization,
+  XPath-injection, and LDAP-injection detectors.
+
+---
+
+## [0.2.22] — 2026-07-24
+
+### Added
+
+- A new shadow-only detector for HTTP request-smuggling patterns
+  (conflicting/ambiguous `Content-Length` / `Transfer-Encoding` framing),
+  evaluated at the gateway header phase as part of the Lane 2 semantic
+  engine.
+
+---
+
+## [0.2.21] — 2026-07-24
+
+### Added
+
+- A new opt-in structural detector for unsafe deserialization payloads
+  (e.g. Java/PHP/Python serialized-object injection), part of the Lane 2
+  semantic engine. Shadow-only and off by default, like the other Lane 2
+  detectors.
+
+---
+
+## [0.2.20] — 2026-07-24
+
+### Added
+
+- A new opt-in structural detector for XPath injection, part of the Lane 2
+  semantic engine.
+
+---
+
+## [0.2.19] — 2026-07-24
+
+### Added
+
+- A new opt-in structural detector for LDAP injection, part of the Lane 2
+  semantic engine.
+
+---
+
+## [0.2.18] — 2026-07-24
+
+### Security
+
+- Extended the RCE detector to catch command execution via interpreter
+  "exec flags" (e.g. `python -c`, `perl -e`), a pattern it previously
+  missed.
+
+### Fixed
+
+- Narrowed two SQLi false-positive sources: legitimate `information_schema`
+  queries and hex-literal values were being flagged.
+- Per-host defense configuration (which detectors and enforcement modes
+  apply to a given host) is now correctly wired through the full runtime
+  request path — some code paths previously ignored per-host overrides.
+
+---
+
+## [0.2.17] — 2026-07-24
+
+### Added
+
+- A new opt-in structural detector for Server-Side Template Injection
+  (SSTI), part of the Lane 2 semantic engine.
+
+---
+
+## [0.2.16] — 2026-07-24
+
+### Added
+
+- A new opt-in structural detector for NoSQL injection (e.g. MongoDB
+  operator injection), part of the Lane 2 semantic engine. Operator-key
+  extraction is restricted to an allowlist, and the higher-risk `$expr`
+  operator ships disabled by default to limit false positives.
+
+---
+
+## [0.2.15] — 2026-07-24
+
+### Added
+
+- A new opt-in structural detector for XML External Entity (XXE)
+  injection, part of the Lane 2 semantic engine.
+
+---
+
+## [0.2.14] — 2026-07-23
+
+### Added
+
+- The Lane 2 semantic engine now parses structured request bodies
+  (JSON/XML/GraphQL/form fields) field by field instead of treating the
+  body as an opaque blob, improving detection accuracy for attacks
+  embedded in structured payloads.
+
+### Security
+
+- Fixed a stack-overflow denial-of-service in GraphQL body parsing,
+  triggerable by deeply nested queries; nesting depth is now bounded by an
+  accurate lexer-level guard.
+- XML numeric character references (e.g. `&#x27;`) in request bodies are
+  now decoded before semantic inspection, closing an encoding-based
+  evasion gap.
+
+---
+
+## [0.2.13] — 2026-07-23
+
+### Added
+
+- Automatic retention pruning for stored Lane 2 semantic-detection
+  observations, preventing unbounded database growth.
+
+---
+
+## [0.2.12] — 2026-07-23
+
+### Added
+
+- A shell-AST (Bash-parser-based) RCE detector that corroborates the
+  existing RCE detection signals for higher-confidence blocking decisions.
+
+### Security
+
+- Fixed a stack-overflow denial-of-service in the new shell-AST parser,
+  triggerable by deeply nested command substitution in request content;
+  parsing is now depth-guarded.
+
+---
+
+## [0.2.11] — 2026-07-23
+
+### Security
+
+- Fixed missed detections (false negatives) in the semantic XSS detector:
+  certain event-handler payloads reparsed inside an HTML frameset were not
+  caught, and a base64-decode path mishandled the `+` character.
+
+### Fixed
+
+- Fixed a false-positive source in the semantic XSS detector where
+  frameset-suffix reparsing could be tricked by HTML comment/RCDATA/RAWTEXT
+  wrapping into flagging benign content.
+
+---
+
+## [0.2.10] — 2026-07-23
+
+### Added
+
+- The Lane 2 semantic engine (SQL injection, RCE, path traversal, XSS) can
+  now actually block matching requests instead of only logging them.
+  Blocking is opt-in: the shipped default configuration remains shadow-only
+  (`log_only`). Operators enable blocking globally via
+  `content_security.enforcement_mode = "enforce"`, or per attack family via
+  the new `enforcement_overrides` setting (e.g. enforce SQL injection only,
+  keep the rest in shadow).
+
+### Security
+
+- A block decision backed solely by a "blind"/synthetic detection view
+  (no directly observable evidence) is downgraded to a log event, so
+  ambiguous provenance can never single-handedly trigger a block.
+
+---
+
+## [0.2.9] — 2026-07-23
+
+### Added
+
+- A second XSS signal source (JavaScript-token analysis) that corroborates
+  with the existing DOM-based XSS detector for higher-confidence
+  detection. Shadow-only, like the rest of the Lane 2 engine at this
+  point.
+
+---
+
+## [0.2.8] — 2026-07-23
+
+### Added
+
+- A DOM-aware (HTML5-parser-based) semantic XSS detector, part of the
+  Lane 2 engine. Shadow-only and off by default.
+
+---
+
+## [0.2.7] — 2026-07-23
+
+### Fixed
+
+- Fixed host create/update passing `remote_ip` as plain text instead of
+  casting it to the database's `inet` type, which could fail or silently
+  mis-store the value.
+
+---
+
+## [0.2.6] — 2026-07-23
+
+### Added
+
+- The Lane 2 SQL-injection detector now also runs a full SQL-parser
+  (AST-based) analysis pass for higher-confidence detection, in addition
+  to its existing structural checks. Still shadow-only.
+
+---
+
+## [0.2.5] — 2026-07-23
+
+### Added
+
+- Two more opt-in Lane 2 semantic detectors: remote command execution
+  (RCE) and path traversal. Same shadow-only, off-by-default posture as
+  the SQL-injection detector.
+
+---
+
+## [0.2.4] — 2026-07-22
+
+### Fixed
+
+- Per-host `log_only_mode` (shadow mode) set via the Admin API or config
+  was not actually applied to the running host configuration on create,
+  update, or startup — it now takes effect immediately.
+
+---
+
+## [0.2.3] — 2026-07-22
+
+### Changed
+
+- The shipped `configs/default.toml` now enables the Lane 2 semantic
+  SQL-injection detector by default, in shadow mode (`log_only`) — it
+  observes and logs matches but never blocks traffic. A fresh install with
+  no config file still ships with it off. Measured zero false positives
+  and full detection on the project's internal bypass corpus before this
+  default flip.
+
+---
+
+## [0.2.2] — 2026-07-22
+
+### Added
+
+- A new opt-in structural SQL-injection detector, the first real detector
+  in a new "Lane 2" semantic content-security engine that sits alongside
+  the existing regex-based rules. Disabled by default; when enabled it
+  only observes and logs matches — it never blocks.
+
+---
+
+## [0.2.1] — 2026-07-22
+
+A large security-hardening release consolidating a full-codebase audit
+(7 crates, ~27K LOC) together with several new features. The headline fix
+is the WAF detection pipeline not running at all for GET/bodyless
+requests — see the notes below before upgrading, several conditions now
+refuse to start the process.
 
 ### Security
 
 #### WAF detection engine
 
-- **(C-1)** Fix WAF inspection never running on GET / bodyless requests: the
-  per-request `request_ctx` was only ever built in `upstream_peer`, which
-  Pingora invokes *after* `request_filter` — so `request_filter` always saw
-  `None` and let every request without a body through with zero checks
-  (SQLi/XSS/RCE/traversal, IP/URL blocklists, rate limiting, GeoIP all
-  bypassed). Detection now runs during `request_filter`; a new
-  `inspect_body` pass handles content-only checks, and empty-body POST/PUT
-  requests are now inspected too (H-6).
-- **(H-7)** Align the HTTP/3 request path with HTTP/1.1: unknown hosts no
-  longer pass through unchecked, backend selection now honours per-host
-  routing instead of a hardcoded loopback target, and request/response
-  headers are no longer silently dropped.
-- **(H-5, M-5)** Scan a curated set of request headers (User-Agent, Referer,
-  X-Forwarded-For, etc.) for SQLi/XSS/RCE, closing a header-injection
-  detection gap; unify directory-traversal detection to also cover
-  body/cookies with recursive decoding.
-- **(H-4)** Apply the configured CrowdSec AppSec `failure_action`
-  (Block/Log/Allow) instead of always treating an unavailable AppSec
-  backend as allow.
-- Fail closed instead of open when a built-in detection `RegexSet` fails to
-  compile, and when GeoIP cannot resolve a client's country while in
-  allow-only mode (M-10).
-- **(M-6)** Normalise the decoded path before matching URL blocklist entries
-  and the custom-rule `Path` field, closing an encoded-path bypass
-  (e.g. `/%61dmin`).
-- **(M-7, M-8)** Honour the custom rule's configured `action`
-  (Allow/Log/Block) instead of always blocking on match; precompile custom
-  rule regexes once at load time instead of per request.
-- **(M-9)** Fix connection-rate-limit counting each request-with-body twice
-  (once at header phase, once at body phase), which had halved the
+- Fixed WAF inspection never running on GET / bodyless requests: the
+  per-request context was only ever built in the upstream-selection phase,
+  which runs *after* the request-filter phase — so the request filter
+  always saw no context and let every request without a body through with
+  zero checks (SQL injection, XSS, RCE, path traversal, IP/URL
+  blocklists, rate limiting, and GeoIP were all bypassed). Detection now
+  runs during the request-filter phase; empty-body POST/PUT requests are
+  now inspected too. **This is the most impactful fix in this release.**
+- Aligned the HTTP/3 request path with HTTP/1.1: unknown hosts no longer
+  pass through unchecked, backend selection now honours per-host routing
+  instead of a hardcoded loopback target, and request/response headers are
+  no longer silently dropped.
+- Header-based attacks were previously invisible to the WAF: a curated set
+  of request headers (User-Agent, Referer, X-Forwarded-For, etc.) is now
+  scanned for SQL injection/XSS/RCE; directory-traversal detection is
+  unified to also cover the request body and cookies with recursive
+  decoding.
+- The configured CrowdSec AppSec `failure_action` (Block/Log/Allow) is now
+  honoured instead of always treating an unavailable AppSec backend as
+  allow. Note that the default is still `allow`, and that fallback is
+  currently silent — set `failure_action` explicitly if you need to know
+  when AppSec protection is unavailable.
+- The SQL injection, XSS, RCE, directory-traversal, scanner and bot
+  detectors now fail closed instead of open when their pattern set fails
+  to compile, as does GeoIP when it cannot resolve a client's country in
+  allow-only mode. The OWASP ruleset loader and the sensitive-data
+  detector still fail open on a load error.
+- URL blocklist entries and the custom-rule `Path` field are now matched
+  against the decoded path as well as the raw one, closing a single-encoded
+  bypass (e.g. `/%61dmin`). Decoding is applied once, so double-encoded
+  paths (`/%2561dmin`) are not yet covered, and custom-rule fields other
+  than `Path` are still matched against raw values.
+- Custom rules now honour their configured `action` (Allow/Log/Block)
+  instead of always blocking on match; custom-rule regexes are precompiled
+  once at load time instead of per request.
+- Fixed connection-rate-limit counting each request-with-body twice (once
+  at the header phase, once at the body phase), which had halved the
   effective rate limit for POST/PUT traffic.
-- **(M-1)** Use the right-most (server-appended) `X-Forwarded-For` entry
-  instead of the client-controlled left-most one.
-- **(M-2)** Reject non-default ports on the bare-host routing fallback,
+- `X-Forwarded-For` now uses the right-most (server-appended) entry
+  instead of the client-controlled left-most one, closing an IP-spoofing
+  gap in IP-based rules and rate limiting.
+- Non-default ports are now rejected on the bare-host routing fallback,
   closing a host/port routing ambiguity.
-- **(M-19)** Deprecate the DNS-rebinding-vulnerable bare
-  `validate_public_url` as a regression guard; production SSRF checks
-  (webhooks, remote rule sources) already use the IP-pinned
-  `validate_public_url_with_ips` variant.
+- Deprecated the DNS-rebinding-vulnerable bare URL validator as a
+  regression-guard only; production SSRF-guarded call sites (webhooks,
+  remote rule sources) already use the IP-pinned variant.
 
 #### Admin API
 
-- **(H-2)** Add RBAC: a new `require_admin` middleware gates all
-  write/sensitive routes. A logged-in but non-admin user can no longer
-  delete hosts, issue cluster join tokens, upload WASM plugins, or change
+- Added RBAC: write/sensitive Admin API routes are now gated by an
+  admin-only check. A logged-in but non-admin user can no longer delete
+  hosts, issue cluster join tokens, upload WASM plugins, or change
   CrowdSec configuration.
-- **(H-1)** Enforce JWT secret strength at startup: reject empty, short
-  (<32 chars), known-placeholder, or low-entropy `JWT_SECRET` values.
-- **(H-3)** Implement TOTP two-factor authentication end-to-end: RFC 6238
-  codes verified over a ±1 time-step window with constant-time comparison
-  and replay protection; two-step self-service enable/verify/disable flow
-  so operators cannot lock themselves out.
-- **(M-13)** Tighten CORS: an empty `cors_origins` no longer allows any
-  origin — cross-origin requests are rejected by default.
-- **(M-14)** Stop leaking internal/database error detail to API clients;
-  return a generic message and log details server-side instead.
-- **(M-15)** Enforce a global request body size limit and a 16 MiB cap on
-  WASM plugin uploads.
-- **(L-1)** Guard the login/logout/refresh endpoints with the admin IP
-  allowlist (`/health` remains unguarded for liveness probes).
-- Compare tunnel auth tokens in constant time; prefer the `Authorization`
-  header over the `?token=` query parameter for tunnel WebSocket auth
-  (query-parameter auth is now deprecated).
+- Startup now rejects a weak `JWT_SECRET` (empty, shorter than 32
+  characters, a known placeholder value, or low entropy).
+- Added end-to-end TOTP two-factor authentication (RFC 6238, ±1 time-step
+  window, constant-time comparison, replay protection) with a two-step
+  self-service enable/verify/disable flow.
+- Tightened CORS: an empty `cors_origins` no longer allows any origin.
+- The Admin API no longer leaks internal/database error detail to
+  clients; details are logged server-side instead.
+- Added a global request body size limit and a 16 MiB cap on WASM plugin
+  uploads.
+- The login/logout/refresh endpoints are now covered by the admin IP
+  allowlist (`/health` stays unguarded for liveness probes).
+- Tunnel auth tokens are now compared in constant time; the
+  `Authorization` header is preferred over the `?token=` query parameter
+  for tunnel WebSocket auth (query-parameter auth is now deprecated).
 
 #### Cluster
 
-- **(H-9)** Bind cluster protocol messages to the authenticated mTLS peer
+- Cluster protocol messages are now bound to the authenticated mTLS peer
   certificate, preventing a peer from forging another node's ID in
   heartbeats or election votes.
-- **(H-10)** Validate the join token on the main node before accepting a
-  `JoinRequest` (it was previously never checked in production); gate
-  encrypted CA-key replication behind an explicit `replicate_ca_key`
-  opt-in, default off.
-- **(H-8)** Enforce a frame-size cap on the cluster transport to prevent an
+- The join token is now actually validated on the main node before
+  accepting a join request (it was previously never checked in
+  production); encrypted CA-key replication is now gated behind an
+  explicit opt-in, default off.
+- Added a frame-size cap on the cluster transport to prevent an
   out-of-memory DoS from an oversized length-prefixed frame.
-- **(M-16)** Use a fixed, configured `members` set for election quorum
-  instead of the live (evictable) peer view, closing a split-brain window
-  during network partitions.
-- **(M-17)** Fail fast at startup when `crypto.auto_generate=true` is
-  combined with a non-empty `seeds` list — that combination can never form
-  a working cluster, since every node would mint its own untrusted CA.
-- **(M-12)** Switch CA-key and encrypted-field-at-rest key derivation from
-  unsalted single-round SHA-256 to Argon2id with a random per-blob salt
-  (legacy blobs remain decryptable for migration); enforce a ≥16-character
-  floor on `MASTER_KEY` and the CA passphrase.
-- **(M-18)** Cap lz4 snapshot decompression at 256 MiB to prevent a
-  decompression-bomb DoS.
+- Election quorum now uses a fixed, configured member set instead of the
+  live (evictable) peer view, closing a split-brain window during network
+  partitions.
+- CA-key and encrypted-field-at-rest key derivation moved from unsalted
+  single-round SHA-256 to Argon2id with a random per-blob salt (legacy
+  blobs remain decryptable for migration).
+- Cluster lz4 snapshot decompression is now capped at 256 MiB to prevent
+  a decompression-bomb DoS.
 
-#### Storage / SSRF
+#### Storage / community threat intel
 
-- **(M-11)** Fix CrowdSec configuration "upsert" silently inserting a new
-  row instead of updating (the `ON CONFLICT` target never matched on the
-  `SERIAL` primary key) — every configuration change had been a no-op, and
-  reads always returned the oldest row.
-- Confirmed production SSRF-guarded call sites (webhook delivery, remote
-  rule fetching) already pin resolved IPs and reject redirects; hardened
-  the bare validator as a regression guard only (see M-19 above).
-
-### ⚠️ Breaking Changes
-
-Startup now **refuses to boot** under any of the following conditions.
-Update your configuration/environment before upgrading:
-
-1. **`JWT_SECRET` is weak** — empty, shorter than 32 characters, or matches
-   a known placeholder value.
-2. **`trust_proxy_headers=true` with an empty `trusted_proxies`** — this
-   previously only logged a warning and trusted `X-Forwarded-For` from any
-   source.
-3. **`cluster.crypto.auto_generate=true` combined with a non-empty
-   `seeds`** — each node would mint its own untrusted CA and the cluster
-   could never actually form; this is now a startup error instead of a
-   silent hang.
-4. **Multi-node clusters now require a configured `join_token`** — a
-   `JoinRequest` without a valid token is rejected by the main node.
-
-Also note:
-
-- `MASTER_KEY` and the cluster CA `ca_passphrase` now require **at least 16
-  characters**.
-- The shipped `docker-compose.yml` / `docker-compose.cluster.yml` no longer
-  ship a default `JWT_SECRET` — you must set one via `.env` (see the new
-  `.env.example`) or the containers will fail to start.
+- Fixed CrowdSec configuration "upsert" silently inserting a duplicate row
+  instead of updating — every CrowdSec configuration change had
+  previously been a silent no-op, and reads always returned the oldest
+  row.
+- Community blocklist integration hardening: initialization now fails
+  closed when a configured signing key is invalid; per-detection signal
+  reporting moved off unbounded background tasks onto a bounded queue to
+  prevent a task-spawn storm under DDoS; community-server HTTP responses
+  are now streamed with an 8 MiB cap instead of buffered fully in memory;
+  blocklist snapshots are now verified with Ed25519 signatures before use.
+- Community delta-sync hardening: delta payloads now use the
+  cryptographically verified payload field instead of trusting the
+  top-level unsigned JSON, closing a signature-replay/tampering gap; size
+  limits were added to the version and signing-key responses.
 
 ### Added
 
-- Migration `0009_totp_replay.sql` — adds `totp_last_step` for TOTP replay
-  protection.
-- Migration `0010_crowdsec_config_unique.sql` — de-duplicates existing
-  CrowdSec config rows per scope and adds a functional unique index
-  enforcing at most one row per host (or global).
-- ACME auto-TLS wiring: new `AcmeConfig`
-  (enabled/email/staging/renewal_check_interval_secs); `init_async` now
-  constructs the `SslManager`, spawns the certificate-renewal task, and
-  triggers one-time issuance for SSL hosts without an active certificate.
-  The ACME HTTP-01 challenge path is now actually served.
-- TOTP self-service endpoints: `POST /api/account/totp/{setup,verify,disable}`.
-- `ClusterConfig.members`, `ClusterConfig.join_token`,
-  `ClusterConfig.replicate_ca_key` configuration fields.
-- `.env.example` documenting the `JWT_SECRET` requirement.
+- ACME auto-TLS: certificates for configured SSL hosts are now
+  automatically issued and renewed, and the ACME HTTP-01 challenge path is
+  actually served.
+- Self-service TOTP endpoints: `POST /api/account/totp/{setup,verify,disable}`.
+- An environment-variable override layer for security-critical settings
+  (`DATABASE_URL`, `PRXWAF_TRUST_PROXY_HEADERS`, `PRXWAF_TRUSTED_PROXIES`,
+  `PRXWAF_CLUSTER_JOIN_TOKEN`, `PRXWAF_CLUSTER_MEMBERS`,
+  `PRXWAF_CLUSTER_SEEDS`, `PRXWAF_CLUSTER_REPLICATE_CA_KEY`,
+  `PRXWAF_CLUSTER_AUTO_GENERATE`, `PRXWAF_CLUSTER_CA_PASSPHRASE`) so
+  operators can configure everything without touching TOML. A new
+  `.env.example` documents them, and the shipped `docker-compose.yml` /
+  `docker-compose.cluster.yml` no longer ship a default `JWT_SECRET`.
+- Opt-in IP-feed threat intelligence: ingest external CIDR blocklists
+  (ET Open, the Tor exit-node list, Spamhaus DROP) on a per-feed schedule
+  with SSRF-guarded, IP-pinned fetching. Disabled by default; shipped
+  config includes license-annotated examples for each feed.
+- Multi-backend load balancing: a per-host backend pool with
+  least-connections selection and health checking, wired into the request
+  path (existing single `remote_host`/`remote_port` setups are
+  unaffected).
+- Response caching: cacheable upstream responses are now cached, with a
+  cache key that includes scheme/host/port/method/path/query and
+  `Accept-Encoding`, and a hard rejection of any response carrying
+  `Set-Cookie` to prevent session-data leakage across requests.
+- Cluster data-plane sync: admin rule/config edits on the main node now
+  broadcast to workers and are consumed on the worker request path,
+  letting a database-less worker enforce custom/IP/URL/sensitive rules
+  purely from cluster sync.
+
+### Changed
+
+- Config defaults: OWASP CRS and GeoIP detection are now enabled out of
+  the box (OWASP CRS at the lowest false-positive paranoia level, with
+  graceful degradation when rule files are absent), and the default
+  Admin API rate limit is more generous. CrowdSec and HTTP/3 now
+  auto-enable when their required configuration is present, instead of
+  needing a separate explicit switch.
+- `MASTER_KEY` (encryption at rest) now requires at least 32 characters,
+  raised from 16; the cluster CA passphrase keeps its existing 16-character
+  minimum.
+- Multi-node clusters now require a configured `join_token` — a join
+  request without a valid token is rejected by the main node.
+- Combining `cluster.crypto.auto_generate=true` with a non-empty `seeds`
+  list is now a startup error instead of a silent hang (each node would
+  otherwise mint its own untrusted CA and the cluster could never form).
+- `trust_proxy_headers=true` with an empty `trusted_proxies` now refuses
+  to start instead of only logging a warning.
 
 ### Fixed
 
-- CrowdSec configuration updates silently had no effect (M-11, see above).
-- Custom rule `action` (Allow/Log/Block) was ignored — every match was
-  treated as Block regardless of configuration.
-- Connection-count rate limiting double-counted requests that had a body,
-  halving the effective limit for POST/PUT traffic relative to GET.
-- ACME certificate download could hang indefinitely on a slow/unresponsive
-  CA; it now times out after 60s and marks the certificate as errored.
+- ACME certificate download could previously hang indefinitely on a
+  slow/unresponsive CA; it now times out after 60 seconds and marks the
+  certificate as errored.
+- The rustls `ring` crypto provider is now installed explicitly at
+  startup, fixing cluster mTLS and HTTP/3 failing to start in some
+  deployments.
 
 ---
 
