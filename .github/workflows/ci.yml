@@ -82,6 +82,16 @@ jobs:
           DATABASE_URL: postgresql://prx_waf:prx_waf@127.0.0.1:15432/prx_waf
         run: cargo test -p waf-engine --test content_security_engine_parity -- --ignored --nocapture
 
+      # waf-storage's suites are #[ignore]d for the same reason and were never
+      # run anywhere: `cargo test --workspace` skips them and this job only
+      # named the engine parity file. Retention, the observation round-trip and
+      # the INET regressions all touch SQL that only a real server checks.
+      # Serial because several of these prune the same tables untagged.
+      - name: Run DB-gated storage tests
+        env:
+          DATABASE_URL: postgresql://prx_waf:prx_waf@127.0.0.1:15432/prx_waf
+        run: cargo test -p waf-storage -- --ignored --nocapture --test-threads=1
+
   build:
     name: Build
     needs: lint
