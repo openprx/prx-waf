@@ -1,0 +1,74 @@
+version: 2
+
+updates:
+  # Rust workspace (all 7 crates share the root Cargo.toml / Cargo.lock).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - rust
+    groups:
+      # Patch/minor bumps arrive as one PR per week; majors stay separate so
+      # they get a real review.
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+      cargo-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # GitHub Actions used by ci.yml / sec-audit.yml / release.yml / scorecard.yml.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions-all:
+        patterns:
+          - "*"
+
+  # Vue 3 + Tailwind admin UI, embedded into the binary by rust-embed.
+  - package-ecosystem: npm
+    directory: "/web/admin-ui"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    versioning-strategy: increase-if-necessary
+    commit-message:
+      prefix: "chore(ui-deps)"
+    labels:
+      - dependencies
+      - frontend
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+      npm-security:
+        applies-to: security-updates
+        patterns:
+          - "*"

@@ -1,0 +1,329 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege by default; the publish job widens it for itself only.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: prx-waf
+
+jobs:
+  # The admin UI is compiled into the binary by rust-embed
+  # (crates/waf-api/src/static_files.rs reads web/admin-ui/dist/, which is
+  # gitignored). Build it exactly once and reuse the same dist for the gate and
+  # for every target, so all published binaries embed a byte-identical UI.
+  frontend:
+    name: Build admin UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/admin-ui/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web/admin-ui
+        run: npm ci
+
+      - name: Build admin UI
+        working-directory: web/admin-ui
+        run: npm run build
+
+      - name: Upload admin UI dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-ui-dist
+          path: web/admin-ui/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  gate:
+    name: Release gate (fmt / clippy / test)
+    needs: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download admin UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: admin-ui-dist
+          path: web/admin-ui/dist
+
+      # A tag that disagrees with the manifest would publish artifacts whose
+      # `--version` output contradicts their file names. Fail before building.
+      - name: Verify tag matches workspace version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "prx-waf") | .version')"
+          if [ -z "$crate_version" ]; then
+            echo "::error::could not read the prx-waf version from cargo metadata"
+            exit 1
+          fi
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${crate_version}"
+            exit 1
+          fi
+          echo "Releasing version ${tag_version}"
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [frontend, gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            cross: false
+            strip: strip
+          - target: aarch64-unknown-linux-gnu
+            cross: true
+            strip: aarch64-linux-gnu-strip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Download admin UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: admin-ui-dist
+          path: web/admin-ui/dist
+
+      # The dependency tree has no openssl-sys/aws-lc-sys; the only C code is
+      # ring and zstd-sys, both of which honour the CC_<target> convention. A
+      # plain GNU cross toolchain is therefore enough — no container needed.
+      - name: Install aarch64 cross toolchain
+        if: matrix.cross
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: cargo build --release --locked -p prx-waf --target ${{ matrix.target }}
+
+      - name: Package tarball
+        env:
+          TARGET: ${{ matrix.target }}
+          STRIP_TOOL: ${{ matrix.strip }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          pkg="${BIN_NAME}-${version}-${TARGET}"
+          stage="staging/${pkg}"
+
+          mkdir -p "${stage}" dist
+          cp "target/${TARGET}/release/${BIN_NAME}" "${stage}/${BIN_NAME}"
+          "${STRIP_TOOL}" "${stage}/${BIN_NAME}"
+          chmod 755 "${stage}/${BIN_NAME}"
+
+          cp -R configs rules migrations "${stage}/"
+          cp README.md CHANGELOG.md LICENSE SECURITY.md "${stage}/"
+
+          # Deterministic ordering / ownership / timestamps so two runs of the
+          # same commit produce the same tarball.
+          mtime="$(git log -1 --format=%cI)"
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="${mtime}" \
+              -czf "dist/${pkg}.tar.gz" -C staging "${pkg}"
+
+          ls -l "dist/${pkg}.tar.gz"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Sign and publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # create the GitHub Release and upload assets
+      id-token: write # OIDC token for cosign keyless signing and attestations
+      attestations: write # store the SLSA build provenance attestation
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-sbom
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json --all-features --describe crate
+          sbom="$(find . -name 'prx-waf*.cdx.json' -not -path './target/*' -not -path './dist/*' | head -n 1)"
+          if [ -z "${sbom}" ]; then
+            echo "::error::cargo-cyclonedx produced no SBOM for prx-waf"
+            exit 1
+          fi
+          cp "${sbom}" "dist/prx-waf-${version}-sbom.cdx.json"
+          echo "SBOM: dist/prx-waf-${version}-sbom.cdx.json ($(wc -c < "dist/prx-waf-${version}-sbom.cdx.json") bytes)"
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum -- *.tar.gz *.cdx.json > SHA256SUMS
+          cat SHA256SUMS
+
+      # Keyless (Fulcio/Rekor) signing: the certificate binds the signature to
+      # this workflow's OIDC identity, so there is no long-lived private key to
+      # protect or rotate. Verification instructions live in docs/RELEASING.md.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign artifacts with cosign (keyless)
+        working-directory: dist
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          for f in *.tar.gz *.cdx.json SHA256SUMS; do
+            echo "Signing ${f}"
+            cosign sign-blob --yes \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem" \
+              "${f}"
+          done
+          ls -l
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.cdx.json
+
+      - name: Assemble release notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          : > release-notes.md
+
+          if [ -f CHANGELOG.md ]; then
+            awk -v header="## [${version}]" '
+              index($0, header) == 1 { found = 1; next }
+              found && /^## \[/ { exit }
+              found { print }
+            ' CHANGELOG.md > changelog-section.md || true
+          fi
+
+          if [ -s changelog-section.md ] && grep -q '[^[:space:]]' changelog-section.md; then
+            cat changelog-section.md >> release-notes.md
+            printf '\n' >> release-notes.md
+          else
+            echo "::warning::no '## [${version}]' section found in CHANGELOG.md; relying on generated notes"
+          fi
+
+          cat >> release-notes.md <<EOF
+          ## Verifying this release
+
+          Every artifact is signed with [cosign](https://docs.sigstore.dev/) in
+          keyless mode and carries SLSA build provenance. There is no long-lived
+          signing key.
+
+          \`\`\`bash
+          # 1. Checksums
+          sha256sum --check --ignore-missing SHA256SUMS
+
+          # 2. Signature (repeat for any artifact; .sig and .pem sit next to it)
+          cosign verify-blob \\
+            --certificate prx-waf-${version}-x86_64-unknown-linux-gnu.tar.gz.pem \\
+            --signature   prx-waf-${version}-x86_64-unknown-linux-gnu.tar.gz.sig \\
+            --certificate-identity-regexp '^https://github.com/openprx/prx-waf/\.github/workflows/release\.yml@refs/tags/v.*$' \\
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \\
+            prx-waf-${version}-x86_64-unknown-linux-gnu.tar.gz
+
+          # 3. Build provenance
+          gh attestation verify prx-waf-${version}-x86_64-unknown-linux-gnu.tar.gz \\
+            --repo openprx/prx-waf
+          \`\`\`
+
+          A CycloneDX SBOM (\`prx-waf-${version}-sbom.cdx.json\`) is attached.
+
+          Full procedure: [docs/RELEASING.md](https://github.com/openprx/prx-waf/blob/${GITHUB_REF_NAME}/docs/RELEASING.md)
+          EOF
+
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: prx-waf ${{ github.ref_name }}
+          body_path: release-notes.md
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.cdx.json
+            dist/*.sig
+            dist/*.pem
+            dist/SHA256SUMS

@@ -1,0 +1,59 @@
+name: Scorecard
+
+# OpenSSF Scorecard: automated supply-chain posture scoring.
+# Results are published to the OpenSSF API (badge + public score) and uploaded
+# to GitHub code scanning so regressions show up as alerts.
+
+on:
+  # Re-score whenever branch protection changes, since it is a scored control.
+  branch_protection_rule:
+  schedule:
+    - cron: "0 7 * * 1"
+  push:
+    branches: [main]
+
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      # Upload the SARIF result to the code-scanning dashboard.
+      security-events: write
+      # Publish results to the OpenSSF API via keyless OIDC (publish_results).
+      id-token: write
+      # Read the workflow run history for the Branch-Protection / CI-Tests checks.
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@v2.4.1
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Required for the public score and the README badge. Only the
+          # scorecard result is published, never repository content.
+          publish_results: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorecard-results
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
