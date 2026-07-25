@@ -23,7 +23,7 @@ rules:
     category: protocol-attack
     severity: warning
     paranoia: 1
-    field: all
+    field: path+body
     operator: regex
     value: (?i)%uff[0-9a-f]{2}
     action: block
@@ -93,7 +93,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 4
-    field: all
+    field: path+query+headers
     operator: regex
     value: (?:^|[^\x5c])\x5c[cdeghijklmpqwxyz123456789]
     action: block

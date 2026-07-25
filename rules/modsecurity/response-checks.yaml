@@ -1,3 +1,16 @@
+# Response-phase rules.
+#
+# Every pattern here describes something the *origin* sent back, so the field
+# must name a response location.  `response_body` is deliberately a field the
+# OWASP loader rejects today: the engine has no response-inspection hook, so
+# these rules are inert and say so at startup instead of being silently run
+# against request bodies.  Running them against requests is not a weaker
+# version of the intended check, it is a different check that only ever fires
+# on innocent traffic — MODSEC-RESP-006 alone would block every form POST
+# carrying an `api_key=` parameter.
+#
+# This directory is not currently loaded (`RuleManager::load_from_dir` does not
+# recurse), but the fields are correct for the day it is.
 version: "1.0"
 description: "HTTP response inspection rules - web shell, error disclosure, security headers"
 source: "prx-waf community rules"
@@ -9,7 +22,7 @@ rules:
     category: "web-shell"
     severity: "critical"
     paranoia: 1
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "(?i)(?:eval\\s*\\(\\s*(?:base64_decode|gzinflate|str_rot13|rawurldecode|hex2bin)\\s*\\(|passthru\\s*\\(\\$_(?:GET|POST|REQUEST|COOKIE)|system\\s*\\(\\$_(?:GET|POST|REQUEST|COOKIE)|shell_exec\\s*\\(\\$_(?:GET|POST|REQUEST|COOKIE))"
     action: "block"
@@ -20,7 +33,7 @@ rules:
     category: "web-shell"
     severity: "critical"
     paranoia: 1
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "(?i)<?php\\s+(?:@)?(?:eval|system|exec|passthru|shell_exec|popen|proc_open)\\s*\\("
     action: "block"
@@ -31,7 +44,7 @@ rules:
     category: "web-shell"
     severity: "critical"
     paranoia: 1
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "(?i)(?:<%\\s*(?:eval|execute|executeglobal)\\s+Request|<(?:script|object)\\s+runat\\s*=\\s*[\"']?server[\"']?)"
     action: "block"
@@ -42,7 +55,7 @@ rules:
     category: "data-leakage"
     severity: "medium"
     paranoia: 1
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "(?i)(?:<title>Index of /|<h1>Index of /|Directory listing for /)"
     action: "log"
@@ -53,7 +66,7 @@ rules:
     category: "data-leakage"
     severity: "critical"
     paranoia: 1
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "\\[core\\]\\s*\\n\\s*repositoryformatversion"
     action: "block"
@@ -65,7 +78,7 @@ rules:
     category: "data-leakage"
     severity: "critical"
     paranoia: 1
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "(?i)(?:APP_KEY=|DB_PASSWORD=|SECRET_KEY=|API_KEY=|AWS_SECRET)"
     action: "block"
@@ -76,7 +89,7 @@ rules:
     category: "data-leakage"
     severity: "high"
     paranoia: 1
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "(?i)(?:XML parsing error|entity.*not defined|failed to load external entity)"
     action: "log"
@@ -87,7 +100,7 @@ rules:
     category: "data-leakage"
     severity: "high"
     paranoia: 2
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "(?i)(?:\"spring\\.datasource\\.password\"|\"management\\.server\\.port\"|\"eureka\\.client\")"
     action: "log"
@@ -98,7 +111,7 @@ rules:
     category: "data-leakage"
     severity: "critical"
     paranoia: 1
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "(?i)(?:\"kind\"\\s*:\\s*\"Secret\"|\"type\"\\s*:\\s*\"kubernetes\\.io/|\"data\"\\s*:\\s*\\{[^}]*\"tls\\.crt\")"
     action: "log"
@@ -109,7 +122,7 @@ rules:
     category: "data-leakage"
     severity: "medium"
     paranoia: 1
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "(?i)(?:Fatal error:|Parse error:|Warning:|Notice:)\\s+.{10,}?\\s+in\\s+/.{5,}?\\.php\\s+on\\s+line\\s+[0-9]+"
     action: "log"
@@ -120,7 +133,7 @@ rules:
     category: "data-leakage"
     severity: "medium"
     paranoia: 2
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "(?i)(?:UnhandledPromiseRejection|at Object\\.exports\\.createServer|at Module\\._compile|node_modules/.+\\.js:[0-9]+:[0-9]+)"
     action: "log"
@@ -131,7 +144,7 @@ rules:
     category: "data-leakage"
     severity: "medium"
     paranoia: 2
-    field: "body"
+    field: "response_body"
     operator: "regex"
     value: "(?i)(?:Traceback \\(most recent call last\\):|File \"[^\"]+\\.py\", line [0-9]+)"
     action: "log"

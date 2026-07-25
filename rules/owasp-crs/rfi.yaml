@@ -28,7 +28,7 @@ rules:
     category: rfi
     severity: critical
     paranoia: 1
-    field: all
+    field: query+body
     operator: regex
     value: |-
       (?i)(?:\binclude[\s\x0b]*\([^\)]*|mosConfig_absolute_path|(?:_(?:CONF\[path|SERVER\[DOCUMENT_ROOT)|path\[docroot|config\[root_dir)\]|GALLERY_BASEDIR|appserv_root)=(?:f(?:ile|tps?)|https?)://

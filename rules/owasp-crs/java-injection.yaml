@@ -14,7 +14,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 1
-    field: all
+    field: query+body+cookies+headers
     operator: regex
     value: java\.lang\.(?:runtime|processbuilder)
     action: block
@@ -28,7 +28,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 1
-    field: all
+    field: query+body+cookies+headers
     operator: regex
     value: (?:runtime|processbuilder)
     action: block
@@ -42,7 +42,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 1
-    field: all
+    field: query+body+cookies+headers
     operator: regex
     value: |-
       (?:clonetransform|xmldecod)er|f(?:orclosure|ilewriter)|in(?:stantiate(?:factory|transformer)|vokertransformer)|(?:prototype(?:clone|serialization)factor|getpropert)y|whileclosure
@@ -71,7 +71,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 1
-    field: all
+    field: unmapped_files
     operator: regex
     value: .*\.(?:jsp|jspx)\.*$
     action: block
@@ -112,7 +112,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 2
-    field: all
+    field: query+body+cookies+headers
     operator: regex
     value: \xac\xed\x00\x05
     action: block
@@ -126,7 +126,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 2
-    field: all
+    field: query+body+cookies+headers
     operator: regex
     value: (?:rO0ABQ|KztAAU|Cs7QAF)
     action: block
@@ -140,7 +140,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 2
-    field: all
+    field: query+body+cookies+headers
     operator: regex
     value: |-
       (?:clonetransform|xmldecod)er|f(?:orclosure|ilewriter)|in(?:stantiate(?:factory|transformer)|vokertransformer)|(?:prototype(?:clone|serialization)factor|getpropert)y|whileclosure
@@ -155,7 +155,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 2
-    field: all
+    field: query+body+cookies+headers
     operator: regex
     value: java\b.+(?:runtime|processbuilder)
     action: block
@@ -169,7 +169,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 2
-    field: all
+    field: query+body+cookies+headers
     operator: regex
     value: |-
       class\.module\.classLoader\.resources\.context\.parent\.pipeline|springframework\.context\.support\.FileSystemXmlApplicationContext
@@ -184,7 +184,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 3
-    field: all
+    field: query+body+cookies+headers
     operator: regex
     value: |-
       c(?:nVudGltZQ|HJv(?:Y2Vzc2J1aWxkZXI|dG90eXBl(?:Y2xvbmVmYWN0b3J5|c2VyaWFsaXphdGlvbmZhY3Rvcnk)))|H(?:J1bnRpbWU|Byb(?:2Nlc3NidWlsZGVy|3RvdHlwZ(?:WNsb25lZmFjdG9yeQ|XNlcmlhbGl6YXRpb25mYWN0b3J5))|doaWxlY2xvc3VyZQ)|B(?:(?:ydW50aW1|mb3JjbG9zdXJ)l|wcm9(?:jZXNzYnVpbGRlcg|0b3R5cGV(?:jbG9uZWZhY3Rvcnk|zZXJpYWxpemF0aW9uZmFjdG9yeQ))|jbG9uZXRyYW5zZm9ybWVy|pbn(?:N0YW50aWF0Z(?:WZhY3Rvcnk|XRyYW5zZm9ybWVy)|Zva2VydHJhbnNmb3JtZXI)|3aGlsZWNsb3N1cmU)|Y2xvbmV0cmFuc2Zvcm1lcg|G(?:Nsb25ldHJhbnNmb3JtZXI|ZvcmNsb3N1cmU|lu(?:c3RhbnRpYXRl(?:ZmFjdG9yeQ|dHJhbnNmb3JtZXI)|dm9rZXJ0cmFuc2Zvcm1lcg))|Zm9yY2xvc3VyZQ|aW5(?:zdGFudGlhdGV(?:mYWN0b3J5|0cmFuc2Zvcm1lcg)|2b2tlcnRyYW5zZm9ybWVy)|d2hpbGVjbG9zdXJl

@@ -207,7 +207,8 @@ rules:
   paranoia: 1                   # Paranoia level 1-4 (integer, OPTIONAL, default: 1)
                                 # Controls how eagerly the rule is activated.
 
-  field: "all"                  # Which part of the request to inspect (REQUIRED)
+  field: "query+body"           # Which part(s) of the request to inspect (REQUIRED)
+                                # Single surface, or several joined with `+`.
                                 # See Field Reference below.
 
   operator: "regex"             # How to match the value (REQUIRED)
@@ -250,7 +251,51 @@ rules:
 | `content_length`   | Content-Length value (numeric comparison)          |
 | `path_length`      | Length of the URI path (numeric comparison)        |
 | `query_arg_count`  | Number of query parameters (numeric comparison)    |
-| `all`              | All of the above fields combined                   |
+| `header_referer`   | Referer header only                                |
+| `header_host`      | Host request header only (not the matched vhost)   |
+| `header_range`     | Range header only                                  |
+| `all`              | Path, query, body, cookies and every header value  |
+
+#### Composite fields
+
+A rule that must read several places at once names them joined with `+`, in
+this order: `path`, `query`, `body`, `cookies`, `headers`, `user_agent`,
+`referer` — for example `query+body+cookies`. `all` is exactly
+`path+query+body+cookies+headers`.
+
+Reach for the narrowest list that covers the rule. `all` walks **every request
+header value**, and a pattern that is safe on arguments is often not safe
+there: CRS-933150 matches the PHP function name `urlencode`, which is a
+substring of `Content-Type: application/x-www-form-urlencoded`, and CRS-941130
+matches `xhtml`, which every browser sends in `Accept`. Both blocked ordinary
+traffic while they carried `all`.
+
+An unknown or duplicated surface name is rejected at load time rather than
+quietly scanning less than the rule says.
+
+#### Fields the engine cannot evaluate
+
+Rule files may also carry a field the loader deliberately refuses:
+
+| Field                    | Meaning                                                      |
+|--------------------------|--------------------------------------------------------------|
+| `response_body`          | Needs the response; there is no response-inspection hook yet |
+| `response_status`        | Same                                                         |
+| `unmapped_<variable>`    | A `ModSecurity` variable with no accessor (see below)        |
+
+These rules are counted, rejected, and named in the startup `WARN`, which is
+the supported way to record "converted, but not enforceable". Never substitute
+`all` for a variable the engine does not support: that turns "we cannot check
+this" into "check everything", which is how CRS-922130
+(`MULTIPART_PART_HEADERS`) came to block any body containing a word followed by
+a colon. Current `unmapped_*` fields, all produced by `tools/modsec2yaml.py`:
+
+| Field                                  | Upstream variable                              |
+|----------------------------------------|------------------------------------------------|
+| `unmapped_files`                       | `FILES`, `FILES_NAMES`, `REQUEST_HEADERS:X-Filename` |
+| `unmapped_multipart_part_headers`      | `MULTIPART_PART_HEADERS`                       |
+| `unmapped_count_request_headers_range` | `&REQUEST_HEADERS:Range` (a count, not a value) |
+| `unmapped_chained_capture_equality`    | A chained `SecRule TX:1 "@streq %{TX.2}"`      |
 
 ### Operator Reference
 

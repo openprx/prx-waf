@@ -14,7 +14,7 @@ rules:
     category: multipart-attack
     severity: critical
     paranoia: 1
-    field: all
+    field: unmapped_multipart_part_headers
     operator: regex
     value: content-transfer-encoding:(.*)
     action: block
@@ -27,7 +27,7 @@ rules:
     category: multipart-attack
     severity: critical
     paranoia: 1
-    field: all
+    field: unmapped_multipart_part_headers
     operator: regex
     value: '[^\x21-\x7E][\x21-\x39\x3B-\x7E]*:'
     action: block

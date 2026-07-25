@@ -14,7 +14,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: all
+    field: query+body
     operator: regex
     value: |-
       (?:get|p(?:(?:os|u)t|atch|rop(?:find|atch))|head|options|co(?:nnect|py)|delete|trac[ek]|m(?:kcol|ove)|(?:un)?lock)[\s\x0b]+[^\s\x0b]+[\s\x0b]+http/[0-9]
@@ -29,7 +29,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: all
+    field: query+body+cookies
     operator: regex
     value: '[\n\r][^0-9A-Z_a-z]*?(?:content-(?:type|length)|set-cookie|location):[\s\x0b]*[0-9A-Z_a-z]'
     action: block
@@ -43,7 +43,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: all
+    field: query+body+cookies
     operator: regex
     value: (?:\bhttp/\d|<(?:html|meta)\b)
     action: block
@@ -114,7 +114,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: all
+    field: query+body+cookies
     operator: regex
     value: |-
       ^[^!&\(\):<>\|~]*\)[\s\x0b]*(?:\((?:[^!&\(\),<->\|~]+[<>~]?=|[\s\x0b]*[!&\|][\s\x0b]*[\(\)]?[\s\x0b]*)|\)[\s\x0b]*\([\s\x0b]*[!&\|][\s\x0b]*|[!&\|][\s\x0b]*\([^!&\(\),<->\|~]+[<>~]?=[^!&\(\):<>\|~]*)
@@ -128,7 +128,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: header_content_type
+    field: content_type
     operator: regex
     value: ^[^\s\x0b,;]+[\s\x0b,;].*?(?:application/(?:.+\+)?json|(?:application/(?:soap\+)?|text/)xml)
     action: block
@@ -184,7 +184,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 2
-    field: header_content_type
+    field: content_type
     operator: regex
     value: |-
       ^[^\s\x0b,;]+[\s\x0b,;].*?\b(?:((?:tex|multipar)t|application)|((?:audi|vide)o|image|cs[sv]|(?:vn|relate)d|p(?:df|lain)|json|(?:soa|cs)p|x(?:ml|-www-form-urlencoded)|form-data|x-amf|(?:octe|repor)t|stream)|([\+/]))\b
@@ -199,7 +199,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 3
-    field: all
+    field: unmapped_count_request_headers_range
     operator: gt
     value: '0'
     action: block

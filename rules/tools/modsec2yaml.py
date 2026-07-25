@@ -61,121 +61,242 @@ TAG_CATEGORY = {
 }
 
 # ── Variable → field mapping ──────────────────────────────────────────────────
+#
+# Every ModSecurity variable is first resolved to a *field name*, then field
+# names are grouped into coarse *surfaces* so that a rule listing several
+# variables can be given the narrowest engine field that still covers them.
+#
+# Two invariants matter here, both learned the hard way:
+#
+#   1. An unrecognised variable must never become `all`.  `all` is the widest
+#      field the engine has (path + query + body + every header value), so
+#      "we do not know what this is" silently turning into "scan everything"
+#      is a fail-open that manufactures false positives.  Unrecognised
+#      variables get an `unmapped_*` sentinel instead: the engine has no such
+#      field, so the rule is rejected at load time and named in the startup
+#      WARN.  Nothing is scanned that the upstream rule did not ask for, and
+#      the gap is visible to whoever maintains the mapping.
+#
+#   2. A rule that names several variables gets a `+`-joined surface list
+#      (`query+body+cookies`), not the catch-all `all`.  `all` walks every
+#      request header value, and CRS patterns are not written expecting that:
+#      CRS-933150 matches the PHP function name `urlencode`, a substring of
+#      `Content-Type: application/x-www-form-urlencoded`, and CRS-941130
+#      matches `xhtml`, a substring of the `Accept` header every browser
+#      sends.  `all` is emitted only when the upstream list really is the
+#      whole request.
+
+# Field names the engine can actually evaluate.  Mirrors `Field::parse` in
+# crates/waf-engine/src/checks/owasp.rs — keep the two in step.
+ENGINE_FIELDS = {
+    "all",
+    "method",
+    "path",
+    "query",
+    "body",
+    "content_length",
+    "content_type",
+    "header_content_type",
+    "user_agent",
+    "header_user_agent",
+    "path_length",
+    "query_arg_count",
+    "headers",
+    "cookies",
+    "header_referer",
+    "header_host",
+    "header_range",
+}
+
+UNMAPPED_PREFIX = "unmapped_"
+
+# Request surfaces an engine field reads.  Mirrors `Surfaces` in
+# crates/waf-engine/src/checks/owasp.rs; the order below is the canonical order
+# surface names appear in a composite field name.
+SURFACE_ORDER = ["path", "query", "body", "cookies", "headers", "user_agent", "referer"]
+
+# `headers` here means "every header value"; a field naming one specific header
+# contributes only that header's surface.  Scalar/derived fields (`method`,
+# `content_length`, ...) never take part in a composite and are absent.
+FIELD_SURFACES = {
+    "path":              ("path",),
+    "query":             ("query",),
+    "body":              ("body",),
+    "cookies":           ("cookies",),
+    "headers":           ("headers",),
+    "user_agent":        ("user_agent",),
+    "header_user_agent": ("user_agent",),
+    "header_referer":    ("referer",),
+}
+
+# Coarse request surface per engine field, kept for callers that only need a
+# single label.
+FIELD_SURFACE = {field: surfaces[0] for field, surfaces in FIELD_SURFACES.items()}
+
+# `ModSecurity` ARGS spans the query string *and* the parsed request body, and
+# the engine approximates the body half with the raw body preview: without it,
+# every argument rule could be bypassed by moving the payload into a POST body.
+#
+# The approximation is not extended to rules whose variable list is *only* the
+# ARGS family.  CRS calls those out in their own names — "Restricted SQL
+# Character Anomaly Detection (args)" — because they describe one parameter
+# value, and the engine has no parameter splitter: it hands the rule the whole
+# `a=1&b=2` string.  CRS-942430 fires on twelve special characters, which any
+# JSON body clears trivially.  Those rules keep the single surface they already
+# had; widening them would trade one class of false positive for two.
+ARGS_FAMILY_PREFIXES = ("ARGS", "QUERY_STRING", "XML:")
+
+
+def _surface_field(surfaces) -> str:
+    """Canonical field name for a set of surfaces."""
+    ordered = [s for s in SURFACE_ORDER if s in surfaces]
+    if not ordered:
+        return "all"
+    if len(ordered) == 1:
+        single = {"headers": "headers", "user_agent": "user_agent", "referer": "header_referer"}
+        return single.get(ordered[0], ordered[0])
+    if set(ordered) == {"path", "query", "body", "cookies", "headers"}:
+        return "all"
+    return "+".join(ordered)
+
+
+def _sentinel(var: str) -> str:
+    """A field name the engine is guaranteed to reject, naming the variable.
+
+    `&VAR` (count of) and `!VAR` (exclusion) keep a readable prefix so the
+    startup WARN says which ModSecurity construct is missing, not just which
+    collection.
+    """
+    v = var.strip()
+    prefix = ""
+    while v[:1] in ("&", "!"):
+        prefix += "count_" if v[0] == "&" else "not_"
+        v = v[1:]
+    slug = re.sub(r"[^a-z0-9]+", "_", (prefix + v).lower()).strip("_")
+    return UNMAPPED_PREFIX + (slug or "variable")
+
 
 def map_variables(var_str: str) -> str:
-    """Map a ModSecurity variable string to prx-waf field name."""
-    vs = var_str.upper().strip()
+    """Map a ModSecurity variable list to a single prx-waf field name."""
+    parts = [p.strip() for p in var_str.strip().strip('"').split("|") if p.strip()]
 
-    # Specific header overrides first
-    if "REQUEST_HEADERS:USER-AGENT" in vs or "REQUEST_HEADERS:User-Agent".upper() in vs:
-        # Check if there's more than just user-agent header
-        parts = [p.strip() for p in vs.split("|")]
-        non_ua = [p for p in parts if p not in ("REQUEST_HEADERS:USER-AGENT",)]
-        if len(non_ua) == 0:
-            return "user_agent"
-        # Has more parts, fall through to count logic
+    # `!VAR` removes members from the collection being scanned.  It can only
+    # narrow a rule, never widen it, and the engine has no exclusion syntax, so
+    # it contributes no field of its own.
+    positives = [p for p in parts if not p.startswith("!")]
+    if not positives:
+        return _sentinel(var_str)
 
-    parts = [p.strip() for p in vs.split("|")]
-    parts = [p for p in parts if p]  # remove empty
+    if len(positives) == 1:
+        return _single_var_map(positives[0])
 
-    # Single variable
-    if len(parts) == 1:
-        v = parts[0]
-        return _single_var_map(v)
+    fields = [_single_var_map(p) for p in positives]
 
-    # Multiple variables - count distinct categories
-    categories = set()
-    for v in parts:
-        categories.add(_var_category(v))
+    # A rule that touches any TX/IP/GEO collection is a CRS bookkeeping rule;
+    # the caller drops it wholesale.
+    if any(f == "tx" for f in fields):
+        return "tx"
 
-    if len(categories) >= 3:
-        return "all"
+    supported = [f for f in fields if f in ENGINE_FIELDS]
+    if not supported:
+        # Nothing in this rule is reachable.  Name the first gap.
+        return next(f for f in fields if f not in ENGINE_FIELDS)
 
-    # Map to best fit
-    if categories == {"cookies"}:
-        return "cookies"
-    if categories == {"query"}:
-        return "query"
-    if categories == {"headers"}:
-        return "headers"
-    if categories == {"path"}:
-        return "path"
-    if categories == {"body"}:
-        return "body"
-    if categories == {"response_body"}:
-        return "response_body"
-    if categories == {"response_status"}:
-        return "response_status"
-    # Mixed → all
-    return "all"
+    # Variables the engine cannot reach are simply not scanned.  Dropping them
+    # narrows the rule, which is safe; widening to cover them is not.
+    if len(set(supported)) == 1:
+        return supported[0]
+
+    surfaces = set()
+    args_only = True
+    for token, field in zip(positives, fields):
+        if field not in ENGINE_FIELDS:
+            continue
+        surfaces.update(FIELD_SURFACES.get(field, ()))
+        if not token.strip().upper().startswith(ARGS_FAMILY_PREFIXES):
+            args_only = False
+    if args_only:
+        surfaces.discard("body")
+    if not surfaces:
+        # Only scalar/derived fields (e.g. two size limits); nothing composite
+        # to express, so keep the first one rather than inventing a scan.
+        return supported[0]
+    return _surface_field(surfaces)
 
 
 def _var_category(v: str) -> str:
-    v = v.upper()
-    if v.startswith("REQUEST_COOKIES"):
-        return "cookies"
-    if v in ("ARGS", "ARGS_NAMES", "ARGS_GET", "ARGS_POST", "ARGS_GET_NAMES",
-             "ARGS_POST_NAMES", "XML:/*", "XML://*"):
-        return "query"
-    if v.startswith("XML:"):
-        return "query"
-    if v == "REQUEST_BODY":
-        return "body"
-    if v == "REQUEST_HEADERS:USER-AGENT":
-        return "user_agent"
-    if v.startswith("REQUEST_HEADERS"):
-        return "headers"
-    if v in ("REQUEST_URI", "REQUEST_FILENAME", "REQUEST_BASENAME",
-             "REQUEST_URI_RAW", "PATH_INFO"):
-        return "path"
-    if v == "REQUEST_LINE":
-        return "path"
-    if v.startswith("RESPONSE_BODY"):
-        return "response_body"
-    # Response-phase variables must never fall through to a request field:
-    # scanning a *request* with a response-phase pattern is pure false positive.
-    if v.startswith("RESPONSE_STATUS") or v.startswith("RESPONSE_PROTOCOL"):
-        return "response_status"
-    if v.startswith("RESPONSE_HEADERS"):
-        return "response_headers"
-    if v.startswith("TX:") or v.startswith("IP:") or v.startswith("GEO:"):
-        return "tx"
-    return "other"
+    """Coarse request surface a single ModSecurity variable belongs to."""
+    return FIELD_SURFACE.get(_single_var_map(v), "other")
 
 
 def _single_var_map(v: str) -> str:
-    v = v.upper()
+    """Map one ModSecurity variable to an engine field, or to a sentinel."""
+    v = v.strip().upper()
+
+    # `&VAR` is the *count* of a collection, not its contents.  The engine has
+    # no counting operator, so these can only be reported as unmapped — mapping
+    # `&REQUEST_HEADERS:Range` to `header_range` would turn "a Range header is
+    # present" into "the Range header matches", a different rule.
+    if v.startswith("&"):
+        # TX bookkeeping counts are dropped by the caller, not warned about.
+        if v.startswith("&TX:") or v.startswith("&IP:") or v.startswith("&GEO:"):
+            return "tx"
+        return _sentinel(v)
+
     if v in ("REQUEST_URI", "REQUEST_FILENAME", "REQUEST_BASENAME",
              "REQUEST_URI_RAW", "PATH_INFO", "REQUEST_LINE"):
         return "path"
     if v in ("ARGS", "ARGS_NAMES", "ARGS_GET", "ARGS_POST",
-             "ARGS_GET_NAMES", "ARGS_POST_NAMES"):
+             "ARGS_GET_NAMES", "ARGS_POST_NAMES", "QUERY_STRING"):
         return "query"
-    if v in ("XML:/*", "XML://*") or v.startswith("XML:"):
-        return "query"
+    # XML:/... selects nodes of the request body parsed as XML.
+    if v.startswith("XML:"):
+        return "body"
     if v == "REQUEST_BODY":
         return "body"
+    if v == "REQUEST_METHOD":
+        return "method"
     if v == "REQUEST_HEADERS:USER-AGENT":
         return "user_agent"
+    # Headers the engine exposes under a name of its own rather than as
+    # `header_<name>`.
+    if v == "REQUEST_HEADERS:CONTENT-LENGTH":
+        return "content_length"
+    if v == "REQUEST_HEADERS:CONTENT-TYPE":
+        return "content_type"
     if v.startswith("REQUEST_HEADERS:"):
-        # Specific header
+        # Specific header.  `header_<name>` is only evaluable for the handful
+        # of headers `Field::parse` knows; the rest are rejected by name, which
+        # is exactly the signal a maintainer needs.
         header = v[len("REQUEST_HEADERS:"):].lower().replace("-", "_")
         return f"header_{header}"
-    if v == "REQUEST_HEADERS":
+    if v in ("REQUEST_HEADERS", "REQUEST_HEADERS_NAMES"):
         return "headers"
     if v.startswith("REQUEST_COOKIES"):
         return "cookies"
     if v.startswith("RESPONSE_BODY"):
         return "response_body"
-    # See _var_category: response-phase variables keep a response-phase field
-    # name so the engine rejects them loudly instead of scanning the request.
+    # Response-phase variables keep a response-phase field name so the engine
+    # rejects them loudly instead of scanning the request.
     if v.startswith("RESPONSE_STATUS") or v.startswith("RESPONSE_PROTOCOL"):
         return "response_status"
     if v.startswith("RESPONSE_HEADERS"):
         return "response_headers"
     if v.startswith("TX:") or v.startswith("IP:") or v.startswith("GEO:"):
         return "tx"
-    return "all"
+
+    # Known-but-unreachable CRS variables.  Listed explicitly so the sentinel
+    # names are stable across re-syncs and so this doubles as the "not
+    # supported yet" inventory:
+    #
+    #   MULTIPART_*        multipart part headers / charset — the engine sees
+    #                      the raw body, not parsed parts (CRS 922).
+    #   FILES, FILES_NAMES uploaded file names (CRS 933110/933220/944140/932180).
+    #   MATCHED_VAR(S)     the previous rule's match, chained rules only.
+    #   REMOTE_ADDR        available to the engine, but not through Field.
+    #   REQBODY_PROCESSOR, UNIQUE_ID, *_COMBINED_SIZE, REQUEST_BODY_LENGTH,
+    #   REQUEST_PROTOCOL   no accessor.
+    return _sentinel(v)
 
 
 # ── Operator mapping ──────────────────────────────────────────────────────────
@@ -367,6 +488,34 @@ def should_skip_rule(variables: str, operator: str, opts: dict) -> tuple[bool, s
     return False, ""
 
 
+# A chained SecRule whose second condition compares two captures of the first
+# (`SecRule TX:1 "@streq %{TX.2}"`) is not a refinement — it *is* the rule.
+# CRS-942130 captures the two words either side of `=` and only fires when they
+# are identical, i.e. a tautology like `1=1`.  Emitting the first condition on
+# its own turns it into "block any `word = word`", which matches `tpl=hello`.
+CHAIN_CAPTURE_COMPARE_RE = re.compile(
+    r'^\s*SecRule\s+TX:\d+\s+"!?@streq\s+%\{TX\.\d+\}"', re.IGNORECASE
+)
+
+# Field name used when the rule's meaning depends on a chained condition the
+# converter cannot express.  The engine rejects it and names it at startup.
+CHAIN_UNSUPPORTED_FIELD = "unmapped_chained_capture_equality"
+
+
+def chain_depends_on_capture_equality(lines: list[str], index: int) -> bool:
+    """True if the SecRule at `index` chains into a capture-equality test."""
+    for line in lines[index + 1: index + 4]:
+        stripped = line.strip()
+        if not stripped.startswith("SecRule"):
+            break
+        if CHAIN_CAPTURE_COMPARE_RE.match(stripped):
+            return True
+        # A chain child carrying its own id starts a new rule.
+        if re.search(r"\bid:\d+", stripped):
+            break
+    return False
+
+
 def extract_rule(variables: str, operator_str: str, opts: dict,
                  default_category: str) -> dict | None:
     """Convert parsed SecRule components into a prx-waf rule dict."""
@@ -465,8 +614,8 @@ def parse_conf_file(path: str, default_category: str) -> list[dict]:
     rules = []
     seen_ids = set()
 
-    for line in lines:
-        line = line.strip()
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
 
         # Skip comments and empty lines
         if not line or line.startswith("#"):
@@ -502,6 +651,9 @@ def parse_conf_file(path: str, default_category: str) -> list[dict]:
         rule = extract_rule(variables, operator_str, opts, default_category)
         if rule is None:
             continue
+
+        if "chain" in opts and chain_depends_on_capture_equality(lines, index):
+            rule["field"] = CHAIN_UNSUPPORTED_FIELD
 
         # Deduplicate
         if rule["crs_id"] in seen_ids:
