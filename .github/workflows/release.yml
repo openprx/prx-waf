@@ -26,10 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: npm
@@ -44,7 +44,7 @@ jobs:
         run: npm run build
 
       - name: Upload admin UI dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: admin-ui-dist
           path: web/admin-ui/dist
@@ -59,7 +59,7 @@ jobs:
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -68,7 +68,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Download admin UI dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: admin-ui-dist
           path: web/admin-ui/dist
@@ -116,7 +116,7 @@ jobs:
             cross: true
             strip: aarch64-linux-gnu-strip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -127,7 +127,7 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Download admin UI dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: admin-ui-dist
           path: web/admin-ui/dist
@@ -179,7 +179,7 @@ jobs:
           ls -l "dist/${pkg}.tar.gz"
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -196,7 +196,7 @@ jobs:
       id-token: write # OIDC token for cosign keyless signing and attestations
       attestations: write # store the SLSA build provenance attestation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -205,7 +205,7 @@ jobs:
           key: release-sbom
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist
@@ -254,7 +254,7 @@ jobs:
           ls -l
 
       - name: Attest build provenance (SLSA)
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/*.tar.gz
@@ -313,7 +313,7 @@ jobs:
           cat release-notes.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: prx-waf ${{ github.ref_name }}
           body_path: release-notes.md
