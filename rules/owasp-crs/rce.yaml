@@ -249,6 +249,11 @@ rules:
     field: unmapped_files
     operator: pm_from_file
     value: restricted-upload.data
+    chain:
+      - field: matched_value
+        operator: regex
+        value: (?i)(?:\.boto|buddyinfo|mtrr|acpi|zoneinfo)\B
+        negate: true
     action: block
     tags:
       - owasp-crs
@@ -337,6 +342,13 @@ rules:
     field: query+body+cookies
     operator: regex
     value: '[''\*\?\x5c`][^\n/]+/|/[^/]+?[''\*\?\x5c`]|\$[!#\$\(\*\-0-9\?-\[_a-\{]'
+    chain:
+      - field: matched_value
+        operator: regex
+        value: /
+      - field: matched_value
+        operator: regex
+        value: \s
     action: block
     tags:
       - owasp-crs
@@ -351,6 +363,18 @@ rules:
     field: header_referer
     operator: regex
     value: ^[^#]+
+    capture: true
+    chain:
+      - field: tx:0
+        operator: regex
+        value: ^[^\.]+\.[^;\?]+[;\?](.*(['\*\?\x5c`][^\n/]+/|/[^/]+?['\*\?\x5c`]|\$[!#\$\(\*\-0-9\?-\[_a-\{]))
+        capture: true
+      - field: tx:1
+        operator: regex
+        value: /
+      - field: tx:1
+        operator: regex
+        value: \s
     action: block
     tags:
       - owasp-crs
@@ -365,6 +389,13 @@ rules:
     field: header_referer
     operator: regex
     value: ^[^\.]*?(?:['\*\?\x5c`][^\n/]+/|/[^/]+?['\*\?\x5c`]|\$[!#\$\(\*\-0-9\?-\[_a-\{])
+    chain:
+      - field: matched_value
+        operator: regex
+        value: /
+      - field: matched_value
+        operator: regex
+        value: \s
     action: block
     tags:
       - owasp-crs
@@ -379,6 +410,21 @@ rules:
     field: header_referer
     operator: regex
     value: '#.*'
+    capture: true
+    chain:
+      - field: tx:0
+        operator: regex
+        value: '[''\*\?\x5c`][^\n/]+/|/[^/]+?[''\*\?\x5c`]|\$[!#\$\(\*\-0-9\?-\[_a-\{]'
+      - field: matched_value
+        operator: regex
+        value: /
+      - field: matched_value
+        operator: regex
+        value: \s
+      - field: matched_value
+        operator: starts_with
+        value: '#:~:text='
+        negate: true
     action: block
     tags:
       - owasp-crs
@@ -409,6 +455,11 @@ rules:
     operator: regex
     value: |-
       (?i)[\-0-9_a-z]+(?:[\s\x0b]*[\"'][^\s\x0b\"',:]+[\"']|(?:[\"'][\"']+|[\[-\]]+|\$+[!#\*\-0-9\?@\x5c_a-\{]+|``|[\$<>]\(\))[\s\x0b]*)[\-0-9_a-z]+
+    chain:
+      - field: matched_value
+        operator: regex
+        value: '[0-9]\s*\''\s*[0-9]'
+        negate: true
     action: block
     tags:
       - owasp-crs

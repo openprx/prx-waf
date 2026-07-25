@@ -60,6 +60,57 @@ The `data/` directory contains wordlists used by `pm_from_file` rules:
 | `ssrf-no-scheme.data` | 934110 | SSRF no-scheme patterns |
 | `ai-critical-artifacts.data` | 934150 | AI/ML sensitive artifacts |
 
+## Chained Rules (`chain:`)
+
+A `ModSecurity` `SecRule ... "chain"` is one rule whose conditions must **all**
+hold. The YAML mirrors that: the head condition stays at the top level and the
+remaining conditions go in an optional `chain:` list. A rule without `chain:` is
+an ordinary single-condition rule and needs no change.
+
+```yaml
+- id: CRS-944110
+  paranoia: 1
+  field: query+body+cookies+headers   # head condition
+  operator: regex
+  value: (?:runtime|processbuilder)
+  chain:                              # every link must also hold
+    - field: matched_value
+      operator: regex
+      value: (?i)(?:unmarshaller|base64data|java\.)
+  action: block
+```
+
+Each link takes the same `field` / `operator` / `value` keys as the head, plus:
+
+| Key | Meaning |
+|-----|---------|
+| `negate: true` | `!@op` — the condition holds for a value the matcher rejects |
+| `capture: true` | bind this regex's groups to `tx:0`…`tx:N` for later conditions (regex only; `capture` is also valid on the head) |
+
+Two pseudo-fields are available to a chain link only:
+
+| `field` | `ModSecurity` | Meaning |
+|---------|---------------|---------|
+| `matched_value` | `MATCHED_VAR` / `MATCHED_VARS` | the values the previous condition matched, in the form it matched them (URL-decoded when the match was made on a decoded form) |
+| `tx:N` | `TX:N` | capture group `N` of the last capturing condition (`tx:0` is the whole match) |
+
+A comparison operand (`equals`, `contains`, `starts_with`, `ends_with`) may
+expand `%{TX.N}` and `%{REQUEST_HEADERS.HOST}`. Any other macro is refused at
+load time rather than compared as a literal.
+
+`count_header_<name>` is a header **presence** test (`&REQUEST_HEADERS:<name>`),
+valid only with `equals` against `'0'` or `'1'` — repeated headers are folded
+into one entry, so no other count is reachable.
+
+Evaluation short-circuits: the head is tested first with the ordinary
+allocation-free path, and the chain runs only if it matched.
+
+A chained CRS rule the converter cannot express faithfully is refused **whole**
+— its `field` becomes an `unmapped_chained_*` marker that the engine rejects and
+names in the startup `WARN`. Emitting only the first condition is never
+conservative: it is always a broader rule than upstream (CRS-944110's first
+condition alone blocks any request mentioning "runtime").
+
 ## Paranoia Levels
 
 | Level | Description | False Positive Risk |

@@ -68,6 +68,11 @@ rules:
     field: header_range
     operator: regex
     value: ^bytes=(?:(?:\d+)?-(?:\d+)?\s*,?\s*){6}
+    chain:
+      - field: path
+        operator: ends_with
+        value: .pdf
+        negate: true
     action: block
     tags:
       - owasp-crs

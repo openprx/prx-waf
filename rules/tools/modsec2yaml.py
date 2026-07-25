@@ -488,32 +488,283 @@ def should_skip_rule(variables: str, operator: str, opts: dict) -> tuple[bool, s
     return False, ""
 
 
-# A chained SecRule whose second condition compares two captures of the first
-# (`SecRule TX:1 "@streq %{TX.2}"`) is not a refinement — it *is* the rule.
-# CRS-942130 captures the two words either side of `=` and only fires when they
-# are identical, i.e. a tautology like `1=1`.  Emitting the first condition on
-# its own turns it into "block any `word = word`", which matches `tpl=hello`.
-CHAIN_CAPTURE_COMPARE_RE = re.compile(
-    r'^\s*SecRule\s+TX:\d+\s+"!?@streq\s+%\{TX\.\d+\}"', re.IGNORECASE
+# ── Chained SecRules ──────────────────────────────────────────────────────────
+#
+# `SecRule ... "...,chain"` followed by further `SecRule` lines is ONE rule
+# whose conditions must all hold.  Emitting only the first condition is never
+# a conservative simplification: it always produces a *broader* rule than
+# upstream, and for CRS that difference is the whole rule.  Two live examples:
+#
+#   * CRS-944110's first condition is `@rx (?:runtime|processbuilder)`.  On its
+#     own it blocks any request mentioning "runtime"; the chained condition
+#     requires the same value to also contain `unmarshaller|base64data|java.`,
+#     i.e. an actual Java deserialization payload.
+#   * CRS-942130 captures the two words either side of `=` and only fires when
+#     the chained `TX:1 @streq %{TX.2}` says they are identical (a `1=1`
+#     tautology).  Without it the rule reads "block any `word = word`".
+#
+# So a chain is either emitted in full or the rule is refused outright by
+# giving it an `unmapped_chained_*` field the engine cannot resolve.
+
+# Engine operators, mirroring `Loader::compile_condition` in
+# crates/waf-engine/src/checks/owasp.rs — keep the two in step.
+ENGINE_OPERATORS = {
+    "regex",
+    "contains",
+    "contains_any",
+    "pm_from_file",
+    "equals",
+    "starts_with",
+    "ends_with",
+    "not_in",
+    "gt",
+    "lt",
+    "detect_sqli",
+    "detect_xss",
+}
+
+# Operators whose value is a comparison operand and may therefore carry a
+# `%{...}` macro.  A macro inside a regex is a different thing entirely and is
+# always refused.
+OPERAND_OPERATORS = {"contains", "equals", "starts_with", "ends_with"}
+
+# Headers `&REQUEST_HEADERS:<name>` may be mapped to a `count_header_<name>`
+# presence test.
+#
+# Deliberately minimal.  The engine can count any header it can read, but
+# turning a `&VAR` test into an enforced rule changes what the rule set blocks:
+# CRS-921230 is `&REQUEST_HEADERS:Range @gt 0` at PL2+, so adding "range" here
+# would start blocking every byte-range media request.  Add a header only
+# together with false-positive probes for the rules it activates.
+COUNT_MAPPED_HEADERS = {"referer"}
+
+MACRO_RE = re.compile(r"%\{([^}]*)\}")
+TX_INDEX_RE = re.compile(r"^TX:(\d+)$", re.IGNORECASE)
+COUNT_HEADER_RE = re.compile(r"^&REQUEST_HEADERS:([\w-]+)$", re.IGNORECASE)
+MATCHED_VALUE_VARS = {"MATCHED_VAR", "MATCHED_VARS"}
+MATCHED_NAME_VARS = {"MATCHED_VAR_NAME", "MATCHED_VARS_NAMES"}
+
+# A chain child may omit the trailing action string (`SecRule VAR "@rx x"`).
+SECRULE_CHILD_RE = re.compile(
+    r'^\s*SecRule\s+'
+    r'((?:"(?:[^"\\]|\\.)*"|[^\s"]+))'
+    r'\s+'
+    r'"((?:[^"\\]|\\.)*)"'
+    r'(?:\s+"((?:[^"\\]|\\.)*)")?'
+    r'\s*$',
+    re.DOTALL
 )
 
-# Field name used when the rule's meaning depends on a chained condition the
-# converter cannot express.  The engine rejects it and names it at startup.
-CHAIN_UNSUPPORTED_FIELD = "unmapped_chained_capture_equality"
+
+class ChainUnsupported(Exception):
+    """A chain condition this converter cannot express faithfully.
+
+    `reason` becomes the `unmapped_chained_<reason>` sentinel field, so the
+    engine's startup WARN names the missing ModSecurity construct.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
-def chain_depends_on_capture_equality(lines: list[str], index: int) -> bool:
-    """True if the SecRule at `index` chains into a capture-equality test."""
-    for line in lines[index + 1: index + 4]:
-        stripped = line.strip()
-        if not stripped.startswith("SecRule"):
-            break
-        if CHAIN_CAPTURE_COMPARE_RE.match(stripped):
-            return True
-        # A chain child carrying its own id starts a new rule.
-        if re.search(r"\bid:\d+", stripped):
-            break
-    return False
+def _count_regex_groups(pattern: str) -> int:
+    """Number of capturing groups in a PCRE pattern.
+
+    Counted by scanning rather than by compiling: CRS patterns use PCRE syntax
+    (`\\x{bc}`, possessive quantifiers) that Python's `re` rejects.
+    """
+    groups = 0
+    in_class = False
+    escaped = False
+    for i, ch in enumerate(pattern):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+        elif in_class:
+            if ch == "]":
+                in_class = False
+        elif ch == "[":
+            in_class = True
+        elif ch == "(" and pattern[i + 1: i + 2] != "?":
+            groups += 1
+    return groups
+
+
+def _map_chain_variables(var_str: str) -> str:
+    """Map a chain child's variable list to an engine condition field."""
+    parts = [p.strip() for p in var_str.strip().strip('"').split("|") if p.strip()]
+    positives = [p for p in parts if not p.startswith("!")]
+    if not positives:
+        raise ChainUnsupported("variable")
+    upper = [p.upper() for p in positives]
+
+    if any(v in MATCHED_NAME_VARS for v in upper):
+        # The *name* of the matched variable; the engine has no parameter
+        # names, only values.
+        raise ChainUnsupported("matched_var_name")
+    if any(v in MATCHED_VALUE_VARS for v in upper):
+        # `MATCHED_VARS|XML:/*` and friends: the extra variables are dropped,
+        # which narrows the condition to the values the previous condition
+        # matched.  Narrowing is safe; widening is not.
+        return "matched_value"
+
+    if len(positives) == 1:
+        single = upper[0]
+        tx = TX_INDEX_RE.match(single)
+        if tx:
+            return f"tx:{int(tx.group(1))}"
+        if single.startswith("TX:") or single.startswith("&TX:"):
+            # `TX:content_type`, `TX:/^header_name_920450_/`: variables a
+            # `setvar` built earlier in the same rule.  The converter models no
+            # variable store, so the condition cannot be reproduced.
+            raise ChainUnsupported("tx_variable")
+        count = COUNT_HEADER_RE.match(single)
+        if count:
+            name = count.group(1).lower().replace("-", "_")
+            if name in COUNT_MAPPED_HEADERS:
+                return f"count_header_{name}"
+            raise ChainUnsupported("header_count")
+
+    field = map_variables(var_str)
+    if field == "tx":
+        raise ChainUnsupported("tx_variable")
+    if field not in ENGINE_FIELDS and "+" not in field:
+        raise ChainUnsupported("variable")
+    return field
+
+
+def _check_macros(operator: str, value: str, bound_captures: int) -> None:
+    """Refuse a value whose `%{...}` macros the engine cannot expand."""
+    if "%{" not in value:
+        return
+    if operator not in OPERAND_OPERATORS:
+        raise ChainUnsupported("macro")
+    for match in MACRO_RE.finditer(value):
+        name = match.group(1).strip().lower()
+        if name == "request_headers.host":
+            continue
+        tx = re.fullmatch(r"tx\.(\d+)", name)
+        if tx:
+            if int(tx.group(1)) >= bound_captures:
+                raise ChainUnsupported("capture")
+            continue
+        raise ChainUnsupported("macro")
+
+
+def _collect_chain_children(lines: list[str], index: int) -> list[dict]:
+    """Gather the SecRule lines chained onto the rule at `index`."""
+    children = []
+    cursor = index + 1
+    while cursor < len(lines):
+        line = lines[cursor].strip()
+        cursor += 1
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("SecRule"):
+            raise ChainUnsupported("directive")
+        match = SECRULE_CHILD_RE.match(line)
+        if not match:
+            raise ChainUnsupported("syntax")
+        opts = parse_options((match.group(3) or "").strip())
+        if "id" in opts:
+            # A child carrying its own id is a new rule: the chain is truncated
+            # in the source, which we must not paper over.
+            raise ChainUnsupported("syntax")
+        children.append({
+            "variables": match.group(1).strip().strip('"'),
+            "operator": match.group(2).strip(),
+            "opts": opts,
+        })
+        if "chain" not in opts:
+            return children
+    raise ChainUnsupported("syntax")
+
+
+def build_chain(head_operator: str, head_value: str, head_opts: dict,
+                lines: list[str], index: int) -> tuple[list[dict], bool]:
+    """Build the YAML chain conditions for the rule at `index`.
+
+    Returns `(conditions, head_capture)`.  Raises `ChainUnsupported` when any
+    condition cannot be expressed, in which case the caller must refuse the
+    whole rule.
+    """
+    children = _collect_chain_children(lines, index)
+
+    # Which condition currently supplies tx:0..tx:N — `-1` is the head.
+    # Captures are only emitted for the conditions something actually reads.
+    bound_captures = 0
+    bound_source = None
+    capture_providers: dict[int, int] = {}
+    used_providers: set[int] = set()
+
+    if "capture" in head_opts and head_operator == "regex":
+        bound_captures = _count_regex_groups(head_value) + 1
+        bound_source = -1
+
+    conditions = []
+    for position, child in enumerate(children):
+        field = _map_chain_variables(child["variables"])
+
+        mapped = _map_chain_operator(child["operator"])
+        if mapped is None:
+            raise ChainUnsupported("syntax")
+        negate, operator, value = mapped
+        if operator not in ENGINE_OPERATORS:
+            raise ChainUnsupported("operator")
+
+        if field.startswith("tx:"):
+            if int(field[3:]) >= bound_captures:
+                raise ChainUnsupported("capture")
+            used_providers.add(bound_source)
+            # `TX:1 @streq %{TX.2}` asserts that the two captures are the same
+            # word — a tautology such as `1=1` *inside one parameter*.  The
+            # engine has no ARGS splitter: it hands the rule the whole
+            # `a=1&b=2` query string, in which the `name=value` separator is
+            # itself a `word = word` pair, so `?tab=tab` would read as a
+            # tautology.  Reproducing this needs per-parameter variables, so
+            # the rule is refused (CRS-942130).  The *dis*equality form has no
+            # such problem: a `name=value` separator is not an inequality
+            # operator, so CRS-942131 converts faithfully.
+            if operator == "equals" and not negate and "%{" in value:
+                raise ChainUnsupported("args_self_equality")
+        _check_macros(operator, value, bound_captures)
+        if "%{" in value and bound_source is not None:
+            used_providers.add(bound_source)
+
+        condition = {"field": field, "operator": operator, "value": value}
+        if negate:
+            condition["negate"] = True
+        conditions.append(condition)
+
+        if "capture" in child["opts"]:
+            if operator != "regex":
+                raise ChainUnsupported("capture")
+            bound_captures = _count_regex_groups(value) + 1
+            bound_source = position
+            capture_providers[position] = position
+
+    for position in used_providers:
+        if position is None:
+            raise ChainUnsupported("capture")
+        if position >= 0:
+            conditions[position]["capture"] = True
+
+    return conditions, -1 in used_providers
+
+
+def _map_chain_operator(operator_str: str):
+    """Split `!@op value` into `(negate, engine_operator, value)`."""
+    text = operator_str.strip()
+    negate = text.startswith("!")
+    if negate:
+        text = text[1:].strip()
+    match = re.match(r'^(@\w+)\s*(.*)?$', text, re.DOTALL)
+    if not match:
+        return None
+    return negate, map_operator(match.group(1)), (match.group(2) or "").strip()
 
 
 def extract_rule(variables: str, operator_str: str, opts: dict,
@@ -586,6 +837,9 @@ def extract_rule(variables: str, operator_str: str, opts: dict,
                 if tag_lower not in rule_tags:
                     rule_tags.append(tag_lower)
 
+    # `capture` / `chain` are filled in by the caller for a chained SecRule and
+    # dropped from the emitted YAML otherwise, so a single-condition rule looks
+    # exactly as it did before chains existed.
     rule = {
         "id":       f"CRS-{rule_id}",
         "name":     msg,
@@ -595,6 +849,8 @@ def extract_rule(variables: str, operator_str: str, opts: dict,
         "field":    field,
         "operator": operator,
         "value":    value,
+        "capture":  None,
+        "chain":    None,
         "action":   action,
         "tags":     rule_tags,
         "crs_id":   int(rule_id),
@@ -632,10 +888,7 @@ def parse_conf_file(path: str, default_category: str) -> list[dict]:
         # Try to parse the SecRule
         m = SECRULE_RE.match(line)
         if not m:
-            # Try simpler pattern
-            m = SECRULE_SIMPLE_RE.match(line)
-            if not m:
-                continue
+            continue
 
         variables = m.group(1).strip().strip('"')
         operator_str = m.group(2).strip()
@@ -652,15 +905,26 @@ def parse_conf_file(path: str, default_category: str) -> list[dict]:
         if rule is None:
             continue
 
-        if "chain" in opts and chain_depends_on_capture_equality(lines, index):
-            rule["field"] = CHAIN_UNSUPPORTED_FIELD
+        if "chain" in opts:
+            try:
+                chain, head_capture = build_chain(
+                    rule["operator"], rule["value"], opts, lines, index
+                )
+            except ChainUnsupported as unsupported:
+                # Refuse the whole rule rather than enforce its first condition,
+                # which is always broader than what upstream declares.
+                rule["field"] = f"{UNMAPPED_PREFIX}chained_{unsupported.reason}"
+            else:
+                if head_capture:
+                    rule["capture"] = True
+                rule["chain"] = chain
 
         # Deduplicate
         if rule["crs_id"] in seen_ids:
             continue
         seen_ids.add(rule["crs_id"])
 
-        rules.append(rule)
+        rules.append({k: v for k, v in rule.items() if v is not None})
 
     return rules
 

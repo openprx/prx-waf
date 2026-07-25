@@ -31,6 +31,10 @@ rules:
     field: query+body+cookies+headers
     operator: regex
     value: (?:runtime|processbuilder)
+    chain:
+      - field: matched_value
+        operator: regex
+        value: (?i)(?:unmarshaller|base64data|java\.)
     action: block
     tags:
       - owasp-crs
@@ -46,6 +50,10 @@ rules:
     operator: regex
     value: |-
       (?:clonetransform|xmldecod)er|f(?:orclosure|ilewriter)|in(?:stantiate(?:factory|transformer)|vokertransformer)|(?:prototype(?:clone|serialization)factor|getpropert)y|whileclosure
+    chain:
+      - field: matched_value
+        operator: regex
+        value: (?:runtime|processbuilder)
     action: block
     tags:
       - owasp-crs

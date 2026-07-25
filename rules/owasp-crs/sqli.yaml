@@ -323,7 +323,7 @@ rules:
     category: sqli
     severity: critical
     paranoia: 2
-    field: unmapped_chained_capture_equality
+    field: unmapped_chained_args_self_equality
     operator: regex
     value: |-
       (?i)[\s\x0b\"'-\)`]*?\b([0-9A-Z_a-z]+)\b[\s\x0b\"'-\)`]*?(?:=|<=>|(?:sounds[\s\x0b]+)?like|glob|r(?:like|egexp))[\s\x0b\"'-\)`]*?\b([0-9A-Z_a-z]+)\b
@@ -338,10 +338,16 @@ rules:
     category: sqli
     severity: critical
     paranoia: 2
-    field: unmapped_chained_capture_equality
+    field: query
     operator: regex
     value: |-
       (?i)[\s\x0b\"'-\)`]*?\b([0-9A-Z_a-z]+)\b[\s\x0b\"'-\)`]*?(?:![<->]|<[=>]?|>=?|\^|is[\s\x0b]+not|not[\s\x0b]+(?:like|r(?:like|egexp)))[\s\x0b\"'-\)`]*?\b([0-9A-Z_a-z]+)\b
+    capture: true
+    chain:
+      - field: tx:1
+        operator: equals
+        value: '%{TX.2}'
+        negate: true
     action: block
     tags:
       - owasp-crs
@@ -638,6 +644,11 @@ rules:
     field: query+body+cookies
     operator: regex
     value: /\*!?|\*/|[';]--|--(?:[\s\x0b]|[^\-]*?-)|[^&\-]#.*?[\s\x0b]|;?\x00
+    chain:
+      - field: matched_value
+        operator: regex
+        value: ^(?:ey[\-0-9A-Z_a-z]+\.ey[\-0-9A-Z_a-z]+\.)?[\-0-9A-Z_a-z]+$
+        negate: true
     action: block
     tags:
       - owasp-crs
@@ -696,6 +707,11 @@ rules:
     operator: regex
     value: |-
       (?i)^(?:[^']*?(?:'[^']*?'[^']*?)*?'|[^\"]*?(?:\"[^\"]*?\"[^\"]*?)*?\"|[^`]*?(?:`[^`]*?`[^`]*?)*?`)[\s\x0b]*([0-9A-Z_a-z]+)\b
+    capture: true
+    chain:
+      - field: tx:1
+        operator: regex
+        value: ^(?:and|or)$
     action: block
     tags:
       - owasp-crs

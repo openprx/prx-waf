@@ -31,6 +31,15 @@ rules:
     operator: regex
     value: |-
       ^(?:j(?:se(?:ssionid|rvsession)|wsession)|(?:asp(?:\.net_)?session|zend_session_)id|p(?:hpsessi(?:on|d)|lay_session)|(?:(?:w(?:eblogic|l)|rack\.|laravel_)sessio|(?:next-auth\.session-|meteor_login_)toke)n|s(?:(?:ession[\-_]?|ails\.s)id|hiny-token)|_(?:session_id|(?:(?:flask|rails)_sessio|_(?:secure|host)-next-auth\.session-toke)n)|c(?:f(?:s?id|token)|onnect\.sid|akephp|i_session)|koa[\.:]sess)$
+    chain:
+      - field: header_referer
+        operator: regex
+        value: ^(?:ht|f)tps?://(.*?)/
+        capture: true
+      - field: tx:1
+        operator: ends_with
+        value: '%{request_headers.host}'
+        negate: true
     action: block
     tags:
       - owasp-crs
@@ -45,6 +54,10 @@ rules:
     operator: regex
     value: |-
       ^(?:j(?:se(?:ssionid|rvsession)|wsession)|(?:asp(?:\.net_)?session|session[\-_]?)id|phpsessi(?:on|d)|(?:weblogic|laravel_)session|_(?:session_id|flask_session)|c(?:f(?:s?id|token)|onnect\.sid))$
+    chain:
+      - field: count_header_referer
+        operator: equals
+        value: '0'
     action: block
     tags:
       - owasp-crs

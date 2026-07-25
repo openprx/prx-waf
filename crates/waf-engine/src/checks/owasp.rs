@@ -125,7 +125,35 @@ struct YamlRule {
     field: String,
     operator: String,
     value: YamlValue,
+    /// `!@op` in `ModSecurity`: the condition holds for a value the matcher
+    /// does *not* accept.
+    #[serde(default)]
+    negate: bool,
+    /// `capture` in `ModSecurity`: bind this condition's regex groups to
+    /// `tx:0`..`tx:9` for the conditions that follow.
+    #[serde(default)]
+    capture: bool,
+    /// Extra conditions that must *all* hold, in order, for the rule to fire
+    /// (`ModSecurity` `chain`).  Empty for an ordinary single-condition rule,
+    /// which keeps every pre-chain rule file valid unchanged.
+    #[serde(default)]
+    chain: Vec<YamlCondition>,
     action: String,
+}
+
+/// One link of a chained rule.  Same shape as the head condition minus the
+/// rule-level metadata, so `field` / `operator` / `value` mean exactly what
+/// they mean at the top level.
+#[derive(Debug, Deserialize)]
+struct YamlCondition {
+    field: String,
+    operator: String,
+    #[serde(default)]
+    value: YamlValue,
+    #[serde(default)]
+    negate: bool,
+    #[serde(default)]
+    capture: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +162,12 @@ enum YamlValue {
     Str(String),
     List(Vec<String>),
     Int(i64),
+}
+
+impl Default for YamlValue {
+    fn default() -> Self {
+        Self::Str(String::new())
+    }
 }
 
 // ── Load diagnostics ──────────────────────────────────────────────────────────
@@ -155,6 +189,8 @@ pub enum RejectCategory {
     InvalidValue,
     /// A `pm_from_file` wordlist could not be located, read, or compiled.
     DataFile,
+    /// A chained (`ModSecurity` `chain`) condition is not representable.
+    Chain,
 }
 
 impl fmt::Display for RejectCategory {
@@ -165,6 +201,7 @@ impl fmt::Display for RejectCategory {
             Self::FieldOperatorMismatch => "field-operator-mismatch",
             Self::InvalidValue => "invalid-value",
             Self::DataFile => "data-file",
+            Self::Chain => "chain-condition",
         };
         f.write_str(s)
     }
@@ -204,6 +241,30 @@ pub enum RejectReason {
         /// Underlying failure description.
         error: String,
     },
+    /// A chained condition could not be compiled.  The whole rule is dropped:
+    /// enforcing only the conditions that *did* compile would be a strictly
+    /// broader rule than the one the source declares, which is how a chained
+    /// CRS rule turns into a false-positive generator.
+    Chain {
+        /// Which link failed, e.g. `chain[1]`.
+        position: String,
+        /// Rendered inner reason.
+        detail: String,
+    },
+    /// `capture` was requested on a condition whose operator produces no
+    /// capture groups, so the `tx:N` bindings it promises would never exist.
+    CaptureWithoutRegex {
+        /// Which condition asked for it.
+        position: String,
+    },
+    /// A condition reads `tx:N` (or expands `%{TX.N}`) that no preceding
+    /// condition captures, so it can never match.
+    UnresolvedCapture {
+        /// Which condition reads it.
+        position: String,
+        /// The capture index that is not bound.
+        index: u8,
+    },
 }
 
 impl RejectReason {
@@ -216,6 +277,9 @@ impl RejectReason {
             Self::NonScalarField { .. } => RejectCategory::FieldOperatorMismatch,
             Self::InvalidValueType { .. } | Self::InvalidRegex(_) | Self::PatternSet(_) => RejectCategory::InvalidValue,
             Self::DataFile { .. } => RejectCategory::DataFile,
+            Self::Chain { .. } | Self::CaptureWithoutRegex { .. } | Self::UnresolvedCapture { .. } => {
+                RejectCategory::Chain
+            }
         }
     }
 }
@@ -240,6 +304,13 @@ impl fmt::Display for RejectReason {
             Self::PatternSet(err) => write!(f, "unusable pattern set: {err}"),
             Self::DataFile { file, error } => {
                 write!(f, "wordlist '{file}' unavailable: {error}")
+            }
+            Self::Chain { position, detail } => write!(f, "{position}: {detail}"),
+            Self::CaptureWithoutRegex { position } => {
+                write!(f, "{position}: 'capture' needs a regex operator")
+            }
+            Self::UnresolvedCapture { position, index } => {
+                write!(f, "{position}: reads tx:{index}, which no earlier condition captures")
             }
         }
     }
@@ -367,7 +438,8 @@ impl LoadSummary {
         warn!(
             "OWASP CRS load summary for {origin}: {} of {} declared rules are ACTIVE — {} rejected \
              ({} unsupported-field, {} unsupported-operator, {} field-operator-mismatch, \
-             {} invalid-value, {} data-file), {} unreadable source(s). Rejected rules are NOT enforced.",
+             {} invalid-value, {} data-file, {} chain-condition), {} unreadable source(s). \
+             Rejected rules are NOT enforced.",
             self.compiled,
             self.attempted,
             self.rejected.len(),
@@ -376,6 +448,7 @@ impl LoadSummary {
             self.count(RejectCategory::FieldOperatorMismatch),
             self.count(RejectCategory::InvalidValue),
             self.count(RejectCategory::DataFile),
+            self.count(RejectCategory::Chain),
             self.source_errors.len(),
         );
 
@@ -507,10 +580,38 @@ enum Field {
     HeaderReferer,
     HeaderHost,
     HeaderRange,
+    /// `&REQUEST_HEADERS:<name>` — how many times the header occurs.
+    ///
+    /// The engine folds repeated headers into a map, so the only values this
+    /// can ever produce are `0` and `1`; that is enough for the
+    /// presence/absence tests CRS chains on (`&REQUEST_HEADERS:Referer @eq 0`
+    /// in CRS-943120) and not enough for anything else, which
+    /// [`Loader::compile_condition`] rejects rather than silently never
+    /// matching.
+    HeaderCount(&'static str),
 }
+
+/// Headers `count_header_<name>` may name.
+///
+/// Restricted to the headers [`Field`] can already read, so the countable set
+/// and the readable set stay the same inventory.  Underscores in the field
+/// name stand for hyphens.
+const COUNTABLE_HEADERS: [&str; 6] = [
+    "content-type",
+    "content-length",
+    "user-agent",
+    "referer",
+    "host",
+    "range",
+];
 
 impl Field {
     fn parse(name: &str) -> Option<Self> {
+        if let Some(header) = name.strip_prefix("count_header_") {
+            let wanted = header.replace('_', "-");
+            let known = COUNTABLE_HEADERS.iter().find(|h| **h == wanted)?;
+            return Some(Self::HeaderCount(known));
+        }
         Some(match name {
             "all" => Self::Multi(Surfaces::ALL),
             "method" => Self::Method,
@@ -564,7 +665,58 @@ impl Field {
                 let count = ctx.query.split('&').filter(|s| !s.is_empty()).count();
                 Some(Cow::Owned(count.to_string()))
             }
+            Self::HeaderCount(name) => Some(Cow::Borrowed(if ctx.headers.contains_key(name) { "1" } else { "0" })),
             Self::Multi(_) | Self::Headers | Self::Cookies => None,
+        }
+    }
+
+    /// Every value this field expands to, materialised.
+    ///
+    /// Only chained rules need this: a single-condition rule is answered by
+    /// [`Self::any_value`], which short-circuits and allocates nothing.  A
+    /// chain has to know *which* values matched so that a later
+    /// `matched_value` (`ModSecurity` `MATCHED_VARS`) condition can be applied
+    /// to them, so the whole expansion is collected — but only after the head
+    /// condition has already matched, so this never runs on ordinary traffic.
+    fn collect_values<'a>(self, ctx: &'a RequestCtx) -> Vec<Cow<'a, str>> {
+        match self {
+            Self::Multi(s) => {
+                let mut out: Vec<Cow<'a, str>> = Vec::new();
+                let header = |name: &str, out: &mut Vec<Cow<'a, str>>| {
+                    if let Some(value) = ctx.headers.get(name) {
+                        out.push(Cow::Borrowed(value.as_str()));
+                    }
+                };
+                if s.has(Surfaces::PATH) {
+                    out.push(Cow::Borrowed(ctx.path.as_str()));
+                }
+                if s.has(Surfaces::QUERY) {
+                    out.push(Cow::Borrowed(ctx.query.as_str()));
+                }
+                if s.has(Surfaces::BODY) {
+                    out.push(String::from_utf8_lossy(&ctx.body_preview));
+                }
+                if s.has(Surfaces::COOKIES) {
+                    out.extend(cookie_values(ctx).map(Cow::Borrowed));
+                }
+                if s.has(Surfaces::HEADER_VALUES) {
+                    out.extend(ctx.headers.values().map(|v| Cow::Borrowed(v.as_str())));
+                }
+                if s.has(Surfaces::USER_AGENT) {
+                    header("user-agent", &mut out);
+                }
+                if s.has(Surfaces::REFERER) {
+                    header("referer", &mut out);
+                }
+                out
+            }
+            Self::Headers => ctx
+                .headers
+                .iter()
+                .flat_map(|(name, value)| [Cow::Borrowed(name.as_str()), Cow::Borrowed(value.as_str())])
+                .collect(),
+            Self::Cookies => cookie_values(ctx).map(Cow::Borrowed).collect(),
+            _ => self.scalar(ctx).into_iter().collect(),
         }
     }
 
@@ -603,33 +755,176 @@ fn cookie_values(ctx: &RequestCtx) -> impl Iterator<Item = &str> + '_ {
 }
 
 /// Apply `f` to `raw` and, when `raw` looks percent/plus-encoded, to its
-/// single- and recursively-decoded forms.
+/// single- and recursively-decoded forms, reporting *which* form matched.
 ///
 /// CRS attaches `t:urlDecodeUni` to its `@pm` / `@pmFromFile` rules, so phrase
 /// matching must see the decoded text.  The cheap "contains `%` or `+`" guard
 /// keeps the common (unencoded) case allocation-free.
-fn any_decoded_form(raw: &str, mut f: impl FnMut(&str) -> bool) -> bool {
+///
+/// The matched form is reported rather than a bare `bool` because
+/// `ModSecurity` `MATCHED_VARS` holds the *transformed* value: a follow-up
+/// condition in a chain must see the decoded text the first condition actually
+/// matched, not the raw bytes off the wire.
+fn matching_decoded_form(raw: &str, f: &mut dyn FnMut(&str) -> bool) -> Option<MatchForm> {
     if f(raw) {
-        return true;
+        return Some(MatchForm::Same);
     }
     if !raw.bytes().any(|b| b == b'%' || b == b'+') {
-        return false;
+        return None;
     }
     let decoded = url_decode(raw);
     if decoded != raw && f(&decoded) {
-        return true;
+        return Some(MatchForm::Transformed(decoded));
     }
     let recursive = url_decode_recursive(raw);
-    recursive != decoded && f(&recursive)
+    if recursive != decoded && f(&recursive) {
+        return Some(MatchForm::Transformed(recursive));
+    }
+    None
+}
+
+// ── Operands ──────────────────────────────────────────────────────────────────
+
+/// One piece of a `ModSecurity` operand after macro expansion.
+#[derive(Debug)]
+enum OperandPart {
+    Lit(String),
+    /// `%{TX.N}` — capture group `N` of the last capturing condition.
+    Capture(u8),
+    /// `%{REQUEST_HEADERS.HOST}` — the request's `Host` header.
+    Host,
+}
+
+/// The right-hand side of a string comparison.
+///
+/// CRS chains compare a capture against another capture
+/// (`SecRule TX:1 "@streq %{TX.2}"`, CRS-942130) or against a request header
+/// (`SecRule TX:1 "!@endsWith %{request_headers.host}"`, CRS-943110).  Storing
+/// the operand as parts keeps the overwhelmingly common literal case a single
+/// borrow while making those two forms expressible instead of comparing
+/// against the uninterpreted text `%{TX.2}`.
+#[derive(Debug)]
+struct Operand(Vec<OperandPart>);
+
+impl Operand {
+    /// Parse the CRS macro syntax.
+    ///
+    /// Returns `None` for a macro this engine cannot expand, so the rule is
+    /// rejected at load time rather than silently comparing against a literal
+    /// `%{...}` that no request will ever contain.
+    fn parse(raw: &str) -> Option<Self> {
+        let mut parts = Vec::new();
+        let mut rest = raw;
+        while let Some(start) = rest.find("%{") {
+            let (before, from_macro) = rest.split_at(start);
+            if !before.is_empty() {
+                parts.push(OperandPart::Lit(before.to_owned()));
+            }
+            let body = from_macro.get(2..)?;
+            let end = body.find('}')?;
+            let (name, after) = body.split_at(end);
+            parts.push(Self::macro_part(name)?);
+            rest = after.get(1..)?;
+        }
+        if !rest.is_empty() || parts.is_empty() {
+            parts.push(OperandPart::Lit(rest.to_owned()));
+        }
+        Some(Self(parts))
+    }
+
+    fn macro_part(name: &str) -> Option<OperandPart> {
+        let lower = name.trim().to_ascii_lowercase();
+        if let Some(index) = lower.strip_prefix("tx.") {
+            return index.parse::<u8>().ok().map(OperandPart::Capture);
+        }
+        (lower == "request_headers.host").then_some(OperandPart::Host)
+    }
+
+    /// The whole operand when it is a single literal, for load-time checks.
+    fn literal(&self) -> Option<&str> {
+        match (self.0.len(), self.0.first()) {
+            (1, Some(OperandPart::Lit(text))) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Highest `%{TX.N}` index referenced, for load-time validation.
+    fn max_capture(&self) -> Option<u8> {
+        self.0
+            .iter()
+            .filter_map(|p| match p {
+                OperandPart::Capture(n) => Some(*n),
+                OperandPart::Lit(_) | OperandPart::Host => None,
+            })
+            .max()
+    }
+
+    /// Expand against the current chain state.  `None` when a referenced
+    /// capture or header is absent, which makes the comparison fail rather
+    /// than succeed against an empty string.
+    fn resolve<'s>(&'s self, ctx: &RequestCtx, state: &ChainState<'_>) -> Option<Cow<'s, str>> {
+        if let (1, Some(OperandPart::Lit(text))) = (self.0.len(), self.0.first()) {
+            return Some(Cow::Borrowed(text.as_str()));
+        }
+        let mut out = String::new();
+        for part in &self.0 {
+            match part {
+                OperandPart::Lit(text) => out.push_str(text),
+                OperandPart::Capture(n) => out.push_str(state.captures.get(usize::from(*n))?),
+                OperandPart::Host => out.push_str(ctx.headers.get("host")?),
+            }
+        }
+        Some(Cow::Owned(out))
+    }
+}
+
+// ── Chain evaluation state ────────────────────────────────────────────────────
+
+/// Which form of a value satisfied a matcher.
+///
+/// `Same` means the value as supplied; `Transformed` carries the decoded text
+/// so it, not the raw input, becomes the `matched_value` a later condition
+/// sees.
+enum MatchForm {
+    Same,
+    Transformed(String),
+}
+
+/// Result of testing one value.
+enum Outcome {
+    Match(MatchForm),
+    NoMatch,
+    /// The comparison could not be made at all — a `%{...}` operand names
+    /// something this request does not have.
+    ///
+    /// Distinct from `NoMatch` because negation must not turn it into a hit:
+    /// `!@endsWith %{request_headers.host}` on a request with no `Host` header
+    /// would otherwise fire on every such request.
+    Unresolvable,
+}
+
+/// Carried between the conditions of one chained rule, for one request.
+#[derive(Default)]
+struct ChainState<'a> {
+    /// The values the most recent condition matched — `ModSecurity`
+    /// `MATCHED_VAR` / `MATCHED_VARS`.
+    matched: Vec<Cow<'a, str>>,
+    /// `tx:0`..`tx:N` from the most recent condition that declared `capture`;
+    /// index 0 is the whole match, as in `ModSecurity`.
+    captures: Vec<String>,
 }
 
 // ── Compiled rule ─────────────────────────────────────────────────────────────
 
 enum CompiledMatcher {
     Regex(Regex),
-    Contains(String),
-    /// Case-sensitive exact comparison (`ModSecurity` `@streq`).
-    Equals(String),
+    Contains(Operand),
+    /// Case-sensitive exact comparison (`ModSecurity` `@streq` / `@eq`).
+    Equals(Operand),
+    /// `ModSecurity` `@beginsWith`.
+    StartsWith(Operand),
+    /// `ModSecurity` `@endsWith`.
+    EndsWith(Operand),
     NotIn(Vec<String>),
     Gt(i64),
     Lt(i64),
@@ -643,87 +938,227 @@ enum CompiledMatcher {
     DetectXss,
 }
 
+impl CompiledMatcher {
+    /// Test one value.  `Some` carries the form that matched, which becomes the
+    /// `matched_value` seen by the next condition of a chain.
+    fn test(&self, value: &str, ctx: &RequestCtx, state: &ChainState<'_>) -> Outcome {
+        let plain = |hit: bool| {
+            if hit {
+                Outcome::Match(MatchForm::Same)
+            } else {
+                Outcome::NoMatch
+            }
+        };
+        let decoded = |hit: Option<MatchForm>| hit.map_or(Outcome::NoMatch, Outcome::Match);
+        macro_rules! operand {
+            ($operand:expr) => {
+                match $operand.resolve(ctx, state) {
+                    Some(resolved) => resolved,
+                    None => return Outcome::Unresolvable,
+                }
+            };
+        }
+        match self {
+            Self::Regex(re) => plain(re.is_match(value)),
+            Self::Contains(operand) => plain(value.contains(operand!(operand).as_ref())),
+            Self::Equals(operand) => plain(value == operand!(operand).as_ref()),
+            Self::StartsWith(operand) => plain(value.starts_with(operand!(operand).as_ref())),
+            Self::EndsWith(operand) => plain(value.ends_with(operand!(operand).as_ref())),
+            Self::NotIn(list) => plain(!list.iter().any(|allowed| allowed.eq_ignore_ascii_case(value))),
+            Self::Gt(n) => plain(value.parse::<i64>().is_ok_and(|v| v > *n)),
+            Self::Lt(n) => plain(value.parse::<i64>().is_ok_and(|v| v < *n)),
+            Self::MultiPattern(ac) => decoded(matching_decoded_form(value, &mut |v| ac.is_match(v))),
+            Self::DetectSqli => decoded(matching_decoded_form(value, &mut |v| {
+                libinjectionrs::detect_sqli(v.as_bytes()).is_injection()
+            })),
+            Self::DetectXss => decoded(matching_decoded_form(value, &mut |v| {
+                libinjectionrs::detect_xss(v.as_bytes()).is_injection()
+            })),
+        }
+    }
+
+    /// The libinjection detector this matcher runs, if any.
+    fn detector(&self) -> Option<fn(&[u8]) -> bool> {
+        match self {
+            Self::DetectSqli => Some(|input| libinjectionrs::detect_sqli(input).is_injection()),
+            Self::DetectXss => Some(|input| libinjectionrs::detect_xss(input).is_injection()),
+            _ => None,
+        }
+    }
+}
+
+/// Where a condition reads its values from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CondField {
+    /// A request surface.
+    Request(Field),
+    /// `ModSecurity` `MATCHED_VAR` / `MATCHED_VARS`: the values the preceding
+    /// condition matched.  Only meaningful inside a chain.
+    MatchedValue,
+    /// `ModSecurity` `TX:N`: capture group `N` of the last capturing condition.
+    Capture(u8),
+}
+
+/// Resolve a condition's `field` name.
+///
+/// The two chain pseudo-fields are spelled apart from the request surfaces so
+/// a rule file can never accidentally name one: `matched_value` and `tx:N`
+/// contain no character sequence a `Surfaces` list can produce.
+fn parse_cond_field(name: &str) -> Option<CondField> {
+    if name == "matched_value" {
+        return Some(CondField::MatchedValue);
+    }
+    if let Some(index) = name.strip_prefix("tx:") {
+        return index.parse::<u8>().ok().map(CondField::Capture);
+    }
+    Field::parse(name).map(CondField::Request)
+}
+
+/// One condition of a rule: the head, or one link of its chain.
+struct Condition {
+    field: CondField,
+    matcher: CompiledMatcher,
+    /// `!@op`: the condition holds for values the matcher rejects.
+    negate: bool,
+    /// Bind this condition's regex groups to `tx:0..` for later conditions.
+    capture: bool,
+}
+
+impl Condition {
+    /// Short-circuiting test used for the head of every rule.
+    ///
+    /// Allocation-free on the hot path: an ordinary request is answered by the
+    /// first surface that fails, and nothing about the match is recorded.
+    fn matches_any(&self, ctx: &RequestCtx) -> bool {
+        let CondField::Request(field) = self.field else {
+            // A bare `matched_value` / `tx:N` head has nothing to read; the
+            // loader rejects it, so this is unreachable in a loaded rule set.
+            return false;
+        };
+        if !self.negate
+            && let Some(detector) = self.matcher.detector()
+        {
+            return detect_injection(field, ctx, detector);
+        }
+        let empty = ChainState::default();
+        field.any_value(ctx, |value| match self.matcher.test(value, ctx, &empty) {
+            Outcome::Match(_) => !self.negate,
+            Outcome::NoMatch => self.negate,
+            Outcome::Unresolvable => false,
+        })
+    }
+
+    /// Evaluate inside a chain, threading `state` forward.
+    ///
+    /// Returns `false` as soon as no value satisfies the condition, so the
+    /// remaining links are never evaluated.
+    fn advance<'a>(&self, ctx: &'a RequestCtx, state: &mut ChainState<'a>) -> bool {
+        let subjects: Vec<Cow<'a, str>> = match self.field {
+            CondField::Request(field) => field.collect_values(ctx),
+            CondField::MatchedValue => std::mem::take(&mut state.matched),
+            CondField::Capture(n) => state
+                .captures
+                .get(usize::from(n))
+                .cloned()
+                .map(Cow::Owned)
+                .into_iter()
+                .collect(),
+        };
+
+        let mut hits: Vec<Cow<'a, str>> = Vec::new();
+        for value in subjects {
+            match (self.matcher.test(&value, ctx, state), self.negate) {
+                (Outcome::Match(MatchForm::Same), false) | (Outcome::NoMatch, true) => hits.push(value),
+                (Outcome::Match(MatchForm::Transformed(decoded)), false) => hits.push(Cow::Owned(decoded)),
+                _ => {}
+            }
+        }
+        if hits.is_empty() {
+            return false;
+        }
+
+        if self.capture
+            && let (CompiledMatcher::Regex(re), Some(first)) = (&self.matcher, hits.first())
+            && let Some(groups) = re.captures(first)
+        {
+            state.captures = groups
+                .iter()
+                .map(|group| group.map_or_else(String::new, |m| m.as_str().to_owned()))
+                .collect();
+        }
+        state.matched = hits;
+        true
+    }
+}
+
 struct CompiledRule {
     id: String,
     name: String,
     paranoia: u8,
-    field: Field,
-    matcher: CompiledMatcher,
+    head: Condition,
+    /// Additional conditions that must all hold (`ModSecurity` `chain`).
+    /// Empty for an ordinary rule.
+    chain: Vec<Condition>,
     #[allow(dead_code)]
     action: String,
 }
 
 impl CompiledRule {
     fn matches(&self, ctx: &RequestCtx) -> bool {
-        match &self.matcher {
-            CompiledMatcher::Regex(re) => self.field.any_value(ctx, |v| re.is_match(v)),
-            CompiledMatcher::Contains(needle) => self.field.any_value(ctx, |v| v.contains(needle.as_str())),
-            CompiledMatcher::MultiPattern(ac) => self
-                .field
-                .any_value(ctx, |v| any_decoded_form(v, |decoded| ac.is_match(decoded))),
-            CompiledMatcher::Equals(target) => self.field.scalar(ctx).is_some_and(|v| v.as_ref() == target.as_str()),
-            CompiledMatcher::NotIn(list) => self
-                .field
-                .scalar(ctx)
-                .is_some_and(|v| !list.iter().any(|allowed| allowed.eq_ignore_ascii_case(v.as_ref()))),
-            CompiledMatcher::Gt(n) => self
-                .field
-                .scalar(ctx)
-                .and_then(|v| v.parse::<i64>().ok())
-                .is_some_and(|v| v > *n),
-            CompiledMatcher::Lt(n) => self
-                .field
-                .scalar(ctx)
-                .and_then(|v| v.parse::<i64>().ok())
-                .is_some_and(|v| v < *n),
-            CompiledMatcher::DetectSqli => {
-                self.detect_injection(ctx, |input| libinjectionrs::detect_sqli(input).is_injection())
-            }
-            CompiledMatcher::DetectXss => {
-                self.detect_injection(ctx, |input| libinjectionrs::detect_xss(input).is_injection())
-            }
+        // The cheap short-circuiting test runs first for every rule, chained or
+        // not, so ordinary traffic pays exactly what it paid before chains
+        // existed.  Only a request that already satisfies the head is walked a
+        // second time to record which values matched.
+        if !self.head.matches_any(ctx) {
+            return false;
         }
-    }
-
-    /// Run a libinjection detector against the appropriate request fields.
-    ///
-    /// For a composite field, scans exactly the surfaces it names (`all` being
-    /// the whole request, matching CRS behavior for libinjection rules).  Each value is tested
-    /// in raw form, single-decoded form, and recursively-decoded form (up to
-    /// [`super::MAX_DECODE_PASSES`] passes, currently 5) to catch `%`-encoded
-    /// and double/triple-encoded evasion attempts.
-    /// For any other field, every value it expands to is tested in all three
-    /// forms.
-    fn detect_injection(&self, ctx: &RequestCtx, detector: impl Fn(&[u8]) -> bool) -> bool {
-        // Helper: test raw, single-decoded, and recursively-decoded forms.
-        let detect_with_decode = |raw: &str| -> bool {
-            if detector(raw.as_bytes()) {
-                return true;
-            }
-            let decoded = url_decode(raw);
-            if decoded != raw && detector(decoded.as_bytes()) {
-                return true;
-            }
-            let recursive = url_decode_recursive(raw);
-            recursive != decoded && detector(recursive.as_bytes())
-        };
-
-        if let Field::Multi(s) = self.field {
-            // The raw byte body is additionally tested unmodified, because the
-            // lossy UTF-8 conversion can destroy a binary payload.
-            let header = |name: &str| ctx.headers.get(name).is_some_and(|v| detect_with_decode(v));
-            return (s.has(Surfaces::PATH) && detect_with_decode(&ctx.path))
-                || (s.has(Surfaces::QUERY) && detect_with_decode(&ctx.query))
-                || (s.has(Surfaces::BODY)
-                    && (detector(&ctx.body_preview)
-                        || detect_with_decode(&String::from_utf8_lossy(&ctx.body_preview))))
-                || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(detect_with_decode))
-                || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| detect_with_decode(v)))
-                || (s.has(Surfaces::USER_AGENT) && header("user-agent"))
-                || (s.has(Surfaces::REFERER) && header("referer"));
+        if self.chain.is_empty() {
+            return true;
         }
-        self.field.any_value(ctx, detect_with_decode)
+        let mut state = ChainState::default();
+        if !self.head.advance(ctx, &mut state) {
+            return false;
+        }
+        self.chain.iter().all(|link| link.advance(ctx, &mut state))
     }
+}
+
+/// Run a libinjection detector against the values of `field`.
+///
+/// For a composite field, scans exactly the surfaces it names (`all` being the
+/// whole request, matching CRS behavior for libinjection rules).  Each value is
+/// tested in raw form, single-decoded form, and recursively-decoded form (up to
+/// [`super::MAX_DECODE_PASSES`] passes, currently 5) to catch `%`-encoded and
+/// double/triple-encoded evasion attempts.  For any other field, every value it
+/// expands to is tested in all three forms.
+fn detect_injection(field: Field, ctx: &RequestCtx, detector: impl Fn(&[u8]) -> bool) -> bool {
+    // Helper: test raw, single-decoded, and recursively-decoded forms.
+    let detect_with_decode = |raw: &str| -> bool {
+        if detector(raw.as_bytes()) {
+            return true;
+        }
+        let decoded = url_decode(raw);
+        if decoded != raw && detector(decoded.as_bytes()) {
+            return true;
+        }
+        let recursive = url_decode_recursive(raw);
+        recursive != decoded && detector(recursive.as_bytes())
+    };
+
+    if let Field::Multi(s) = field {
+        // The raw byte body is additionally tested unmodified, because the
+        // lossy UTF-8 conversion can destroy a binary payload.
+        let header = |name: &str| ctx.headers.get(name).is_some_and(|v| detect_with_decode(v));
+        return (s.has(Surfaces::PATH) && detect_with_decode(&ctx.path))
+            || (s.has(Surfaces::QUERY) && detect_with_decode(&ctx.query))
+            || (s.has(Surfaces::BODY)
+                && (detector(&ctx.body_preview) || detect_with_decode(&String::from_utf8_lossy(&ctx.body_preview))))
+            || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(detect_with_decode))
+            || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| detect_with_decode(v)))
+            || (s.has(Surfaces::USER_AGENT) && header("user-agent"))
+            || (s.has(Surfaces::REFERER) && header("referer"));
+    }
+    field.any_value(ctx, detect_with_decode)
 }
 
 // ── Loader ────────────────────────────────────────────────────────────────────
@@ -781,55 +1216,190 @@ impl Loader {
     }
 
     fn compile(&mut self, rule: YamlRule) -> Result<CompiledRule, RejectReason> {
-        // Validate the field *before* the operator: an unreadable field makes
-        // the rule unenforceable no matter which matcher it asks for.
-        let field = Field::parse(&rule.field).ok_or_else(|| RejectReason::UnsupportedField(rule.field.clone()))?;
+        // `capture` binds tx:0..tx:N for the conditions that follow; the count
+        // is carried forward so a `tx:N` read that nothing produces is rejected
+        // at load time instead of never matching at runtime.
+        let mut bound_captures = 0usize;
 
-        let op = rule.operator.as_str();
-        if matches!(op, "equals" | "not_in" | "gt" | "lt") && !field.is_scalar() {
-            return Err(RejectReason::NonScalarField {
-                operator: op.to_owned(),
-                field: rule.field.clone(),
-            });
+        // `matched_value` / `tx:N` read what an earlier condition produced, so
+        // they mean nothing as the head of a rule.
+        if !matches!(parse_cond_field(&rule.field), Some(CondField::Request(_))) {
+            return Err(RejectReason::UnsupportedField(rule.field.clone()));
         }
+        let head = self.compile_condition(
+            "head",
+            &rule.field,
+            &rule.operator,
+            &rule.value,
+            rule.negate,
+            rule.capture,
+            &mut bound_captures,
+        )?;
 
-        let matcher = match op {
-            "regex" => {
-                let pattern = str_value(&rule.value, op)?;
-                Regex::new(pattern)
-                    .map(CompiledMatcher::Regex)
-                    .map_err(|e| RejectReason::InvalidRegex(e.to_string()))?
-            }
-            "contains" => CompiledMatcher::Contains(str_value(&rule.value, op)?.to_owned()),
-            "equals" => CompiledMatcher::Equals(str_value(&rule.value, op)?.to_owned()),
-            "contains_any" => CompiledMatcher::MultiPattern(build_phrase_set(&rule.value, op)?),
-            "pm_from_file" => {
-                let file = str_value(&rule.value, op)?;
-                CompiledMatcher::MultiPattern(self.wordlist(file)?)
-            }
-            "not_in" => {
-                let YamlValue::List(list) = &rule.value else {
-                    return Err(RejectReason::InvalidValueType {
-                        operator: op.to_owned(),
-                        expected: "list of strings",
-                    });
-                };
-                CompiledMatcher::NotIn(list.clone())
-            }
-            "gt" => CompiledMatcher::Gt(int_value(&rule.value, op)?),
-            "lt" => CompiledMatcher::Lt(int_value(&rule.value, op)?),
-            "detect_sqli" | "@detectSQLi" => CompiledMatcher::DetectSqli,
-            "detect_xss" | "@detectXSS" => CompiledMatcher::DetectXss,
-            other => return Err(RejectReason::UnsupportedOperator(other.to_owned())),
-        };
+        let mut chain = Vec::with_capacity(rule.chain.len());
+        for (index, link) in rule.chain.iter().enumerate() {
+            let position = format!("chain[{index}]");
+            let condition = self
+                .compile_condition(
+                    &position,
+                    &link.field,
+                    &link.operator,
+                    &link.value,
+                    link.negate,
+                    link.capture,
+                    &mut bound_captures,
+                )
+                .map_err(|reason| match reason {
+                    already @ (RejectReason::Chain { .. }
+                    | RejectReason::CaptureWithoutRegex { .. }
+                    | RejectReason::UnresolvedCapture { .. }) => already,
+                    inner => RejectReason::Chain {
+                        position: position.clone(),
+                        detail: inner.to_string(),
+                    },
+                })?;
+            chain.push(condition);
+        }
 
         Ok(CompiledRule {
             id: rule.id,
             name: rule.name,
             paranoia: rule.paranoia,
+            head,
+            chain,
+            action: rule.action,
+        })
+    }
+
+    /// Compile one condition — the head or one chain link.
+    ///
+    /// `bound_captures` is the number of `tx:` slots the preceding conditions
+    /// bound (0 when nothing captured yet); it is updated in place when this
+    /// condition declares `capture`.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_condition(
+        &mut self,
+        position: &str,
+        field_name: &str,
+        operator: &str,
+        value: &YamlValue,
+        negate: bool,
+        capture: bool,
+        bound_captures: &mut usize,
+    ) -> Result<Condition, RejectReason> {
+        // Validate the field *before* the operator: an unreadable field makes
+        // the condition unevaluable no matter which matcher it asks for.
+        let field =
+            parse_cond_field(field_name).ok_or_else(|| RejectReason::UnsupportedField(field_name.to_owned()))?;
+        if let CondField::Capture(index) = field
+            && usize::from(index) >= *bound_captures
+        {
+            return Err(RejectReason::UnresolvedCapture {
+                position: position.to_owned(),
+                index,
+            });
+        }
+
+        // Scalar comparisons stay restricted to single-valued request fields:
+        // the schema cannot express the CRS collection-member selector, so
+        // `equals` on `cookies` would silently mean "any cookie".  Chain
+        // pseudo-fields are exempt — they are single values by construction.
+        if let CondField::Request(request_field) = field
+            && matches!(operator, "equals" | "not_in" | "gt" | "lt")
+            && !request_field.is_scalar()
+        {
+            return Err(RejectReason::NonScalarField {
+                operator: operator.to_owned(),
+                field: field_name.to_owned(),
+            });
+        }
+
+        let operand = |op: &str| -> Result<Operand, RejectReason> {
+            let raw = str_value(value, op)?;
+            Operand::parse(raw).ok_or_else(|| RejectReason::InvalidValueType {
+                operator: op.to_owned(),
+                expected: "literal or %{TX.N} / %{REQUEST_HEADERS.HOST} macro",
+            })
+        };
+
+        let matcher = match operator {
+            "regex" => {
+                let pattern = str_value(value, operator)?;
+                Regex::new(pattern)
+                    .map(CompiledMatcher::Regex)
+                    .map_err(|e| RejectReason::InvalidRegex(e.to_string()))?
+            }
+            "contains" => CompiledMatcher::Contains(operand(operator)?),
+            "equals" => CompiledMatcher::Equals(operand(operator)?),
+            "starts_with" => CompiledMatcher::StartsWith(operand(operator)?),
+            "ends_with" => CompiledMatcher::EndsWith(operand(operator)?),
+            "contains_any" => CompiledMatcher::MultiPattern(build_phrase_set(value, operator)?),
+            "pm_from_file" => {
+                let file = str_value(value, operator)?;
+                CompiledMatcher::MultiPattern(self.wordlist(file)?)
+            }
+            "not_in" => {
+                let YamlValue::List(list) = value else {
+                    return Err(RejectReason::InvalidValueType {
+                        operator: operator.to_owned(),
+                        expected: "list of strings",
+                    });
+                };
+                CompiledMatcher::NotIn(list.clone())
+            }
+            "gt" => CompiledMatcher::Gt(int_value(value, operator)?),
+            "lt" => CompiledMatcher::Lt(int_value(value, operator)?),
+            "detect_sqli" | "@detectSQLi" => CompiledMatcher::DetectSqli,
+            "detect_xss" | "@detectXSS" => CompiledMatcher::DetectXss,
+            other => return Err(RejectReason::UnsupportedOperator(other.to_owned())),
+        };
+
+        // A macro operand may only name a capture an earlier condition bound.
+        if let Some(highest) = match &matcher {
+            CompiledMatcher::Contains(operand)
+            | CompiledMatcher::Equals(operand)
+            | CompiledMatcher::StartsWith(operand)
+            | CompiledMatcher::EndsWith(operand) => operand.max_capture(),
+            _ => None,
+        } && usize::from(highest) >= *bound_captures
+        {
+            return Err(RejectReason::UnresolvedCapture {
+                position: position.to_owned(),
+                index: highest,
+            });
+        }
+
+        // A header count is 0 or 1 in this engine (repeated headers are folded
+        // into one entry), so a comparison against anything else — or with any
+        // other operator — could never be reached and is refused instead of
+        // shipping a rule that never fires.
+        if let CondField::Request(Field::HeaderCount(_)) = field {
+            let reachable = match &matcher {
+                CompiledMatcher::Equals(operand) => matches!(operand.literal(), Some("0" | "1")),
+                _ => false,
+            };
+            if !reachable {
+                return Err(RejectReason::InvalidValueType {
+                    operator: operator.to_owned(),
+                    expected: "`equals` against '0' or '1' (a header count is presence-only here)",
+                });
+            }
+        }
+
+        if capture {
+            let CompiledMatcher::Regex(re) = &matcher else {
+                return Err(RejectReason::CaptureWithoutRegex {
+                    position: position.to_owned(),
+                });
+            };
+            *bound_captures = re.captures_len();
+        }
+
+        Ok(Condition {
             field,
             matcher,
-            action: rule.action,
+            negate,
+            capture,
         })
     }
 
@@ -1877,14 +2447,17 @@ rules:
         );
         // `&REQUEST_HEADERS:Range` is a *count*, not a value.
         assert_eq!(by_field("unmapped_count_request_headers_range"), 1, "CRS-921230");
-        // CRS-942130 / CRS-942131 only mean anything with their chained
-        // `TX:1 @streq %{TX.2}` capture comparison; without it they reduce to
-        // "block any `word = word`".
-        assert_eq!(
-            by_field("unmapped_chained_capture_equality"),
-            2,
-            "CRS-942130 / CRS-942131"
-        );
+        // CRS-931130's chained condition reads `TX:/rfi_parameter_.*/`, a
+        // collection an earlier `setvar` in the same rule built.  The converter
+        // models no variable store, so the rule is refused whole: its first
+        // condition alone is "block any argument containing `scheme://`".
+        assert_eq!(by_field("unmapped_chained_tx_variable"), 1, "CRS-931130");
+        // CRS-942130's chained `TX:1 @streq %{TX.2}` asserts that two captures
+        // of one *parameter* are the same word.  The engine has no ARGS
+        // splitter, so it sees the whole query string, where the `name=value`
+        // separator forms that equality by itself: `?tab=tab` would read as a
+        // `1=1` tautology.
+        assert_eq!(by_field("unmapped_chained_args_self_equality"), 1, "CRS-942130");
         assert_eq!(summary.rejected_field_count(), 112, "rules the engine cannot evaluate");
         assert!(
             summary
@@ -1904,6 +2477,41 @@ rules:
         assert_eq!(summary.count(RejectCategory::FieldOperatorMismatch), 1);
         assert_eq!(summary.count(RejectCategory::InvalidValue), 0);
         assert_eq!(summary.count(RejectCategory::DataFile), 0, "every wordlist must load");
+        // A chained rule the converter could not express is refused by its
+        // `field`, before the chain is even looked at; this category only fires
+        // for a hand-written rule file.
+        assert_eq!(summary.count(RejectCategory::Chain), 0);
+
+        // Every `ModSecurity` `chain` in the shipped set is enforced with all
+        // of its conditions, or not at all.  Enforcing only the first condition
+        // is what made CRS-944110 block any request mentioning "runtime".
+        let chained: Vec<&str> = checker
+            .rules
+            .iter()
+            .filter(|r| !r.chain.is_empty())
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(
+            chained,
+            [
+                "CRS-944110",
+                "CRS-944120",
+                "CRS-933150",
+                "CRS-920200",
+                "CRS-932200",
+                "CRS-932205",
+                "CRS-932206",
+                "CRS-932207",
+                "CRS-932240",
+                "CRS-943110",
+                "CRS-943120",
+                "CRS-942131",
+                "CRS-942440",
+                "CRS-942521",
+                "CRS-941310",
+            ],
+            "chained rules enforced in full"
+        );
 
         // `all` walks every request header value, so it is reserved for the
         // rules whose upstream variable list really is the whole request.  The
@@ -1912,7 +2520,7 @@ rules:
         let catch_all = checker
             .rules
             .iter()
-            .filter(|r| r.field == Field::Multi(Surfaces::ALL))
+            .filter(|r| r.head.field == CondField::Request(Field::Multi(Surfaces::ALL)))
             .count();
         assert_eq!(catch_all, 6, "rules scanning the entire request");
 
@@ -2462,5 +3070,581 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
             hit.is_some(),
             "a known scanner UA must be detected by the shipped rules"
         );
+    }
+    // ── Chained rules (ModSecurity `chain`) ──────────────────────────────────
+
+    /// Evaluate one shipped rule by id, ignoring the paranoia gate.
+    ///
+    /// The point of these tests is the rule's own semantics; whether the host
+    /// runs at PL1 or PL2 is a separate policy question, and several of the
+    /// chained rules are PL2.
+    fn fires(checker: &OWASPCheck, id: &str, ctx: &RequestCtx) -> bool {
+        checker
+            .rules
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("{id} must be an enforced rule"))
+            .matches(ctx)
+    }
+
+    /// Ordinary traffic that every chained rule used to block, because only
+    /// the rule's *first* condition survived the conversion.
+    ///
+    /// Each entry names the rule that blocked it and the condition that was
+    /// missing.  These are the regressions the `chain:` schema exists to fix.
+    #[test]
+    fn chained_rules_do_not_block_ordinary_traffic() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+
+        let cases: Vec<(&str, RequestCtx)> = vec![
+            // CRS-944110's first condition is `@rx (?:runtime|processbuilder)`.
+            // Alone it blocked every request that so much as mentions the word;
+            // the chained condition requires the *same* value to also contain
+            // `unmarshaller|base64data|java.`.
+            (
+                "944110: java runtime mentioned in a log payload",
+                probe(
+                    "POST",
+                    "/api/logs",
+                    "",
+                    &[("content-type", "application/json")],
+                    "{\"msg\":\"java runtime version 17.0.9 started\"}",
+                    1,
+                ),
+            ),
+            (
+                "944110: 'runtime' as a documentation query",
+                probe("GET", "/docs", "topic=runtime", &[], "", 1),
+            ),
+            (
+                "944110: ProcessBuilder named in a trace header",
+                probe("GET", "/", "", &[("x-trace", "processbuilder")], "", 1),
+            ),
+            // CRS-944120 is the same shape with the gadget list first.
+            (
+                "944120: gadget class name in prose without a spawn call",
+                probe("POST", "/api/notes", "", &[], "note=InvokerTransformer explained", 1),
+            ),
+            // CRS-932205/6/7 first conditions match *any* Referer
+            // (`^[^#]+`, `#.*`), so a plain product link was a 403.
+            (
+                "932205/932206: ordinary Referer",
+                probe(
+                    "GET",
+                    "/p",
+                    "",
+                    &[("referer", "https://shop.example.com/products?page=2")],
+                    "",
+                    2,
+                ),
+            ),
+            (
+                "932207: Referer carrying a fragment",
+                probe(
+                    "GET",
+                    "/p",
+                    "",
+                    &[("referer", "https://shop.example.com/docs#section-2")],
+                    "",
+                    2,
+                ),
+            ),
+            (
+                "932207: scroll-to-text fragment",
+                probe(
+                    "GET",
+                    "/p",
+                    "",
+                    &[("referer", "https://shop.example.com/docs#:~:text=hello")],
+                    "",
+                    2,
+                ),
+            ),
+            // CRS-920200 exempts PDF viewers, which legitimately ask for many
+            // ranges; without the chained condition every one was blocked.
+            (
+                "920200: multi-range PDF fetch",
+                probe(
+                    "GET",
+                    "/docs/manual.pdf",
+                    "",
+                    &[("range", "bytes=0-1,1-2,2-3,3-4,4-5,5-6,6-7")],
+                    "",
+                    2,
+                ),
+            ),
+            // CRS-933150 matches PHP function *names*; the chained condition
+            // requires a parenthesis, i.e. an actual call.
+            (
+                "933150: PHP function name in prose",
+                probe(
+                    "POST",
+                    "/api/notes",
+                    "",
+                    &[],
+                    "note=we replaced array_map with a loop",
+                    1,
+                ),
+            ),
+            // CRS-932200's first condition matches a quote followed by a path;
+            // the chain requires the same value to hold a slash *and*
+            // whitespace, i.e. a command line.
+            (
+                "932200: relative redirect target in a query argument",
+                probe("GET", "/login", "next=/account/settings?tab=billing", &[], "", 2),
+            ),
+            // CRS-943110/943120 only mean "session id in the URL *and* an
+            // off-domain / absent Referer".
+            (
+                "943110: session id parameter with a same-origin Referer",
+                probe(
+                    "GET",
+                    "/x",
+                    "phpsessid",
+                    &[("referer", "https://example.com/a"), ("host", "example.com")],
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "943120: session id parameter with a Referer present",
+                probe(
+                    "GET",
+                    "/x",
+                    "phpsessid",
+                    &[("referer", "https://example.com/a"), ("host", "example.com")],
+                    "",
+                    1,
+                ),
+            ),
+            // CRS-931130 is refused outright (its chain reads a `setvar`
+            // collection): its first condition alone blocked every OAuth
+            // redirect and every absolute URL in a query argument.
+            (
+                "931130: absolute URL in an OAuth redirect parameter",
+                probe(
+                    "GET",
+                    "/oauth/authorize",
+                    "redirect_uri=https://app.example.com/cb&state=xyz",
+                    &[("host", "example.com")],
+                    "",
+                    2,
+                ),
+            ),
+            // CRS-942130 is refused outright (see the converter's
+            // `args_self_equality` note): its capture-equality test reads the
+            // query string's own `name=value` separator as a tautology.
+            (
+                "942130: a parameter whose value equals its name",
+                probe("GET", "/s", "tab=tab", &[], "", 2),
+            ),
+        ];
+
+        for (label, ctx) in &cases {
+            assert!(
+                checker.check(ctx).is_none(),
+                "{label} must not be blocked, got {:?}",
+                checker.check(ctx).and_then(|d| d.rule_id)
+            );
+        }
+    }
+
+    /// What each chained rule is actually for must still be caught — by that
+    /// very rule, not incidentally by a neighbour.
+    #[test]
+    fn chained_rules_still_detect_their_attacks() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+
+        let cases: Vec<(&str, RequestCtx)> = vec![
+            (
+                "CRS-944110",
+                probe(
+                    "POST",
+                    "/struts",
+                    "",
+                    &[("content-type", "application/xml")],
+                    "<map><jdk.nashorn.internal.objects.NativeString><value \
+                     class=\"com.sun.xml.internal.bind.v2.runtime.unmarshaller.Base64Data\">",
+                    1,
+                ),
+            ),
+            // Lower-case on purpose: upstream CRS applies `t:lowercase` to
+            // this rule and this engine implements no transformation pipeline,
+            // so `InvokerTransformer` as written in a Java class name is not
+            // matched.  That gap predates chaining and is tracked separately.
+            (
+                "CRS-944120",
+                probe(
+                    "POST",
+                    "/api",
+                    "",
+                    &[("content-type", "application/xml")],
+                    "org.apache.commons.collections.functors.invokertransformer runtime",
+                    1,
+                ),
+            ),
+            (
+                "CRS-932206",
+                probe("GET", "/", "", &[("referer", "x';id /tmp'")], "", 2),
+            ),
+            (
+                "CRS-920200",
+                probe(
+                    "GET",
+                    "/img/tile.png",
+                    "",
+                    &[("range", "bytes=0-1,1-2,2-3,3-4,4-5,5-6,6-7")],
+                    "",
+                    2,
+                ),
+            ),
+            (
+                "CRS-933150",
+                probe("POST", "/api/notes", "", &[], "note=array_map('system',$_GET)", 1),
+            ),
+            (
+                "CRS-932200",
+                probe("POST", "/run", "", &[], "cmd='/bin/cat /etc/passwd'", 2),
+            ),
+            ("CRS-942131", probe("GET", "/s", "id=1 or 3>2", &[], "", 2)),
+            ("CRS-942521", probe("GET", "/s", "u=admin' or 1", &[], "", 2)),
+            (
+                "CRS-943110",
+                probe(
+                    "GET",
+                    "/x",
+                    "phpsessid",
+                    &[("referer", "https://evil.test/a"), ("host", "example.com")],
+                    "",
+                    1,
+                ),
+            ),
+            (
+                "CRS-943120",
+                probe("GET", "/x", "phpsessid", &[("host", "example.com")], "", 1),
+            ),
+        ];
+
+        for (id, ctx) in &cases {
+            assert!(fires(&checker, id, ctx), "{id} must still fire on its own attack");
+            assert!(checker.check(ctx).is_some(), "{id}'s attack must be blocked");
+        }
+    }
+
+    /// A chain stops at the first condition that fails, and the whole rule is
+    /// silent unless every condition holds.
+    #[test]
+    fn chain_requires_every_condition() {
+        let yaml = r#"
+version: "1.0"
+rules:
+  - id: TEST-CHAIN
+    name: chained rule
+    category: test
+    severity: critical
+    paranoia: 1
+    field: query
+    operator: contains
+    value: alpha
+    chain:
+      - field: query
+        operator: contains
+        value: beta
+      - field: header_referer
+        operator: contains
+        value: gamma
+    action: block
+"#;
+        let checker = OWASPCheck::from_yaml(yaml);
+        assert_eq!(checker.rule_count(), 1);
+
+        let all = probe("GET", "/", "alpha+beta", &[("referer", "gamma")], "", 1);
+        assert!(checker.check(&all).is_some(), "every condition holds");
+
+        for (label, ctx) in [
+            ("head fails", probe("GET", "/", "beta", &[("referer", "gamma")], "", 1)),
+            (
+                "link 0 fails",
+                probe("GET", "/", "alpha", &[("referer", "gamma")], "", 1),
+            ),
+            ("link 1 fails", probe("GET", "/", "alpha+beta", &[], "", 1)),
+        ] {
+            assert!(checker.check(&ctx).is_none(), "{label}: chain must not fire");
+        }
+    }
+
+    /// `matched_value` is the value the previous condition matched, not the
+    /// whole request: a second condition satisfied by a *different* surface
+    /// must not complete the chain.
+    #[test]
+    fn matched_value_is_scoped_to_the_value_that_matched() {
+        let yaml = r#"
+version: "1.0"
+rules:
+  - id: TEST-MATCHED
+    name: matched value chain
+    category: test
+    severity: critical
+    paranoia: 1
+    field: query+body
+    operator: contains
+    value: runtime
+    chain:
+      - field: matched_value
+        operator: contains
+        value: java
+    action: block
+"#;
+        let checker = OWASPCheck::from_yaml(yaml);
+        assert_eq!(checker.rule_count(), 1);
+
+        let same = probe("POST", "/", "", &[], "java.runtime.exec", 1);
+        assert!(checker.check(&same).is_some(), "one value satisfies both conditions");
+
+        // `runtime` in the query, `java` in the body: two different values, so
+        // the chain must stay silent.  A naive "re-scan the whole request"
+        // implementation would fire here.
+        let split = probe("POST", "/", "topic=runtime", &[], "a java tutorial", 1);
+        assert!(checker.check(&split).is_none(), "different values must not combine");
+    }
+
+    /// `matched_value` carries the *decoded* form when the match was made on
+    /// one, mirroring `ModSecurity` `MATCHED_VARS` holding the transformed
+    /// value.
+    #[test]
+    fn matched_value_carries_the_decoded_form() {
+        let yaml = r#"
+version: "1.0"
+rules:
+  - id: TEST-DECODED
+    name: decoded matched value
+    category: test
+    severity: critical
+    paranoia: 1
+    field: query
+    operator: contains_any
+    value: 'system'
+    chain:
+      - field: matched_value
+        operator: contains
+        value: '('
+    action: block
+"#;
+        let checker = OWASPCheck::from_yaml(yaml);
+        let ctx = probe("GET", "/", "cmd=%73ystem%28id%29", &[], "", 1);
+        assert!(
+            checker.check(&ctx).is_some(),
+            "the chain must see the urlDecoded text the phrase matched"
+        );
+    }
+
+    /// `tx:N` reads the capture groups of the last capturing condition, and
+    /// `%{TX.N}` expands one on the right-hand side.
+    #[test]
+    fn captures_are_bound_and_comparable() {
+        let yaml = r#"
+version: "1.0"
+rules:
+  - id: TEST-CAPTURE
+    name: capture equality
+    category: test
+    severity: critical
+    paranoia: 1
+    field: query
+    operator: regex
+    value: '([a-z]+)=([a-z]+)'
+    capture: true
+    chain:
+      - field: tx:1
+        operator: equals
+        value: '%{TX.2}'
+    action: block
+"#;
+        let checker = OWASPCheck::from_yaml(yaml);
+        assert_eq!(checker.rule_count(), 1);
+        assert!(
+            checker.check(&probe("GET", "/", "same=same", &[], "", 1)).is_some(),
+            "identical captures must fire"
+        );
+        assert!(
+            checker.check(&probe("GET", "/", "left=right", &[], "", 1)).is_none(),
+            "different captures must not fire"
+        );
+    }
+
+    /// `%{REQUEST_HEADERS.HOST}` expands to the request's `Host` header, and a
+    /// request without one must not satisfy the *negated* comparison — the
+    /// failure mode that would block every `Host`-less request.
+    #[test]
+    fn host_macro_expands_and_an_absent_host_never_matches() {
+        let yaml = r#"
+version: "1.0"
+rules:
+  - id: TEST-HOST
+    name: off-domain referer
+    category: test
+    severity: critical
+    paranoia: 1
+    field: header_referer
+    operator: regex
+    value: '^https?://([^/]*)/'
+    capture: true
+    chain:
+      - field: tx:1
+        operator: ends_with
+        value: '%{request_headers.host}'
+        negate: true
+    action: block
+"#;
+        let checker = OWASPCheck::from_yaml(yaml);
+        assert_eq!(checker.rule_count(), 1);
+
+        let off_domain = probe(
+            "GET",
+            "/",
+            "",
+            &[("referer", "https://evil.test/a"), ("host", "example.com")],
+            "",
+            1,
+        );
+        assert!(checker.check(&off_domain).is_some(), "off-domain referer fires");
+
+        let same_domain = probe(
+            "GET",
+            "/",
+            "",
+            &[("referer", "https://example.com/a"), ("host", "example.com")],
+            "",
+            1,
+        );
+        assert!(checker.check(&same_domain).is_none(), "same-origin referer is fine");
+
+        let no_host = probe("GET", "/", "", &[("referer", "https://example.com/a")], "", 1);
+        assert!(
+            checker.check(&no_host).is_none(),
+            "an unexpandable macro must not satisfy a negated condition"
+        );
+    }
+
+    /// `count_header_<name>` is a presence test, and only `0`/`1` targets are
+    /// accepted — anything else could never be reached.
+    #[test]
+    fn header_count_is_presence_only() {
+        let yaml = |value: &str| {
+            format!(
+                "version: \"1.0\"\nrules:\n  - id: TEST-COUNT\n    name: t\n    category: test\n    \
+                 severity: critical\n    paranoia: 1\n    field: count_header_referer\n    \
+                 operator: equals\n    value: '{value}'\n    action: block\n"
+            )
+        };
+        let checker = OWASPCheck::from_yaml(&yaml("0"));
+        assert_eq!(checker.rule_count(), 1);
+        assert!(checker.check(&probe("GET", "/", "", &[], "", 1)).is_some(), "absent");
+        assert!(
+            checker
+                .check(&probe("GET", "/", "", &[("referer", "http://x/")], "", 1))
+                .is_none(),
+            "present"
+        );
+
+        let unreachable = OWASPCheck::from_yaml(&yaml("2"));
+        assert_eq!(unreachable.rule_count(), 0, "a count of 2 is not reachable");
+        assert_eq!(unreachable.load_summary().count(RejectCategory::InvalidValue), 1);
+
+        // Only headers the engine can read may be counted.
+        let unknown = OWASPCheck::from_yaml(&single_rule_yaml("count_header_accept", "equals", "'0'"));
+        assert_eq!(unknown.rule_count(), 0);
+        assert_eq!(unknown.load_summary().rejected_field_count(), 1);
+    }
+
+    /// A chain condition the engine cannot compile drops the whole rule and
+    /// says which link failed — it never degrades to "run what compiled".
+    #[test]
+    fn unusable_chain_condition_rejects_the_whole_rule() {
+        let rule = |link: &str| {
+            format!(
+                "version: \"1.0\"\nrules:\n  - id: TEST-BAD-CHAIN\n    name: t\n    category: test\n    \
+                 severity: critical\n    paranoia: 1\n    field: query\n    operator: contains\n    \
+                 value: alpha\n    chain:\n{link}    action: block\n"
+            )
+        };
+
+        // Unsupported field in a link.
+        let bad_field = OWASPCheck::from_yaml(&rule(
+            "      - field: response_body\n        operator: contains\n        value: x\n",
+        ));
+        assert_eq!(bad_field.rule_count(), 0);
+        assert_eq!(bad_field.load_summary().count(RejectCategory::Chain), 1);
+
+        // Unsupported operator in a link.
+        let bad_op = OWASPCheck::from_yaml(&rule(
+            "      - field: query\n        operator: verify_cc\n        value: x\n",
+        ));
+        assert_eq!(bad_op.rule_count(), 0);
+        assert_eq!(bad_op.load_summary().count(RejectCategory::Chain), 1);
+        assert_eq!(
+            bad_op.load_summary().rejected_operator_count(),
+            0,
+            "a chain failure is reported as a chain failure"
+        );
+
+        // `tx:1` with nothing capturing before it can never match.
+        let unbound = OWASPCheck::from_yaml(&rule(
+            "      - field: tx:1\n        operator: contains\n        value: x\n",
+        ));
+        assert_eq!(unbound.rule_count(), 0);
+        assert!(matches!(
+            unbound.load_summary().rejected.first().map(|r| &r.reason),
+            Some(RejectReason::UnresolvedCapture { index: 1, .. })
+        ));
+
+        // `%{TX.3}` with nothing capturing before it, likewise.
+        let unbound_macro = OWASPCheck::from_yaml(&rule(
+            "      - field: query\n        operator: equals\n        value: '%{TX.3}'\n",
+        ));
+        assert_eq!(unbound_macro.rule_count(), 0);
+        assert_eq!(unbound_macro.load_summary().count(RejectCategory::Chain), 1);
+
+        // `capture` on a non-regex operator promises bindings it cannot make.
+        let bad_capture = OWASPCheck::from_yaml(
+            "version: \"1.0\"\nrules:\n  - id: TEST-BAD-CAPTURE\n    name: t\n    category: test\n    \
+             severity: critical\n    paranoia: 1\n    field: query\n    operator: contains\n    \
+             value: alpha\n    capture: true\n    action: block\n",
+        );
+        assert_eq!(bad_capture.rule_count(), 0);
+        assert!(matches!(
+            bad_capture.load_summary().rejected.first().map(|r| &r.reason),
+            Some(RejectReason::CaptureWithoutRegex { .. })
+        ));
+
+        // An unexpandable macro is rejected rather than compared literally.
+        let bad_macro = OWASPCheck::from_yaml(&single_rule_yaml("query", "equals", "'%{tx.crs_setup_version}'"));
+        assert_eq!(bad_macro.rule_count(), 0);
+        assert_eq!(bad_macro.load_summary().count(RejectCategory::InvalidValue), 1);
+    }
+
+    /// The head pseudo-fields are chain-only: a rule whose *head* reads
+    /// `matched_value` or `tx:N` has nothing to read from.
+    #[test]
+    fn chain_pseudo_fields_are_not_valid_as_a_head() {
+        for field in ["matched_value", "tx:0"] {
+            let checker = OWASPCheck::from_yaml(&single_rule_yaml(field, "contains", "x"));
+            assert_eq!(checker.rule_count(), 0, "{field} must not be a head field");
+            assert_eq!(checker.load_summary().rejected_field_count(), 1);
+        }
+    }
+
+    /// `negate` is per-value: the condition holds when *some* value fails the
+    /// matcher, which is what `ModSecurity` `!@op` means on a collection.
+    #[test]
+    fn negate_holds_when_a_value_fails_the_matcher() {
+        let checker = OWASPCheck::from_yaml(
+            "version: \"1.0\"\nrules:\n  - id: TEST-NEG\n    name: t\n    category: test\n    \
+             severity: critical\n    paranoia: 1\n    field: path\n    operator: ends_with\n    \
+             value: .pdf\n    negate: true\n    action: block\n",
+        );
+        assert_eq!(checker.rule_count(), 1);
+        assert!(checker.check(&make_ctx("GET", "/a/b.png", 0)).is_some());
+        assert!(checker.check(&make_ctx("GET", "/a/b.pdf", 0)).is_none());
     }
 }

@@ -303,6 +303,10 @@ rules:
     field: path+query+body+cookies
     operator: regex
     value: \xbc[^\xbe>]*[\xbe>]|<[^\xbe]*\xbe
+    chain:
+      - field: matched_value
+        operator: regex
+        value: \x{bc}[\s\x0b]*/[\s\x0b]*[^>\x{be}]*[>\x{be}]|<[\s\x0b]*/[\s\x0b]*[^\x{be}]*\x{be}
     action: block
     tags:
       - owasp-crs

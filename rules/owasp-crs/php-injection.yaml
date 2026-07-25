@@ -109,6 +109,10 @@ rules:
     field: path+query+body+cookies
     operator: pm_from_file
     value: php-function-names-933150.data
+    chain:
+      - field: matched_value
+        operator: contains_any
+        value: ( )
     action: block
     tags:
       - owasp-crs
