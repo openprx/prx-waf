@@ -151,6 +151,149 @@ pub fn is_form_urlencoded(content_type: Option<&str>) -> bool {
     })
 }
 
+// ── Response-phase context ────────────────────────────────────────────────────
+
+/// Context handed to the response-phase detectors.
+///
+/// # Why this is a separate struct and not a field on [`RequestCtx`]
+///
+/// The obvious alternative — `RequestCtx { response: Option<ResponseCtx>, .. }`
+/// — is wrong twice over. Every request-phase construction site would have to
+/// name a field that is *structurally* always `None` there (the response does
+/// not exist yet), and every request-phase detector would be handed a field it
+/// must remember to ignore; "always `None` on this code path" is a comment, not
+/// a type. It also costs the hot path: [`RequestCtx`] is cloned once per body
+/// inspection window, so widening it is paid by every request whether or not a
+/// response is ever inspected.
+///
+/// Nesting the other way round matches the real data dependency. Response-phase
+/// rules are routinely written against request variables too — CRS 954101
+/// (`RESPONSE_STATUS "!@rx ^404$"`) only means anything next to the request that
+/// provoked it — so a response context without its request would be unable to
+/// express the upstream rule set. Owning the request also makes the struct
+/// self-contained, so it can be built once in the gateway and handed to the
+/// detectors without lifetime plumbing through Pingora's `&mut` filter
+/// callbacks.
+#[derive(Debug, Clone)]
+pub struct ResponseCtx {
+    /// The request this response answers, exactly as the request phase saw it
+    /// (`GeoIP`-enriched, folded headers).
+    pub request: RequestCtx,
+    /// Upstream response status code (`ModSecurity` `RESPONSE_STATUS`).
+    pub status: u16,
+    /// Folded, lower-cased response headers (`ModSecurity` `RESPONSE_HEADERS`).
+    pub headers: HashMap<String, String>,
+    /// The slice of the response body handed to the detectors
+    /// (`ModSecurity` `RESPONSE_BODY`).
+    ///
+    /// Empty in the response-header phase. In the body phase this is one
+    /// inspection window, which for a streamed response is a *portion* of the
+    /// body rather than the whole of it.
+    pub body_preview: Bytes,
+    /// `true` when the body is larger than the inspection ceiling, so bytes
+    /// beyond this window will never be shown to a detector.
+    ///
+    /// A rule that concludes "no leak present" must treat this as "no leak in
+    /// the inspected prefix". This is the same distinction `ModSecurity` draws
+    /// with `SecResponseBodyLimitAction ProcessPartial`.
+    pub body_truncated: bool,
+}
+
+impl ResponseCtx {
+    /// Value of a response header by (lower-cased) name.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).map(String::as_str)
+    }
+
+    /// `Content-Type` of the response, if it declared one.
+    #[must_use]
+    pub fn content_type(&self) -> Option<&str> {
+        self.header("content-type")
+    }
+
+    /// `Content-Encoding` of the response, if it declared one.
+    #[must_use]
+    pub fn content_encoding(&self) -> Option<&str> {
+        self.header("content-encoding")
+    }
+}
+
+/// Response media types the response-phase detectors are allowed to read.
+///
+/// # Where this list comes from
+///
+/// It is **not** from CRS. `tx.allowed_response_content_type` does not exist in
+/// the Core Rule Set (verified against v4.25.0: neither `crs-setup.conf.example`
+/// nor `rules/` mentions it — only the request-side
+/// `tx.allowed_request_content_type` exists, defaulted by rule 901xxx and
+/// consumed by 920420). CRS delegates response-body MIME gating entirely to the
+/// connector, which is `ModSecurity`'s `SecResponseBodyMimeType` — its
+/// `modsecurity.conf-recommended` default being `text/plain text/html text/xml`.
+///
+/// This list is that default plus the structured text types a modern origin
+/// actually serves errors and stack traces in (`application/json`,
+/// `application/xml`, `application/xhtml+xml`). Everything else — images,
+/// video, fonts, archives, `application/octet-stream`, and critically
+/// `text/event-stream` — is never buffered and never scanned, because scanning
+/// it can only cost latency and invent false positives.
+pub const INSPECTABLE_RESPONSE_MEDIA_TYPES: &[&str] = &[
+    "text/plain",
+    "text/html",
+    "text/xml",
+    "application/xml",
+    "application/xhtml+xml",
+    "application/json",
+    "text/json",
+];
+
+/// The media type of a `Content-Type` value: everything left of the first `;`,
+/// trimmed. `text/html; charset=utf-8` → `text/html`.
+#[must_use]
+pub fn media_type_essence(content_type: &str) -> &str {
+    content_type.split(';').next().unwrap_or(content_type).trim()
+}
+
+/// `true` when a response declaring `content_type` may be shown to the
+/// response-phase detectors.
+///
+/// A response with **no** `Content-Type` is not inspected. The alternative —
+/// guessing `text/plain` — would put every untyped byte stream (the exact shape
+/// of a file download) through the detectors, and there is no honest way to tell
+/// those apart from an untyped error page.
+#[must_use]
+pub fn is_inspectable_response_media_type(content_type: Option<&str>) -> bool {
+    let Some(raw) = content_type else {
+        return false;
+    };
+    let essence = media_type_essence(raw);
+    INSPECTABLE_RESPONSE_MEDIA_TYPES
+        .iter()
+        .any(|allowed| essence.eq_ignore_ascii_case(allowed))
+}
+
+/// `true` when `Content-Encoding` makes the response body opaque to detectors
+/// that match plaintext patterns.
+///
+/// CRS handles this with rules 950010 … 956010, each of which opens its file
+/// with `SecRule RESPONSE_HEADERS:Content-Encoding "@pm gzip compress deflate br
+/// zstd" … skipAfter:END-RESPONSE-<file>` — i.e. upstream simply gives up on a
+/// compressed response rather than matching regexes against compressed bytes.
+///
+/// This predicate is deliberately **stricter** than that phrase list: any
+/// content coding other than `identity` counts as opaque, so a coding CRS's
+/// `@pm` list has never heard of does not silently become "scan the ciphertext",
+/// which is pure cost and a fresh false-positive source.
+#[must_use]
+pub fn is_opaque_content_encoding(content_encoding: Option<&str>) -> bool {
+    let Some(raw) = content_encoding else {
+        return false;
+    };
+    raw.split(',')
+        .map(str::trim)
+        .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
+}
+
 /// WAF action decision
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -232,6 +375,12 @@ pub enum Phase {
     /// Unsafe / insecure deserialization — object-injection & gadget-chain
     /// signatures (Lane 2 semantic `deserialization` family, T2-F)
     Deserialization = 24,
+    /// Response-header phase — `ModSecurity` `phase:3`. The status line and the
+    /// response headers are available; the body is not.
+    ResponseHeaders = 25,
+    /// Response-body phase — `ModSecurity` `phase:4`. The (bounded, possibly
+    /// truncated) response body is available alongside the headers.
+    ResponseBody = 26,
 }
 
 impl std::fmt::Display for Phase {
@@ -261,6 +410,8 @@ impl std::fmt::Display for Phase {
             Self::LdapInjection => write!(f, "LDAP Injection"),
             Self::XpathInjection => write!(f, "XPath Injection"),
             Self::Deserialization => write!(f, "Unsafe Deserialization"),
+            Self::ResponseHeaders => write!(f, "Response Headers"),
+            Self::ResponseBody => write!(f, "Response Body"),
         }
     }
 }
@@ -534,6 +685,83 @@ mod tests {
             args.last().map(|a| a.name),
             Some(format!("k{}", MAX_FORM_ARGS - 1).as_str())
         );
+    }
+
+    // ── Response-phase gates ─────────────────────────────────────────────────
+
+    #[test]
+    fn media_type_essence_drops_parameters() {
+        assert_eq!(media_type_essence("text/html; charset=utf-8"), "text/html");
+        assert_eq!(media_type_essence("  application/json  "), "application/json");
+        assert_eq!(media_type_essence("text/html"), "text/html");
+        assert_eq!(media_type_essence(""), "");
+    }
+
+    #[test]
+    fn only_text_shaped_responses_are_inspectable() {
+        for ct in [
+            "text/html",
+            "text/html; charset=UTF-8",
+            "TEXT/HTML",
+            "text/plain",
+            "application/json",
+            "application/json;charset=utf-8",
+            "text/xml",
+            "application/xml",
+            "application/xhtml+xml",
+        ] {
+            assert!(is_inspectable_response_media_type(Some(ct)), "{ct} should be inspected");
+        }
+        for ct in [
+            // The streaming escape hatch: SSE must never be buffered.
+            "text/event-stream",
+            "application/octet-stream",
+            "image/png",
+            "video/mp4",
+            "font/woff2",
+            "application/pdf",
+            "application/zip",
+            "application/grpc",
+            // Prefix collisions must not sneak through.
+            "text/htmlx",
+            "application/jsonp",
+            "",
+        ] {
+            assert!(
+                !is_inspectable_response_media_type(Some(ct)),
+                "{ct} must not be inspected"
+            );
+        }
+        // No Content-Type at all: not inspected (see the fn docs).
+        assert!(!is_inspectable_response_media_type(None));
+    }
+
+    #[test]
+    fn compressed_responses_are_opaque() {
+        // The exact codings CRS 950010…956010 bail out on.
+        for ce in ["gzip", "compress", "deflate", "br", "zstd", "GZIP", " gzip "] {
+            assert!(is_opaque_content_encoding(Some(ce)), "{ce} should be opaque");
+        }
+        // Stricter than the CRS `@pm` list: an unknown coding is opaque too.
+        assert!(is_opaque_content_encoding(Some("exi")));
+        assert!(is_opaque_content_encoding(Some("identity, gzip")));
+        // Only `identity` (and an absent / empty header) is transparent.
+        assert!(!is_opaque_content_encoding(Some("identity")));
+        assert!(!is_opaque_content_encoding(Some("IDENTITY")));
+        assert!(!is_opaque_content_encoding(Some("")));
+        assert!(!is_opaque_content_encoding(None));
+    }
+
+    #[test]
+    fn response_phase_variants_are_appended_not_renumbered() {
+        // The discriminants of the pre-existing variants are part of the
+        // on-the-wire contract; the response phases must only extend the range.
+        assert_eq!(Phase::IpWhitelist as u8, 1);
+        assert_eq!(Phase::Deserialization as u8, 24);
+        assert_eq!(Phase::ResponseHeaders as u8, 25);
+        assert_eq!(Phase::ResponseBody as u8, 26);
+        assert_eq!(Phase::ResponseHeaders.to_string(), "Response Headers");
+        assert_eq!(Phase::ResponseBody.to_string(), "Response Body");
     }
 
     #[test]

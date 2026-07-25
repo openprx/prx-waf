@@ -104,6 +104,16 @@ const fn compute_confidence(phase: Phase) -> f64 {
         // Whitelist phases rarely trigger signal reporting,
         // but covered for exhaustive matching.
         Phase::IpWhitelist | Phase::UrlWhitelist => 0.30,
+        // Weakest signal in the table, and deliberately below `GeoIp`. Every
+        // other phase says something about the *client*; a response-phase
+        // finding says the **origin** leaked something (a stack trace, a SQL
+        // error, a web shell's output), and the same page leaks to every
+        // visitor. Attributing that to whoever happened to load it would poison
+        // the shared feed with the IPs of ordinary users. Nothing feeds these to
+        // the reporter today — the gateway's response path does not call
+        // `report_community_signal` — so the arm exists to make wiring it up
+        // later a deliberate decision rather than an inherited default.
+        Phase::ResponseHeaders | Phase::ResponseBody => 0.20,
     }
 }
 

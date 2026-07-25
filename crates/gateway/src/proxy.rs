@@ -11,12 +11,16 @@ use pingora_proxy::{ProxyHttp, Session};
 
 use waf_common::{HostConfig, RequestCtx, WafAction};
 use waf_engine::WafEngine;
+use waf_engine::checks::ResponseCheckSet;
 
 use crate::cache::ResponseCache;
 use crate::context::{
     CACHE_BODY_LIMIT, FoldedHeaders, GatewayCtx, body_inspection_policy, fold_request_headers, rightmost_forwarded_for,
 };
 use crate::lb::LoadBalancerRegistry;
+use crate::response::{
+    ResponseInspectMode, ResponseInspector, fold_response_headers, gate as response_gate, response_inspection_policy,
+};
 use crate::router::HostRouter;
 use crate::ssl::ChallengeStore;
 
@@ -49,6 +53,16 @@ pub struct WafProxy {
     /// inspected for desync indicators and any match is logged; the request's
     /// allow/block decision is **never** changed. `false` skips the check.
     pub smuggling_detection: bool,
+    /// Response-phase detectors (`ModSecurity` `phase:3` / `phase:4`).
+    ///
+    /// **Empty by default, and empty as this ships.** The whole response path
+    /// keys off [`ResponseCheckSet::is_empty`]: while the set is empty no
+    /// response is gated, buffered, scanned or delayed, and
+    /// [`upstream_response_body_filter`](ProxyHttp::upstream_response_body_filter)
+    /// runs the same cache-only code it ran before the response phase existed.
+    /// The CRS `RESPONSE-95x` rules attach here once `checks::owasp` learns to
+    /// evaluate `RESPONSE_BODY` / `RESPONSE_STATUS`.
+    pub response_checks: Arc<ResponseCheckSet>,
 }
 
 impl WafProxy {
@@ -62,6 +76,7 @@ impl WafProxy {
             lb_registry: Arc::new(LoadBalancerRegistry::new()),
             cache: None,
             smuggling_detection: true,
+            response_checks: Arc::new(ResponseCheckSet::new()),
         }
     }
 
@@ -191,6 +206,122 @@ impl WafProxy {
             path,
             query,
             accept_encoding,
+        ))
+    }
+
+    /// Feed one response-body chunk to the response-phase detectors.
+    ///
+    /// Called only when [`GatewayCtx::response_inspection`] is armed. Returns
+    /// `Err` when the response must be abandoned, which is the strongest action
+    /// available at this point: the status line left the process before the
+    /// first body byte arrived, so a finding cannot be turned into a `403`. What
+    /// it *can* do is make sure the offending bytes never leave — in
+    /// [`ResponseInspectMode::Enforce`] the chunk is withheld until its window
+    /// comes back clean, so a hit inside the inspected prefix leaks nothing —
+    /// and hand the client a message it is obliged to reject: Pingora answers
+    /// the error by closing the downstream connection without completing the
+    /// body, which is a `Content-Length` shortfall or a chunked body with no
+    /// terminating chunk (RFC 9112 §8, an incomplete message).
+    ///
+    /// In [`ResponseInspectMode::Observe`] — the default — and for a host in
+    /// `log_only_mode`, a finding is recorded and the response is delivered
+    /// untouched.
+    fn inspect_response_chunk(
+        &self,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut GatewayCtx,
+    ) -> pingora_core::Result<()> {
+        // Disjoint field borrows: the inspector is mutated while the request
+        // context and host config are read.
+        let GatewayCtx {
+            response_inspection,
+            request_ctx,
+            host_config,
+            ..
+        } = ctx;
+        let Some(inspector) = response_inspection.as_mut() else {
+            return Ok(());
+        };
+
+        let step = inspector.push(body, end_of_stream);
+
+        if step.over_cap {
+            let policy = response_inspection_policy();
+            warn!(
+                "Response body exceeds the {} byte inspection ceiling; the remainder is delivered UNINSPECTED: \
+                 host={} path={}",
+                policy.max_total_bytes,
+                request_ctx.as_ref().map_or("", |c| c.host.as_str()),
+                request_ctx.as_ref().map_or("", |c| c.path.as_str()),
+            );
+        }
+
+        let Some(window) = step.inspect else {
+            return Ok(());
+        };
+        let Some(request) = request_ctx.as_ref() else {
+            return Ok(());
+        };
+
+        let response_ctx = inspector.context(request, window, step.truncated);
+        let Some(result) = self.response_checks.evaluate(&response_ctx) else {
+            return Ok(());
+        };
+
+        // A host in log_only_mode downgrades every veto, exactly as it does for
+        // the request phase.
+        let log_only =
+            inspector.mode() == ResponseInspectMode::Observe || host_config.as_ref().is_some_and(|h| h.log_only_mode);
+
+        if log_only {
+            warn!(
+                "WAF response detection (log only): rule={} phase={} status={} ip={} host={} path={} detail={}",
+                result.rule_name,
+                result.phase,
+                response_ctx.status,
+                request.client_ip,
+                request.host,
+                request.path,
+                result.detail,
+            );
+            return Ok(());
+        }
+
+        warn!(
+            "WAF abandoned response: rule={} phase={} status={} ip={} host={} path={} detail={}",
+            result.rule_name,
+            result.phase,
+            response_ctx.status,
+            request.client_ip,
+            request.host,
+            request.path,
+            result.detail,
+        );
+
+        // Withhold whatever this window would have released; the abort below
+        // must not race a partial write of the offending bytes.
+        *body = None;
+
+        // `HTTPStatus(403)` is not cosmetic, and it is not guaranteed either.
+        //
+        // Pingora drains upstream tasks in batches: it filters every task in the
+        // batch into `filtered_tasks` and only then calls
+        // `write_response_tasks` (`proxy_h1.rs`). Returning `Err` here aborts
+        // that loop through `?`, so a header sitting in the *same* batch is
+        // dropped unwritten — `fail_to_proxy` then finds `response_written() ==
+        // None` and emits a genuine `403`. That is the likely path for the small
+        // origin responses the CRS `RESPONSE-95x` rules exist to catch (an error
+        // page, a stack trace, a JSON fault) arriving from a fast backend.
+        //
+        // When the header went out in an earlier batch — any streamed or large
+        // response — `respond_error` sees a written response, declines to write
+        // a second one, and closes the connection instead. Both outcomes are
+        // acceptable; only the first is a status code, and which one occurs is a
+        // property of upstream timing, so nothing may be built on top of it.
+        Err(pingora_core::Error::explain(
+            pingora_core::ErrorType::HTTPStatus(403),
+            "WAF blocked upstream response",
         ))
     }
 }
@@ -607,9 +738,16 @@ impl ProxyHttp for WafProxy {
         Ok(())
     }
 
-    /// Capture the upstream response headers and decide whether the body is
-    /// worth buffering for a cache store. Runs only when the request was a
-    /// cache-store candidate (`ctx.cache_key` set in `request_filter`).
+    /// Arm the response-phase WAF for this response, then capture the upstream
+    /// response headers and decide whether the body is worth buffering for a
+    /// cache store. The cache half runs only when the request was a cache-store
+    /// candidate (`ctx.cache_key` set in `request_filter`).
+    ///
+    /// Note what is **not** happening here: the status is not being held back.
+    /// By the time this returns, Pingora writes the header task straight to the
+    /// downstream socket (`proxy_h1.rs`, `write_response_tasks`), so nothing the
+    /// body phase later discovers can change it. See [`crate::response`] for why
+    /// that constraint is structural and what the response phase does instead.
     async fn upstream_response_filter(
         &self,
         _session: &mut Session,
@@ -619,6 +757,36 @@ impl ProxyHttp for WafProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // ── Response-phase WAF arming ─────────────────────────────────────────
+        // The `is_empty` test comes first and short-circuits everything: with no
+        // registered response detector not a single header is folded and no
+        // inspector is allocated, so this whole block is one pointer test.
+        if !self.response_checks.is_empty() {
+            let status = upstream_response.status.as_u16();
+            let guard_status = ctx.host_config.as_ref().is_some_and(|h| h.guard_status);
+            let header_str = |name: &str| {
+                upstream_response
+                    .headers
+                    .get(name)
+                    .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+            };
+            // Gate on the raw header map first; the fold only happens for a
+            // response that is actually going to be inspected.
+            let decision = response_gate(
+                true,
+                guard_status,
+                status,
+                header_str("content-type"),
+                header_str("content-encoding"),
+            );
+            if decision.is_inspect() {
+                let headers = fold_response_headers(&upstream_response.headers);
+                ctx.response_inspection = Some(ResponseInspector::new(*response_inspection_policy(), status, headers));
+            } else {
+                debug!("Response phase skipped: {}", decision.reason());
+            }
+        }
+
         if self.cache.is_none() || ctx.cache_key.is_none() {
             return Ok(());
         }
@@ -674,6 +842,28 @@ impl ProxyHttp for WafProxy {
         end_of_stream: bool,
         ctx: &mut GatewayCtx,
     ) -> pingora_core::Result<Option<std::time::Duration>> {
+        // ── Response-phase WAF ────────────────────────────────────────────────
+        // `response_inspection` is `None` unless `upstream_response_filter` armed
+        // an inspector, which it only does when a response detector is
+        // registered. With none registered this is the *only* difference from
+        // the cache-only filter that shipped before: one `Option` test.
+        //
+        // It runs **before** the cache accumulator on purpose. In enforce mode
+        // the inspector re-times chunks (withholding each one until its window
+        // is scanned) without adding, dropping or reordering a byte, so the
+        // accumulator below still sees the complete body in order — but only if
+        // it reads `body` after the inspector has finished with it.
+        if ctx.response_inspection.is_some()
+            && let Err(e) = self.inspect_response_chunk(body, end_of_stream, ctx)
+        {
+            // The response was abandoned mid-stream; a partial body must never
+            // reach the cache.
+            ctx.cache_store = false;
+            ctx.cache_key = None;
+            ctx.cache_body.clear();
+            return Err(e);
+        }
+
         if !ctx.cache_store {
             return Ok(None);
         }

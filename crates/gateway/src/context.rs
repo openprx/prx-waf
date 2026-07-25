@@ -483,6 +483,17 @@ pub struct GatewayCtx {
     pub cache_store: bool,
     /// Accumulated upstream response body for the pending cache store.
     pub cache_body: BytesMut,
+    // ── Response-phase WAF ─────────────────────────────────────────────────────
+    /// Armed response-body inspector, or `None` when this response is not
+    /// inspected.
+    ///
+    /// `None` is the overwhelmingly common state and the one this round ships
+    /// in: [`crate::proxy::WafProxy`] only arms an inspector when a
+    /// response-phase detector is registered *and* the response clears
+    /// [`crate::response::gate`]. While it is `None` the response path costs one
+    /// `Option` test per chunk and behaves exactly as it did before the response
+    /// phase existed.
+    pub response_inspection: Option<crate::response::ResponseInspector>,
 }
 
 #[cfg(test)]

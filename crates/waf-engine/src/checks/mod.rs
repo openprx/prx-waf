@@ -27,7 +27,7 @@ pub use sensitive::SensitiveCheck;
 pub use sql_injection::SqlInjectionCheck;
 pub use xss::XssCheck;
 
-use waf_common::{DetectionResult, RequestCtx};
+use waf_common::{DetectionResult, RequestCtx, ResponseCtx};
 
 /// Trait implemented by every WAF checker module.
 ///
@@ -36,6 +36,89 @@ use waf_common::{DetectionResult, RequestCtx};
 /// short-circuits on the first `Some(result)`.
 pub trait Check: Send + Sync {
     fn check(&self, ctx: &RequestCtx) -> Option<DetectionResult>;
+}
+
+// ─── Response phase ───────────────────────────────────────────────────────────
+
+/// Trait implemented by every **response-phase** WAF checker.
+///
+/// The counterpart of [`Check`] for `ModSecurity`'s `phase:3` / `phase:4`: the
+/// implementor is shown the upstream status, the response headers and (in the
+/// body phase) one bounded window of the response body, wrapped in a
+/// [`ResponseCtx`] that also carries the request that provoked it.
+///
+/// # Why this is not just `Check`
+///
+/// [`Check::check`] takes `&RequestCtx`, which structurally cannot carry a
+/// status code or a response body — a response-phase rule expressed through it
+/// would have to smuggle its inputs through a request field, which is how a
+/// detector ends up matching the wrong surface. A second trait keeps the two
+/// phases' inputs honest and lets the gateway decide, by type, which pipeline a
+/// checker belongs to.
+///
+/// # Sync on purpose
+///
+/// Pingora's `upstream_response_body_filter` is a **synchronous** callback, so
+/// the response pipeline has no `.await` point available to it. Keeping this
+/// trait sync makes that a compile-time fact rather than a runtime surprise;
+/// anything that must do I/O has to hand the work off to a spawned task.
+pub trait ResponseCheck: Send + Sync {
+    /// Inspect one response context. `None` means "nothing found".
+    fn check(&self, ctx: &ResponseCtx) -> Option<DetectionResult>;
+}
+
+/// The registered response-phase checkers.
+///
+/// Ships **empty**: this round lands the plumbing (context type, trait, gateway
+/// call site) and no detectors. An empty set is the load-bearing invariant of
+/// that state — [`Self::is_empty`] is what the gateway tests before it does any
+/// response-phase work at all, so with no registered checker the response path
+/// is byte-for-byte the one that shipped before. The CRS response rules attach
+/// here in the round that teaches `checks::owasp` to evaluate
+/// `RESPONSE_BODY` / `RESPONSE_STATUS`.
+#[derive(Default)]
+pub struct ResponseCheckSet {
+    checks: Vec<Box<dyn ResponseCheck>>,
+}
+
+impl ResponseCheckSet {
+    /// An empty set — no response-phase inspection happens.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { checks: Vec::new() }
+    }
+
+    /// Build a set from an explicit checker list.
+    #[must_use]
+    pub fn from_checks(checks: Vec<Box<dyn ResponseCheck>>) -> Self {
+        Self { checks }
+    }
+
+    /// Register one more checker.
+    pub fn push(&mut self, check: Box<dyn ResponseCheck>) {
+        self.checks.push(check);
+    }
+
+    /// `true` when no checker is registered — the gateway's fast path.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.checks.is_empty()
+    }
+
+    /// Number of registered checkers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.checks.len()
+    }
+
+    /// Run the checkers in order and return the first finding.
+    ///
+    /// Same first-match-wins short-circuit as the request-phase pipeline, so a
+    /// clean response costs one pass and a dirty one stops early.
+    #[must_use]
+    pub fn evaluate(&self, ctx: &ResponseCtx) -> Option<DetectionResult> {
+        self.checks.iter().find_map(|check| check.check(ctx))
+    }
 }
 
 // ─── Shared utilities ─────────────────────────────────────────────────────────
