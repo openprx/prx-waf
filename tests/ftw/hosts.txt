@@ -1,0 +1,57 @@
+# Virtual hosts that the CRS regression corpus sends in its `Host:` header.
+#
+# prx-waf's HostRouter answers 404 for any Host it does not know
+# (gateway/src/proxy.rs — "No route found for host"). A 404 is one of go-ftw's
+# `negativeExpectedStatuses`, so an unregistered host would silently turn every
+# negative test into a free pass and every positive test into a failure that has
+# nothing to do with detection quality. Every Host value that appears anywhere
+# in coreruleset/tests/regression/tests is therefore registered here.
+#
+# Format: one entry per line, `name` (registered on port 80, which also
+# registers the bare hostname) or `name:port` for the few tests that carry an
+# explicit port in the Host header. The literal token `<empty>` registers the
+# empty Host header, which the 920280 "Request Missing a Host Header" tests
+# send on purpose — without it the router 404s them before the rule can fire.
+#
+# Regenerate with:
+#   grep -rhiE '^[[:space:]]*Host:' <crs>/tests/regression/tests \
+#     | sed -E 's/^[[:space:]]*[Hh]ost:[[:space:]]*//' | tr -d "\"'" | sort -u
+
+<empty>
+localhost
+localhost%00
+localhost%1F
+%00
+127.0.0.1
+1.2.3.4
+[::1]
+[fe80::f1:01:fe01:1]
+[fe80::f1:01:fe01:1]:80
+example.com
+api.example.com
+app.example.com
+nextjs.example
+deadbeef.de
+deadbeef.de:8080
+myapp.com
+webapp.com
+aspapp.com
+cakeapp.com
+cfapp.com
+ciapp.com
+coldapp.com
+flaskapp.com
+genericapp.com
+javaapp.com
+koaapp.com
+meteorapp.com
+nextjs-app.com
+nodeapp.io
+phpapp.com
+playapp.com
+railsapp.com
+rubyapp.com
+sailsapp.com
+shinyapp.com
+weblogicapp.com
+zendapp.com

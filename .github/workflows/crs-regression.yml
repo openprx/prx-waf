@@ -1,0 +1,129 @@
+# OWASP CRS official regression suite (go-ftw) against prx-waf.
+#
+# Purpose is regression detection, not a green tick: the suite does not pass
+# today and is not expected to. The gate is tests/ftw/baseline.json — a run
+# fails only when MORE tests fail than the recorded baseline allows. The
+# baseline lives in a file, not in this workflow, so moving it is a reviewable
+# diff in the PR that earned it.
+name: crs-regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rules/owasp-crs/**'
+      - 'crates/waf-engine/**'
+      - 'crates/gateway/**'
+      - 'crates/waf-common/**'
+      - 'tests/ftw/**'
+      - '.github/workflows/crs-regression.yml'
+  pull_request:
+    paths:
+      - 'rules/owasp-crs/**'
+      - 'crates/waf-engine/**'
+      - 'crates/gateway/**'
+      - 'crates/waf-common/**'
+      - 'tests/ftw/**'
+      - '.github/workflows/crs-regression.yml'
+  workflow_dispatch:
+    inputs:
+      paranoia:
+        description: 'Comma-separated paranoia levels'
+        required: false
+        default: '1,2'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crs-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ftw:
+    name: CRS regression (PL${{ matrix.pl }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        pl: [1, 2]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: prx_waf
+          POSTGRES_PASSWORD: prx_waf
+          POSTGRES_DB: prx_waf
+        ports:
+          - 15433:5432
+        options: >-
+          --health-cmd "pg_isready -U prx_waf"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: crs-regression
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      # The pinned CRS checkout and the two Go tools are the slow part and never
+      # change between runs at a fixed pin, so cache them on the pins themselves.
+      - name: Cache CRS corpus and go-ftw
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/ftw-work/coreruleset-v4.25.0
+            ${{ runner.temp }}/ftw-work/bin
+          key: ftw-crs-v4.25.0-goftw-v1.3.0-albedo-v0.3.0
+
+      - name: Build prx-waf
+        run: cargo build --release -p prx-waf
+
+      # run.sh gates on tests/ftw/baseline.json itself (BASELINE=...): it exits
+      # non-zero only when MORE tests fail than the baseline plus its tolerance.
+      - name: Run CRS regression suite
+        env:
+          PL: ${{ matrix.pl }}
+          WORK: ${{ runner.temp }}/ftw-work
+          PRXWAF_BIN: ${{ github.workspace }}/target/release/prx-waf
+          BASELINE: ${{ github.workspace }}/tests/ftw/baseline.json
+          # Postgres comes from `services:` above, already listening on 15433,
+          # so run.sh must not start (or remove) a container of its own.
+          SKIP_POSTGRES: '1'
+          PG_PORT: '15433'
+          RUST_LOG: warn
+        run: bash tests/ftw/run.sh
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crs-regression-pl${{ matrix.pl }}
+          path: ${{ runner.temp }}/ftw-work/reports/
+          retention-days: 14
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo '## CRS regression — PL${{ matrix.pl }}'
+            echo '```'
+            head -60 "${{ runner.temp }}/ftw-work/reports/report-pl${{ matrix.pl }}.txt" \
+              2>/dev/null || echo '(no report produced)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

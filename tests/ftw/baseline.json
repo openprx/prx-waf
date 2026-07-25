@@ -1,0 +1,65 @@
+{
+  "_comment": [
+    "Recorded result of the OWASP CRS regression suite against prx-waf.",
+    "",
+    "This file is the CI gate. `tests/ftw/run.sh` with BASELINE set exits",
+    "non-zero when a paranoia level produces MORE failures than the number",
+    "below plus `tolerance`. It is deliberately a data file and not a constant",
+    "inside the workflow: moving the number has to be a reviewable diff in the",
+    "pull request that earned it.",
+    "",
+    "Improving the number is not an error, but the run prints a reminder to",
+    "lower the baseline in the same PR — otherwise the ratchet stops working.",
+    "",
+    "Numbers are only comparable at the same crs_version, the same go_ftw",
+    "version and the same paranoia level. Restate all three whenever the",
+    "figure is quoted anywhere."
+  ],
+  "crs_version": "v4.25.0",
+  "go_ftw_version": "v1.3.0",
+  "mode": "cloud",
+  "recorded_at": "2026-07-25",
+  "recorded_from": "35fedb5ac678fad52c451696e9df649bf3318042",
+  "tolerance": 5,
+  "results": {
+    "PL1": {
+      "run": 4674,
+      "passed": 3133,
+      "failed": 1541,
+      "pass_rate": 67.03,
+      "buckets": {
+        "not-implemented": 290,
+        "paranoia-scope": 928,
+        "over-block": 107,
+        "missed-detection": 177,
+        "harness": 39
+      }
+    },
+    "PL2": {
+      "run": 4674,
+      "passed": 3683,
+      "failed": 991,
+      "pass_rate": 78.8,
+      "buckets": {
+        "not-implemented": 246,
+        "paranoia-scope": 283,
+        "over-block": 237,
+        "missed-detection": 188,
+        "harness": 37
+      }
+    },
+    "PL4": {
+      "run": 4674,
+      "passed": 3915,
+      "failed": 759,
+      "pass_rate": 83.76,
+      "buckets": {
+        "not-implemented": 248,
+        "paranoia-scope": 0,
+        "over-block": 349,
+        "missed-detection": 125,
+        "harness": 37
+      }
+    }
+  }
+}

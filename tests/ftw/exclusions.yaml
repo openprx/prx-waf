@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Declared exclusions for the CRS regression run.
+#
+# POLICY: the headline number is computed over the FULL corpus with this list
+# NOT applied. Nothing here is subtracted from the denominator unless the run
+# is invoked with APPLY_EXCLUSIONS=1, and even then both numbers are printed.
+# This exists so the cost of each structural gap is stated as a number rather
+# than made to disappear, which is exactly what an exclusion list is normally
+# abused for.
+#
+# Every entry must carry:
+#   match   a full-match regex over "<rule_id>-<test_id>"
+#   gap     the engine gap it is attributable to (one of the ids below)
+#   reason  what specifically cannot work, in one sentence
+#
+# Engine gaps referenced here:
+#
+#   G1  no anomaly-scoring model
+#       CRS v4 rules almost all do `setvar:tx.inbound_anomaly_score_pl1=+N`
+#       and blocking happens once in rule 949110 when the accumulated score
+#       crosses the threshold. prx-waf blocks on the first matching rule. This
+#       distorts in both directions: a single low-severity match that CRS would
+#       merely score becomes a 403 (visible as failing NEGATIVE tests), and a
+#       payload that only crosses the threshold by accumulation is a non-issue
+#       for us because one hit already blocks.
+#
+#   G2  no ARGS parameter splitter
+#       The engine hands whole query strings / bodies to a rule; upstream
+#       evaluates each ARGS member and each ARGS_NAMES member separately. Rules
+#       anchored to a single parameter value, and rules targeting ARGS_NAMES,
+#       therefore see a different subject than upstream.
+#
+#   G3  rule absent from rules/owasp-crs/
+#       The converter refuses rules it cannot express faithfully, and the
+#       engine has no response-phase channel at all. Response-phase rules
+#       (RESPONSE-95x), FILES targets, MULTIPART_PART_HEADERS targets,
+#       header-count targets (&REQUEST_HEADERS:...) and TX sentinels are all
+#       in this group.
+#
+#   G4  paranoia scoping
+#       A rule that declares a paranoia level above the level under test is
+#       never evaluated. Upstream behaves the same way; this is not a defect,
+#       it only means the corpus is broader than the configuration.
+#
+#   H   harness limitation
+#       Something about the test cannot be expressed through a reverse proxy
+#       at all, independent of detection.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+version: 1
+
+exclusions: []
+# Deliberately empty for the baseline. The classifier attributes every failure
+# to G1/G2/G3/G4/H from the corpus and the rule set instead, which keeps the
+# denominator at the full corpus size while still reporting the cost of each
+# gap. Add entries here only for tests that cannot be *executed* meaningfully
+# (gap H), never for tests that merely fail.
