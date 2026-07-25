@@ -18,10 +18,10 @@ fn install_crypto_provider() {
 
 use waf_cluster::{
     ClusterMessage, NodeState, RuleReloader, StorageMode,
-    crypto::{ca::CertificateAuthority, node_cert::NodeCertificate},
+    crypto::{ca::CertificateAuthority, node_cert::NodeCertificate, token::generate_token},
     node::PeerInfo,
-    protocol::{ChangeOp, RuleSyncRequest, SyncType},
-    sync::rules::{RuleChangelog, apply_sync_response, handle_sync_request},
+    protocol::{ChangeOp, ElectionResult, RuleSyncRequest, RuleSyncResponse, SyncType},
+    sync::rules::{RuleChangelog, apply_sync_response, handle_sync_request, snapshot_rules},
     transport::{client::ClusterClient, server::ClusterServer},
 };
 use waf_common::config::{ClusterConfig, NodeRole};
@@ -526,4 +526,184 @@ async fn e2e_rule_sync_applied_only_from_authenticated_main() {
         "worker must apply the rule pushed by the authenticated Main over QUIC"
     );
     assert!(version >= 1, "worker registry version must follow the Main");
+}
+
+// ─── H-11 / N-M / AUD-L4 over real QUIC mTLS ───────────────────────────────────
+
+/// **Attack ① end to end** — a rogue node that holds a perfectly valid cluster
+/// certificate announces itself as Main over a live mTLS connection with
+/// `term: u64::MAX` and an empty ballot, then immediately pushes a rule.
+///
+/// Everything up to and including the TLS handshake succeeds — that is the point
+/// of the scenario: the attacker is an authenticated cluster member. The victim
+/// must still refuse to record it as Main, and therefore refuse the rule push
+/// that the `is_current_main` gate protects.
+#[tokio::test]
+async fn e2e_forged_election_result_cannot_hijack_the_rule_registry() {
+    install_crypto_provider();
+
+    let victim_addr = random_loopback_addr();
+    let ca = CertificateAuthority::generate(365).expect("CA generate");
+    let ca_cert_der = ca.cert_der().expect("CA DER");
+    let victim_cert = NodeCertificate::generate("victim", &ca, 1).expect("victim cert");
+    let rogue_cert = NodeCertificate::generate("rogue", &ca, 1).expect("rogue cert");
+
+    let victim_state = make_node_state("victim", minimal_config(victim_addr));
+    let server = ClusterServer::new(
+        victim_addr,
+        ca_cert_der.clone(),
+        victim_cert.cert_pem.clone(),
+        victim_cert.key_pem.clone(),
+    );
+    let victim_srv = Arc::clone(&victim_state);
+    tokio::spawn(async move {
+        if let Err(e) = server.serve(victim_srv).await {
+            tracing::error!("victim server error: {e}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let rogue_state = make_node_state("rogue", minimal_config(random_loopback_addr()));
+    let (tx, rx) = mpsc::channel::<ClusterMessage>(16);
+    let client = ClusterClient::new(
+        victim_addr,
+        "rogue".to_string(),
+        ca_cert_der,
+        rogue_cert.cert_pem,
+        rogue_cert.key_pem,
+    );
+    tokio::spawn(async move {
+        if let Err(e) = client.run_with_reconnect(rogue_state, rx).await {
+            tracing::error!("rogue client error: {e}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // Step 1: unilateral coronation.
+    tx.send(ClusterMessage::ElectionResult(ElectionResult {
+        term: u64::MAX,
+        elected_id: "rogue".to_string(),
+        voter_ids: vec![],
+    }))
+    .await
+    .expect("send forged result");
+
+    // Step 2: rewrite the victim's whole rule set as the "new Main".
+    tx.send(ClusterMessage::RuleSyncResponse(RuleSyncResponse {
+        version: 999,
+        sync_type: SyncType::Full,
+        changes: vec![],
+        snapshot_lz4: snapshot_rules(&[make_test_rule("attacker-owns-you")]).expect("snapshot"),
+    }))
+    .await
+    .expect("send forged rule push");
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    assert!(
+        !victim_state.is_current_main("rogue").await,
+        "a self-declared winner with an empty ballot must not become the authoritative Main"
+    );
+    assert!(
+        victim_state.main_node_id().await.is_none(),
+        "no Main may be recorded from an uncorroborated ElectionResult"
+    );
+    assert!(
+        !victim_state
+            .rule_registry
+            .read()
+            .rules
+            .contains_key("attacker-owns-you"),
+        "the usurper must not be able to rewrite the victim's rules"
+    );
+    assert_eq!(
+        victim_state.election.current_term_sync(),
+        0,
+        "a forged term must not pin the victim's term"
+    );
+    assert_eq!(*victim_state.rules_version.read().await, 0);
+}
+
+/// **Positive control** — the whole legitimate path over real QUIC: a worker
+/// dials the Main, the client sends its `JoinRequest` automatically, the Main
+/// validates the join token and answers, the worker records the authenticated
+/// Main, and a rule pull from the Main is then applied to the data plane.
+#[tokio::test]
+async fn e2e_worker_joins_main_with_a_token_and_syncs_rules() {
+    install_crypto_provider();
+
+    let main_addr = random_loopback_addr();
+    let ca = CertificateAuthority::generate(365).expect("CA generate");
+    let ca_cert_der = ca.cert_der().expect("CA DER");
+    let main_cert = NodeCertificate::generate("join-main", &ca, 1).expect("main cert");
+    let worker_cert = NodeCertificate::generate("join-worker", &ca, 1).expect("worker cert");
+
+    // ── Main: role=main, holds the CA key, mints a join token ──────────────
+    let mut main_cfg = minimal_config(main_addr);
+    main_cfg.role = "main".to_string();
+    let main_state = make_node_state("join-main", main_cfg);
+    *main_state.ca_key_pem.lock() = Some(ca.key_pem().to_string());
+    let token = generate_token(ca.key_pem(), 3_600_000).expect("mint join token");
+    main_state
+        .record_rule_change(
+            ChangeOp::Upsert,
+            "sqli-777".to_string(),
+            Some(make_test_rule("sqli-777")),
+        )
+        .await;
+
+    let server = ClusterServer::new(
+        main_addr,
+        ca_cert_der.clone(),
+        main_cert.cert_pem.clone(),
+        main_cert.key_pem.clone(),
+    );
+    let main_srv = Arc::clone(&main_state);
+    tokio::spawn(async move {
+        if let Err(e) = server.serve(main_srv).await {
+            tracing::error!("join-main server error: {e}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // ── Worker: same token in its config, no Main known yet ────────────────
+    let mut worker_cfg = minimal_config(random_loopback_addr());
+    worker_cfg.join_token = token;
+    let worker_state = make_node_state("join-worker", worker_cfg);
+    assert!(worker_state.main_node_id().await.is_none());
+
+    let (tx, rx) = mpsc::channel::<ClusterMessage>(16);
+    let client = ClusterClient::new(
+        main_addr,
+        "join-worker".to_string(),
+        ca_cert_der,
+        worker_cert.cert_pem,
+        worker_cert.key_pem,
+    );
+    let worker_for_task = Arc::clone(&worker_state);
+    tokio::spawn(async move {
+        if let Err(e) = client.run_with_reconnect(worker_for_task, rx).await {
+            tracing::error!("join-worker client error: {e}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // The join handshake ran on connect and recorded the authenticated Main.
+    assert_eq!(
+        worker_state.main_node_id().await.as_deref(),
+        Some("join-main"),
+        "an accepted JoinResponse from the real Main records its identity"
+    );
+    let registered = { main_state.peers.read().await.iter().any(|p| p.node_id == "join-worker") };
+    assert!(registered, "the Main registers the joined worker");
+
+    // …and rules from that Main are now accepted on the request path.
+    tx.send(ClusterMessage::RuleSyncRequest(RuleSyncRequest { current_version: 0 }))
+        .await
+        .expect("send pull");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        worker_state.rule_registry.read().rules.contains_key("sqli-777"),
+        "the joined worker applies rules from its authenticated Main"
+    );
 }

@@ -4,13 +4,29 @@
 //! is self-signed with 10-year validity and signs all node certificates.
 
 use anyhow::{Context, Result};
-use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ED25519};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose, PKCS_ED25519,
+};
 use rustls_pki_types::pem::PemObject as _;
 use time::OffsetDateTime;
 use tracing::info;
 
 /// Fixed internal cluster server name used as TLS SNI and SAN in all node certs.
 pub const CLUSTER_SERVER_NAME: &str = "cluster.prx-waf";
+
+/// Key usages asserted by the cluster CA certificate (AUD-L4).
+///
+/// Without an explicit list rcgen emits no `keyUsage` extension at all, leaving
+/// a CA whose certificate never says it may sign certificates. The CA signs node
+/// certificates (`keyCertSign`), may publish revocation lists (`crlSign`), and
+/// self-signs its own certificate (`digitalSignature`). No EKU is set: an EKU on
+/// a root would constrain every certificate beneath it, and the leaves declare
+/// their own TLS usages.
+const CA_KEY_USAGES: [KeyUsagePurpose; 3] = [
+    KeyUsagePurpose::KeyCertSign,
+    KeyUsagePurpose::CrlSign,
+    KeyUsagePurpose::DigitalSignature,
+];
 
 /// Cluster root Certificate Authority.
 ///
@@ -31,6 +47,7 @@ impl CertificateAuthority {
             .context("invalid cluster server name for CA SAN")?;
 
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = CA_KEY_USAGES.to_vec();
         params.not_before = OffsetDateTime::now_utc();
         params.not_after = OffsetDateTime::now_utc() + time::Duration::days(i64::from(validity_days));
 
@@ -105,6 +122,7 @@ impl CertificateAuthority {
         let mut ca_params = CertificateParams::new(vec![CLUSTER_SERVER_NAME.to_owned()])
             .context("invalid cluster server name for CA reconstruction")?;
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = CA_KEY_USAGES.to_vec();
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, "prx-waf Cluster CA");
         dn.push(DnType::OrganizationName, "prx-waf");

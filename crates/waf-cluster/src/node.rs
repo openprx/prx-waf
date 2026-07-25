@@ -18,6 +18,7 @@ use waf_common::config::{ClusterConfig, NodeRole};
 use waf_engine::{Rule, RuleRegistry, RuleReloader};
 
 use crate::cluster_forward::PendingForwards;
+use crate::crypto::token::{JoinTokenClaims, UsedJoinTokens};
 use crate::election::ElectionManager;
 use crate::health::HeartbeatTracker;
 use crate::protocol::{ChangeOp, ClusterMessage, ConfigSync, RuleChange, RuleSyncResponse, SyncType};
@@ -27,6 +28,9 @@ use crate::sync::{ApiForwardHandler, NoopRuleReloader};
 
 /// Number of recent rule changes the main node retains for incremental sync.
 const RULE_CHANGELOG_CAPACITY: usize = 1_024;
+
+/// Maximum number of spent join-token nonces retained for replay detection.
+const USED_JOIN_TOKEN_CAPACITY: usize = 4_096;
 
 /// Whether this node has a live database connection or must forward writes.
 #[derive(Debug, Clone)]
@@ -69,6 +73,12 @@ pub struct NodeState {
     pub ca_key_pem: ParkingMutex<Option<String>>,
     /// AES-GCM encrypted CA private key stored by worker nodes for failover.
     pub ca_key_encrypted: ParkingMutex<Option<Vec<u8>>>,
+    /// Join tokens already spent on this node, keyed by token nonce (AUD-L4).
+    ///
+    /// A token may be re-presented by the node that first used it (so a restart
+    /// or reconnect still works with the operator-configured token) but never by
+    /// a different node.
+    used_join_tokens: ParkingMutex<UsedJoinTokens>,
     // ── Data-plane synchronisation ────────────────────────────────────────────
     /// Shared rule registry that synced rules are applied into (worker side) and
     /// served from (main side). Behind an `Arc<RwLock>` so a hot-reload swap is
@@ -143,6 +153,7 @@ impl NodeState {
             peer_channels: ParkingMutex::new(Vec::new()),
             ca_key_pem: ParkingMutex::new(None),
             ca_key_encrypted: ParkingMutex::new(None),
+            used_join_tokens: ParkingMutex::new(UsedJoinTokens::new(USED_JOIN_TOKEN_CAPACITY)),
             rule_registry: Arc::new(ParkingRwLock::new(RuleRegistry::new())),
             rule_changelog: TokioMutex::new(RuleChangelog::new(RULE_CHANGELOG_CAPACITY)),
             config_syncer: TokioMutex::new(ConfigSyncer::new(node_id_for_sync)),
@@ -378,6 +389,45 @@ impl NodeState {
             info!(main = %id, "Recorded authenticated cluster Main identity");
         }
         *guard = Some(id);
+    }
+
+    /// The recorded authenticated Main identity, if one has been verified.
+    pub async fn main_node_id(&self) -> Option<String> {
+        self.main_node_id.read().await.clone()
+    }
+
+    /// Returns `true` when this node has a verified Main that still looks alive.
+    ///
+    /// Drives the re-join loop (see [`crate::discovery::run_rejoin_loop`]): a
+    /// node whose Main is unknown, evicted, or phi-dead re-runs the join
+    /// handshake to re-learn the current Main instead of adopting an
+    /// uncorroborated `ElectionResult` (H-11).
+    pub async fn verified_main_is_live(&self) -> bool {
+        let Some(main_id) = self.main_node_id().await else {
+            return false;
+        };
+        if main_id == self.node_id {
+            return true;
+        }
+        let known = self.peers.read().await.iter().any(|p| p.node_id == main_id);
+        if !known {
+            return false;
+        }
+        let now_ms = crate::health::now_unix_ms();
+        !self.heartbeat_tracker.lock().is_peer_dead(&main_id, now_ms)
+    }
+
+    /// Burn a validated join token so it cannot be replayed by another node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token's nonce was already spent by a
+    /// **different** node (AUD-L4 replay), so the caller must reject the join.
+    /// Re-presentation by the same node succeeds, which keeps worker restarts
+    /// and reconnects working with the operator-configured token.
+    pub fn claim_join_token(&self, claims: &JoinTokenClaims, node_id: &str) -> Result<()> {
+        let now_ms = crate::health::now_unix_ms();
+        self.used_join_tokens.lock().claim(claims, node_id, now_ms)
     }
 
     /// Returns `true` when `id` is the recorded authenticated Main identity.

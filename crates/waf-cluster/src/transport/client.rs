@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use crate::crypto::ca::CLUSTER_SERVER_NAME;
 use crate::node::NodeState;
 use crate::protocol::ClusterMessage;
-use crate::transport::{frame, identity};
+use crate::transport::{apply_election_result, frame, identity};
 
 /// Minimum reconnect back-off delay (ms).
 const BACKOFF_MIN_MS: u64 = 500;
@@ -115,6 +115,20 @@ impl ClusterClient {
             .context("failed to read authenticated identity from cluster peer certificate")?;
 
         let (mut send, mut recv) = conn.open_bi().await.context("failed to open cluster control stream")?;
+
+        // Re-run the join handshake on every (re)connection rather than only
+        // once at process start. This is what lets a node that has no verified
+        // Main — a fresh node, a restarted one, or one that could not
+        // corroborate the last `ElectionResult` (H-11) — re-learn the Main
+        // identity from a seed without having to disrupt the cluster with a new
+        // election. Idempotent on the Main side, and the join token stays
+        // re-presentable by the same node (AUD-L4).
+        if node_state.current_role().await != waf_common::config::NodeRole::Main {
+            let join_req = crate::discovery::join_request_for(node_state);
+            frame::write_frame(&mut send, &join_req)
+                .await
+                .context("failed to send cluster JoinRequest")?;
+        }
 
         let state = Arc::clone(node_state);
         tokio::select! {
@@ -234,7 +248,24 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState, auth_id:
                 );
                 return;
             }
+            // N-M: the above check is satisfied by construction (a responder
+            // always names itself), so it proves only "the peer I dialled says
+            // it is Main". The real gate is server-side: a non-Main node now
+            // refuses to answer a join at all. Here we add the membership check
+            // — a seed outside the declared membership can never be our Main.
+            if resp.accepted && !node_state.election.is_declared_member(auth_id) {
+                warn!(
+                    authenticated = %auth_id,
+                    "Dropping JoinResponse: responder is not a declared cluster member"
+                );
+                return;
+            }
             if resp.accepted {
+                // Adopt the cluster's term from the Main we just joined (clamped
+                // against an implausible jump) so a freshly (re)started node does
+                // not sit at term 0 and reject every subsequent election result.
+                node_state.election.advance_term(resp.cluster_state.term);
+
                 // Record the authenticated Main identity (validated above) so
                 // rule/config pushes from it are accepted (H-9).
                 node_state
@@ -286,10 +317,14 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState, auth_id:
                     }
                 }
             } else {
-                warn!(
-                    reason = resp.reason.as_deref().unwrap_or("unknown"),
-                    "JoinRequest rejected by main"
-                );
+                let reason = resp.reason.as_deref().unwrap_or("unknown");
+                if reason == crate::transport::JOIN_REJECT_NOT_MAIN {
+                    // Routine: this seed is a worker, or a failover moved the
+                    // Main elsewhere. The re-join loop keeps asking the others.
+                    debug!(peer = %auth_id, "Seed is not the cluster Main; join not accepted here");
+                } else {
+                    warn!(reason, "JoinRequest rejected by main");
+                }
             }
         }
 
@@ -324,23 +359,7 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState, auth_id:
         }
 
         ClusterMessage::ElectionResult(result) => {
-            // H-9: only the winner itself may announce its own election result.
-            if result.elected_id != auth_id {
-                warn!(
-                    declared = %result.elected_id,
-                    authenticated = %auth_id,
-                    "Dropping ElectionResult: elected_id does not match peer certificate identity"
-                );
-                return;
-            }
-            // Record the authenticated winner as the current Main (H-9).
-            if node_state.election.is_valid_term(result.term) {
-                node_state.set_main_node_id(result.elected_id.clone()).await;
-            }
-            match node_state.election.process_result(&result) {
-                Ok(new_role) => node_state.transition_to(new_role).await,
-                Err(e) => warn!("process_result error: {e}"),
-            }
+            apply_election_result(node_state, auth_id, &result).await;
         }
 
         // ── Data-plane sync (responses / pushes from the Main) ──────────────
@@ -434,6 +453,70 @@ mod tests {
             2,
             "authenticated voter must be counted"
         );
+    }
+
+    fn join_response(accepted: bool, main_node_id: &str, term: u64) -> ClusterMessage {
+        ClusterMessage::JoinResponse(crate::protocol::JoinResponse {
+            accepted,
+            reason: None,
+            node_cert_pem: String::new(),
+            ca_cert_pem: String::new(),
+            cluster_state: crate::protocol::ClusterState {
+                main_node_id: main_node_id.to_string(),
+                nodes: Vec::new(),
+                rules_version: 0,
+                config_version: 0,
+                term,
+            },
+            encrypted_ca_key_b64: None,
+        })
+    }
+
+    /// **Attack ②** — a peer that answers a join while naming *another* node as
+    /// Main is dropped (H-9); only a responder that authenticated as the Main it
+    /// names can be adopted, and the server side refuses to answer at all unless
+    /// it really is the Main (N-M).
+    #[tokio::test]
+    async fn join_response_naming_a_third_party_main_is_dropped() {
+        let n = node("worker-1");
+        dispatch_incoming(join_response(true, "real-main", 3), &n, "rogue-seed").await;
+        assert!(
+            n.main_node_id().await.is_none(),
+            "a responder may not nominate a third party as Main"
+        );
+        assert_eq!(n.election.current_term_sync(), 0, "no term adopted from a dropped join");
+    }
+
+    /// M-16: a seed outside the declared membership can never become our Main.
+    #[tokio::test]
+    async fn join_response_from_undeclared_member_is_dropped() {
+        let cfg = ClusterConfig {
+            node_id: "worker-1".to_string(),
+            members: ["worker-1", "main-A"].into_iter().map(String::from).collect(),
+            ..ClusterConfig::default()
+        };
+        let n = Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"));
+
+        dispatch_incoming(join_response(true, "stranger", 2), &n, "stranger").await;
+        assert!(n.main_node_id().await.is_none());
+
+        // The declared Main is accepted, and its term is adopted.
+        dispatch_incoming(join_response(true, "main-A", 2), &n, "main-A").await;
+        assert_eq!(n.main_node_id().await.as_deref(), Some("main-A"));
+        assert_eq!(
+            n.election.current_term_sync(),
+            2,
+            "a joined node adopts the cluster term so later results verify"
+        );
+    }
+
+    /// A rejected join must not record a Main or move the term.
+    #[tokio::test]
+    async fn rejected_join_response_records_nothing() {
+        let n = node("worker-1");
+        dispatch_incoming(join_response(false, "main-A", 9), &n, "main-A").await;
+        assert!(n.main_node_id().await.is_none());
+        assert_eq!(n.election.current_term_sync(), 0);
     }
 
     #[tokio::test]

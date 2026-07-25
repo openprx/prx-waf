@@ -22,8 +22,35 @@
 //!   are discarded.
 //! - A node only wins if `vote_count >= (total_nodes / 2) + 1`.
 //! - `ElectionResult` with `term < current_term` is silently ignored (fencing).
+//!
+//! # Byzantine hardening (H-11)
+//!
+//! `ElectionResult` is a *self-declared* claim: nothing in the message proves
+//! that the votes it lists were ever cast. Before H-11 the receiver adopted the
+//! announced winner as the authoritative Main after only checking that the
+//! sender's mTLS identity matched `elected_id` (H-9), so **any** node holding a
+//! valid cluster certificate could announce `ElectionResult { term: u64::MAX,
+//! elected_id: self, voter_ids: [] }` and have the whole cluster accept it —
+//! and, through the `is_current_main` gate, accept its rule and config pushes.
+//!
+//! Because the vote grants are unicast to the candidate and carry no per-voter
+//! signature, a receiver cannot cryptographically recount the ballot. What it
+//! *can* do is check the claim against evidence it produced itself:
+//! [`ElectionManager::process_result`] accepts a result only when **this node
+//! granted its own vote to `elected_id` in exactly that term**. A node's own
+//! vote record is local, unforgeable, and — because a node grants at most one
+//! vote per term — a usurper can only ever be recognised by nodes that really
+//! did vote for it. A zero-vote or stuffed-ballot takeover is therefore
+//! impossible; see `docs/` and the crate report for the residual
+//! minority-usurpation case that needs signed vote certificates to close.
+//!
+//! Term monotonicity is hardened in the same pass: an unverified result never
+//! advances the local term, and any single message may advance it by at most
+//! [`MAX_TERM_JUMP`], so `term: u64::MAX` can no longer pin the cluster into a
+//! permanently un-electable state.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,6 +63,103 @@ use waf_common::config::NodeRole;
 
 use crate::protocol::{ClusterMessage, ElectionResult, ElectionVote};
 
+/// Maximum number of terms a single inbound message may advance this node's term.
+///
+/// A node that has been partitioned for a long time can legitimately be many
+/// terms behind, so the guard **clamps** instead of rejecting: each message
+/// moves us at most this far, and repeated messages from the genuinely-ahead
+/// peer let us converge. What it prevents is a single forged message pinning
+/// the term at (or near) `u64::MAX`, which would deadlock every future election
+/// — `voted_for` is only reset when the term advances, so a saturated term
+/// freezes every node's vote forever.
+pub const MAX_TERM_JUMP: u64 = 1024;
+
+/// The vote this node granted, together with the term it was granted in.
+///
+/// Kept as a pair so that acceptance of an `ElectionResult` can be anchored to
+/// "did *I* vote for this winner in *this* term" without relying on the term
+/// bookkeeping being reset elsewhere (H-11).
+#[derive(Debug, Clone)]
+struct GrantedVote {
+    term: u64,
+    candidate_id: String,
+}
+
+/// Why a broadcast [`ElectionResult`] was not accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultRejection {
+    /// Term 0 is never the product of an election.
+    ZeroTerm,
+    /// The announced term is older than ours (classic fencing).
+    StaleTerm { result_term: u64, current_term: u64 },
+    /// The announced term is ahead of ours: we took no part in that ballot and
+    /// therefore hold no evidence that it happened.
+    UnobservedTerm { result_term: u64, current_term: u64 },
+    /// The winner is not part of the declared cluster membership (M-16).
+    IneligibleWinner { elected_id: String },
+    /// We did not grant our vote to the announced winner in that term.
+    NoLocalVote {
+        elected_id: String,
+        granted_to: Option<String>,
+    },
+    /// The announced ballot does not even contain the winner's own vote.
+    WinnerNotInBallot { elected_id: String },
+    /// The announced ballot does not add up to a quorum.
+    QuorumShortfall { counted: usize, quorum_total: usize },
+}
+
+impl fmt::Display for ResultRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroTerm => write!(f, "election result carries term 0"),
+            Self::StaleTerm {
+                result_term,
+                current_term,
+            } => write!(f, "stale term {result_term} < current term {current_term}"),
+            Self::UnobservedTerm {
+                result_term,
+                current_term,
+            } => write!(
+                f,
+                "term {result_term} is ahead of our term {current_term}; this node cast no vote in it"
+            ),
+            Self::IneligibleWinner { elected_id } => {
+                write!(f, "winner '{elected_id}' is not a declared cluster member")
+            }
+            Self::NoLocalVote { elected_id, granted_to } => write!(
+                f,
+                "this node did not vote for '{elected_id}' in that term (granted to {})",
+                granted_to.as_deref().unwrap_or("nobody")
+            ),
+            Self::WinnerNotInBallot { elected_id } => {
+                write!(f, "announced ballot does not contain the winner '{elected_id}'")
+            }
+            Self::QuorumShortfall { counted, quorum_total } => write!(
+                f,
+                "announced ballot holds {counted} eligible vote(s), short of a majority of {quorum_total}"
+            ),
+        }
+    }
+}
+
+/// Outcome of validating a broadcast [`ElectionResult`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultDecision {
+    /// The result was corroborated by local evidence; take this role and treat
+    /// `elected_id` as the authoritative Main.
+    Accepted(NodeRole),
+    /// The result could not be corroborated and was ignored. No term, role or
+    /// Main-identity state was changed.
+    Rejected(ResultRejection),
+}
+
+impl ResultDecision {
+    /// Returns `true` when the result was accepted.
+    pub const fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted(_))
+    }
+}
+
 /// Raft-lite election state machine shared by all transport handlers.
 ///
 /// All lock operations are short-lived and never held across `.await` points.
@@ -43,8 +167,8 @@ pub struct ElectionManager {
     pub(crate) node_id: String,
     /// Current Raft term (monotonically increasing).
     term: ParkingRwLock<u64>,
-    /// Which candidate we have voted for in the current term (`None` = not yet).
-    voted_for: ParkingRwLock<Option<String>>,
+    /// The vote granted in the current term (`None` = not yet voted).
+    voted_for: ParkingRwLock<Option<GrantedVote>>,
     /// Min/max random election timeout in milliseconds.
     timeout_min_ms: u64,
     timeout_max_ms: u64,
@@ -80,11 +204,14 @@ impl ElectionManager {
         members.extend(member_ids.iter().cloned());
     }
 
-    /// Returns `true` if `voter_id` is eligible to vote (in the declared
-    /// membership, or membership is unconstrained).
-    fn is_eligible_voter(&self, voter_id: &str) -> bool {
+    /// Returns `true` if `node_id` may take part in elections (it is in the
+    /// declared membership, or membership is unconstrained).
+    ///
+    /// Applies to both voters and candidates: a node outside the declared
+    /// membership neither counts toward quorum nor may be recognised as Main.
+    pub fn is_declared_member(&self, node_id: &str) -> bool {
         let members = self.members.read();
-        members.is_empty() || members.contains(voter_id)
+        members.is_empty() || members.contains(node_id)
     }
 
     /// Current term (non-blocking, `parking_lot`).
@@ -109,11 +236,17 @@ impl ElectionManager {
     pub fn increment_term_and_vote_for_self(&self) -> u64 {
         let new_term = {
             let mut term = self.term.write();
-            *term += 1;
+            // Saturating: a term pushed to u64::MAX by a hostile peer must never
+            // wrap (wrapping would silently roll the cluster back to term 0) nor
+            // panic. MAX_TERM_JUMP makes saturation practically unreachable.
+            *term = term.saturating_add(1);
             *term
         };
         // Reset voting state for the new term
-        *self.voted_for.write() = Some(self.node_id.clone());
+        *self.voted_for.write() = Some(GrantedVote {
+            term: new_term,
+            candidate_id: self.node_id.clone(),
+        });
         // Keep only the new term's vote bucket (remove older)
         let mut votes = self.votes_for_me.lock();
         votes.retain(|&t, _| t >= new_term);
@@ -125,12 +258,28 @@ impl ElectionManager {
     ///
     /// Returns `true` if this is a new (non-duplicate) vote.
     pub fn record_vote_for_me(&self, term: u64, voter_id: String) -> bool {
-        // Only count votes for the current term
-        if term < *self.term.read() {
+        // Grants only count for the term this node is actually standing in, and
+        // only while it is standing (it voted for itself). A grant for a term we
+        // never ran in — including a fabricated far-future term — is discarded
+        // instead of being parked in the ballot map (H-11).
+        if term != *self.term.read() {
+            return false;
+        }
+        let standing = matches!(
+            self.voted_for.read().as_ref(),
+            Some(v) if v.term == term && v.candidate_id == self.node_id
+        );
+        if !standing {
+            debug!(
+                node_id = %self.node_id,
+                voter = %voter_id,
+                term,
+                "Ignoring vote grant: this node is not a candidate in that term"
+            );
             return false;
         }
         // M-16: a voter outside the declared membership does not count toward quorum.
-        if !self.is_eligible_voter(&voter_id) {
+        if !self.is_declared_member(&voter_id) {
             debug!(
                 node_id = %self.node_id,
                 voter = %voter_id,
@@ -161,27 +310,71 @@ impl ElectionManager {
     }
 
     /// Returns `true` if `incoming_term` is not stale (fencing token check).
+    ///
+    /// This is a **staleness** test only — `>=` is deliberate, because the
+    /// legitimate winner of the election this node just took part in announces
+    /// its result at exactly the current term. It is *not* an authorisation
+    /// check and must never be used on its own to decide whether a peer may act
+    /// as Main; use [`Self::process_result`] for that (H-11).
     pub fn is_valid_term(&self, incoming_term: u64) -> bool {
         incoming_term >= *self.term.read()
     }
 
     /// Try to update the term if `incoming_term` is larger. Resets `voted_for` on
     /// term advance. Returns the new current term.
+    ///
+    /// The advance is clamped to [`MAX_TERM_JUMP`] terms per call so a single
+    /// forged message cannot pin the term near `u64::MAX`; a peer that is
+    /// genuinely far ahead pulls us up over successive messages.
     pub fn advance_term(&self, incoming_term: u64) -> u64 {
         let mut term = self.term.write();
         if incoming_term > *term {
-            *term = incoming_term;
+            let ceiling = term.saturating_add(MAX_TERM_JUMP);
+            let capped = incoming_term.min(ceiling);
+            if capped < incoming_term {
+                warn!(
+                    node_id = %self.node_id,
+                    incoming_term,
+                    current_term = *term,
+                    clamped_to = capped,
+                    "Implausible term jump clamped (possible forged term)"
+                );
+            }
+            *term = capped;
             *self.voted_for.write() = None;
         }
         *term
     }
 
+    /// The candidate this node granted its vote to in `term`, if any.
+    ///
+    /// This is the local, unforgeable evidence an `ElectionResult` is checked
+    /// against (H-11).
+    pub fn granted_vote_in_term(&self, term: u64) -> Option<String> {
+        self.voted_for
+            .read()
+            .as_ref()
+            .filter(|v| v.term == term)
+            .map(|v| v.candidate_id.clone())
+    }
+
     /// Decide whether to grant a vote to `vote.candidate_id`.
     ///
     /// Grants if:
-    /// - `vote.term >= current_term` (not stale), AND
-    /// - We have not yet voted for a *different* candidate this term.
+    /// - the candidate is a declared cluster member (M-16), AND
+    /// - `vote.term >= current_term` and the term is not an implausible jump, AND
+    /// - we have not yet voted for a *different* candidate this term.
     pub fn process_vote(&self, vote: &ElectionVote) -> anyhow::Result<bool> {
+        // M-16: only declared members may stand for election. This also bounds
+        // who can drive our term forward.
+        if !self.is_declared_member(&vote.candidate_id) {
+            debug!(
+                node_id = %self.node_id,
+                candidate = %vote.candidate_id,
+                "Denied vote — candidate is not a declared cluster member"
+            );
+            return Ok(false);
+        }
         let current_term = *self.term.read();
         if vote.term < current_term {
             debug!(
@@ -194,14 +387,23 @@ impl ElectionManager {
             return Ok(false);
         }
         if vote.term > current_term {
-            // Advance our term; clear prior vote
-            *self.term.write() = vote.term;
-            *self.voted_for.write() = None;
+            // Advance our term (clamped); a clamped jump means the request is
+            // implausibly far ahead — deny this round and let the candidate
+            // pull us the rest of the way with its next request.
+            let reached = self.advance_term(vote.term);
+            if reached < vote.term {
+                return Ok(false);
+            }
         }
         let mut voted_for = self.voted_for.write();
-        let can_vote = voted_for.is_none() || voted_for.as_deref() == Some(vote.candidate_id.as_str());
+        let can_vote = voted_for
+            .as_ref()
+            .is_none_or(|v| v.term < vote.term || v.candidate_id == vote.candidate_id);
         if can_vote {
-            *voted_for = Some(vote.candidate_id.clone());
+            *voted_for = Some(GrantedVote {
+                term: vote.term,
+                candidate_id: vote.candidate_id.clone(),
+            });
             info!(
                 node_id = %self.node_id,
                 candidate = %vote.candidate_id,
@@ -213,29 +415,88 @@ impl ElectionManager {
         debug!(
             node_id = %self.node_id,
             candidate = %vote.candidate_id,
-            already_voted_for = voted_for.as_deref().unwrap_or("?"),
+            already_voted_for = voted_for.as_ref().map_or("?", |v| v.candidate_id.as_str()),
             "Denied vote — already voted for different candidate"
         );
         Ok(false)
     }
 
-    /// Process an `ElectionResult`.
+    /// Validate a broadcast `ElectionResult` and decide the resulting role.
     ///
-    /// Returns the `NodeRole` this node should transition to:
-    /// - `Main` if we are the elected leader.
-    /// - `Worker` otherwise.
-    pub fn process_result(&self, result: &ElectionResult) -> anyhow::Result<NodeRole> {
-        // Fencing: reject stale-term leaders
-        if !self.is_valid_term(result.term) {
-            warn!(
-                node_id = %self.node_id,
-                result_term = result.term,
-                current_term = self.current_term_sync(),
-                "Rejected stale ElectionResult (split-brain prevention)"
-            );
-            return Ok(NodeRole::Worker);
+    /// # Security (H-11)
+    ///
+    /// `result` is an unauthenticated claim about a ballot this node cannot
+    /// recount, so it is corroborated against local evidence instead:
+    ///
+    /// 1. the term must be non-zero and **exactly** the term this node is in —
+    ///    a stale term is fenced off, and a term we never reached is a ballot we
+    ///    did not take part in;
+    /// 2. the winner must be a declared cluster member (M-16);
+    /// 3. **this node must itself have granted its vote to the winner in that
+    ///    term** — the anchor. A node grants at most one vote per term, so a
+    ///    node that never voted for the sender can never be talked into
+    ///    recognising it, no matter what `voter_ids` claims;
+    /// 4. the announced ballot must contain the winner and, counting only
+    ///    declared members plus this node's own (known-genuine) vote, must reach
+    ///    a majority of `quorum_total`.
+    ///
+    /// A rejected result changes **nothing**: not the term, not the role, not
+    /// the recorded Main identity. In particular the term is never advanced from
+    /// an unverified result, which is what closes the `term: u64::MAX` lockout.
+    ///
+    /// `quorum_total` is the cluster size quorum is measured against — see
+    /// [`crate::node::NodeState::quorum_total`].
+    pub fn process_result(&self, result: &ElectionResult, quorum_total: usize) -> ResultDecision {
+        if result.term == 0 {
+            return ResultDecision::Rejected(ResultRejection::ZeroTerm);
         }
-        self.advance_term(result.term);
+        let current_term = self.current_term_sync();
+        if result.term < current_term {
+            return ResultDecision::Rejected(ResultRejection::StaleTerm {
+                result_term: result.term,
+                current_term,
+            });
+        }
+        if result.term > current_term {
+            return ResultDecision::Rejected(ResultRejection::UnobservedTerm {
+                result_term: result.term,
+                current_term,
+            });
+        }
+        if !self.is_declared_member(&result.elected_id) {
+            return ResultDecision::Rejected(ResultRejection::IneligibleWinner {
+                elected_id: result.elected_id.clone(),
+            });
+        }
+        let granted_to = self.granted_vote_in_term(result.term);
+        if granted_to.as_deref() != Some(result.elected_id.as_str()) {
+            return ResultDecision::Rejected(ResultRejection::NoLocalVote {
+                elected_id: result.elected_id.clone(),
+                granted_to,
+            });
+        }
+        if !result.voter_ids.contains(&result.elected_id) {
+            return ResultDecision::Rejected(ResultRejection::WinnerNotInBallot {
+                elected_id: result.elected_id.clone(),
+            });
+        }
+        // Count distinct declared members only. Our own vote is added
+        // unconditionally: step 3 proved we cast it, whether or not the winner
+        // bothered to list us.
+        let mut ballot: HashSet<&str> = result
+            .voter_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| self.is_declared_member(id))
+            .collect();
+        ballot.insert(self.node_id.as_str());
+        if !Self::is_majority(ballot.len(), quorum_total) {
+            return ResultDecision::Rejected(ResultRejection::QuorumShortfall {
+                counted: ballot.len(),
+                quorum_total,
+            });
+        }
+
         if result.elected_id == self.node_id {
             info!(
                 node_id = %self.node_id,
@@ -243,7 +504,7 @@ impl ElectionManager {
                 voters = ?result.voter_ids,
                 "Elected as cluster main"
             );
-            Ok(NodeRole::Main)
+            ResultDecision::Accepted(NodeRole::Main)
         } else {
             info!(
                 node_id = %self.node_id,
@@ -251,7 +512,7 @@ impl ElectionManager {
                 term = result.term,
                 "Stepping down — new main elected"
             );
-            Ok(NodeRole::Worker)
+            ResultDecision::Accepted(NodeRole::Worker)
         }
     }
 }

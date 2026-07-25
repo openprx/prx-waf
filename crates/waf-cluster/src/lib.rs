@@ -188,21 +188,10 @@ impl ClusterNode {
             node_state.add_peer_channel(tx.clone());
             peer_senders.push(tx.clone());
 
-            // Send JoinRequest as the initial handshake message
-            let join_req = ClusterMessage::JoinRequest(crate::protocol::JoinRequest {
-                token: self.config.join_token.clone(),
-                csr_pem: String::new(),
-                node_info: crate::protocol::NodeInfo {
-                    node_id: node_state.node_id.clone(),
-                    hostname: node_state.node_id.clone(),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    listen_addr: self.config.listen_addr.clone(),
-                    capabilities: vec!["waf".to_string()],
-                },
-            });
-            if let Err(e) = tx.try_send(join_req) {
-                warn!(seed = %seed_str, "Failed to queue JoinRequest: {e}");
-            }
+            // The JoinRequest is no longer queued here: `ClusterClient` sends it
+            // on every (re)connection, so a node that drops its link — or that
+            // could not corroborate the last ElectionResult (H-11) — re-learns
+            // the Main identity instead of never joining again.
 
             let client = ClusterClient::new(
                 seed_addr,
@@ -239,6 +228,15 @@ impl ClusterNode {
             let eviction_interval_ms = self.config.election.heartbeat_interval_ms.saturating_mul(3);
             tokio::spawn(async move {
                 run_peer_eviction(eviction_state, eviction_interval_ms).await;
+            });
+        }
+
+        // ── Re-join loop (re-learn the Main without forcing an election) ──────
+
+        {
+            let state_rejoin = Arc::clone(&node_state);
+            tokio::spawn(async move {
+                crate::discovery::run_rejoin_loop(state_rejoin, crate::discovery::REJOIN_INTERVAL_MS).await;
             });
         }
 

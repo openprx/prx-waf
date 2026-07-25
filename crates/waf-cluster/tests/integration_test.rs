@@ -83,10 +83,13 @@ fn spawn_counting_server(ep: quinn::Endpoint) -> Arc<AtomicU32> {
                 while let Ok((_send, mut recv)) = conn.accept_bi().await {
                     let cnt2 = Arc::clone(&cnt);
                     tokio::spawn(async move {
-                        if let Ok(ClusterMessage::Heartbeat(_)) =
-                            frame::read_frame::<ClusterMessage, _>(&mut recv).await
-                        {
-                            cnt2.fetch_add(1, Ordering::SeqCst);
+                        // Drain the control stream like the real server does: a
+                        // client opens one long-lived stream and sends its
+                        // JoinRequest first, then heartbeats.
+                        while let Ok(msg) = frame::read_frame::<ClusterMessage, _>(&mut recv).await {
+                            if matches!(msg, ClusterMessage::Heartbeat(_)) {
+                                cnt2.fetch_add(1, Ordering::SeqCst);
+                            }
                         }
                     });
                 }

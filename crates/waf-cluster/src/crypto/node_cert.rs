@@ -5,7 +5,7 @@
 //! passes when connecting with `ServerName` "cluster.prx-waf".
 
 use anyhow::{Context, Result};
-use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
+use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, PKCS_ED25519};
 use rustls_pki_types::pem::PemObject as _;
 use time::OffsetDateTime;
 use tracing::info;
@@ -43,6 +43,22 @@ impl NodeCertificate {
         node_params.not_before = OffsetDateTime::now_utc();
         node_params.not_after = OffsetDateTime::now_utc() + time::Duration::days(i64::from(validity_days));
 
+        // AUD-L4: state the certificate's purpose instead of leaving KU/EKU
+        // unset (rcgen defaults to empty vectors, which emit no extension at all
+        // and therefore constrain nothing). Ed25519 only ever signs, so
+        // `digitalSignature` is the sole key usage; TLS 1.3 needs nothing more.
+        //
+        // Both TLS EKUs are present on purpose: cluster nodes form a full mesh
+        // in which every node is simultaneously a QUIC server (accepting peers)
+        // and a QUIC client (dialling seeds), so one identity legitimately plays
+        // both roles. Splitting them would need two key pairs per node and a
+        // provisioning change; the win here is that the certificate is now
+        // scoped to TLS peer authentication and can no longer be used for
+        // unrelated purposes such as code or OCSP signing.
+        node_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        node_params.extended_key_usages =
+            vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
+
         let node_cert = node_params
             .signed_by(&node_key, &ca_cert, &ca_key)
             .context("failed to sign node certificate with CA")?;
@@ -78,6 +94,71 @@ impl NodeCertificate {
 mod tests {
     use super::*;
     use crate::crypto::ca::CertificateAuthority;
+    use rustls::pki_types::CertificateDer;
+    use x509_parser::prelude::{FromDer, X509Certificate};
+
+    /// Parse the leaf certificate out of a PEM chain for extension inspection.
+    fn with_leaf<T>(cert_pem: &str, f: impl FnOnce(&X509Certificate<'_>) -> T) -> T {
+        let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse chain");
+        let der = chain.first().expect("non-empty chain").as_ref().to_vec();
+        let (_, cert) = X509Certificate::from_der(&der).expect("parse leaf");
+        f(&cert)
+    }
+
+    /// **Attack scenario ④ (control)** — node certificates must declare what
+    /// they may be used for. Before the fix rcgen emitted no KU/EKU extension at
+    /// all, so the certificate placed no constraint on its own use.
+    #[test]
+    fn node_cert_declares_key_usage_and_eku() {
+        let ca = CertificateAuthority::generate(3650).unwrap();
+        let node_cert = NodeCertificate::generate("ku-node", &ca, 365).unwrap();
+
+        with_leaf(&node_cert.cert_pem, |cert| {
+            let ku = cert
+                .key_usage()
+                .expect("read keyUsage")
+                .expect("node cert must carry a keyUsage extension")
+                .value;
+            assert!(ku.digital_signature(), "Ed25519 TLS auth needs digitalSignature");
+            assert!(!ku.key_cert_sign(), "a leaf must not be able to sign certificates");
+            assert!(!ku.crl_sign());
+
+            let eku = cert
+                .extended_key_usage()
+                .expect("read EKU")
+                .expect("node cert must carry an extendedKeyUsage extension")
+                .value;
+            // Full-mesh cluster: every node is both a QUIC server and a client.
+            assert!(eku.server_auth, "needed to accept peer connections");
+            assert!(eku.client_auth, "needed to dial seeds");
+            assert!(!eku.any, "must not be an unconstrained anyExtendedKeyUsage");
+            assert!(!eku.code_signing);
+            assert!(!eku.ocsp_signing);
+        });
+    }
+
+    /// The CA must assert `keyCertSign`, otherwise nothing in its certificate
+    /// says it is allowed to issue the node certificates it signs.
+    #[test]
+    fn ca_cert_declares_cert_signing_usage() {
+        let ca = CertificateAuthority::generate(3650).unwrap();
+        with_leaf(ca.cert_pem(), |cert| {
+            let ku = cert
+                .key_usage()
+                .expect("read keyUsage")
+                .expect("CA cert must carry a keyUsage extension")
+                .value;
+            assert!(ku.key_cert_sign(), "a CA must assert keyCertSign");
+            assert!(ku.crl_sign());
+            assert!(cert.is_ca(), "basicConstraints CA must still be set");
+            assert!(
+                cert.extended_key_usage().expect("read EKU").is_none(),
+                "an EKU on the root would constrain every certificate beneath it"
+            );
+        });
+    }
 
     #[test]
     fn generate_and_parse_node_cert() {

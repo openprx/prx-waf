@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::node::{NodeState, PeerInfo};
 use crate::protocol::{ApiForwardResponse, ClusterMessage, ClusterState, ElectionVote, JoinResponse, NodeInfo};
-use crate::transport::{frame, identity};
+use crate::transport::{apply_election_result, frame, identity};
 
 /// QUIC mTLS server for cluster communication.
 pub struct ClusterServer {
@@ -223,33 +223,56 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState, auth_id: 
             }
             debug!(from = %req.node_info.node_id, "JoinRequest received");
 
+            // N-M: only the Main may answer a join. A `JoinResponse` makes the
+            // joiner record the responder as its authoritative Main (the
+            // responder always names *itself* in `cluster_state.main_node_id`,
+            // and the joiner's H-9 check — "declared main == peer certificate
+            // identity" — is then satisfied by construction). Without this gate
+            // any authenticated worker could answer a join and be adopted as
+            // Main, after which its rule/config pushes pass the
+            // `is_current_main` gate. Mirrors the `RuleSyncRequest` role check.
+            if node_state.current_role().await != waf_common::config::NodeRole::Main {
+                warn!(
+                    from = %req.node_info.node_id,
+                    "Rejecting JoinRequest: this node is not the cluster Main"
+                );
+                return Some(reject_join(node_state, crate::transport::JOIN_REJECT_NOT_MAIN).await);
+            }
+
+            // M-16: with a declared membership, only listed nodes may enrol.
+            if !node_state.election.is_declared_member(auth_id) {
+                warn!(
+                    from = %req.node_info.node_id,
+                    "Rejecting JoinRequest: node is not in the declared cluster membership"
+                );
+                return Some(reject_join(node_state, "node is not a declared cluster member").await);
+            }
+
             // Snapshot the CA key once under a short-lived lock (never held across await).
             let ca_key_opt = node_state.ca_key_pem.lock().clone();
 
-            // H-10: validate the join token against the cluster CA key BEFORE
-            // accepting. Previously `validate_token` was never called on the
-            // production path, so any peer could join. A node without the CA key
-            // cannot validate tokens and therefore must not accept joins.
-            let token_valid = ca_key_opt
-                .as_deref()
-                .is_some_and(|ca_key_pem| crate::crypto::token::validate_token(ca_key_pem, &req.token).is_ok());
+            // H-10 / AUD-L4: validate the join token against the cluster CA key
+            // BEFORE accepting, then burn its nonce so it cannot be replayed by
+            // a different node. A node without the CA key cannot validate tokens
+            // and therefore must not accept joins.
+            let token_check = ca_key_opt.as_deref().map_or_else(
+                || Err(anyhow::anyhow!("no cluster CA key available to validate join tokens")),
+                |ca_key_pem| {
+                    let claims = crate::crypto::token::verify_token(ca_key_pem, &req.token, auth_id)?;
+                    node_state.claim_join_token(&claims, auth_id)?;
+                    Ok(())
+                },
+            );
 
-            let cluster_state = build_cluster_state(node_state).await;
-
-            if !token_valid {
+            if let Err(e) = token_check {
                 warn!(
                     from = %req.node_info.node_id,
-                    "Rejecting JoinRequest: invalid or missing join token"
+                    "Rejecting JoinRequest: {e}"
                 );
-                return Some(ClusterMessage::JoinResponse(JoinResponse {
-                    accepted: false,
-                    reason: Some("invalid or missing join token".to_string()),
-                    node_cert_pem: String::new(),
-                    ca_cert_pem: String::new(),
-                    cluster_state,
-                    encrypted_ca_key_b64: None,
-                }));
+                return Some(reject_join(node_state, "invalid or missing join token").await);
             }
+
+            let cluster_state = build_cluster_state(node_state).await;
 
             // H-10: CA key replication is now double-gated — the token must be
             // valid (checked above) AND the operator must have explicitly opted
@@ -339,29 +362,7 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState, auth_id: 
         }
 
         ClusterMessage::ElectionResult(result) => {
-            // H-9: only the winner itself may announce its own election result.
-            if result.elected_id != auth_id {
-                warn!(
-                    declared = %result.elected_id,
-                    authenticated = %auth_id,
-                    "Dropping ElectionResult: elected_id does not match peer certificate identity"
-                );
-                return None;
-            }
-            debug!(
-                elected = %result.elected_id,
-                term = result.term,
-                "ElectionResult received"
-            );
-            // Record the authenticated winner as the current Main so subsequent
-            // rule/config pushes from it are accepted (H-9).
-            if node_state.election.is_valid_term(result.term) {
-                node_state.set_main_node_id(result.elected_id.clone()).await;
-            }
-            match node_state.election.process_result(&result) {
-                Ok(new_role) => node_state.transition_to(new_role).await,
-                Err(e) => warn!("process_result error: {e}"),
-            }
+            apply_election_result(node_state, auth_id, &result).await;
             None
         }
 
@@ -461,6 +462,20 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState, auth_id: 
     }
 }
 
+/// Build a rejecting `JoinResponse` carrying `reason`.
+///
+/// Never leaks CA key material or a node certificate, whatever the reason.
+async fn reject_join(node_state: &NodeState, reason: &str) -> ClusterMessage {
+    ClusterMessage::JoinResponse(JoinResponse {
+        accepted: false,
+        reason: Some(reason.to_string()),
+        node_cert_pem: String::new(),
+        ca_cert_pem: String::new(),
+        cluster_state: build_cluster_state(node_state).await,
+        encrypted_ca_key_b64: None,
+    })
+}
+
 /// Build the current [`ClusterState`] snapshot advertised in a `JoinResponse`.
 async fn build_cluster_state(node_state: &NodeState) -> ClusterState {
     let rules_version = *node_state.rules_version.read().await;
@@ -511,10 +526,13 @@ mod tests {
         Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"))
     }
 
+    const TEST_CA_KEY: &str = "fake-ca-private-key-pem-material-for-tests";
+
     /// A main node holding a CA key, plus a valid join token minted from it.
     fn main_node_with_token(replicate_ca_key: bool, ca_passphrase: &str) -> (Arc<NodeState>, String) {
         let cfg = ClusterConfig {
             node_id: "main".to_string(),
+            role: "main".to_string(),
             replicate_ca_key,
             crypto: ClusterCryptoConfig {
                 ca_passphrase: ca_passphrase.to_string(),
@@ -523,9 +541,8 @@ mod tests {
             ..ClusterConfig::default()
         };
         let n = Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"));
-        let ca_key = "fake-ca-private-key-pem-material-for-tests";
-        *n.ca_key_pem.lock() = Some(ca_key.to_string());
-        let token = crate::crypto::token::generate_token(ca_key, 3_600_000).expect("generate_token");
+        *n.ca_key_pem.lock() = Some(TEST_CA_KEY.to_string());
+        let token = crate::crypto::token::generate_token(TEST_CA_KEY, 3_600_000).expect("generate_token");
         (n, token)
     }
 
@@ -632,6 +649,257 @@ mod tests {
         assert_eq!(n.current_role().await, NodeRole::Worker);
     }
 
+    // ── H-11: ElectionResult over the real dispatch path ─────────────────────
+
+    fn election_result(term: u64, elected: &str, voters: &[&str]) -> ClusterMessage {
+        ClusterMessage::ElectionResult(crate::protocol::ElectionResult {
+            term,
+            elected_id: elected.to_string(),
+            voter_ids: voters.iter().map(|s| (*s).to_string()).collect(),
+        })
+    }
+
+    /// **Attack ①** — an authenticated worker announces itself Main with an
+    /// empty ballot and `u64::MAX`. It must not become the recorded Main (which
+    /// is what would let its rule pushes through `is_current_main`), and it must
+    /// not be able to pin the term.
+    #[tokio::test]
+    async fn self_declared_main_with_empty_ballot_is_not_adopted() {
+        let n = node("victim");
+        n.add_or_update_peer(PeerInfo {
+            node_id: "usurper".to_string(),
+            addr: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            role: NodeRole::Worker,
+            last_seen_ms: 0,
+        })
+        .await;
+
+        let resp = dispatch_message(election_result(u64::MAX, "usurper", &[]), &n, "usurper").await;
+        assert!(resp.is_none());
+        assert!(
+            !n.is_current_main("usurper").await,
+            "a self-declared winner must not be recorded as the authoritative Main"
+        );
+        assert_eq!(n.current_role().await, NodeRole::Worker);
+        assert_eq!(
+            n.election.current_term_sync(),
+            0,
+            "an unverifiable result must not advance the term"
+        );
+    }
+
+    /// **Attack ①f** — the usurper first wins our vote, then lies about the rest
+    /// of the ballot to claim a quorum it never had.
+    #[tokio::test]
+    async fn self_declared_main_with_forged_quorum_is_not_adopted() {
+        let cfg = ClusterConfig {
+            node_id: "victim".to_string(),
+            members: ["victim", "main-A", "n3", "n4", "usurper"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ..ClusterConfig::default()
+        };
+        let n = Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"));
+
+        // We voted for main-A this term, not for the usurper.
+        let granted = dispatch_message(
+            ClusterMessage::ElectionVote(ElectionVote {
+                term: 1,
+                candidate_id: "main-A".to_string(),
+                last_log_index: 0,
+                voter_id: None,
+            }),
+            &n,
+            "main-A",
+        )
+        .await;
+        assert!(granted.is_some(), "the honest candidate gets our vote");
+
+        dispatch_message(
+            election_result(1, "usurper", &["usurper", "victim", "n3", "n4"]),
+            &n,
+            "usurper",
+        )
+        .await;
+        assert!(
+            !n.is_current_main("usurper").await,
+            "a stuffed ballot must not install the usurper as Main"
+        );
+    }
+
+    /// Positive control: a winner this node actually voted for, with a real
+    /// quorum, is adopted as Main over the same dispatch path.
+    #[tokio::test]
+    async fn genuine_election_winner_is_adopted_as_main() {
+        let cfg = ClusterConfig {
+            node_id: "voter".to_string(),
+            members: ["voter", "winner", "n3"].into_iter().map(String::from).collect(),
+            ..ClusterConfig::default()
+        };
+        let n = Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"));
+
+        let granted = dispatch_message(
+            ClusterMessage::ElectionVote(ElectionVote {
+                term: 1,
+                candidate_id: "winner".to_string(),
+                last_log_index: 0,
+                voter_id: None,
+            }),
+            &n,
+            "winner",
+        )
+        .await;
+        assert!(granted.is_some());
+
+        dispatch_message(election_result(1, "winner", &["winner", "voter"]), &n, "winner").await;
+        assert!(
+            n.is_current_main("winner").await,
+            "the corroborated winner becomes the authoritative Main"
+        );
+        assert_eq!(n.current_role().await, NodeRole::Worker);
+    }
+
+    /// Split-vote resolution: an incumbent Main that voted for the *losing*
+    /// candidate cannot corroborate the real winner's announcement. It must
+    /// stand down (otherwise two nodes believe they are Main) — but it must not
+    /// adopt the claimant as its Main either.
+    #[tokio::test]
+    async fn incumbent_main_stands_down_for_an_unverifiable_claim() {
+        let (n, _token) = main_node_with_token(false, "");
+        assert_eq!(n.current_role().await, NodeRole::Main);
+
+        dispatch_message(election_result(7, "challenger", &["challenger"]), &n, "challenger").await;
+
+        assert_eq!(
+            n.current_role().await,
+            NodeRole::Worker,
+            "the incumbent stands down rather than forming a second Main"
+        );
+        assert!(
+            n.main_node_id().await.is_none(),
+            "standing down must not hand authority to the unverified claimant"
+        );
+        assert_eq!(
+            n.election.current_term_sync(),
+            0,
+            "an unverifiable claim still does not move the term"
+        );
+    }
+
+    /// A worker is unaffected by the same claim: it keeps its recorded Main.
+    #[tokio::test]
+    async fn worker_keeps_its_main_when_an_unverifiable_claim_arrives() {
+        let n = node("worker-1");
+        n.set_main_node_id("main-A".to_string()).await;
+        dispatch_message(election_result(7, "challenger", &["challenger"]), &n, "challenger").await;
+        assert_eq!(n.main_node_id().await.as_deref(), Some("main-A"));
+        assert_eq!(n.current_role().await, NodeRole::Worker);
+    }
+
+    // ── N-M: only the Main may answer a join ─────────────────────────────────
+
+    /// **Attack ②** — a non-Main node answering a `JoinRequest` would be adopted
+    /// as Main by the joiner (its self-named `main_node_id` always matches its
+    /// own certificate). It must refuse instead.
+    #[tokio::test]
+    async fn non_main_node_refuses_to_answer_a_join() {
+        // Worker role, but it does hold a replicated CA key and a valid token.
+        let cfg = ClusterConfig {
+            node_id: "rogue-worker".to_string(),
+            role: "worker".to_string(),
+            replicate_ca_key: true,
+            crypto: ClusterCryptoConfig {
+                ca_passphrase: "supersecret-passphrase-16".to_string(),
+                ..ClusterCryptoConfig::default()
+            },
+            ..ClusterConfig::default()
+        };
+        let n = Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"));
+        *n.ca_key_pem.lock() = Some(TEST_CA_KEY.to_string());
+        let token = crate::crypto::token::generate_token(TEST_CA_KEY, 3_600_000).expect("token");
+
+        let resp = as_join_response(dispatch_message(join_request("worker-2", &token), &n, "worker-2").await);
+        assert!(!resp.accepted, "a non-Main node must not accept a join");
+        assert_eq!(resp.reason.as_deref(), Some("responder is not the cluster main"));
+        assert!(
+            resp.encrypted_ca_key_b64.is_none(),
+            "a non-Main node must not hand out CA key material"
+        );
+        let registered = { n.peers.read().await.iter().any(|p| p.node_id == "worker-2") };
+        assert!(!registered);
+    }
+
+    /// A node that wins an election and becomes Main may then answer joins.
+    #[tokio::test]
+    async fn promoted_main_answers_joins() {
+        let (n, token) = main_node_with_token(false, "");
+        n.demote_to_worker().await;
+        let rejected = as_join_response(dispatch_message(join_request("worker-1", &token), &n, "worker-1").await);
+        assert!(!rejected.accepted, "still a worker → refuse");
+
+        n.promote_to_main().await;
+        let accepted = as_join_response(dispatch_message(join_request("worker-1", &token), &n, "worker-1").await);
+        assert!(accepted.accepted, "after promotion the same join succeeds");
+    }
+
+    /// M-16: a node outside the declared membership cannot enrol.
+    #[tokio::test]
+    async fn join_from_undeclared_member_is_rejected() {
+        let cfg = ClusterConfig {
+            node_id: "main".to_string(),
+            role: "main".to_string(),
+            members: ["main", "worker-1"].into_iter().map(String::from).collect(),
+            ..ClusterConfig::default()
+        };
+        let n = Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"));
+        *n.ca_key_pem.lock() = Some(TEST_CA_KEY.to_string());
+        let token = crate::crypto::token::generate_token(TEST_CA_KEY, 3_600_000).expect("token");
+
+        let resp = as_join_response(dispatch_message(join_request("stranger", &token), &n, "stranger").await);
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason.as_deref(), Some("node is not a declared cluster member"));
+
+        let ok = as_join_response(dispatch_message(join_request("worker-1", &token), &n, "worker-1").await);
+        assert!(ok.accepted, "a declared member still joins");
+    }
+
+    // ── AUD-L4: join-token replay ────────────────────────────────────────────
+
+    /// **Attack ③** — a token lifted from a worker's config is replayed by a
+    /// second node inside the TTL. The first (legitimate) node may keep using
+    /// it across restarts.
+    #[tokio::test]
+    async fn join_token_replay_by_another_node_is_rejected() {
+        let (n, token) = main_node_with_token(false, "");
+
+        let first = as_join_response(dispatch_message(join_request("worker-1", &token), &n, "worker-1").await);
+        assert!(first.accepted, "first use of the token succeeds");
+
+        let replay = as_join_response(dispatch_message(join_request("rogue-2", &token), &n, "rogue-2").await);
+        assert!(!replay.accepted, "the same token must not enrol a second node");
+        let registered = { n.peers.read().await.iter().any(|p| p.node_id == "rogue-2") };
+        assert!(!registered, "the replaying node must not be registered");
+
+        let restart = as_join_response(dispatch_message(join_request("worker-1", &token), &n, "worker-1").await);
+        assert!(restart.accepted, "the original node may re-present its token");
+    }
+
+    /// A node-bound token is refused when presented by anybody else, even on
+    /// its very first use.
+    #[tokio::test]
+    async fn node_bound_join_token_is_refused_for_another_node() {
+        let (n, _wildcard) = main_node_with_token(false, "");
+        let bound =
+            crate::crypto::token::generate_token_for_node(TEST_CA_KEY, 3_600_000, "worker-1").expect("bound token");
+
+        let wrong = as_join_response(dispatch_message(join_request("worker-2", &bound), &n, "worker-2").await);
+        assert!(!wrong.accepted, "a token pinned to worker-1 must not admit worker-2");
+
+        let right = as_join_response(dispatch_message(join_request("worker-1", &bound), &n, "worker-1").await);
+        assert!(right.accepted, "the pinned node is admitted");
+    }
+
     #[tokio::test]
     async fn join_with_bad_token_is_rejected() {
         let (n, _valid) = main_node_with_token(true, "supersecret-passphrase-16");
@@ -652,10 +920,18 @@ mod tests {
 
     #[tokio::test]
     async fn join_without_ca_key_cannot_validate_and_is_rejected() {
-        // Node has no CA key → cannot validate any token → must reject.
-        let n = node("worker-standalone");
+        // Main-role node, but no CA key → cannot validate any token → must reject.
+        let cfg = ClusterConfig {
+            node_id: "main-no-ca".to_string(),
+            role: "main".to_string(),
+            ..ClusterConfig::default()
+        };
+        let n = Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"));
+        assert!(n.ca_key_pem.lock().is_none());
+
         let resp = as_join_response(dispatch_message(join_request("worker-1", "any.token"), &n, "worker-1").await);
         assert!(!resp.accepted, "a node without a CA key cannot accept joins");
+        assert_eq!(resp.reason.as_deref(), Some("invalid or missing join token"));
     }
 
     #[tokio::test]
