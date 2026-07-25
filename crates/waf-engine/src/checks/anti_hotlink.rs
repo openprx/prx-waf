@@ -114,10 +114,7 @@ impl Check for AntiHotlinkCheck {
     fn check(&self, ctx: &RequestCtx) -> Option<DetectionResult> {
         let host_code = &ctx.host_config.code;
 
-        let config = match self.configs.get(host_code) {
-            Some(c) => c.clone(),
-            None => return None,
-        };
+        let config = self.configs.get(host_code)?.clone();
 
         if !config.enabled {
             return None;
