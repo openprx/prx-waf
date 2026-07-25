@@ -472,6 +472,13 @@ pub struct SemanticVerdict {
     /// All signals, for persistence / dashboards (plan §13.1).
     pub signals: Vec<DetectionSignal>,
     /// Budget was exhausted → a semantic-only miss window (plan §12.4).
+    ///
+    /// Purely observational (D1): it marks that some part of the request was never
+    /// inspected, so the signal set may be incomplete. It does **not** weaken the
+    /// signals that were produced — `recommendation` / `request_score` /
+    /// `primary_result` / `enforce_safe` are computed identically whether or not
+    /// this is set. Persisted as the observation's `degraded` / `exhausted`
+    /// columns.
     pub degraded: bool,
     /// Whether a `Block` recommendation is eligible to be **enforced** (E0 / A2).
     /// `true` only when the winning (primary) family's group is corroborated by

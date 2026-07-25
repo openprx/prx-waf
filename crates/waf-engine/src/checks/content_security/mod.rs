@@ -774,11 +774,19 @@ mod tests {
     }
 
     #[test]
-    fn degraded_request_fails_open_no_recommendation() {
-        // codex A-2: a positive signal on the first field, then the budget is
-        // exhausted → the request is degraded → the Semantic verdict carries NO
-        // recommendation (fail-open to legacy), even though the mock detector
-        // fired confidence 100. Header scope so there are ≥2 fields.
+    fn degraded_request_keeps_the_signals_it_already_observed() {
+        // D1 (was: `degraded_request_fails_open_no_recommendation`). A positive
+        // signal on the first field, then the budget is exhausted → the request is
+        // degraded. Degradation is an abstention over the fields that were never
+        // inspected, NOT a retraction of the hit that was: the verdict must still
+        // carry the score / recommendation / primary the observed signal earns, and
+        // must still report `degraded` for telemetry. Header scope so there are ≥2
+        // fields.
+        //
+        // The old contract (score 0 / recommendation None / primary None on any
+        // degradation) was a bypass primitive: every budget counter is
+        // attacker-reachable, so padding a request into the degraded state disabled
+        // the whole semantic lane for it.
         let mut cfg = enabled_enforce_cfg();
         // Output budget large enough for the short path field (raw + normalise)
         // but exhausted before the query field → degraded mid-phase.
@@ -798,16 +806,51 @@ mod tests {
         match sub.evaluate_scoped(&req, InspectionScope::Header, &mut st) {
             ContentVerdict::Semantic(v) => {
                 assert!(st.is_degraded(), "budget exhaustion must mark the request degraded");
+                assert!(v.degraded, "the miss window must stay visible in the verdict");
                 assert_eq!(
                     v.recommendation,
-                    SemanticAction::None,
-                    "a degraded request must not produce a Block/Log recommendation"
+                    SemanticAction::Block,
+                    "the fully-observed conf-100 hit on the first field must still score"
+                );
+                assert_eq!(v.request_score, 100, "weight 1.0 × confidence 100");
+                assert_eq!(
+                    v.primary_result.as_ref().and_then(|r| r.rule_id.as_deref()),
+                    Some("sql.union_null"),
+                    "the observed signal is still the primary"
                 );
                 assert!(
-                    v.primary_result.is_none(),
-                    "degraded fail-open clears the primary result"
+                    v.enforce_safe,
+                    "degradation says nothing about the provenance of what WAS observed"
                 );
-                assert_eq!(v.request_score, 0, "degraded fail-open reports no score");
+            }
+            other => panic!("expected Semantic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn degraded_request_with_no_signal_still_recommends_nothing() {
+        // Negative control for the test above: degradation on its own never
+        // manufactures a verdict. Same tiny budget, but the production detector set
+        // (no mock) on benign traffic → degraded, yet score 0 / no recommendation /
+        // no primary. Degradation is neutral in BOTH directions.
+        let mut cfg = enabled_enforce_cfg();
+        cfg.budget = Budget {
+            max_preprocess_output_bytes_total: 4,
+            ..Budget::default()
+        };
+        let sub = ContentSecuritySubsystem::with_config(cfg);
+        let mut req = ctx();
+        req.path = "/a".to_string();
+        req.query = "greeting=hello_there_this_is_a_benign_long_value".to_string();
+        let mut st = ContentInspectionState::new(sub.config().budget);
+        match sub.evaluate_scoped(&req, InspectionScope::Header, &mut st) {
+            ContentVerdict::Semantic(v) => {
+                assert!(st.is_degraded(), "the tiny budget must degrade the request");
+                assert!(v.degraded);
+                assert_eq!(v.request_score, 0, "benign traffic scores 0 even when degraded");
+                assert_eq!(v.recommendation, SemanticAction::None);
+                assert!(v.primary_result.is_none());
+                assert!(!v.enforce_safe);
             }
             other => panic!("expected Semantic, got {other:?}"),
         }
@@ -1672,6 +1715,274 @@ mod tests {
             SemanticAction::None,
             "enforce: a None recommendation stays None"
         );
+    }
+
+    // ── D1: a wide body must not be able to zero out an observed signal ───────
+
+    /// A JSON body with `pad_leaves` harmless string leaves plus one payload leaf.
+    ///
+    /// `serde_json` orders object entries by key (`Value::Object` is a `BTreeMap`)
+    /// and `extract_json` pushes them onto a walk stack it then **pops**, so the
+    /// alphabetically-last key is extracted FIRST. Naming the payload key
+    /// `z_payload` therefore pins it to leaf #1 regardless of how much padding
+    /// precedes it — the attacker-favourable arrangement (payload observed, budget
+    /// then exhausted by the padding).
+    fn wide_json_body(pad_leaves: usize, payload: &str) -> String {
+        let mut parts: Vec<String> = (0..pad_leaves).map(|i| format!("\"k{i:03}\":\"pad\"")).collect();
+        parts.push(format!("\"z_payload\":\"{payload}\""));
+        format!("{{{}}}", parts.join(","))
+    }
+
+    /// Shadow config for the single-`ast`-detector `SQLi` family with the field
+    /// budget pinned to 64, so the test is independent of the shipped default.
+    fn wide_body_sqli_rt() -> RuntimeContentSecurityConfig {
+        let mut rt = single_family_log_only_rt("sql_injection", "ast");
+        rt.budget = Budget {
+            max_fields_per_phase: 64,
+            ..Budget::default()
+        };
+        rt
+    }
+
+    #[test]
+    fn wide_json_body_cannot_zero_out_an_observed_sqli_signal() {
+        // D1, the reported bypass primitive: an attacker parks a real SQLi payload
+        // in one JSON leaf and pads the same body with 80 harmless keys. That pushes
+        // the phase past `max_fields_per_phase`, which marks the request degraded —
+        // and under the old contract degradation reset `request_score` to 0,
+        // `recommendation` to None and `primary_result` to None, silencing a payload
+        // the pipeline had ALREADY fully inspected. The verdict must now survive.
+        let sub = ContentSecuritySubsystem::with_config(wide_body_sqli_rt());
+        // JSON-unicode-escaped tautology: the raw body carries only the literal
+        // `'` text so Lane 1 stays clean and Lane 2 gets to run; extraction
+        // unescapes the leaf to `1' OR '1'='1` (same fixture as the Lane B test).
+        let body = wide_json_body(80, "1\\u0027 OR \\u00271\\u0027=\\u00271");
+        let mut req = ctx();
+        req.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        req.body_preview = Bytes::from(body);
+        req.content_length = req.body_preview.len() as u64;
+
+        let mut st = ContentInspectionState::new(sub.config().budget);
+        let verdict = match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => v,
+            other => panic!("Lane 1 must stay clean → Semantic, got {other:?}"),
+        };
+        assert!(
+            st.is_degraded(),
+            "81 leaves against a 64-field budget must exhaust the phase (that is the primitive)"
+        );
+        assert!(verdict.degraded, "the miss window must remain observable in telemetry");
+
+        let sig = verdict
+            .signals
+            .iter()
+            .find(|s| s.attack == AttackKind::SqlInjection && s.detector == DetectorId::Ast)
+            .expect("the payload leaf was inspected before the budget ran out — its signal must survive");
+        assert_eq!(*sig.field, *"body.json", "the signal came from the extracted leaf");
+        assert!(
+            sig.rule_key.starts_with("ast."),
+            "a real AST SQLi rule_key: {}",
+            sig.rule_key
+        );
+        assert!(
+            verdict.request_score > 0,
+            "a degraded request must still score what it observed, got {}",
+            verdict.request_score
+        );
+        assert_ne!(
+            verdict.recommendation,
+            SemanticAction::None,
+            "padding a request into the degraded state must not silence the lane"
+        );
+        // Shadow red line is untouched: the recommendation is still only advisory.
+        assert_ne!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Block,
+            "shadow (log_only) still never blocks"
+        );
+    }
+
+    #[test]
+    fn wide_benign_json_body_degrades_without_a_false_positive() {
+        // Negative control for the test above: the SAME padding shape with NO
+        // payload must degrade and score nothing. Keeping the score on a degraded
+        // request adds no false positives — only real detector hits are scored.
+        let sub = ContentSecuritySubsystem::with_config(wide_body_sqli_rt());
+        let body = wide_json_body(80, "an ordinary product description");
+        let mut req = ctx();
+        req.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        req.body_preview = Bytes::from(body);
+        req.content_length = req.body_preview.len() as u64;
+
+        let mut st = ContentInspectionState::new(sub.config().budget);
+        let verdict = match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => v,
+            other => panic!("expected Semantic, got {other:?}"),
+        };
+        assert!(st.is_degraded() && verdict.degraded, "the wide body still degrades");
+        assert!(
+            verdict.signals.is_empty(),
+            "benign wide traffic must produce no signal: {:?}",
+            verdict.signals.iter().map(|s| s.rule_key).collect::<Vec<_>>()
+        );
+        assert_eq!(verdict.request_score, 0);
+        assert_eq!(verdict.recommendation, SemanticAction::None);
+    }
+
+    // ── D2: query/path/cookie payloads past byte 64 reach the scorer ──────────
+
+    /// Drive the Lane 2 **header-scope** pipeline (preprocess → detectors → score)
+    /// directly.
+    ///
+    /// `evaluate_scoped` cannot be used for these fixtures: Lane 1's frozen
+    /// detectors veto a raw `<script>` / traversal in the query and short-circuit
+    /// before Lane 2 ever runs — the same reason the sibling
+    /// `real_*_detector_fires_but_shadow_never_blocks` tests drive the lane
+    /// directly. The point under test is Lane 2 coverage, not Lane 1 precedence.
+    fn score_header_scope(sub: &ContentSecuritySubsystem, req: &RequestCtx) -> SemanticVerdict {
+        let mut st = ContentInspectionState::new(sub.config().budget);
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Header, req, &mut st);
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Header,
+            req,
+        };
+        let mut signals: Vec<DetectionSignal> = Vec::new();
+        for view in &views {
+            for det in &sub.detectors {
+                if let Some(finding) = det.detect(view, &pctx, &mut st) {
+                    signals.push(view.to_signal(det.id(), InspectionScope::Header, finding));
+                }
+            }
+        }
+        score(&signals, &sub.config().scoring, st.is_degraded())
+    }
+
+    /// A query in the reported bypass shape: harmless parameters padding well past
+    /// the 64-byte per-token cut-off, then the real payload.
+    fn padded_query(payload: &str) -> String {
+        format!("id=1&user=admin&note={}&q={payload}", "a".repeat(60))
+    }
+
+    #[test]
+    fn late_query_xss_payload_scores_through_the_header_pipeline() {
+        // D2 acceptance for the reported fixture:
+        // `?id=1&user=admin&note=<60 chars>&q=<script>alert(1)</script>`.
+        //
+        // Honest scope note: `XssDomDetector` parses `view.text`, **not**
+        // `lower_trunc` (it needs un-collapsed whitespace to parse HTML), so this
+        // particular family was already reachable before D2. What D2 fixes for this
+        // request is the *normalised* surface every other Lane 2 family reads —
+        // pinned directly by `preprocess::tests::late_query_payload_survives_normalisation`,
+        // which fails without the fix. This test is the end-to-end witness that the
+        // reported request scores; `late_query_traversal_payload_scores_through_lower_trunc`
+        // and `late_cookie_traversal_payload_scores_through_lower_trunc` below are the
+        // fix-dependent ones.
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("xss", "xss_dom"));
+        let mut req = ctx();
+        req.query = padded_query("<script>alert(1)</script>");
+        let verdict = score_header_scope(&sub, &req);
+        let sig = verdict
+            .signals
+            .iter()
+            .find(|s| s.attack == AttackKind::Xss)
+            .expect("the late query payload must reach the XSS detector");
+        assert_eq!(*sig.field, *"query", "the signal is attributed to the query field");
+        assert!(verdict.request_score > 0, "a late payload must score");
+        assert_ne!(verdict.recommendation, SemanticAction::None);
+        assert_ne!(
+            sub.resolve_action(verdict.recommendation),
+            SemanticAction::Block,
+            "shadow (log_only) still never blocks"
+        );
+    }
+
+    #[test]
+    fn late_query_traversal_payload_scores_through_lower_trunc() {
+        // The same primitive against a detector that reads `lower_trunc` (the
+        // truncated surface itself), so this fixture is silent without the D2 fix:
+        // `TraversalStructuralDetector` matches `view.lower_trunc`, which used to
+        // stop at byte 64.
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("traversal", "traversal"));
+        let mut req = ctx();
+        req.query = format!("id=1&user=admin&note={}&file=../../../../etc/passwd", "a".repeat(60));
+        let verdict = score_header_scope(&sub, &req);
+        let sig = verdict
+            .signals
+            .iter()
+            .find(|s| s.attack == AttackKind::Traversal)
+            .expect("the late traversal payload must reach the lower_trunc detector");
+        assert_eq!(*sig.field, *"query");
+        assert!(
+            sig.rule_key.starts_with("traversal."),
+            "a real traversal rule_key: {}",
+            sig.rule_key
+        );
+        assert!(verdict.request_score > 0);
+    }
+
+    #[test]
+    fn late_cookie_traversal_payload_scores_through_lower_trunc() {
+        // The cookie header is the third header-scope source. A browser writes
+        // `; ` between pairs, but the header is attacker-controlled and RFC-legal
+        // without the space — a whitespace-free cookie is one token, so a session id
+        // alone (64+ bytes) used to bury everything after it. The payload here is
+        // space-free end to end, so no URL-decode round can re-tokenise it either.
+        let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt("traversal", "traversal"));
+        let mut req = ctx();
+        req.headers.insert(
+            "cookie".to_string(),
+            format!("sid={};lang=en;next=../../../../etc/passwd", "0".repeat(64)),
+        );
+        let verdict = score_header_scope(&sub, &req);
+        let sig = verdict
+            .signals
+            .iter()
+            .find(|s| s.attack == AttackKind::Traversal)
+            .expect("the late cookie payload must reach the lower_trunc detector");
+        assert_eq!(*sig.field, *"cookie");
+        assert!(verdict.request_score > 0);
+    }
+
+    #[test]
+    fn benign_long_header_scope_traffic_does_not_score() {
+        // FP control for D2: making the whole query/path/cookie visible must not
+        // start firing on ordinary long requests. Checked against every shipped
+        // family at once (the full production detector set is registered; each
+        // config just picks which family carries weight).
+        let benign_query = format!(
+            "search={}&page=2&sort=created_at&dir=desc&utm_source=newsletter",
+            "product-name-".repeat(12)
+        );
+        for (family, detector) in [
+            ("sql_injection", "struct_rule"),
+            ("xss", "xss_dom"),
+            ("traversal", "traversal"),
+            ("rce", "rce"),
+        ] {
+            let sub = ContentSecuritySubsystem::with_config(single_family_log_only_rt(family, detector));
+            let mut req = ctx();
+            req.path = format!("/catalog/{}/details", "category-segment/".repeat(8));
+            req.query = benign_query.clone();
+            req.headers.insert(
+                "cookie".to_string(),
+                format!("sid={}; lang=en-GB; consent=analytics", "0".repeat(80)),
+            );
+            let verdict = score_header_scope(&sub, &req);
+            assert_eq!(
+                verdict.request_score,
+                0,
+                "{family}: benign long header-scope traffic must not score, signals: {:?}",
+                verdict
+                    .signals
+                    .iter()
+                    .map(|s| (s.field.as_ref(), s.rule_key))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(verdict.recommendation, SemanticAction::None, "{family}");
+        }
     }
 
     /// Shared serializable source for the enabled-enforce config, reused with a

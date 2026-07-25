@@ -25,8 +25,49 @@ use waf_common::RequestCtx;
 use super::budget::ContentInspectionState;
 use super::types::{DetectionFinding, DetectionSignal, DetectorId, InspectionScope, Provenance};
 
-/// Per-token truncation length inside a normalised view (plan §7.5).
+/// Per-token truncation length inside a normalised view (plan §7.5). Applies to
+/// genuinely whitespace-delimited text (the body scope), where "token" is a real
+/// lexical unit and 64 bytes comfortably holds any keyword / path / operator a
+/// structural rule matches on.
 const MAX_TOKEN_LEN: usize = 64;
+
+/// Per-token truncation length for **URL-structured** sources (D2).
+///
+/// [`normalise`] tokenises on whitespace, which silently assumes the input *has*
+/// whitespace. A query string, a path and a cookie header have none by
+/// construction, so the entire field is a single token and the plain
+/// [`MAX_TOKEN_LEN`] cap made everything past the first 64 bytes invisible to
+/// every `lower_trunc` detector — an attacker only had to prefix 64 bytes of
+/// harmless parameters (`?a=1&pad=…&q=<payload>`). Splitting these sources on URL
+/// punctuation (`&` / `=` / `;` / `/`) instead is not an option: the delimiters are
+/// load-bearing inside the payloads themselves (`</script>`, `/etc/passwd`,
+/// `../../`, `; select`), so re-tokenising on them would break the very structures
+/// the rules match. The fix is therefore the truncation *bound*, not the
+/// tokenisation: raise the per-token cap for these sources and bound the result by
+/// an explicit whole-view ceiling ([`MAX_NORMALISED_VIEW_BYTES`]).
+///
+/// 8 KiB covers the conventional 8 KiB request-line / header-size limit every
+/// upstream enforces, so a realistic query / path / cookie is now inspected end to
+/// end, while still being a hard constant an attacker cannot grow.
+const MAX_URL_TOKEN_LEN: usize = 8 * 1024;
+
+/// Absolute ceiling on one view's normalised (`lower_trunc`) output for the
+/// URL-structured sources (D2).
+///
+/// This is the `DoS` bound that replaces per-token truncation for those sources,
+/// and it is deliberately set to the worst case the pre-existing design **already**
+/// admitted: a whitespace-rich view could always reach
+/// `max_tokens_per_view × MAX_TOKEN_LEN` = `512 × 64` = 32 KiB of normalised text,
+/// so nothing here widens the largest single view a detector can be handed.
+///
+/// The request-level bound is unchanged and is the one that actually matters:
+/// every `lower_trunc` byte is charged to `max_preprocess_output_bytes_total`
+/// (512 KiB per request) by [`ContentInspectionState::try_take_preprocess_bytes`],
+/// and each field's *input* is capped at `max_field_input_bytes` (16 KiB) before
+/// any of this runs. Total regex input per request is therefore still ≤ 512 KiB —
+/// the change only redistributes that budget toward bytes that were previously
+/// dropped on the floor.
+const MAX_NORMALISED_VIEW_BYTES: usize = 32 * 1024;
 
 /// Field-value delimiters used to split a raw field into candidate encoded
 /// tokens for the blind base64 / hex decoders. Deliberately excludes `+` and
@@ -495,6 +536,7 @@ fn push_extra_view(
     views_for_field: &mut u32,
     max_views: u32,
     max_tokens: u32,
+    limits: NormaliseLimits,
     location: &Cow<'static, str>,
     round: u8,
     text: String,
@@ -506,7 +548,7 @@ fn push_extra_view(
     if !state.try_take_preprocess_bytes(text.len()) {
         return;
     }
-    let lower_trunc = normalise(&text, max_tokens);
+    let lower_trunc = normalise(&text, max_tokens, limits);
     if !state.try_take_preprocess_bytes(lower_trunc.len()) {
         return;
     }
@@ -787,18 +829,71 @@ fn percent_decode_keep_plus_rounds(s: &str, max_rounds: u8) -> String {
 /// chains are not explored (and are bounded anyway by the per-field view cap).
 const MAX_TRANSFORM_DEPTH: u8 = 2;
 
+/// Truncation limits for one normalised view (D2). Which set applies is decided
+/// by the [`InspectionScope`] in [`semantic_preprocessor`] — never by a detector
+/// and never by request content — so the choice is as un-forgeable as
+/// [`Provenance`].
+#[derive(Debug, Clone, Copy)]
+struct NormaliseLimits {
+    /// Longest single whitespace token kept, in bytes.
+    max_token_len: usize,
+    /// Ceiling on the whole normalised output, in bytes.
+    max_total_len: usize,
+}
+
+impl NormaliseLimits {
+    /// Genuinely whitespace-delimited text — the **body scope**. Byte-for-byte the
+    /// historical behaviour (plan §7.5): 64 bytes per token, count-bounded by
+    /// `max_tokens_per_view`, with no additional whole-view ceiling. Body-side
+    /// coverage is already carried by `struct_extract`, which hands each structured
+    /// leaf to the pipeline as its own field, so this path is deliberately frozen.
+    const WHITESPACE: Self = Self {
+        max_token_len: MAX_TOKEN_LEN,
+        max_total_len: usize::MAX,
+    };
+
+    /// URL-structured sources — the **header scope** (path / query / cookie /
+    /// curated headers), which carry little or no whitespace and so degenerate to
+    /// a single token under [`MAX_TOKEN_LEN`] (D2).
+    const URL: Self = Self {
+        max_token_len: MAX_URL_TOKEN_LEN,
+        max_total_len: MAX_NORMALISED_VIEW_BYTES,
+    };
+
+    /// The limits for `scope`.
+    const fn for_scope(scope: InspectionScope) -> Self {
+        match scope {
+            InspectionScope::Header => Self::URL,
+            InspectionScope::Body => Self::WHITESPACE,
+        }
+    }
+}
+
 /// Build the normalised `lower_trunc` form: lowercase, whitespace-tokenise,
-/// truncate each token, and cap the token count against the budget.
-fn normalise(text: &str, max_tokens: u32) -> String {
+/// truncate each token to `limits.max_token_len`, cap the token count against the
+/// budget, and stop entirely at `limits.max_total_len` bytes of output.
+///
+/// The two bounds compose so the output length is `≤ limits.max_total_len` and
+/// `≤ max_tokens × (limits.max_token_len + 1)` — whichever binds first. Never
+/// panics: every slice goes through `get`, and the remaining-space arithmetic
+/// cannot underflow because the loop breaks before `out.len()` can pass
+/// `max_total_len`.
+fn normalise(text: &str, max_tokens: u32, limits: NormaliseLimits) -> String {
     let mut out = String::with_capacity(text.len().min(1024));
     for (i, token) in text.split_whitespace().take(max_tokens as usize).enumerate() {
+        if out.len() >= limits.max_total_len {
+            break;
+        }
         if i > 0 {
             out.push(' ');
         }
         let lowered = token.to_ascii_lowercase();
-        let truncated = if lowered.len() > MAX_TOKEN_LEN {
-            // Truncate on a char boundary at/below MAX_TOKEN_LEN.
-            let mut end = MAX_TOKEN_LEN;
+        // Effective cap for this token: the per-token limit, further clipped by the
+        // space left under the whole-view ceiling.
+        let cap = limits.max_token_len.min(limits.max_total_len.saturating_sub(out.len()));
+        let truncated = if lowered.len() > cap {
+            // Truncate on a char boundary at/below `cap`.
+            let mut end = cap;
             while end > 0 && !lowered.is_char_boundary(end) {
                 end -= 1;
             }
@@ -959,11 +1054,11 @@ fn collect_field_sources<'a>(
 /// any clone / URL-decode / normalise allocation, so it cannot force unbudgeted
 /// work. Every retained input byte **and** every normalise-output byte is then
 /// metered against the total preprocess-output budget; exceeding any cap marks
-/// the state degraded and stops producing more work. On a degraded request the
-/// closed scoring model ([`super::scoring::score`]) fails open to the legacy
-/// verdict (no positive/negative recommendation, plan §12.4). Call
-/// [`ContentInspectionState::begin_phase`] before this to reset the per-phase
-/// field counter.
+/// the state degraded and stops producing more work. Degradation bounds *how much
+/// of the request was looked at*; it does not retract the views already produced,
+/// and the closed scoring model ([`super::scoring::score`]) still scores their
+/// signals in full (D1). Call [`ContentInspectionState::begin_phase`] before this
+/// to reset the per-phase field counter.
 #[must_use]
 pub fn semantic_preprocessor<'a>(
     scope: InspectionScope,
@@ -973,6 +1068,10 @@ pub fn semantic_preprocessor<'a>(
     let max_views = state.budget().max_views_per_field;
     let max_rounds = state.budget().max_decode_rounds;
     let max_tokens = state.budget().max_tokens_per_view;
+    // D2: the header scope's fields (path / query / cookie / curated headers) are
+    // URL-structured and effectively whitespace-free, so they get the URL
+    // truncation limits; the body scope keeps the frozen whitespace limits.
+    let limits = NormaliseLimits::for_scope(scope);
 
     let mut views: Vec<View<'a>> = Vec::new();
 
@@ -1017,7 +1116,7 @@ pub fn semantic_preprocessor<'a>(
         if !state.try_take_preprocess_bytes(raw.len()) {
             break;
         }
-        let lower_trunc = normalise(&raw, max_tokens);
+        let lower_trunc = normalise(&raw, max_tokens, limits);
         if !state.try_take_preprocess_bytes(lower_trunc.len()) {
             break;
         }
@@ -1051,7 +1150,7 @@ pub fn semantic_preprocessor<'a>(
             if !state.try_take_preprocess_bytes(decoded.len()) {
                 break;
             }
-            let lower_trunc = normalise(&decoded, max_tokens);
+            let lower_trunc = normalise(&decoded, max_tokens, limits);
             if !state.try_take_preprocess_bytes(lower_trunc.len()) {
                 break;
             }
@@ -1125,6 +1224,7 @@ pub fn semantic_preprocessor<'a>(
                     &mut views_for_field,
                     max_views,
                     max_tokens,
+                    limits,
                     &location,
                     round,
                     child.text,
@@ -1331,8 +1431,150 @@ mod tests {
 
     #[test]
     fn normalise_lowercases_and_truncates() {
-        let out = normalise("SELECT   UNION", 8);
+        let out = normalise("SELECT   UNION", 8, NormaliseLimits::WHITESPACE);
         assert_eq!(out, "select union");
+    }
+
+    // ── D2: URL-structured sources are not cut off at the 64-byte token cap ──
+
+    /// A query string in the shape of the reported bypass: harmless parameters
+    /// padding past [`MAX_TOKEN_LEN`], then the real payload. Query strings carry no
+    /// whitespace, so the whole thing is ONE token.
+    fn padded_query(payload: &str) -> String {
+        let pad = "a".repeat(60);
+        format!("id=1&user=admin&note={pad}&q={payload}")
+    }
+
+    #[test]
+    fn late_query_payload_survives_normalisation() {
+        // D2 (the reported bypass): `?id=1&user=admin&note=<60 chars>&q=<script>…`.
+        // The query has no whitespace → one token → the old per-token cap made
+        // everything past byte 64 invisible to every `lower_trunc` detector.
+        let payload = "<script>alert(1)</script>";
+        let query = padded_query(payload);
+        let offset = query.find(payload).expect("payload is present");
+        assert!(
+            offset > MAX_TOKEN_LEN,
+            "fixture must place the payload past the old 64-byte cut-off (offset {offset})"
+        );
+        assert_eq!(
+            query.split_whitespace().count(),
+            1,
+            "a query string is a single whitespace token — that is the whole bug"
+        );
+
+        let req = req_with("/a", &query, b"");
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Header, &req, &mut st);
+        let q = views
+            .iter()
+            .find(|v| *v.location == *"query" && v.round == 0)
+            .expect("the query field produces a round-0 view");
+        assert!(
+            q.lower_trunc.contains(payload),
+            "the normalised query view must carry the late payload, got {} bytes: {:?}",
+            q.lower_trunc.len(),
+            q.lower_trunc
+        );
+    }
+
+    #[test]
+    fn late_path_and_cookie_payloads_survive_normalisation() {
+        // The same primitive on the other two whitespace-free header-scope sources.
+        let pad = "a".repeat(70);
+        let path = format!("/app/{pad}/../../../../etc/passwd");
+        let cookie = format!("sid={pad}; theme=dark; next=../../../../etc/passwd");
+        let mut req = req_with(&path, "q=1", b"");
+        req.headers.insert("cookie".to_string(), cookie);
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Header, &req, &mut st);
+        for field in ["path", "cookie"] {
+            let v = views
+                .iter()
+                .find(|v| *v.location == *field && v.round == 0)
+                .unwrap_or_else(|| panic!("{field} produces a round-0 view"));
+            assert!(
+                v.lower_trunc.contains("/etc/passwd"),
+                "{field}: the normalised view must reach past byte 64: {:?}",
+                v.lower_trunc
+            );
+        }
+    }
+
+    #[test]
+    fn body_scope_token_truncation_is_frozen_at_the_64_byte_cap() {
+        // Anti-regression for the D2 blast radius: the BODY scope is deliberately
+        // untouched (structured leaves already give it per-field coverage via
+        // `struct_extract`), so a long whitespace-free body token must still be cut
+        // at exactly MAX_TOKEN_LEN.
+        let payload = "<script>alert(1)</script>";
+        let body = padded_query(payload);
+        let req = req_with("/a", "q=1", body.as_bytes());
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Body, &req, &mut st);
+        let b = views
+            .iter()
+            .find(|v| *v.location == *"body" && v.round == 0)
+            .expect("the body field produces a round-0 view");
+        assert_eq!(
+            b.lower_trunc.len(),
+            MAX_TOKEN_LEN,
+            "body-scope truncation must stay at 64 bytes: {:?}",
+            b.lower_trunc
+        );
+        assert!(!b.lower_trunc.contains(payload), "body behaviour is unchanged");
+    }
+
+    #[test]
+    fn url_normalisation_is_bounded_by_the_per_token_and_whole_view_ceilings() {
+        // The DoS bound that replaces per-token truncation. A single whitespace-free
+        // token far over MAX_URL_TOKEN_LEN is cut there, and a whitespace-rich text
+        // whose tokens would collectively overflow the view ceiling stops at
+        // MAX_NORMALISED_VIEW_BYTES — never unbounded.
+        let single = "b".repeat(MAX_URL_TOKEN_LEN * 3);
+        let out = normalise(&single, 512, NormaliseLimits::URL);
+        assert_eq!(out.len(), MAX_URL_TOKEN_LEN, "one token is capped at the URL token cap");
+
+        let many = vec!["c".repeat(MAX_URL_TOKEN_LEN); 16].join(" ");
+        let out = normalise(&many, 512, NormaliseLimits::URL);
+        assert!(
+            out.len() <= MAX_NORMALISED_VIEW_BYTES,
+            "the whole view is capped at {MAX_NORMALISED_VIEW_BYTES}, got {}",
+            out.len()
+        );
+        // And the ceiling is exactly the worst case the pre-existing whitespace path
+        // already admitted (max_tokens_per_view × MAX_TOKEN_LEN), so no view handed
+        // to a detector got bigger than what was always possible.
+        assert_eq!(MAX_NORMALISED_VIEW_BYTES, 512 * MAX_TOKEN_LEN);
+    }
+
+    #[test]
+    fn url_normalisation_never_splits_a_multibyte_char() {
+        // Truncation stays on a char boundary at the new cap too (never panics,
+        // never emits invalid UTF-8).
+        let text = "é".repeat(MAX_URL_TOKEN_LEN);
+        let out = normalise(&text, 512, NormaliseLimits::URL);
+        assert!(out.len() <= MAX_URL_TOKEN_LEN);
+        assert!(out.chars().all(|c| c == 'é'), "no partial code unit survived");
+    }
+
+    #[test]
+    fn benign_long_query_produces_no_extra_views() {
+        // FP control for D2: a long, perfectly ordinary query now fully visible to
+        // the detectors must still synthesise nothing beyond its raw view.
+        let query = format!("search={}&page=2&sort=created_at&dir=desc", "product-name-".repeat(12));
+        let req = req_with("/catalog", &query, b"");
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Header, &req, &mut st);
+        assert!(
+            views.iter().all(|v| v.provenance == Provenance::Raw),
+            "benign long query must not synthesise decode views: {:?}",
+            views.iter().map(|v| v.provenance).collect::<Vec<_>>()
+        );
     }
 
     // ── F-J: UTF-16 BOM transcode ────────────────────────────────────────────

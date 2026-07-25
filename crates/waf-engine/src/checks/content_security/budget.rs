@@ -14,10 +14,17 @@
 //!
 //! The time softness (an `Instant` deadline cannot preempt a running parse) is
 //! handled at the detector layer; this module is the deterministic *work-count*
-//! half. Exceeding any cap sets [`ContentInspectionState::degraded`]. This module
-//! only *records* exhaustion; the fail-open itself is enforced in
-//! [`super::scoring::score`], which returns **no** recommendation for a degraded
-//! request so Lane 2 never overwrites the legacy verdict (plan §12.4).
+//! half. Exceeding any cap sets [`ContentInspectionState::degraded`].
+//!
+//! This module only *records* exhaustion. `degraded` means **"part of this request
+//! was never inspected"** — an abstention over the remainder — and it is
+//! deliberately **not** a retraction of the signals already produced: since every
+//! counter here is attacker-reachable (a wide JSON body, an oversized field, a
+//! wide decode fan-out), letting exhaustion clear the verdict would hand an
+//! attacker a one-request kill switch for the whole semantic lane (D1). The flag
+//! is carried into [`super::types::SemanticVerdict::degraded`] and persisted, so
+//! the miss window stays observable without weakening the scored result
+//! ([`super::scoring::score`]).
 
 use waf_common::content_security_config::SemanticBudgetConfig;
 

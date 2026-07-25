@@ -253,26 +253,38 @@ type WinnerKey<'a> = (u8, u8, Reverse<(u8, u8, &'a str, &'a str)>);
 /// `0..=100`. With `signals` empty (the P1a production reality — no detectors)
 /// the result is always `recommendation = None`, `request_score = 0`,
 /// `primary_result = None`.
+///
+/// **`degraded` semantics (D1).** `degraded` records that the per-request work
+/// budget ran out, i.e. some part of the request was never inspected. It is
+/// **scoring-neutral**: the signals that *were* produced are scored, ranked and
+/// (if they cross a threshold) recommended exactly as on a non-degraded request,
+/// and `enforce_safe` is still derived from the winning group's provenance rather
+/// than being forced to `false`. Degradation is an abstention over what was not
+/// looked at; it is not evidence against what was. The flag is propagated to
+/// [`SemanticVerdict::degraded`] so the miss window remains observable in the
+/// persisted observation (`degraded` / `exhausted`).
 #[must_use]
 pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, degraded: bool) -> SemanticVerdict {
-    // Budget-degraded requests fail open to the legacy verdict (plan §12.4,
-    // codex A-2). Once the per-request budget is exhausted the signal set is
-    // only partial, so Lane 2 must produce **no** recommendation — positive or
-    // negative — and must never overwrite a legacy-only outcome. Signals are
-    // retained for telemetry; `recommendation`/`primary_result` are cleared so
-    // the engine dispatch is inert on a degraded request.
-    if degraded {
-        return SemanticVerdict {
-            recommendation: SemanticAction::None,
-            request_score: 0,
-            primary_result: None,
-            signals: signals.to_vec(),
-            degraded: true,
-            // A degraded verdict carries no recommendation, so it is never
-            // enforceable.
-            enforce_safe: false,
-        };
-    }
+    // Budget degradation is an **abstention over the un-inspected remainder**, not
+    // a retraction of what was already observed (D1). It is deliberately NOT a
+    // short-circuit here: the signals below are real detector hits on real views
+    // that were fully inspected before the budget ran out, and they are scored
+    // exactly as on a non-degraded request. `degraded` is carried through to the
+    // verdict (and from there to the persisted observation) so the miss window
+    // stays visible in telemetry.
+    //
+    // Why the earlier "degraded ⇒ zero the whole verdict" rule was a bypass
+    // primitive, not a safe fail-open: every budget counter is attacker-reachable
+    // (a JSON body with `max_fields_per_phase` harmless leaves, an oversized field,
+    // a wide decode fan-out), so an attacker could pad any request into the
+    // degraded state and have the entire Lane 2 verdict — including a
+    // fully-observed, high-confidence hit on an *early* field — reset to
+    // `request_score = 0` / `recommendation = None`. Fail-open must mean "we do not
+    // claim the request is clean", which is already true: Lane 2 only runs after
+    // Lane 1 came back clean and it never suppresses a Lane 1 verdict, so a
+    // partial signal set can only ever ADD detection, never remove one. Under-
+    // scoring (a group missing a corroborating detector that never got to run) is
+    // the only direction partiality can move the score, and that direction is safe.
 
     // 1) Canonical max-aggregation: keep, per (scope, field, attack, detector),
     //    the highest-confidence signal (arg-max — keep the whole signal so
