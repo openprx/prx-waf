@@ -117,6 +117,13 @@ ENGINE_FIELDS = {
     "header_referer",
     "header_host",
     "header_range",
+    # Response-phase surfaces.  A rule naming one of these is routed to the
+    # response pipeline by `Field::is_response`; they belong in this set so a
+    # *chained* response rule is expressible too.  Without them CRS-954130's
+    # `RESPONSE_BODY` link was refused as an unknown variable, which is how a
+    # `phase:4` rule whose head this converter can read still came out unusable.
+    "response_body",
+    "response_status",
 }
 
 UNMAPPED_PREFIX = "unmapped_"
@@ -380,6 +387,66 @@ def _single_var_map(v: str) -> str:
     #   REQBODY_PROCESSOR, UNIQUE_ID, *_COMBINED_SIZE, REQUEST_BODY_LENGTH,
     #   REQUEST_PROTOCOL   no accessor.
     return _sentinel(v)
+
+
+# ── Negated heads ─────────────────────────────────────────────────────────────
+#
+# `!@op` inverts the operator, and inversion turns every approximation this
+# converter is otherwise allowed to make into its opposite.
+#
+# For a positive operator, mapping a ModSecurity variable onto a *narrower*
+# engine field can only make the rule match less, which is the safe direction
+# and is why `XML:/*` may be approximated by the whole body and `REQUEST_LINE`
+# by `REQUEST_URI_RAW`.  Negate the same rule and the approximation becomes a
+# fail-open in reverse: "the text the engine can see does not satisfy the
+# pattern" is trivially true for every byte upstream looked at and the engine
+# did not.
+#
+# CRS-920100 is the worked example.  `REQUEST_LINE !@rx ^(?:get /…|…) HTTP…$`
+# asserts that the whole request line is well formed.  The engine's nearest
+# field is `path_raw` (`REQUEST_URI_RAW`), which holds `/index.html` — no
+# method, no protocol — so the anchored pattern never matches, the negation
+# always holds, and the rule fires on *every request*.  Emitting it would take
+# a site down on the first request.
+#
+# So a negated head is only emitted when the engine reproduces the variable
+# byte for byte, and is otherwise refused with a sentinel field that names the
+# variable in the startup WARN.  The list below is exactly the set of variables
+# the engine reads straight out of the request with no reconstruction:
+#
+#   REQUEST_METHOD         `ctx.method`
+#   REQUEST_HEADERS:<h>    the folded header value, undecoded, for the headers
+#                          `Field::parse` knows by name
+#   RESPONSE_STATUS        the upstream status rendered as three digits
+#
+# `REQUEST_HEADERS:Content-Length` is deliberately NOT in the list, even though
+# the engine has a `content_length` field.  That field is the *declared body
+# size* the gateway tracks, a `u64` that reads `0` for a request carrying no
+# `Content-Length` at all — so a negated pattern the string `0` fails to
+# satisfy would fire on every ordinary GET.  It costs CRS-920340 and CRS-920160,
+# and buying them back means giving the engine the raw header, not relaxing
+# this.
+#
+# Everything else — `REQUEST_LINE`, `REQUEST_URI`, `QUERY_STRING`,
+# `REQUEST_BODY`, `RESPONSE_BODY`, `REQUEST_HEADERS` as a collection — is
+# decoded, truncated to a preview window, or widened to names as well as
+# values, and none of those survive inversion.
+NEGATION_FAITHFUL_VARS = {
+    "REQUEST_METHOD",
+    "REQUEST_HEADERS:CONTENT-TYPE",
+    "REQUEST_HEADERS:USER-AGENT",
+    "REQUEST_HEADERS:REFERER",
+    "REQUEST_HEADERS:HOST",
+    "REQUEST_HEADERS:RANGE",
+    "RESPONSE_STATUS",
+}
+
+
+def _negation_is_faithful(var_str: str) -> bool:
+    """`True` when inverting the operator over `var_str` cannot widen the rule."""
+    parts = [p.strip() for p in var_str.strip().strip('"').split("|") if p.strip()]
+    positives = [p.upper() for p in parts if not p.startswith("!")]
+    return bool(positives) and all(p in NEGATION_FAITHFUL_VARS for p in positives)
 
 
 # ── Operator mapping ──────────────────────────────────────────────────────────
@@ -871,7 +938,7 @@ def build_chain(head_field: str, head_operator: str, head_value: str, head_opts:
     for position, child in enumerate(children):
         field = _map_chain_variables(child["variables"])
 
-        mapped = _map_chain_operator(child["operator"])
+        mapped = _split_operator(child["operator"])
         if mapped is None:
             raise ChainUnsupported("syntax")
         negate, operator, value = mapped
@@ -929,8 +996,15 @@ def build_chain(head_field: str, head_operator: str, head_value: str, head_opts:
     return conditions, -1 in used_providers
 
 
-def _map_chain_operator(operator_str: str):
-    """Split `!@op value` into `(negate, engine_operator, value)`."""
+def _split_operator(operator_str: str):
+    """Split `!@op value` into `(negate, engine_operator, value)`.
+
+    The leading `!` is `ModSecurity`'s negation and belongs to the *operator*,
+    never to the operand.  Letting it fall into the value is not a cosmetic
+    slip: CRS-954130 used to be emitted as `operator: regex,
+    value: '!@rx ^404$'`, which compiled into a regex matching the literal text
+    `!@rx ^404$` and could therefore never fire.
+    """
     text = operator_str.strip()
     negate = text.startswith("!")
     if negate:
@@ -981,14 +1055,21 @@ def extract_rule(variables: str, operator_str: str, opts: dict,
         return None
 
     # operator + value
-    op_match = re.match(r'^(@\w+)\s*(.*)?$', operator_str.strip(), re.DOTALL)
-    if not op_match:
+    #
+    # `!@op` is parsed here, not swallowed: the head of a rule may be negated
+    # just as a chain link may be, and `YamlRule::negate` has always been able
+    # to express it.  What the head could not do until now was *reach* the
+    # engine — the operator pattern did not admit the `!`, so all fourteen
+    # negated CRS detection heads fell out of the conversion without a word.
+    split = _split_operator(operator_str)
+    if split is None:
         return None
-    op_raw = op_match.group(1)
-    op_value = (op_match.group(2) or "").strip()
+    negate, operator, value = split
 
-    operator = map_operator(op_raw)
-    value = op_value
+    # A negated head over an approximated variable is a fail-open in reverse;
+    # refuse it by name rather than emit it.  See NEGATION_FAITHFUL_VARS.
+    if negate and not _negation_is_faithful(variables):
+        field = UNMAPPED_PREFIX + "negated_" + _sentinel(variables)[len(UNMAPPED_PREFIX):]
 
     # action
     #
@@ -1040,6 +1121,10 @@ def extract_rule(variables: str, operator_str: str, opts: dict,
         # declares no transformation, which in `ModSecurity` means the value is
         # matched exactly as the parser produced it.
         "transform": list(opts.get("_transforms") or []) or None,
+        # `!@op`: the condition holds for a value the matcher rejects.  Omitted
+        # entirely when the head is positive, so every pre-negation rule file
+        # stays byte-identical.
+        "negate":   True if negate else None,
         "capture":  None,
         "chain":    None,
         "action":   action,

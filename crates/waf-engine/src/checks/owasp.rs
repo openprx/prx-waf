@@ -4591,20 +4591,21 @@ rules:
         let summary = checker.load_summary();
 
         assert!(summary.source_errors.is_empty(), "shipped rule set must parse cleanly");
-        assert_eq!(summary.attempted, 284, "declared CRS rules");
+        assert_eq!(summary.attempted, 286, "declared CRS rules");
         // 215 before per-parameter `ARGS`: CRS-942130 joins the set, because
         // its `TX:1 @streq %{TX.2}` capture equality is only a tautology test
         // when the head is evaluated one parameter at a time. 216 before the
         // response phase was wired: the 950–956 rules used to be rejected as
-        // `UnsupportedField(response_body)` and now compile.
-        assert_eq!(summary.compiled, 274, "enforceable CRS rules");
+        // `UnsupportedField(response_body)` and now compile. 274 before `!@op`
+        // heads were converted at all: CRS-920470 and CRS-954130 join the set.
+        assert_eq!(summary.compiled, 276, "enforceable CRS rules");
         assert_eq!(checker.rule_count(), summary.compiled);
         assert_eq!(summary.attempted, summary.compiled + summary.rejected.len());
 
         // The split between the two pipelines, stated so a rule that quietly
         // changes sides is a test failure rather than a coverage surprise.
-        assert_eq!(checker.request_rule_count(), 216, "request-phase rules");
-        assert_eq!(checker.response_rule_count(), 58, "response-phase rules");
+        assert_eq!(checker.request_rule_count(), 217, "request-phase rules");
+        assert_eq!(checker.response_rule_count(), 59, "response-phase rules");
         assert_eq!(
             checker.request_rule_count() + checker.response_rule_count(),
             checker.rule_count()
@@ -5766,6 +5767,107 @@ rules:
             checker.check(&no_host).is_none(),
             "an unexpandable macro must not satisfy a negated condition"
         );
+    }
+
+    /// The same three-state guarantee at the **head** of a rule, which is where
+    /// negation now arrives from the converter.
+    ///
+    /// [`Condition::matches_any`] is a separate code path from
+    /// [`Condition::advance`], so "an unexpandable `%{...}` is not a match" has
+    /// to be pinned on both. A head that reads `!@endsWith
+    /// %{request_headers.host}` on a request carrying no `Host` would otherwise
+    /// hold for every value of the surface and block the request outright —
+    /// [`Outcome::Unresolvable`] exists precisely so `NoMatch` and "could not be
+    /// compared" are not the same answer under `negate`.
+    #[test]
+    fn a_negated_head_never_fires_on_an_unexpandable_macro() {
+        let yaml = r#"
+version: "1.0"
+rules:
+  - id: TEST-NEG-HEAD
+    name: referer is off-host
+    category: test
+    severity: critical
+    paranoia: 1
+    field: header_referer
+    operator: ends_with
+    value: '%{request_headers.host}'
+    negate: true
+    action: block
+"#;
+        let checker = OWASPCheck::from_yaml(yaml);
+        assert_eq!(checker.rule_count(), 1);
+
+        let off_host = probe(
+            "GET",
+            "/",
+            "",
+            &[("referer", "https://evil.test"), ("host", "example.com")],
+            "",
+            1,
+        );
+        assert!(checker.check(&off_host).is_some(), "an off-host referer still fires");
+
+        let same_host = probe(
+            "GET",
+            "/",
+            "",
+            &[("referer", "https://example.com"), ("host", "example.com")],
+            "",
+            1,
+        );
+        assert!(checker.check(&same_host).is_none(), "a same-host referer is fine");
+
+        let no_host = probe("GET", "/", "", &[("referer", "https://example.com")], "", 1);
+        assert!(
+            checker.check(&no_host).is_none(),
+            "an unexpandable macro must not satisfy a negated HEAD condition"
+        );
+    }
+
+    /// A negated head reads nothing at all when the request does not carry the
+    /// variable, which is what keeps `!@rx` rules off ordinary traffic.
+    ///
+    /// `ModSecurity` does not evaluate a rule whose target is absent, so
+    /// CRS-920470 ("Illegal Content-Type header") says nothing about a request
+    /// that sends no `Content-Type`. Mapping "absent" onto an empty string
+    /// instead would invert that: the empty string fails the media-type
+    /// pattern, the negation would hold, and every GET a browser makes would
+    /// score a CRITICAL. The scalar accessor returning `None` is what makes
+    /// this structural rather than incidental.
+    #[test]
+    fn a_negated_head_reads_nothing_when_the_header_is_absent() {
+        let checker = crs_checker();
+        let hit = |headers: &[(&str, &str)]| {
+            checker
+                .check(&probe("POST", "/upload", "", headers, "a=1", 1))
+                .map(|d| d.detail)
+        };
+
+        // Nothing to test — CRS-920470 cannot reach this request.
+        assert_eq!(hit(&[]), None, "a request with no Content-Type is not judged");
+
+        // The media types real clients send, none of which may be flagged.
+        for legal in [
+            "application/x-www-form-urlencoded",
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/json;charset=UTF-8",
+            "text/html; charset=ISO-8859-1",
+            "multipart/form-data; boundary=----WebKitFormBoundaryB1oJ2Kd9x",
+            "application/vnd.api+json",
+            "image/svg+xml",
+            "application/grpc-web+proto",
+            "text/plain",
+        ] {
+            assert_eq!(hit(&[("content-type", legal)]), None, "{legal} is a legal media type");
+        }
+
+        // And what the rule is actually for: a header that is not a media type.
+        for illegal in ["application/json, text/html", "*/*; q=0.5\r\nX-Injected: 1"] {
+            let detail = hit(&[("content-type", illegal)]).unwrap_or_default();
+            assert!(detail.contains("920470"), "{illegal} must be flagged, got {detail:?}");
+        }
     }
 
     /// `count_header_<name>` is a presence test, and only `0`/`1` targets are
@@ -7486,16 +7588,16 @@ rules:
             checker.request_rule_count(),
             "the enforced request set is only critical and warning rules: {counts:?}"
         );
-        // 206 critical / 10 warning. The scoring model changes the verdict of a
+        // 207 critical / 10 warning. The scoring model changes the verdict of a
         // lone match for the 10 only — 95% of the enforced set still blocks on a
         // single hit — so this is a false-positive control, not a relaxation of
         // detection. Pinned so a rule-file change that shifts the balance has to
         // be argued for in the diff.
         assert_eq!(warning, 10, "the rules that stop blocking alone: {counts:?}");
-        assert_eq!(critical, 206, "the rules that still block alone: {counts:?}");
+        assert_eq!(critical, 207, "the rules that still block alone: {counts:?}");
 
         // The response set has its own shape and its own threshold, so it is
-        // counted separately. 43 critical + 15 error, all of which reach the
+        // counted separately. 43 critical + 16 error, all of which reach the
         // outbound threshold of 4 on their own — which is upstream's posture
         // for RESPONSE-95x, not a local escalation.
         let mut response_counts: BTreeMap<&str, usize> = BTreeMap::new();
@@ -7509,7 +7611,7 @@ rules:
         );
         assert_eq!(
             response_counts.get("error").copied().unwrap_or_default(),
-            15,
+            16,
             "{response_counts:?}"
         );
         assert_eq!(response_counts.values().sum::<usize>(), checker.response_rule_count());
@@ -7765,7 +7867,7 @@ rules:
         assert!(lines.contains("inbound score reaches 5"), "{lines}");
         assert!(lines.contains("OUTBOUND score reaches 4"), "{lines}");
         assert!(lines.contains("959100"), "{lines}");
-        assert!(lines.contains("58 enforced"), "{lines}");
+        assert!(lines.contains("59 enforced"), "{lines}");
     }
 
     /// With no response rule loaded the check must decline before it looks at
@@ -7775,6 +7877,34 @@ rules:
         let checker = OWASPCheck::from_yaml(&single_rule_yaml("query", "contains", "evil"));
         assert_eq!(checker.response_rule_count(), 0);
         assert!(ResponseCheck::check(&checker, &response_ctx(500, "ORA-00933:", 4)).is_none());
+    }
+
+    /// CRS-954130 is the rule the `!@op` gap cost most visibly: a `phase:4`
+    /// rule both of whose conditions this engine can read, which used to be
+    /// emitted as `operator: regex, value: '!@rx ^404$'` — a pattern matching
+    /// the literal text `!@rx ^404$`, so it could never fire — and was then
+    /// dropped outright.
+    ///
+    /// Its negation carries the meaning: an ASP.NET stack trace on a 404 is the
+    /// framework's own "not found" page and says nothing about the
+    /// application, while the same text on any other status is the leak.
+    #[test]
+    fn the_negated_response_status_rule_distinguishes_404_from_a_leak() {
+        let checker = crs_checker();
+        let asp_error = "<h1>Server Error in '/shop' Application.</h1><pre>at Shop.Db.Open()</pre>";
+
+        let leak = ResponseCheck::check(&checker, &response_ctx(500, asp_error, 1))
+            .expect("an ASP.NET stack trace on a 500 is a leak");
+        assert!(leak.detail.contains("954130"), "{}", leak.detail);
+
+        assert!(
+            ResponseCheck::check(&checker, &response_ctx(404, asp_error, 1)).is_none(),
+            "the same text on a 404 is the framework's own not-found page"
+        );
+        assert!(
+            ResponseCheck::check(&checker, &response_ctx(500, "<h1>Something went wrong</h1>", 1)).is_none(),
+            "an ordinary error page is not a leak"
+        );
     }
 
     /// A truncated body is reported as such: "no leak found" in a prefix is a

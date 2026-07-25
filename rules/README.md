@@ -516,7 +516,7 @@ Current rule inventory (as of the last sync):
 
 | Source       | Files | Rules | Description                        |
 |--------------|-------|-------|------------------------------------|
-| OWASP CRS    | 24    | 274   | OWASP ModSecurity Core Rule Set v4 |
+| OWASP CRS    | 24    | 276   | OWASP ModSecurity Core Rule Set v4 |
 | ModSecurity  | 4     | 46    | ModSecurity community rules        |
 | CVE Patches  | 7     | 43    | Targeted CVE virtual patches       |
 | Advanced     | 6     | 77    | SSRF, XXE, SSTI, deserialization, prototype pollution, webshell upload |
@@ -524,7 +524,7 @@ Current rule inventory (as of the last sync):
 | GeoIP        | 1     | 2     | Geographic IP blocking             |
 | OWASP API    | 5     | 64    | OWASP API Security Top 10          |
 | Custom       | 1     | 8     | Example / template rules           |
-| **Total**    | **51**| **556**| |
+| **Total**    | **51**| **558**| |
 
 ---
 

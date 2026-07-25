@@ -49,6 +49,24 @@ rules:
       - owasp-crs
       - data-leakage
     crs_id: 954120
+  - id: CRS-954130
+    name: IIS Information Leakage
+    category: data-leakage
+    severity: error
+    paranoia: 1
+    field: response_status
+    operator: regex
+    value: ^404$
+    negate: true
+    chain:
+      - field: response_body
+        operator: regex
+        value: \bServer Error in.{0,50}?\bApplication\b
+    action: block
+    tags:
+      - owasp-crs
+      - data-leakage
+    crs_id: 954130
   - id: CRS-954101
     name: Disclosure of IIS install location
     category: data-leakage

@@ -62,6 +62,41 @@ rules:
       - protocol-attack
     crs_id: 920610
 
+  # Upstream is `REQUEST_HEADERS:Content-Type "!@rx ^[\w/.+*-]+(...)*$"`: the
+  # negation means "this header is not a well-formed media type", so the rule
+  # fires on what the pattern *rejects*. Two properties keep that from becoming
+  # a false-positive generator, and both are structural rather than lucky:
+  #
+  #   * `content_type` is the raw header, byte for byte, so inverting the
+  #     operator does not silently widen the surface the way it would over a
+  #     decoded or reconstructed field (see NEGATION_FAITHFUL_VARS in
+  #     rules/tools/modsec2yaml.py).
+  #   * a request with no `Content-Type` at all yields no value, and a
+  #     condition with nothing to test cannot hold — so every ordinary GET is
+  #     untouched, exactly as in ModSecurity, where an absent variable is not
+  #     evaluated.
+  #
+  # What it does reject is a parameter name outside the RFC-blessed set
+  # (`action|boundary|charset|component|start|start-info|type|version`), which
+  # is upstream's deliberate allow-list and the whole point of the rule.
+  - id: CRS-920470
+    name: Illegal Content-Type header
+    category: protocol-attack
+    severity: critical
+    paranoia: 1
+    field: content_type
+    operator: regex
+    value: ^[\w/.+*-]+(?:\s?;\s*(?:action|boundary|charset|component|start(?:-info)?|type|version)\s?=\s?['\"\w.()+,/:=?<>@#*-]+)*$
+    transform:
+      - lowercase
+    negate: true
+    action: block
+    tags:
+      - owasp-crs
+      - protocol-attack
+      - attack-protocol
+    crs_id: 920470
+
   - id: CRS-920200
     name: 'Range: Too many fields (6 or more)'
     category: protocol-attack

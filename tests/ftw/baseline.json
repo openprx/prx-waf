@@ -53,12 +53,36 @@
     "response-phase failure under not-implemented ('the engine never feeds it a",
     "response body'), because it now does. Response-phase failures are ordinary",
     "missed detections / over-blocks / paranoia-scope exclusions and are counted",
-    "as such. Only the buckets are affected; passed and failed are not."
+    "as such. Only the buckets are affected; passed and failed are not.",
+    "",
+    "NEGATED HEADS (`!@op`). The converter used to accept only a bare `@op` at the",
+    "head of a SecRule, so every upstream rule whose head is negated fell out of",
+    "the conversion without a word. Two of them are expressible against surfaces",
+    "this engine reproduces byte for byte and are now shipped: CRS-920470",
+    "(`REQUEST_HEADERS:Content-Type !@rx <media-type grammar>`) and CRS-954130",
+    "(`RESPONSE_STATUS !@rx ^404$` chained to an ASP.NET stack trace in the body).",
+    "That is the whole of the +4 / +4 / +4 in log mode and in cloud mode: the four",
+    "920470 positive tests (920470-1/-2/-12/-17). CRS-954130 has no regression",
+    "test upstream, so it moves no number here.",
+    "",
+    "The remaining negated heads are refused ON PURPOSE and score nothing:",
+    "inverting an operator inverts the safety of every surface approximation, so",
+    "CRS-920100 over `path_raw` (which holds no method and no protocol) would",
+    "have fired on every request. See NEGATION_FAITHFUL_VARS in",
+    "rules/tools/modsec2yaml.py.",
+    "",
+    "Cloud PL2/PL4 show over-block 227 -> 229 and 290 -> 292. Those two tests",
+    "(920470-3, 920470-11) are NOT newly blocked: both are 403 at PL2 before and",
+    "after the change, by a different rule, and log mode — which can name the rule",
+    "that fired — records no new over-block at any level. What changed is the",
+    "bucket: classify.py files a failing test under not-implemented while the rule",
+    "it names is absent from the shipped set, and under over-block once it is",
+    "present. Six not-implemented failures became four passes and two over-blocks."
   ],
   "crs_version": "v4.25.0",
   "go_ftw_version": "v1.3.0",
   "recorded_at": "2026-07-25",
-  "recorded_from": "5b37ce674bce03ce96bd07c29d86d6107621b837 + the response-phase wiring (working tree, uncommitted)",
+  "recorded_from": "52fed37 + the negated-head (`!@op`) conversion (working tree, uncommitted)",
   "tolerance": 5,
   "modes": {
     "log": {
@@ -66,11 +90,11 @@
       "results": {
         "PL1": {
           "run": 4674,
-          "passed": 2739,
-          "failed": 1935,
-          "pass_rate": 58.6,
+          "passed": 2743,
+          "failed": 1931,
+          "pass_rate": 58.69,
           "buckets": {
-            "not-implemented": 242,
+            "not-implemented": 238,
             "paranoia-scope": 1507,
             "over-block": 26,
             "missed-detection": 159,
@@ -79,11 +103,11 @@
         },
         "PL2": {
           "run": 4674,
-          "passed": 3696,
-          "failed": 978,
-          "pass_rate": 79.08,
+          "passed": 3700,
+          "failed": 974,
+          "pass_rate": 79.16,
           "buckets": {
-            "not-implemented": 242,
+            "not-implemented": 238,
             "paranoia-scope": 494,
             "over-block": 32,
             "missed-detection": 209,
@@ -92,11 +116,11 @@
         },
         "PL4": {
           "run": 4674,
-          "passed": 4171,
-          "failed": 503,
-          "pass_rate": 89.24,
+          "passed": 4175,
+          "failed": 499,
+          "pass_rate": 89.32,
           "buckets": {
-            "not-implemented": 242,
+            "not-implemented": 238,
             "paranoia-scope": 0,
             "over-block": 34,
             "missed-detection": 226,
@@ -110,11 +134,11 @@
       "results": {
         "PL1": {
           "run": 4674,
-          "passed": 3184,
-          "failed": 1490,
-          "pass_rate": 68.12,
+          "passed": 3188,
+          "failed": 1486,
+          "pass_rate": 68.21,
           "buckets": {
-            "not-implemented": 233,
+            "not-implemented": 229,
             "paranoia-scope": 973,
             "over-block": 95,
             "missed-detection": 188,
@@ -123,26 +147,26 @@
         },
         "PL2": {
           "run": 4674,
-          "passed": 3749,
-          "failed": 925,
-          "pass_rate": 80.21,
+          "passed": 3753,
+          "failed": 921,
+          "pass_rate": 80.3,
           "buckets": {
-            "not-implemented": 220,
+            "not-implemented": 214,
             "paranoia-scope": 286,
-            "over-block": 227,
+            "over-block": 229,
             "missed-detection": 191,
             "harness": 1
           }
         },
         "PL4": {
           "run": 4674,
-          "passed": 3993,
-          "failed": 681,
-          "pass_rate": 85.43,
+          "passed": 3997,
+          "failed": 677,
+          "pass_rate": 85.52,
           "buckets": {
-            "not-implemented": 207,
+            "not-implemented": 201,
             "paranoia-scope": 0,
-            "over-block": 290,
+            "over-block": 292,
             "missed-detection": 183,
             "harness": 1
           }

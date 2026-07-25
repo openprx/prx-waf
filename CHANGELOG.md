@@ -11,6 +11,34 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Negated CRS rule heads are converted instead of dropped.**
+  `modsec2yaml.py` matched `^(@\w+)` at the head of a `SecRule`, so the
+  fourteen upstream rules whose head is `!@rx` / `!@within` / `!@eq` never
+  reached the engine — even though `Condition.negate` had always been able to
+  evaluate them, and even though one of them (CRS-954130) had previously been
+  emitted as `operator: regex, value: '!@rx ^404$'`: a pattern matching that
+  literal text, which could never fire. The `!` is now parsed as part of the
+  operator and emitted as `negate: true`.
+
+  Negation is only emitted for variables this engine reproduces byte for byte.
+  Inverting an operator inverts the safety of every surface approximation the
+  converter is otherwise allowed to make: CRS-920100 asserts that the whole
+  request line is well formed, the nearest engine field (`path_raw`) holds no
+  method and no protocol, so the anchored pattern never matches and the negated
+  rule would have fired on *every request*. Twelve of the fourteen are
+  therefore refused by name — visible in the startup WARN rather than silently
+  gone — and two are shipped: **CRS-920470** (illegal `Content-Type` header)
+  and **CRS-954130** (IIS information leakage, `RESPONSE_STATUS !@rx ^404$`
+  chained to an ASP.NET stack trace). Enforced rules: **274 → 276** (217
+  request-phase, 59 response-phase).
+
+  go-ftw v1.3.0 against CRS v4.25.0: log mode **2739 → 2743 / 3696 → 3700 /
+  4171 → 4175** at PL1 / PL2 / PL4 (89.24% → 89.32%), cloud mode **3184 → 3188
+  / 3749 → 3753 / 3993 → 3997**. No test regressed in either mode; the two
+  cloud-mode over-block entries that appear at PL2/PL4 are 403 before and after
+  the change, by a different rule, and only moved bucket because the rule they
+  name now exists.
+
 - **The CRS response rules actually run.** `RESPONSE_BODY` and
   `RESPONSE_STATUS` are engine fields, `OWASPCheck` implements `ResponseCheck`,
   and `main.rs` registers it on the response pipeline — the three things that

@@ -18,7 +18,8 @@ runs the suite; prints a classified report; and tears everything down again.
 ## Where we stand
 
 CRS v4.25.0, go-ftw v1.3.0, 4674 tests, CRS check only. Recorded from
-`c3eb2dd` on 2026-07-25; the same numbers are the CI gate in `baseline.json`.
+`52fed37` + the negated-head conversion on 2026-07-25; the same numbers are the
+CI gate in `baseline.json`.
 **A pass rate is meaningless without its mode and its paranoia level — always
 quote all three.**
 
@@ -29,13 +30,13 @@ the posture ModSecurity v2 + CRS and Coraza are measured in.
 
 | | PL1 | PL2 | PL4 |
 |---|---|---|---|
-| passed | 2671 | 3618 | 4093 |
-| **pass rate** | **57.15%** | **77.41%** | **87.57%** |
-| not-implemented | 315 | 315 | 315 |
-| paranoia-scope | 1488 | 493 | 0 |
+| passed | 2743 | 3700 | 4175 |
+| **pass rate** | **58.69%** | **79.16%** | **89.32%** |
+| not-implemented | 238 | 238 | 238 |
+| paranoia-scope | 1507 | 494 | 0 |
 | over-block | 26 | 32 | 34 |
-| missed-detection | 141 | 184 | 200 |
-| harness | 33 | 32 | 32 |
+| missed-detection | 159 | 209 | 226 |
+| harness | 1 | 1 | 1 |
 
 ### cloud mode — the blocking decision
 
@@ -43,13 +44,13 @@ WAF enforcing, verdicts from HTTP status codes.
 
 | | PL1 | PL2 | PL4 |
 |---|---|---|---|
-| passed | 3184 | 3749 | 3993 |
-| **pass rate** | **68.12%** | **80.21%** | **85.43%** |
-| not-implemented | 290 | 249 | 235 |
-| paranoia-scope | 954 | 285 | 0 |
-| over-block | 89 | 216 | 279 |
-| missed-detection | 118 | 138 | 130 |
-| harness | 39 | 37 | 37 |
+| passed | 3188 | 3753 | 3997 |
+| **pass rate** | **68.21%** | **80.30%** | **85.52%** |
+| not-implemented | 229 | 214 | 201 |
+| paranoia-scope | 973 | 286 | 0 |
+| over-block | 95 | 229 | 292 |
+| missed-detection | 188 | 191 | 183 |
+| harness | 1 | 1 | 1 |
 
 PL4 is the level CRS runs its own regression suite at
 (`BLOCKING_PARANOIA: 4` in coreruleset `tests/docker-compose.yml`), so it is
@@ -58,33 +59,33 @@ the same question upstream asks it. PL1 is the shipping default.
 
 For reference: ModSecurity v2 + CRS is 100% (it is the reference
 implementation), Coraza is 100%, ModSecurity v3 is 96–98%. Those are log-mode
-numbers, so **`87.57%` at PL4 is the figure that belongs next to them**; the
+numbers, so **`89.32%` at PL4 is the figure that belongs next to them**; the
 cloud column is a different question with a different answer.
 
 ### Why the two columns disagree in both directions
 
-At PL1 cloud looks *better* (68.12% vs 57.15%) and at PL4 it looks *worse*
-(85.43% vs 87.57%). Neither is noise — a status code is a lossy projection of
+At PL1 cloud looks *better* (68.21% vs 58.69%) and at PL4 it looks *worse*
+(85.52% vs 89.32%). Neither is noise — a status code is a lossy projection of
 the corpus's assertions, and it loses information in both directions. Comparing
-the two failure **sets** at PL4 (399 tests fail in both modes):
+the two failure **sets** at PL4 (368 tests fail in both modes):
 
 | | count | what it is |
 |---|---|---|
-| fails only in cloud | 282 | 245 `over-block`, 17 `not-implemented`, 14 `missed-detection`, 6 `harness` |
-| fails only in log | 182 | 97 `not-implemented`, 84 `missed-detection`, 1 `harness` |
+| fails only in cloud | 309 | 258 `over-block`, 41 `missed-detection`, 10 `not-implemented` |
+| fails only in log | 131 | 84 `missed-detection`, 47 `not-implemented` |
 
 * **Cloud invents failures.** A negative test asserts "rule 941100 did not
   fire". Cloud can only ask "did anything block?", so any *other* rule blocking
-  fails it. Those are the 245. Log mode deletes that entire class: `collateral`
+  fails it. Those are the 258. Log mode deletes that entire class: `collateral`
   is structurally impossible when the assertion names an id, because a rule the
   test does not name cannot fail it. All 34 of log mode's PL4 `over-block`
   entries are `same-rule` — real false positives of the rule under test.
 * **Cloud hands out free passes.** A positive test asserts "rule 933151 fired".
   Cloud can only ask "did anything block?", so when an unrelated rule blocks the
   request the test passes without the rule under test ever matching. Those are
-  the 182 — and they are not marginal: 97 of them are for rules that do not
+  the 131 — and they are not marginal: 47 of them are for rules that do not
   exist in `rules/owasp-crs/` at all. The same effect explains PL1, where
-  cloud's `paranoia-scope` is 954 against log mode's 1488: 534 tests for rules
+  cloud's `paranoia-scope` is 973 against log mode's 1507: 534 tests for rules
   that were never even evaluated at PL1 still "passed" in cloud because
   something else blocked.
 
