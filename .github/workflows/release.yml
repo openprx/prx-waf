@@ -167,7 +167,7 @@ jobs:
           chmod 755 "${stage}/${BIN_NAME}"
 
           cp -R configs rules migrations "${stage}/"
-          cp README.md CHANGELOG.md LICENSE SECURITY.md "${stage}/"
+          cp README.md CHANGELOG.md LICENSE-APACHE LICENSE-MIT SECURITY.md "${stage}/"
 
           # Deterministic ordering / ownership / timestamps so two runs of the
           # same commit produce the same tarball.

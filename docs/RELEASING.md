@@ -158,7 +158,7 @@ SHA256SUMS                                               (+ .sig, .pem)
 
 Each tarball unpacks to `prx-waf-<version>-<target>/` containing the stripped
 binary plus `configs/`, `rules/`, `migrations/`, `README.md`, `CHANGELOG.md`,
-`LICENSE`, `SECURITY.md`.
+`LICENSE-APACHE`, `LICENSE-MIT`, `SECURITY.md`.
 
 Signing is **cosign keyless**: the pipeline gets a short-lived certificate from
 Fulcio bound to the workflow's GitHub OIDC identity and logs the signature to
