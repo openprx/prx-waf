@@ -4,6 +4,10 @@
 .DS_Store
 node_modules/
 web/admin-ui/dist/
+# Keep the directory itself tracked: crates/waf-api embeds it via rust-embed,
+# whose derive macro fails to compile when the folder is absent. Without this,
+# a fresh checkout cannot build waf-api at all.
+!web/admin-ui/dist/.gitkeep
 # ip2region xdb binary data files — download with `prx-waf geoip download`
 data/*.xdb
 
