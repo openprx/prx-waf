@@ -733,45 +733,42 @@ impl WafEngine {
             return decision;
         }
 
-        // ── Phase 3: URL Whitelist — allow immediately if matched ──────────────
-        if let Some(url_wl) = check_url_whitelist(ctx, &self.store) {
-            debug!("Request allowed by URL whitelist: {}", ctx.path);
-            return url_wl;
-        }
-        if let Some(s) = &synced {
-            let decoded = crate::checks::url_decode(&ctx.path);
-            if let Some(rule_id) = s.allow_urls.matches(&host_code, &decoded) {
-                debug!("Request allowed by synced URL whitelist: {}", ctx.path);
-                return WafDecision {
-                    action: WafAction::Allow,
-                    result: Some(DetectionResult {
-                        rule_id: Some(rule_id),
-                        rule_name: "URL Whitelist (Cluster Sync)".to_string(),
-                        phase: waf_common::Phase::UrlWhitelist,
-                        detail: format!("Path {} matched synced URL whitelist", ctx.path),
-                    }),
-                };
-            }
+        // ── Phase 3: URL Whitelist ─────────────────────────────────────────────
+        // A whitelist hit is an *exemption from content inspection*, not a
+        // blanket "allow": it is resolved here (so it still wins over the URL
+        // blacklist, as before) but the allow decision is held back until the
+        // client-scoped phases below have run. A URL rule cannot express trust
+        // in a *client*, so it must not switch off IP reputation, geo control
+        // or rate limiting — that would turn any whitelisted prefix into a free
+        // DoS / blocklist-evasion channel.
+        let mut url_whitelist = check_url_whitelist(ctx, &self.store);
+        if url_whitelist.is_none()
+            && let Some(s) = &synced
+            && let Some(rule_id) = crate::checker::match_url_whitelist(&s.allow_urls, &host_code, &ctx.path)
+        {
+            url_whitelist = Some(WafDecision {
+                action: WafAction::Allow,
+                result: Some(DetectionResult {
+                    rule_id: Some(rule_id),
+                    rule_name: "URL Whitelist (Cluster Sync)".to_string(),
+                    phase: waf_common::Phase::UrlWhitelist,
+                    detail: format!("Path {} matched synced URL whitelist", ctx.path),
+                }),
+            });
         }
 
         // ── Phase 4: URL Blacklist — block if matched ──────────────────────────
-        let url_bl = check_url_blacklist(ctx, &self.store);
-        if !url_bl.is_allowed() {
-            self.log_attack(ctx, &url_bl);
-            self.report_community_signal(ctx, &url_bl);
-            return url_bl;
-        }
-        if let Some(s) = &synced {
-            // Match both the raw and decoded path (M-6 evasion parity).
-            let decoded = crate::checks::url_decode(&ctx.path);
-            let matched = s.block_urls.matches(&host_code, &ctx.path).or_else(|| {
-                if decoded == ctx.path {
-                    None
-                } else {
-                    s.block_urls.matches(&host_code, &decoded)
-                }
-            });
-            if let Some(rule_id) = matched {
+        if url_whitelist.is_none() {
+            let url_bl = check_url_blacklist(ctx, &self.store);
+            if !url_bl.is_allowed() {
+                self.log_attack(ctx, &url_bl);
+                self.report_community_signal(ctx, &url_bl);
+                return url_bl;
+            }
+            if let Some(s) = &synced
+                // Match the raw, decoded and normalised path (M-6 evasion parity).
+                && let Some(rule_id) = crate::checker::match_url_blacklist(&s.block_urls, &host_code, &ctx.path)
+            {
                 let decision = WafDecision::block(
                     403,
                     Some("Access denied.".to_string()),
@@ -811,6 +808,22 @@ impl WafEngine {
         // ── Phase 11: CC / rate limit — single counting point ─────────────────
         if let Some(result) = self.cc_check.check(ctx) {
             return self.record_block(ctx, result, true);
+        }
+
+        // ── Phase 3 (deferred): URL whitelist exemption ───────────────────────
+        // Every client-scoped phase above has now run and cleared the request.
+        // The whitelist exempts what remains — scanner / bot fingerprinting,
+        // the signature and content detectors, custom rules, OWASP CRS,
+        // sensitive-data and hotlink — which is exactly the false-positive
+        // surface an allow rule exists to silence (a site that deliberately
+        // serves `/phpmyadmin` still whitelists it successfully). The body
+        // phase is unaffected: it never consulted the whitelist.
+        if let Some(decision) = url_whitelist {
+            debug!(
+                "Request exempted from content inspection by URL whitelist: {}",
+                ctx.path
+            );
+            return decision;
         }
 
         // ── Phase 8 / 10: scanner + bot (header-only) ─────────────────────────

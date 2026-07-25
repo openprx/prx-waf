@@ -22,20 +22,22 @@ use uuid::Uuid;
 use waf_common::{HostConfig, RequestCtx, WafAction};
 use waf_engine::WafEngine;
 
-use crate::context::BODY_PREVIEW_LIMIT;
+use crate::context::{BodyOverflowAction, BodyWindows, body_inspection_policy, fold_request_headers};
 use crate::router::HostRouter;
 
 // ─── Limits ───────────────────────────────────────────────────────────────────
 
-/// Maximum request-body bytes buffered for a single HTTP/3 request.
+/// Absolute per-request body buffer ceiling for a single HTTP/3 request.
 ///
-/// Unlike the Pingora path (which streams the body to the upstream while
-/// inspecting only the first [`BODY_PREVIEW_LIMIT`] bytes), the H3 forwarder
-/// buffers the whole body before handing it to `reqwest`, so an explicit hard
-/// cap is required to bound per-request memory.  Requests exceeding this are
-/// rejected with 413 rather than partially forwarded — a WAF must never relay
-/// unscanned bytes.  Inspection still only looks at the first
-/// [`BODY_PREVIEW_LIMIT`] bytes, matching the HTTP/1.1 behaviour.
+/// The H3 forwarder buffers the whole body before handing it to `reqwest`, so
+/// an explicit hard cap is required to bound per-request memory regardless of
+/// the configured inspection policy.  Requests exceeding this are rejected with
+/// 413 rather than partially forwarded — a WAF must never relay unscanned
+/// bytes.
+///
+/// The *inspection* ceiling is [`crate::context::BodyInspectionPolicy`], shared
+/// with the HTTP/1.1 path, and defaults to the same 10 MiB so both protocols
+/// behave identically out of the box.
 const MAX_H3_REQUEST_BODY: usize = 10 * 1024 * 1024;
 
 // ─── Alt-Svc header value ─────────────────────────────────────────────────────
@@ -262,6 +264,36 @@ where
     let query = parts.uri.query().unwrap_or("").to_string();
     let method = parts.method.to_string();
 
+    // ── Header folding (identical semantics to the HTTP/1.1 path) ────────────
+    // Repeated header names are folded into one RFC-shaped value so the
+    // detectors see every value, and the two abuse cases folding cannot
+    // represent faithfully are refused outright.
+    let folded = fold_request_headers(&parts.headers);
+    if folded.duplicate_host {
+        warn!("Rejecting H3 request with duplicate Host headers: ip={}", peer.ip());
+        return respond_simple(
+            &mut stream,
+            http::StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(b"Bad Request"),
+        )
+        .await;
+    }
+    if let Some(name) = &folded.overflow {
+        warn!(
+            "Rejecting H3 request: header '{name}' exceeds the fold limits: ip={}",
+            peer.ip()
+        );
+        return respond_simple(
+            &mut stream,
+            http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(b"Request Header Fields Too Large"),
+        )
+        .await;
+    }
+    let headers = folded.headers;
+
     // Extract Host header for route resolution.
     let host_header = parts
         .headers
@@ -311,13 +343,6 @@ where
         .await;
     }
 
-    // Build request headers map (lower-cased keys, like the Pingora path).
-    let mut headers = std::collections::HashMap::new();
-    for (name, value) in &parts.headers {
-        if let Ok(v) = std::str::from_utf8(value.as_bytes()) {
-            headers.insert(name.as_str().to_lowercase(), v.to_string());
-        }
-    }
     let content_length = headers
         .get("content-length")
         .and_then(|v| v.parse::<u64>().ok())
@@ -390,19 +415,56 @@ where
     }
 
     // ── WAF body-phase inspection ───────────────────────────────────────────
+    // The whole buffered body is scanned in overlapping windows — the same
+    // window size, overlap and inspected-byte ceiling the HTTP/1.1 path uses —
+    // so padding the front of the body with harmless bytes cannot push the
+    // payload past the scanner on either protocol.
     if !body_buf.is_empty() {
-        let preview_len = body_buf.len().min(BODY_PREVIEW_LIMIT);
-        let preview = body_buf.get(..preview_len).unwrap_or(&body_buf);
-        request_ctx.body_preview = Bytes::copy_from_slice(preview);
-        request_ctx.content_length = body_buf.len() as u64;
+        let policy = body_inspection_policy();
+        let ceiling = policy.max_total_bytes;
+        if ceiling > 0 && body_buf.len() > ceiling {
+            if policy.overflow == BodyOverflowAction::Reject {
+                warn!(
+                    "H3 request body ({} bytes) exceeds the {ceiling} byte inspection ceiling: ip={} host={}",
+                    body_buf.len(),
+                    request_ctx.client_ip,
+                    request_ctx.host,
+                );
+                return respond_simple(
+                    &mut stream,
+                    http::StatusCode::PAYLOAD_TOO_LARGE,
+                    "text/plain; charset=utf-8",
+                    Bytes::from_static(b"Payload Too Large"),
+                )
+                .await;
+            }
+            warn!(
+                "H3 request body ({} bytes) exceeds the {ceiling} byte inspection ceiling; the remainder is forwarded \
+                 UNINSPECTED (PRXWAF_BODY_INSPECT_OVERFLOW=log): ip={} host={}",
+                body_buf.len(),
+                request_ctx.client_ip,
+                request_ctx.host,
+            );
+        }
 
-        let decision = engine
-            .inspect_body_with_state(&mut request_ctx, &mut content_inspection)
-            .await;
-        if !decision.is_allowed()
-            && let Some(handled) = respond_waf_action(&mut stream, &decision.action, &request_ctx).await?
-        {
-            return handled;
+        request_ctx.content_length = body_buf.len() as u64;
+        let inspect_len = if ceiling > 0 {
+            body_buf.len().min(ceiling)
+        } else {
+            body_buf.len()
+        };
+        let inspectable = body_buf.get(..inspect_len).unwrap_or(&body_buf);
+
+        for window in BodyWindows::with_policy(inspectable, policy) {
+            request_ctx.body_preview = Bytes::copy_from_slice(window);
+            let decision = engine
+                .inspect_body_with_state(&mut request_ctx, &mut content_inspection)
+                .await;
+            if !decision.is_allowed()
+                && let Some(handled) = respond_waf_action(&mut stream, &decision.action, &request_ctx).await?
+            {
+                return handled;
+            }
         }
     }
 

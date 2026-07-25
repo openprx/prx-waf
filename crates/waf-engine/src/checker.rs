@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::{debug, info};
 
 use waf_common::{DetectionResult, Phase, RequestCtx, WafAction, WafDecision};
 use waf_storage::Database;
 
-use crate::checks::url_decode;
+use crate::checks::{MAX_DECODE_PASSES, url_decode};
 use crate::rules::{IpRuleSet, UrlMatchType, UrlRule, UrlRuleSet};
 
 /// In-memory rule store backed by `PostgreSQL`
@@ -202,6 +203,174 @@ impl RuleStore {
     }
 }
 
+// ─── Path canonicalisation ────────────────────────────────────────────────────
+//
+// URL rules are matched against a *decoded* path, but nothing used to remove
+// dot-segments, so `/static/..%2f..%2f..%2fetc/passwd` single-decoded to
+// `/static/../../../etc/passwd`, still started with `/static`, and matched a
+// `/static` whitelist prefix — while the origin resolved the very same request
+// to `/etc/passwd`. Detection and origin must agree on what the path *is*,
+// which is what the helpers below establish.
+
+/// Apply RFC 3986 §5.2.4 `remove_dot_segments` to a path and collapse empty
+/// segments (`//`), yielding the path an origin actually resolves.
+///
+/// Borrows when the input is already canonical, so the common case allocates
+/// nothing.
+pub(crate) fn remove_dot_segments(path: &str) -> Cow<'_, str> {
+    // Fast path: no dot-segment and no empty segment can be present.
+    if !path.contains("./") && !path.contains("//") && !path.ends_with('.') {
+        return Cow::Borrowed(path);
+    }
+
+    let absolute = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    // Whether the resolved path keeps a trailing slash (`/a/b/`, `/a/.`, `/a/..`).
+    let mut trailing_slash = false;
+    for segment in path.split('/') {
+        match segment {
+            // Empty segments come from a leading, trailing or doubled slash.
+            "" | "." => trailing_slash = true,
+            ".." => {
+                // Excess `..` at the root is discarded, as RFC 3986 requires.
+                let _ = out.pop();
+                trailing_slash = true;
+            }
+            other => {
+                out.push(other);
+                trailing_slash = false;
+            }
+        }
+    }
+
+    let mut resolved = String::with_capacity(path.len());
+    if absolute {
+        resolved.push('/');
+    }
+    for (i, segment) in out.iter().enumerate() {
+        if i > 0 {
+            resolved.push('/');
+        }
+        resolved.push_str(segment);
+    }
+    if trailing_slash && !resolved.ends_with('/') {
+        resolved.push('/');
+    }
+
+    if resolved == path {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(resolved)
+    }
+}
+
+/// Percent-decode repeatedly until the value stops changing.
+///
+/// Bounded by [`MAX_DECODE_PASSES`] so a crafted deeply re-encoded path cannot
+/// force unbounded per-request work.
+fn decode_recursive(path: &str) -> Cow<'_, str> {
+    let mut current = Cow::Borrowed(path);
+    for _ in 0..MAX_DECODE_PASSES {
+        let next = url_decode(&current);
+        if next == *current {
+            break;
+        }
+        current = Cow::Owned(next);
+    }
+    current
+}
+
+/// Like [`decode_recursive`] but reports non-termination: `None` when the value
+/// was still changing after [`MAX_DECODE_PASSES`] passes, i.e. residual
+/// encoding remains and the true path is unknown.
+fn decode_until_stable(path: &str) -> Option<Cow<'_, str>> {
+    let mut current = Cow::Borrowed(path);
+    for _ in 0..MAX_DECODE_PASSES {
+        let next = url_decode(&current);
+        if next == *current {
+            return Some(current);
+        }
+        current = Cow::Owned(next);
+    }
+    None
+}
+
+/// Fully decoded, dot-segment-free form of a request path.
+///
+/// Used as an **additional** matching form for deny rules: normalising can only
+/// add matches, never remove them, so this is always safe to try.
+pub(crate) fn normalized_path(path: &str) -> Cow<'_, str> {
+    let decoded = decode_recursive(path);
+    match remove_dot_segments(&decoded) {
+        Cow::Borrowed(_) => decoded,
+        Cow::Owned(resolved) => Cow::Owned(resolved),
+    }
+}
+
+/// Canonical path used for **allow** (whitelist) matching, or `None` when the
+/// request path is structurally ambiguous.
+///
+/// An allow rule disables detection, so it may only be applied to a path whose
+/// meaning the WAF and the origin are guaranteed to agree on. A path is
+/// therefore rejected as a whitelist candidate when:
+///
+/// * percent-decoding does not stabilise within [`MAX_DECODE_PASSES`] passes;
+/// * decoding changes the number of `/` separators — i.e. the request smuggled
+///   an encoded slash (`%2f`), so the origin may treat the path as one segment
+///   while the WAF sees several;
+/// * the decoded path contains a backslash or a control character (alternate
+///   separators / terminators that origins interpret inconsistently);
+/// * dot-segments or empty segments survive decoding, so the resolved path
+///   differs from the requested one (`/static/../../etc/passwd`).
+///
+/// Encoded *characters* are still accepted (`/%61dmin` → `/admin`, the M-6
+/// behaviour): they change the spelling, never the structure. Every rejected
+/// path simply falls through to the full detection pipeline — the safe
+/// direction.
+pub(crate) fn whitelist_path(path: &str) -> Option<Cow<'_, str>> {
+    let decoded = decode_until_stable(path)?;
+
+    if decoded.matches('/').count() != path.matches('/').count() {
+        return None;
+    }
+    if decoded.bytes().any(|b| b < 0x20 || b == b'\\' || b == 0x7f) {
+        return None;
+    }
+    if remove_dot_segments(&decoded).as_ref() != decoded.as_ref() {
+        return None;
+    }
+
+    Some(decoded)
+}
+
+/// Match a path against an allow rule set using the canonical path only.
+pub(crate) fn match_url_whitelist(rules: &UrlRuleSet, host_code: &str, path: &str) -> Option<String> {
+    let candidate = whitelist_path(path)?;
+    rules.matches(host_code, &candidate)
+}
+
+/// Match a path against a deny rule set in every form an origin might resolve:
+/// raw, single-decoded (M-6) and fully normalised.
+pub(crate) fn match_url_blacklist(rules: &UrlRuleSet, host_code: &str, path: &str) -> Option<String> {
+    if let Some(rule_id) = rules.matches(host_code, path) {
+        return Some(rule_id);
+    }
+
+    let decoded = url_decode(path);
+    if decoded != path
+        && let Some(rule_id) = rules.matches(host_code, &decoded)
+    {
+        return Some(rule_id);
+    }
+
+    let normalized = normalized_path(path);
+    if normalized.as_ref() != path && normalized.as_ref() != decoded.as_str() {
+        return rules.matches(host_code, &normalized);
+    }
+
+    None
+}
+
 /// Run Phase 1 WAF check: IP whitelist
 /// If the IP is whitelisted, allow immediately (skip further checks)
 pub fn check_ip_whitelist(ctx: &RequestCtx, store: &RuleStore) -> WafDecision {
@@ -262,15 +431,20 @@ pub fn check_ip_blacklist(ctx: &RequestCtx, store: &RuleStore) -> WafDecision {
 }
 
 /// Run Phase 3 WAF check: URL whitelist
-/// If the URL is whitelisted, allow immediately.
 ///
-/// Matching uses the **decoded** path (M-6) so an encoded request such as
-/// `/%61dmin` is whitelisted consistently with its canonical form `/admin`.
+/// Matching uses the **canonical** path (see [`whitelist_path`]): fully decoded
+/// and dot-segment free, and only when decoding cannot have changed the path's
+/// structure. An encoded request such as `/%61dmin` is still whitelisted
+/// consistently with its canonical form `/admin` (M-6), while
+/// `/static/..%2f..%2fetc/passwd` no longer matches a `/static` prefix rule.
+///
+/// A match does **not** allow the request outright — see
+/// [`crate::WafEngine::inspect_with_state`], where the allow decision is held
+/// back until the client-scoped phases (reputation, geo, rate limit) have run.
 pub fn check_url_whitelist(ctx: &RequestCtx, store: &RuleStore) -> Option<WafDecision> {
     let host_code = &ctx.host_config.code;
-    let decoded = url_decode(&ctx.path);
 
-    if let Some(rule_id) = store.allow_urls.matches(host_code, &decoded) {
+    if let Some(rule_id) = match_url_whitelist(&store.allow_urls, host_code, &ctx.path) {
         debug!("URL {} whitelisted for host {}", ctx.path, host_code);
         return Some(WafDecision {
             action: WafAction::Allow,
@@ -288,22 +462,13 @@ pub fn check_url_whitelist(ctx: &RequestCtx, store: &RuleStore) -> Option<WafDec
 
 /// Run Phase 4 WAF check: URL blacklist.
 ///
-/// Matching is attempted against both the **raw** and the **decoded** path
-/// (M-6) so encoding tricks such as `/%61dmin` cannot bypass a `/admin`
-/// blacklist rule.
+/// Matching is attempted against the **raw**, the **decoded** (M-6) and the
+/// fully **normalised** path, so neither encoding tricks such as `/%61dmin` nor
+/// dot-segment tricks such as `/x/..%2fadmin` can bypass an `/admin` rule.
 pub fn check_url_blacklist(ctx: &RequestCtx, store: &RuleStore) -> WafDecision {
     let host_code = &ctx.host_config.code;
 
-    let decoded = url_decode(&ctx.path);
-    let matched = store.block_urls.matches(host_code, &ctx.path).or_else(|| {
-        if decoded == ctx.path {
-            None
-        } else {
-            store.block_urls.matches(host_code, &decoded)
-        }
-    });
-
-    if let Some(rule_id) = matched {
+    if let Some(rule_id) = match_url_blacklist(&store.block_urls, host_code, &ctx.path) {
         debug!("URL {} blocked for host {}", ctx.path, host_code);
         return WafDecision::block(
             403,
@@ -318,4 +483,133 @@ pub fn check_url_blacklist(ctx: &RequestCtx, store: &RuleStore) -> WafDecision {
     }
 
     WafDecision::allow()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOST: &str = "h1";
+
+    fn rule_set(pattern: &str, match_type: UrlMatchType) -> UrlRuleSet {
+        let set = UrlRuleSet::new();
+        set.load(
+            HOST,
+            vec![UrlRule {
+                id: "r1".to_string(),
+                pattern: pattern.to_string(),
+                match_type,
+            }],
+        );
+        set
+    }
+
+    // ── remove_dot_segments (RFC 3986 §5.2.4) ────────────────────────────────
+
+    #[test]
+    fn dot_segments_are_resolved() {
+        assert_eq!(remove_dot_segments("/static/../../../etc/passwd"), "/etc/passwd");
+        assert_eq!(remove_dot_segments("/a/b/../c"), "/a/c");
+        assert_eq!(remove_dot_segments("/a/./b"), "/a/b");
+        assert_eq!(remove_dot_segments("/a//b"), "/a/b");
+        assert_eq!(remove_dot_segments("/a/b/"), "/a/b/");
+        assert_eq!(remove_dot_segments("/a/b/.."), "/a/");
+        assert_eq!(remove_dot_segments("/"), "/");
+        // Already canonical paths are borrowed, not rebuilt.
+        assert!(matches!(remove_dot_segments("/static/app.js"), Cow::Borrowed(_)));
+        assert_eq!(remove_dot_segments("/static/app.js"), "/static/app.js");
+        // A dot inside a segment name is not a dot-segment.
+        assert_eq!(
+            remove_dot_segments("/.well-known/acme-challenge/x"),
+            "/.well-known/acme-challenge/x"
+        );
+        assert_eq!(remove_dot_segments("/a/..b/c"), "/a/..b/c");
+    }
+
+    // ── Bypass 2: whitelist short-circuit + missing normalisation ────────────
+
+    /// Attack scenario: with a `/static` prefix whitelist configured, the
+    /// classic encoded-traversal probe must NOT be whitelisted — pre-fix it
+    /// single-decoded to `/static/../../../etc/passwd`, still started with
+    /// `/static`, and skipped every detection phase while the origin resolved
+    /// the request to `/etc/passwd`.
+    #[test]
+    fn encoded_traversal_is_not_whitelisted_by_a_static_prefix() {
+        let allow = rule_set("/static", UrlMatchType::Prefix);
+        let attack = "/static/..%2f..%2f..%2fetc/passwd";
+
+        assert_eq!(
+            match_url_whitelist(&allow, HOST, attack),
+            None,
+            "encoded traversal was allowed through the /static whitelist"
+        );
+        // The path the origin actually resolves, for the record.
+        assert_eq!(normalized_path(attack), "/etc/passwd");
+        // The plain (unencoded) and double-encoded spellings are refused too.
+        assert_eq!(match_url_whitelist(&allow, HOST, "/static/../../etc/passwd"), None);
+        assert_eq!(
+            match_url_whitelist(&allow, HOST, "/static/..%252f..%252fetc/passwd"),
+            None
+        );
+        assert_eq!(
+            match_url_whitelist(&allow, HOST, "/static/%2e%2e/%2e%2e/etc/passwd"),
+            None
+        );
+    }
+
+    /// Negative control: ordinary traffic under the whitelisted prefix — and
+    /// the documented M-6 encoded-spelling case — still match.
+    #[test]
+    fn ordinary_paths_still_match_the_whitelist() {
+        let allow = rule_set("/static", UrlMatchType::Prefix);
+        assert_eq!(
+            match_url_whitelist(&allow, HOST, "/static/app.js").as_deref(),
+            Some("r1")
+        );
+        assert_eq!(
+            match_url_whitelist(&allow, HOST, "/static/css/site.css").as_deref(),
+            Some("r1")
+        );
+        // Percent-encoded *characters* change spelling, not structure (M-6).
+        assert_eq!(
+            match_url_whitelist(&allow, HOST, "/%73tatic/app.js").as_deref(),
+            Some("r1")
+        );
+        // Unrelated paths still do not match.
+        assert_eq!(match_url_whitelist(&allow, HOST, "/api/users"), None);
+    }
+
+    #[test]
+    fn structurally_ambiguous_paths_are_never_whitelist_candidates() {
+        // Encoded separator: the origin may treat this as one segment.
+        assert_eq!(whitelist_path("/static%2fapp.js"), None);
+        // Backslash and control characters.
+        assert_eq!(whitelist_path("/static\\..\\etc"), None);
+        assert_eq!(whitelist_path("/static/%00.js"), None);
+        // Decoding that never stabilises within the pass budget.
+        assert_eq!(whitelist_path("/%25%32%35%32%66"), None);
+        // Canonical paths are accepted and returned decoded.
+        assert_eq!(whitelist_path("/static/app.js").as_deref(), Some("/static/app.js"));
+        assert_eq!(whitelist_path("/%61dmin").as_deref(), Some("/admin"));
+    }
+
+    // ── Deny-side normalisation ──────────────────────────────────────────────
+
+    #[test]
+    fn blacklist_matches_normalised_and_encoded_forms() {
+        let block = rule_set("/admin", UrlMatchType::Prefix);
+        assert_eq!(match_url_blacklist(&block, HOST, "/admin/index").as_deref(), Some("r1"));
+        // Encoded spelling (M-6) and dot-segment detour both still match.
+        assert_eq!(match_url_blacklist(&block, HOST, "/%61dmin").as_deref(), Some("r1"));
+        assert_eq!(
+            match_url_blacklist(&block, HOST, "/x/..%2fadmin/index").as_deref(),
+            Some("r1")
+        );
+        assert_eq!(
+            match_url_blacklist(&block, HOST, "/public/../admin").as_deref(),
+            Some("r1")
+        );
+        // Negative control: unrelated traffic is untouched.
+        assert_eq!(match_url_blacklist(&block, HOST, "/public/index.html"), None);
+    }
 }

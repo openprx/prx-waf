@@ -13,7 +13,9 @@ use waf_common::{HostConfig, RequestCtx, WafAction};
 use waf_engine::WafEngine;
 
 use crate::cache::ResponseCache;
-use crate::context::{BODY_PREVIEW_LIMIT, CACHE_BODY_LIMIT, GatewayCtx};
+use crate::context::{
+    CACHE_BODY_LIMIT, FoldedHeaders, GatewayCtx, body_inspection_policy, fold_request_headers, rightmost_forwarded_for,
+};
 use crate::lb::LoadBalancerRegistry;
 use crate::router::HostRouter;
 use crate::ssl::ChallengeStore;
@@ -86,10 +88,13 @@ impl WafProxy {
             // one. The left-most value is fully client-controlled and can be
             // spoofed to bypass IP blocklists / rate limits; the right-most
             // entry is the address appended by the closest (trusted) proxy.
+            //
+            // The scan spans **every** `X-Forwarded-For` line: `get_header`
+            // returns only the first one, so a client that prepends its own
+            // `X-Forwarded-For` line would otherwise have its spoofed value
+            // read as the right-most entry.
             if peer_trusted
-                && let Some(xff) = session.get_header("x-forwarded-for")
-                && let Ok(s) = std::str::from_utf8(xff.as_bytes())
-                && let Some(rightmost) = s.rsplit(',').map(str::trim).find(|seg| !seg.is_empty())
+                && let Some(rightmost) = rightmost_forwarded_for(&session.req_header().headers)
                 && let Ok(ip) = rightmost.parse()
             {
                 return ip;
@@ -99,8 +104,17 @@ impl WafProxy {
         peer_ip
     }
 
-    /// Build a `RequestCtx` from the Pingora session
-    fn build_request_ctx(&self, session: &Session, host_config: Arc<HostConfig>) -> RequestCtx {
+    /// Build a `RequestCtx` from the Pingora session.
+    ///
+    /// `headers` is the already-folded header map (see [`fold_request_headers`])
+    /// — it must carry **every** value of a repeated header name, because the
+    /// detectors only ever see this flat map.
+    fn build_request_ctx(
+        &self,
+        session: &Session,
+        host_config: Arc<HostConfig>,
+        headers: HashMap<String, String>,
+    ) -> RequestCtx {
         let client_ip = self.extract_client_ip(session);
         let client_port = session
             .client_addr()
@@ -114,14 +128,6 @@ impl WafProxy {
 
         let host = host_config.host.clone();
         let port = host_config.port;
-
-        // Extract headers as HashMap
-        let mut headers = HashMap::new();
-        for (name, value) in &session.req_header().headers {
-            if let Ok(v) = std::str::from_utf8(value.as_bytes()) {
-                headers.insert(name.as_str().to_lowercase(), v.to_string());
-            }
-        }
 
         // Parse Content-Length for informational purposes
         let content_length = headers
@@ -205,6 +211,23 @@ fn is_uncacheable_header(name: &str) -> bool {
             | "upgrade"
             | "set-cookie"
     )
+}
+
+/// Body value that withholds the current chunk from the upstream.
+///
+/// Pingora treats `None` as "the downstream body is finished" and closes the
+/// upstream stream, so a chunk that is merely being buffered for inspection has
+/// to be replaced with an **empty** `Bytes`: Pingora skips writing it (an empty
+/// write would be a terminating chunk on the wire) and keeps the stream open.
+/// Once the downstream really is done, `None` is the correct value.
+const fn withheld_body(end_of_stream: bool) -> Option<Bytes> {
+    if end_of_stream { None } else { Some(Bytes::new()) }
+}
+
+/// Body value that releases `forward` (already inspected) to the upstream,
+/// falling back to [`withheld_body`] when there is nothing to release yet.
+fn release_body(forward: Option<Bytes>, end_of_stream: bool) -> Option<Bytes> {
+    forward.or_else(|| withheld_body(end_of_stream))
 }
 
 #[async_trait]
@@ -301,6 +324,41 @@ impl ProxyHttp for WafProxy {
             return Ok(true);
         }
 
+        // ── Header folding (must precede routing and inspection) ──────────────
+        // Every value of a repeated header name is folded into one RFC-shaped
+        // value so the detectors see the complete request, and the two abuse
+        // cases that folding cannot represent faithfully are refused outright.
+        let folded = fold_request_headers(&session.req_header().headers);
+        if folded.duplicate_host {
+            // RFC 9112 §3.2: more than one Host line is unroutable — we would
+            // pick one and the origin might pick the other.
+            warn!(
+                "Rejecting request with duplicate Host headers: ip={}",
+                self.extract_client_ip(session)
+            );
+            let response = pingora_http::ResponseHeader::build(400, None)?;
+            session.write_response_header(Box::new(response), false).await?;
+            session
+                .write_response_body(Some(Bytes::from_static(b"Bad Request")), true)
+                .await?;
+            return Ok(true);
+        }
+        if let Some(name) = &folded.overflow {
+            // The folded value would be incomplete; inspecting a truncated
+            // header is exactly the bypass the fold closes, so refuse instead.
+            warn!(
+                "Rejecting request: header '{name}' exceeds the fold limits: ip={}",
+                self.extract_client_ip(session)
+            );
+            let response = pingora_http::ResponseHeader::build(431, None)?;
+            session.write_response_header(Box::new(response), false).await?;
+            session
+                .write_response_body(Some(Bytes::from_static(b"Request Header Fields Too Large")), true)
+                .await?;
+            return Ok(true);
+        }
+        let FoldedHeaders { headers, .. } = folded;
+
         // ── Host routing (moved here from upstream_peer, C-1) ─────────────────
         let host_header = session
             .get_header("host")
@@ -353,7 +411,7 @@ impl ProxyHttp for WafProxy {
         }
 
         // ── WAF header-phase inspection ───────────────────────────────────────
-        let mut request_ctx = self.build_request_ctx(session, host_config);
+        let mut request_ctx = self.build_request_ctx(session, host_config, headers);
         let client_ip = request_ctx.client_ip;
         let path = request_ctx.path.clone();
         let host = request_ctx.host.clone();
@@ -419,12 +477,20 @@ impl ProxyHttp for WafProxy {
         Ok(false)
     }
 
-    /// Buffer the first [`BODY_PREVIEW_LIMIT`] bytes of the request body and
-    /// run WAF body-content inspection once enough data is available.
+    /// Inspect the request body window by window and release each window to the
+    /// upstream only after it has been scanned.
     ///
-    /// This callback is invoked for each body chunk *before* it is forwarded
-    /// to the upstream.  We buffer up to 64 KiB and then run a supplementary
-    /// WAF check so that `SQLi` / XSS / RCE patterns in POST bodies are caught.
+    /// This callback is invoked for each body chunk *before* it is forwarded.
+    /// Chunks are buffered (and withheld from the upstream) until a full
+    /// inspection window — or the end of the stream — is available; the window
+    /// is then handed to the WAF and, if clean, forwarded. Consecutive windows
+    /// overlap, so a payload split across a boundary is still seen contiguously.
+    ///
+    /// Unlike the previous implementation this never stops inspecting after the
+    /// first window: a request that pads 64 KiB of harmless bytes in front of
+    /// its payload no longer bypasses body detection. Bodies larger than the
+    /// policy's inspected-byte ceiling are refused with `413` by default (see
+    /// [`crate::context::BodyInspectionPolicy`]).
     async fn request_body_filter(
         &self,
         session: &mut Session,
@@ -432,47 +498,63 @@ impl ProxyHttp for WafProxy {
         end_of_stream: bool,
         ctx: &mut GatewayCtx,
     ) -> pingora_core::Result<()> {
-        // Only buffer when we have a request context and haven't inspected yet
-        if ctx.body_inspected {
+        let step = ctx.body_inspector.push(body.take(), end_of_stream);
+
+        // Nothing may leave the WAF until its window has been scanned; the
+        // release happens at the end of this function. Note that a `None` body
+        // means *end of body* to Pingora (it flags `upstream_end_of_body` and
+        // terminates the upstream stream), so a withheld chunk must be an
+        // **empty** `Bytes` — Pingora skips writing it and keeps the stream
+        // open. `None` is only correct once the downstream really is done.
+        *body = withheld_body(end_of_stream);
+
+        if step.reject {
+            let policy = body_inspection_policy();
+            let (ip, path, host) = ctx.request_ctx.as_ref().map_or_else(
+                || (String::from("unknown"), String::new(), String::new()),
+                |c| (c.client_ip.to_string(), c.path.clone(), c.host.clone()),
+            );
+            warn!(
+                "WAF rejected request body over the {} byte inspection ceiling: ip={ip} path={path} host={host}",
+                policy.max_total_bytes,
+            );
+            let response = pingora_http::ResponseHeader::build(413, None)?;
+            session.write_response_header(Box::new(response), false).await?;
+            session
+                .write_response_body(Some(Bytes::from_static(b"Payload Too Large")), true)
+                .await?;
+            return Err(pingora_core::Error::explain(
+                pingora_core::ErrorType::HTTPStatus(413),
+                "request body exceeds the WAF inspection ceiling",
+            ));
+        }
+
+        if step.over_cap {
+            // Only reachable under the opt-in fail-open policy — never silent.
+            let policy = body_inspection_policy();
+            warn!(
+                "Request body exceeds the {} byte inspection ceiling; remaining bytes are forwarded UNINSPECTED \
+                 (PRXWAF_BODY_INSPECT_OVERFLOW=log): ip={} path={}",
+                policy.max_total_bytes,
+                ctx.request_ctx
+                    .as_ref()
+                    .map_or_else(String::new, |c| c.client_ip.to_string()),
+                ctx.request_ctx.as_ref().map_or("", |c| c.path.as_str()),
+            );
+        }
+
+        let Some(window) = step.inspect else {
+            *body = release_body(step.forward, end_of_stream);
             return Ok(());
-        }
-
-        // Accumulate body bytes up to the preview limit
-        if let Some(chunk) = body {
-            let remaining = BODY_PREVIEW_LIMIT.saturating_sub(ctx.body_buf.len());
-            if remaining > 0 {
-                let take = chunk.len().min(remaining);
-                if let Some(slice) = chunk.get(..take) {
-                    ctx.body_buf.extend_from_slice(slice);
-                }
-                if take < chunk.len() {
-                    debug!(
-                        "Request body exceeds {BODY_PREVIEW_LIMIT} byte inspection limit; only the first {BODY_PREVIEW_LIMIT} bytes are scanned"
-                    );
-                }
-            } else {
-                debug!(
-                    "Request body exceeds {BODY_PREVIEW_LIMIT} byte inspection limit; only the first {BODY_PREVIEW_LIMIT} bytes are scanned"
-                );
-            }
-        }
-
-        // Run body WAF check when we have enough data or at end of stream
-        let should_inspect = ctx.body_buf.len() >= BODY_PREVIEW_LIMIT || (end_of_stream && !ctx.body_buf.is_empty());
-
-        if !should_inspect {
-            return Ok(());
-        }
-
-        ctx.body_inspected = true;
-
-        // Build a RequestCtx clone with body_preview populated
-        let mut request_ctx = match &ctx.request_ctx {
-            Some(c) => c.clone(),
-            None => return Ok(()),
         };
 
-        request_ctx.body_preview = Bytes::copy_from_slice(&ctx.body_buf);
+        // Build a RequestCtx clone with body_preview populated
+        let Some(mut request_ctx) = ctx.request_ctx.clone() else {
+            *body = release_body(step.forward, end_of_stream);
+            return Ok(());
+        };
+
+        request_ctx.body_preview = window;
 
         // Run body-phase WAF inspection (content detectors only — CC / IP / URL
         // / geo / bouncer / community already ran once in the header phase).
@@ -518,6 +600,9 @@ impl ProxyHttp for WafProxy {
                 _ => {}
             }
         }
+
+        // Scanned and clean: release this window to the upstream.
+        *body = release_body(step.forward, end_of_stream);
 
         Ok(())
     }
@@ -640,5 +725,30 @@ impl ProxyHttp for WafProxy {
                 ctx.upstream_addr.as_deref().unwrap_or("unknown"),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pingora reads `None` as "downstream body finished". A chunk that is only
+    /// being held back for inspection must therefore be an empty `Bytes`,
+    /// otherwise the upstream stream is closed mid-request and the body is
+    /// truncated.
+    #[test]
+    fn withheld_chunk_is_empty_not_none() {
+        assert_eq!(withheld_body(false), Some(Bytes::new()));
+        assert_eq!(withheld_body(true), None);
+    }
+
+    #[test]
+    fn released_window_is_forwarded_verbatim() {
+        let window = Bytes::from_static(b"user=alice");
+        assert_eq!(release_body(Some(window.clone()), false), Some(window.clone()));
+        assert_eq!(release_body(Some(window.clone()), true), Some(window));
+        // Nothing to release yet: withhold rather than terminate the stream.
+        assert_eq!(release_body(None, false), Some(Bytes::new()));
+        assert_eq!(release_body(None, true), None);
     }
 }
