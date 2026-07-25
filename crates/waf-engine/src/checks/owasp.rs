@@ -36,6 +36,7 @@ use tracing::{debug, error, info, warn};
 use waf_common::{DetectionResult, OwaspConfig, Phase, RequestCtx, is_form_urlencoded, split_form_args};
 
 use super::Check;
+use crate::audit_log::{AuditLogSink, RuleHit, ScoreVerdict};
 
 /// How many contributing rules are named in the `detail` of a score-triggered
 /// block before the list is elided.
@@ -126,6 +127,17 @@ const fn default_paranoia_level() -> u8 {
 struct YamlRule {
     id: String,
     name: String,
+    /// The upstream `SecRule` id this rule was converted from (`942100`), as
+    /// emitted by `rules/tools/modsec2yaml.py`.
+    ///
+    /// Every generated file carries it and nothing read it until now: the
+    /// engine's own `id` is the prefixed `CRS-942100`, which is the right key
+    /// for our diagnostics and the wrong one for anything speaking CRS. The
+    /// audit log writes `[id "942100"]` because that is the token every CRS
+    /// tool chain greps for. `Option` because a hand-written rule file is not
+    /// obliged to have an upstream counterpart.
+    #[serde(default)]
+    crs_id: Option<u32>,
     #[allow(dead_code)]
     #[serde(default)]
     category: String,
@@ -2549,6 +2561,9 @@ impl Default for AnomalyScoring {
 /// One rule's contribution to a request's anomaly score.
 struct Contribution<'r> {
     id: &'r str,
+    /// Upstream numeric CRS id, when the rule declares one. See
+    /// [`CompiledRule::crs_id`].
+    crs_id: Option<u32>,
     name: &'r str,
     severity: Severity,
     score: u32,
@@ -2556,6 +2571,9 @@ struct Contribution<'r> {
 
 struct CompiledRule {
     id: String,
+    /// The upstream `SecRule` id (`942100`) behind [`Self::id`]
+    /// (`CRS-942100`), when the source file declares one.
+    crs_id: Option<u32>,
     name: String,
     paranoia: u8,
     head: Condition,
@@ -2732,8 +2750,15 @@ impl Loader {
             RuleAction::Score
         });
 
+        // A file that predates `crs_id` still yields the upstream id, because
+        // the converter has always written it into `id` as `CRS-<n>`.
+        let crs_id = rule
+            .crs_id
+            .or_else(|| rule.id.strip_prefix("CRS-").and_then(|n| n.parse::<u32>().ok()));
+
         Ok(CompiledRule {
             id: rule.id,
+            crs_id,
             name: rule.name,
             paranoia: rule.paranoia,
             head,
@@ -2914,6 +2939,7 @@ impl Loader {
             rules: self.rules,
             summary: self.summary,
             scoring: AnomalyScoring::default(),
+            audit: None,
         }
     }
 }
@@ -2997,6 +3023,10 @@ pub struct OWASPCheck {
     /// Severity weights and the blocking threshold. Defaults to the upstream
     /// CRS v4.25.0 numbers; [`Self::with_config`] replaces them from the TOML.
     scoring: AnomalyScoring,
+    /// Rule-hit audit log. `None` — the default and the shipped configuration —
+    /// means nothing is recorded and the check behaves exactly as it did before
+    /// the log existed. See [`crate::audit_log`].
+    audit: Option<Arc<AuditLogSink>>,
 }
 
 impl OWASPCheck {
@@ -3149,6 +3179,17 @@ impl OWASPCheck {
         self
     }
 
+    /// Attach the rule-hit audit log.
+    ///
+    /// Without this the check records nothing, which is the shipped
+    /// configuration: `audit_log.enabled` defaults to `false` and the engine
+    /// then never builds a sink to attach.
+    #[must_use]
+    pub fn with_audit_log(mut self, sink: Option<Arc<AuditLogSink>>) -> Self {
+        self.audit = sink;
+        self
+    }
+
     /// Human-readable description of the active decision model, for the startup
     /// log.
     ///
@@ -3247,6 +3288,7 @@ impl OWASPCheck {
                     score = score.saturating_add(points);
                     contributions.push(Contribution {
                         id: &rule.id,
+                        crs_id: rule.crs_id,
                         name: &rule.name,
                         severity: rule.severity,
                         score: points,
@@ -3256,6 +3298,28 @@ impl OWASPCheck {
         }
 
         Ok((score, contributions))
+    }
+
+    /// Hand one request's rule hits to the audit log, if one is attached.
+    ///
+    /// Both halves of the verdict go through here — the rules that fired and
+    /// whether the total reached the threshold — because the sub-threshold case
+    /// is precisely the one no other log records today.
+    fn record_audit(&self, ctx: &RequestCtx, contributions: &[Contribution<'_>], verdict: ScoreVerdict) {
+        let Some(sink) = self.audit.as_ref() else {
+            return;
+        };
+        let hits: Vec<RuleHit<'_>> = contributions
+            .iter()
+            .map(|c| RuleHit {
+                crs_id: c.crs_id,
+                rule_ref: c.id,
+                name: c.name,
+                severity: c.severity.label(),
+                score: c.score,
+            })
+            .collect();
+        sink.record_rule_hits(ctx, &hits, verdict);
     }
 }
 
@@ -3324,6 +3388,22 @@ impl Check for OWASPCheck {
                 .rules
                 .iter()
                 .find(|rule| rule.paranoia <= paranoia && rule.matches(&view))?;
+            self.record_audit(
+                ctx,
+                &[Contribution {
+                    id: &rule.id,
+                    crs_id: rule.crs_id,
+                    name: &rule.name,
+                    severity: rule.severity,
+                    score: 0,
+                }],
+                ScoreVerdict {
+                    score: 0,
+                    threshold: 0,
+                    paranoia,
+                    reached_threshold: true,
+                },
+            );
             return Some(DetectionResult {
                 rule_id: Some(rule.id.clone()),
                 rule_name: rule.name.clone(),
@@ -3334,6 +3414,22 @@ impl Check for OWASPCheck {
 
         let (score, contributions) = match self.evaluate(&view, paranoia) {
             Err(rule) => {
+                self.record_audit(
+                    ctx,
+                    &[Contribution {
+                        id: &rule.id,
+                        crs_id: rule.crs_id,
+                        name: &rule.name,
+                        severity: rule.severity,
+                        score: 0,
+                    }],
+                    ScoreVerdict {
+                        score: 0,
+                        threshold: self.scoring.inbound_threshold,
+                        paranoia,
+                        reached_threshold: true,
+                    },
+                );
                 return Some(DetectionResult {
                     rule_id: Some(rule.id.clone()),
                     rule_name: rule.name.clone(),
@@ -3349,6 +3445,16 @@ impl Check for OWASPCheck {
         };
 
         let threshold = self.scoring.inbound_threshold;
+        self.record_audit(
+            ctx,
+            &contributions,
+            ScoreVerdict {
+                score,
+                threshold,
+                paranoia,
+                reached_threshold: score >= threshold,
+            },
+        );
         if score < threshold {
             // The negative case needs to be as legible as the positive one: an
             // operator chasing a miss has to be able to see that rules *did*
@@ -7021,5 +7127,67 @@ rules:
             "every shipped rule must declare an action this engine understands: {:?}",
             checker.load_summary().action_defaulted
         );
+    }
+
+    /// The converter has written `crs_id:` into every generated file since it
+    /// was written, and until this field existed serde discarded all of it —
+    /// leaving the engine unable to name a rule the way every other CRS tool
+    /// names it.
+    #[test]
+    fn every_shipped_rule_carries_its_upstream_crs_id() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        assert!(checker.rule_count() > 0, "no rules loaded from {}", crs_dir().display());
+        let missing: Vec<&str> = checker
+            .rules
+            .iter()
+            .filter(|r| r.crs_id.is_none())
+            .map(|r| r.id.as_str())
+            .collect();
+        assert!(missing.is_empty(), "rules without an upstream CRS id: {missing:?}");
+        let libinjection = checker
+            .rules
+            .iter()
+            .find(|r| r.id == "CRS-942100")
+            .expect("CRS-942100 is in the shipped rule set");
+        assert_eq!(libinjection.crs_id, Some(942_100));
+    }
+
+    /// A rule file that predates the `crs_id:` key must still yield the numeric
+    /// id, because the prefixed `id:` has always carried it.
+    #[test]
+    fn a_missing_crs_id_is_recovered_from_the_prefixed_id() {
+        let checker = OWASPCheck::from_yaml(
+            r"
+version: '1.0'
+rules:
+  - id: CRS-931100
+    name: Legacy rule without crs_id
+    severity: critical
+    paranoia: 1
+    field: query
+    operator: contains
+    value: 'legacy'
+    action: block
+  - id: LOCAL-1
+    name: Rule with no upstream counterpart
+    severity: critical
+    paranoia: 1
+    field: query
+    operator: contains
+    value: 'local'
+    action: block
+",
+        );
+        assert_eq!(checker.rules.len(), 2);
+        let by_id = |id: &str| {
+            checker
+                .rules
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.crs_id)
+                .expect("rule present in the inline rule set")
+        };
+        assert_eq!(by_id("CRS-931100"), Some(931_100));
+        assert_eq!(by_id("LOCAL-1"), None);
     }
 }

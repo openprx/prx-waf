@@ -7,6 +7,27 @@ structural gaps in the engine and only the fourth is a detection-quality defect.
 This script splits the failures into those groups so a later change can be
 measured against the group it was supposed to move.
 
+Two modes, and the buckets do not mean the same thing in both
+============================================================
+
+`--mode cloud`  go-ftw judged every test by its HTTP status code. A negative
+                test can then only assert "nothing blocked", so any CRS rule
+                blocking the request fails it — including one the corpus never
+                mentions. That is the `over-block`/`collateral` split below, and
+                it is an artefact of the mode, not of the rule set.
+
+`--mode log`    go-ftw judged every test by the rule ids prx-waf wrote to its
+                audit log, with the WAF in DetectionOnly. A negative test now
+                asserts exactly what the corpus says — "rule X did not fire" —
+                so `collateral` cannot occur by construction and every
+                `over-block` entry is a genuine false positive of the rule under
+                test. This is the posture ModSecurity v2 + CRS and Coraza are
+                measured in.
+
+In log mode the firing rules come from go-ftw itself (`triggered-rules` in its
+JSON output, one list per stage — runner/stats.go), so attribution needs no
+replay and is exact rather than inferred from a block page.
+
 Buckets, applied to every FAILED test in this order:
 
   not-implemented   The rule the test targets does not exist in
@@ -17,8 +38,11 @@ Buckets, applied to every FAILED test in this order:
                     this run enabled, so it was never evaluated. Not a defect —
                     the same test fails on ModSecurity at that PL too.
   over-block        A *negative* test (CRS asserts the rule must NOT fire) that
-                    came back 403. With --replay this splits further, because
-                    the two halves have completely different owners:
+                    the WAF got wrong. In log mode that is always the rule under
+                    test firing on a payload it must not match. In cloud mode it
+                    is "the request was blocked", which with --replay splits
+                    further, because the two halves have completely different
+                    owners:
 
                       same-rule   the rule under test is the one that fired.
                                   A genuine false positive of that rule — the
@@ -79,6 +103,11 @@ def load_corpus(crs_dir: str) -> dict:
         for case in doc.get("tests") or []:
             stages = case.get("stages") or []
             positive = negative = False
+            # The concrete ids each stage asserts on. Cloud mode cannot use
+            # these — a status code carries no id — but log mode compares them
+            # directly against what go-ftw saw fire.
+            expect_ids: set[str] = set()
+            no_expect_ids: set[str] = set()
             for stage in stages:
                 out = stage.get("output") or {}
                 log = out.get("log") or {}
@@ -86,12 +115,16 @@ def load_corpus(crs_dir: str) -> dict:
                     positive = True
                 if log.get("no_expect_ids") or log.get("no_match_regex") or out.get("no_log_contains"):
                     negative = True
+                expect_ids.update(str(i) for i in (log.get("expect_ids") or []))
+                no_expect_ids.update(str(i) for i in (log.get("no_expect_ids") or []))
             tests[f"{rule}-{case['test_id']}"] = {
                 "rule": rule,
                 "test": case["test_id"],
                 "desc": (case.get("desc") or "").strip(),
                 "positive": positive,
                 "negative": negative,
+                "expect_ids": expect_ids,
+                "no_expect_ids": no_expect_ids,
                 "group": os.path.relpath(path, root).split(os.sep)[0],
                 "stages": stages,
             }
@@ -229,11 +262,16 @@ def replay(stage: dict, host: str, port: int, timeout: float = 5.0) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", required=True, help="go-ftw -o json output")
+    ap.add_argument("--extra-results", default=None,
+                    help="second go-ftw json (the individually re-run `retry_once` tests) "
+                         "merged into the headline number")
     ap.add_argument("--crs", required=True, help="coreruleset checkout")
     ap.add_argument("--rules", required=True, help="rules/owasp-crs directory under test")
     ap.add_argument("--exclusions", default=None)
     ap.add_argument("--waf-log", default=None)
     ap.add_argument("--paranoia", type=int, required=True)
+    ap.add_argument("--mode", choices=("cloud", "log"), default="cloud",
+                    help="how go-ftw reached its verdicts; changes what the buckets mean")
     ap.add_argument("--crs-version", default="?")
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--apply-exclusions", action="store_true")
@@ -275,6 +313,35 @@ def main() -> int:
     failed = set(stats.get("failed") or [])
     skipped = set(stats.get("skipped") or [])
     ignored = set(stats.get("ignored") or [])
+    # `forced-fail` is the quarantine run.sh applies to the `retry_once` tests so
+    # that one of them cannot abort the whole run (go-ftw runner/run.go,
+    # `RunTest`). They are failures in the bulk number and are then replaced by
+    # their real verdict from --extra-results below, so nothing is double-counted
+    # and nothing is dropped from the denominator.
+    forced_fail = set(stats.get("forced-fail") or [])
+    failed |= forced_fail
+
+    # go-ftw records the rule ids it found in the log for every stage it ran
+    # (runner/stats.go, `TriggeredRules map[string][][]uint`). It is empty in
+    # cloud mode — `FTWCheck.GetTriggeredRules` returns nil there — and exact in
+    # log mode, which is what makes log-mode attribution need no replay.
+    triggered_raw = dict(stats.get("triggered-rules") or {})
+
+    if args.extra_results and os.path.exists(args.extra_results):
+        with open(args.extra_results, encoding="utf-8") as fh:
+            extra = json.load(fh)
+        extra_pass = set(extra.get("success") or [])
+        extra_fail = set(extra.get("failed") or [])
+        # The individual re-run is the authority for these ids.
+        passed -= extra_fail
+        failed -= extra_pass
+        skipped -= extra_pass | extra_fail
+        passed |= extra_pass
+        failed |= extra_fail
+        triggered_raw.update(extra.get("triggered-rules") or {})
+
+    def fired(tid: str) -> set[str]:
+        return {str(i) for stage in (triggered_raw.get(tid) or []) for i in (stage or [])}
 
     host = port = None
     if args.replay:
@@ -333,22 +400,47 @@ def main() -> int:
             entry["why"] = f"rule declares paranoia {rule['paranoia']} > PL{args.paranoia}"
             buckets["paranoia-scope"].append(entry)
         elif meta["negative"] and not meta["positive"]:
-            fired = (entry.get("replay") or {}).get("rule_name")
-            fired_ids = name_to_ids.get((fired or "").strip(), set())
-            if fired is None:
-                entry["fired"] = None
-                entry["why"] = "blocked a request CRS expects to pass (firing rule unknown; use REPLAY=1)"
-            elif rid in fired_ids:
-                entry["fired"] = rid
-                entry["why"] = "the rule under test fired on a payload CRS says it must not match"
+            if args.mode == "log":
+                # Exact: the ids the test forbids, intersected with the ids
+                # go-ftw actually saw in the log. There is no `collateral` half
+                # here — a rule the test never named cannot fail it.
+                hits = fired(tid)
+                offenders = sorted(hits & meta["no_expect_ids"])
+                entry["fired_ids"] = offenders
+                if rid in offenders:
+                    entry["fired"] = rid
+                    entry["why"] = "the rule under test fired on a payload CRS says it must not match"
+                elif offenders:
+                    entry["fired"] = offenders[0]
+                    entry["why"] = (f"a rule this test also forbids (CRS-{offenders[0]}) fired")
+                else:
+                    entry["fired"] = None
+                    entry["why"] = ("negative assertion failed with no forbidden id logged "
+                                    "(no_match_regex or a status expectation)")
             else:
-                entry["fired"] = sorted(fired_ids)[0] if fired_ids else "?"
-                entry["why"] = (f"a different rule (CRS-{entry['fired']}) blocked; upstream logs it too "
-                                "but scores it instead of blocking outright")
+                hit_name = (entry.get("replay") or {}).get("rule_name")
+                fired_ids = name_to_ids.get((hit_name or "").strip(), set())
+                if hit_name is None:
+                    entry["fired"] = None
+                    entry["why"] = "blocked a request CRS expects to pass (firing rule unknown; use REPLAY=1)"
+                elif rid in fired_ids:
+                    entry["fired"] = rid
+                    entry["why"] = "the rule under test fired on a payload CRS says it must not match"
+                else:
+                    entry["fired"] = sorted(fired_ids)[0] if fired_ids else "?"
+                    entry["why"] = (f"a different rule (CRS-{entry['fired']}) blocked; upstream logs it too "
+                                    "but scores it instead of blocking outright")
             buckets["over-block"].append(entry)
         elif meta["positive"]:
             suspect = "ARGS_NAMES" in up.get("vars", "")
-            entry["why"] = "rule present and in scope but the payload did not match"
+            if args.mode == "log":
+                missing = sorted(meta["expect_ids"] - fired(tid))
+                entry["missing_ids"] = missing
+                entry["why"] = ("rule present and in scope but its id was never logged"
+                                + (f" (missing: {', '.join(missing)})" if missing else
+                                   " (match_regex assertion)"))
+            else:
+                entry["why"] = "rule present and in scope but the payload did not match"
             entry["args_splitter_suspect"] = bool(suspect)
             buckets["missed-detection"].append(entry)
         else:
@@ -367,7 +459,14 @@ def main() -> int:
 
     print("=" * 78)
     print(f"OWASP CRS {args.crs_version} regression suite — prx-waf, PARANOIA LEVEL {args.paranoia}")
-    print("go-ftw cloud mode (verdict from HTTP status only: block=403, pass=200/404/405)")
+    if args.mode == "log":
+        print("go-ftw LOG mode (verdict from the rule ids in prx-waf's audit log; "
+              "WAF in DetectionOnly)")
+        print("  — the posture ModSecurity v2 + CRS and Coraza are measured in")
+    else:
+        print("go-ftw CLOUD mode (verdict from HTTP status only: block=403, pass=200/404/405)")
+        print("  — a negative test here asserts 'nothing blocked', which is stricter "
+              "than the corpus means")
     print("=" * 78)
     print(f"  total tests run   {run}")
     print(f"  passed            {len(passed)}   ({pct(len(passed), run)})")
@@ -401,12 +500,22 @@ def main() -> int:
         same = [r for r in buckets["over-block"] if r.get("fired") == r["rule"]]
         other = [r for r in buckets["over-block"] if r.get("fired") not in (None, r["rule"])]
         unknown = [r for r in buckets["over-block"] if r.get("fired") is None]
-        print("over-block — who actually blocked")
-        print("-" * 78)
-        print(f"  {len(same):>5}  same-rule   the rule under test fired (genuine false positive)")
-        print(f"  {len(other):>5}  collateral  another CRS rule fired (upstream scores it, we block on it)")
-        if unknown:
-            print(f"  {len(unknown):>5}  unknown     no replay data — run with REPLAY=1")
+        if args.mode == "log":
+            print("over-block — which forbidden rule fired")
+            print("-" * 78)
+            print(f"  {len(same):>5}  same-rule   the rule under test fired (genuine false positive)")
+            print(f"  {len(other):>5}  other-forbidden  another id the same test forbids fired")
+            if unknown:
+                print(f"  {len(unknown):>5}  no-id       regex/status assertion, not an id assertion")
+            print("  collateral is structurally impossible in log mode: a rule the test does")
+            print("  not name cannot fail it.")
+        else:
+            print("over-block — who actually blocked")
+            print("-" * 78)
+            print(f"  {len(same):>5}  same-rule   the rule under test fired (genuine false positive)")
+            print(f"  {len(other):>5}  collateral  another CRS rule fired (upstream scores it, we block on it)")
+            if unknown:
+                print(f"  {len(unknown):>5}  unknown     no replay data — run with REPLAY=1")
         print()
 
     for name in ("over-block", "missed-detection"):
@@ -469,7 +578,7 @@ def main() -> int:
     report = {
         "crs_version": args.crs_version,
         "paranoia": args.paranoia,
-        "mode": "cloud",
+        "mode": args.mode,
         "run": run,
         "passed": len(passed),
         "failed": len(failed),
@@ -489,12 +598,16 @@ def main() -> int:
         with open(args.baseline, encoding="utf-8") as fh:
             base = json.load(fh)
         key = f"PL{args.paranoia}"
-        expected = (base.get("results") or {}).get(key)
+        # A baseline is only meaningful within one mode — the two modes ask the
+        # WAF different questions and their failure counts are not comparable —
+        # so the file is keyed by mode first.
+        mode_block = (base.get("modes") or {}).get(args.mode) or {}
+        expected = (mode_block.get("results") or {}).get(key)
         if expected is None:
-            print(f"BASELINE: no entry for {key} in {args.baseline} — not gating.")
+            print(f"BASELINE: no entry for {args.mode}/{key} in {args.baseline} — not gating.")
         else:
             allowed = expected["failed"] + base.get("tolerance", 0)
-            print(f"BASELINE {key}: failed={len(failed)} allowed<={allowed} "
+            print(f"BASELINE {args.mode}/{key}: failed={len(failed)} allowed<={allowed} "
                   f"(baseline {expected['failed']} + tolerance {base.get('tolerance', 0)})")
             if len(failed) > allowed:
                 print("BASELINE REGRESSION — more tests fail than the recorded baseline allows.")

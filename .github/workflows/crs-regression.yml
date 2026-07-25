@@ -5,6 +5,20 @@
 # fails only when MORE tests fail than the recorded baseline allows. The
 # baseline lives in a file, not in this workflow, so moving it is a reviewable
 # diff in the PR that earned it.
+#
+# ── Why both modes run ───────────────────────────────────────────────────────
+# They cannot substitute for each other, so neither one alone is a gate.
+#
+#   log    The corpus as written, WAF in DetectionOnly, verdicts from the rule
+#          ids in the audit log. This is detection quality — the number that is
+#          comparable to ModSecurity v2 + CRS and Coraza — and the only one that
+#          moves when a rule pattern gets better or worse.
+#   cloud  Verdicts from HTTP status codes, WAF enforcing. This is what a user
+#          experiences, and it is the only mode that can catch a regression in
+#          the *blocking* decision: a scoring-model change that starts blocking
+#          benign traffic leaves every log-mode assertion untouched.
+#
+# Four jobs (2 modes × 2 paranoia levels), independent, none blocking the other.
 name: crs-regression
 
 on:
@@ -31,6 +45,10 @@ on:
         description: 'Comma-separated paranoia levels'
         required: false
         default: '1,2'
+      mode:
+        description: 'go-ftw verdict mode (log | cloud)'
+        required: false
+        default: 'log'
 
 permissions:
   contents: read
@@ -41,12 +59,13 @@ concurrency:
 
 jobs:
   ftw:
-    name: CRS regression (PL${{ matrix.pl }})
+    name: CRS regression (${{ matrix.mode }}, PL${{ matrix.pl }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
+        mode: [log, cloud]
         pl: [1, 2]
 
     services:
@@ -87,9 +106,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ${{ runner.temp }}/ftw-work/coreruleset-v4.25.0
-            ${{ runner.temp }}/ftw-work/bin
-          key: ftw-crs-v4.25.0-goftw-v1.3.0-albedo-v0.3.0
+            ${{ runner.temp }}/ftw-work-${{ matrix.mode }}/coreruleset-v4.25.0
+            ${{ runner.temp }}/ftw-work-${{ matrix.mode }}/bin
+          key: ftw-${{ matrix.mode }}-crs-v4.25.0-goftw-v1.3.0-albedo-v0.3.0
 
       - name: Build prx-waf
         run: cargo build --release -p prx-waf
@@ -98,8 +117,9 @@ jobs:
       # non-zero only when MORE tests fail than the baseline plus its tolerance.
       - name: Run CRS regression suite
         env:
+          MODE: ${{ matrix.mode }}
           PL: ${{ matrix.pl }}
-          WORK: ${{ runner.temp }}/ftw-work
+          WORK: ${{ runner.temp }}/ftw-work-${{ matrix.mode }}
           PRXWAF_BIN: ${{ github.workspace }}/target/release/prx-waf
           BASELINE: ${{ github.workspace }}/tests/ftw/baseline.json
           # Postgres comes from `services:` above, already listening on 15433,
@@ -113,17 +133,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crs-regression-pl${{ matrix.pl }}
-          path: ${{ runner.temp }}/ftw-work/reports/
+          name: crs-regression-${{ matrix.mode }}-pl${{ matrix.pl }}
+          path: ${{ runner.temp }}/ftw-work-${{ matrix.mode }}/reports/
           retention-days: 14
 
       - name: Job summary
         if: always()
         run: |
           {
-            echo '## CRS regression — PL${{ matrix.pl }}'
+            echo '## CRS regression — ${{ matrix.mode }} mode, PL${{ matrix.pl }}'
             echo '```'
-            head -60 "${{ runner.temp }}/ftw-work/reports/report-pl${{ matrix.pl }}.txt" \
+            head -60 "${{ runner.temp }}/ftw-work-${{ matrix.mode }}/reports/report-pl${{ matrix.pl }}.txt" \
               2>/dev/null || echo '(no report produced)'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

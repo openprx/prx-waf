@@ -54,17 +54,147 @@ pub struct AppConfig {
     /// install behaves like a stock CRS deployment. See [`OwaspConfig`].
     #[serde(default)]
     pub owasp: OwaspConfig,
+    /// Per-request rule-hit audit log.
+    ///
+    /// **Off by default** — enabling it creates a file and writes one line per
+    /// matched rule, which no existing deployment asked for. See
+    /// [`AuditLogConfig`].
+    #[serde(default)]
+    pub audit_log: AuditLogConfig,
 }
 
 impl AppConfig {
     /// Cross-field semantic validation applied after deserialisation.
     ///
     /// Validates the Lane 2 semantic content-security config (plan §6.2 strict
-    /// loader rule) and the OWASP anomaly-scoring model. Returns a
-    /// human-readable error on the first violation.
+    /// loader rule), the OWASP anomaly-scoring model and the audit log. Returns
+    /// a human-readable error on the first violation.
     pub fn validate(&self) -> Result<(), String> {
         self.content_security.validate()?;
-        self.owasp.validate()
+        self.owasp.validate()?;
+        self.audit_log.validate()
+    }
+}
+
+/// Per-request rule-hit audit log.
+///
+/// # What it is for
+///
+/// `security_events` records the *verdict*: one row, one rule id — the heaviest
+/// contributor. That answers "why was this blocked" and nothing else. The
+/// question an operator actually asks when tuning a rule set is "which rules did
+/// this request touch, and how much did each of them add", including for the
+/// requests that scored but stayed under the threshold and therefore produce no
+/// row at all. This log answers that: one line per matched rule, plus one line
+/// for the anomaly-score verdict, in `ModSecurity` error-log shape.
+///
+/// # PII
+///
+/// The log records request *metadata*, not request content: client IP, host,
+/// method and URI path — the same fields `attack_logs` already persists — plus
+/// the rule ids that matched. The query string is **excluded unless**
+/// [`Self::include_query`] is set, and the matched data is never written at all.
+/// Because the file is the operator's to keep, [`Self::max_size_mb`] and
+/// [`Self::keep_rotations`] bound both its size and how long that metadata
+/// survives on disk; the equivalent of the database retention pruner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogConfig {
+    /// Write the audit log at all. `false` (the default) means no file is
+    /// opened, no writer task is started and nothing is recorded.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path of the live log file. Relative paths resolve against the working
+    /// directory, like `rules.dir`.
+    #[serde(default = "default_audit_log_path")]
+    pub path: String,
+    /// Rotate the live file once it exceeds this many megabytes. `0` disables
+    /// rotation, which lets the file grow without bound — only sensible when
+    /// something external (logrotate, a container log driver) truncates it.
+    #[serde(default = "default_audit_log_max_size_mb")]
+    pub max_size_mb: u64,
+    /// How many rotated generations (`<path>.1`, `<path>.2`, …) to keep. The
+    /// oldest is deleted on each rotation, which is what bounds the lifetime of
+    /// the request metadata on disk.
+    #[serde(default = "default_audit_log_keep_rotations")]
+    pub keep_rotations: u8,
+    /// Append the query string to the logged URI. Off by default: query strings
+    /// carry user-supplied data and, on an attack, the payload itself.
+    #[serde(default)]
+    pub include_query: bool,
+    /// Name of a request header whose value is echoed to the log as a
+    /// synchronisation marker, and whose presence suppresses that request's own
+    /// rule lines.
+    ///
+    /// Empty (the default) turns the marker protocol off. Setting it to
+    /// `X-CRS-Test` reproduces what the upstream CRS test container does with
+    /// `CRS_ENABLE_TEST_MARKER=1` (rule `999999`: log the header value, then
+    /// `ctl:ruleRemoveById=1-999999` so the marker request contributes no other
+    /// line), which is what `go-ftw`'s log mode reads to delimit one test.
+    #[serde(default)]
+    pub marker_header: String,
+}
+
+fn default_audit_log_path() -> String {
+    "logs/audit.log".to_owned()
+}
+const fn default_audit_log_max_size_mb() -> u64 {
+    64
+}
+const fn default_audit_log_keep_rotations() -> u8 {
+    3
+}
+
+impl Default for AuditLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_audit_log_path(),
+            max_size_mb: default_audit_log_max_size_mb(),
+            keep_rotations: default_audit_log_keep_rotations(),
+            include_query: false,
+            marker_header: String::new(),
+        }
+    }
+}
+
+impl AuditLogConfig {
+    /// Reject a configuration that cannot produce a usable log.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.path.trim().is_empty() {
+            return Err("audit_log.path must not be empty when audit_log.enabled is true".to_owned());
+        }
+        if self.marker_header.contains(char::is_whitespace) {
+            return Err(format!(
+                "audit_log.marker_header must be a single HTTP header name, got {:?}",
+                self.marker_header
+            ));
+        }
+        Ok(())
+    }
+
+    /// Rotation threshold in bytes, or `None` when rotation is disabled.
+    #[must_use]
+    pub const fn max_size_bytes(&self) -> Option<u64> {
+        if self.max_size_mb == 0 {
+            None
+        } else {
+            Some(self.max_size_mb.saturating_mul(1024 * 1024))
+        }
+    }
+
+    /// The marker header name in lower case, or `None` when the marker protocol
+    /// is off. Request headers are stored lower-cased by the gateway.
+    #[must_use]
+    pub fn marker_header_lower(&self) -> Option<String> {
+        let trimmed = self.marker_header.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_ascii_lowercase())
+        }
     }
 }
 
@@ -723,6 +853,16 @@ pub struct HostEntry {
     /// behaviour when the key is absent.
     #[serde(default)]
     pub defense_config: crate::types::DefenseConfig,
+    /// Detect but do not enforce: every block this host would produce is
+    /// downgraded to a logged `LogOnly` decision and the request is proxied
+    /// through. The equivalent of `ModSecurity`'s `SecRuleEngine DetectionOnly`.
+    ///
+    /// Defaults to `false` (enforce), which is what a config file without the
+    /// key has always meant. Hosts created through the admin API carry the same
+    /// flag on their database row; this is the config-file half of it, which was
+    /// previously unreachable without the API.
+    #[serde(default)]
+    pub log_only_mode: bool,
 }
 
 /// Response caching configuration

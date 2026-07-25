@@ -15,14 +15,17 @@
 #
 # Engine gaps referenced here:
 #
-#   G1  no anomaly-scoring model
-#       CRS v4 rules almost all do `setvar:tx.inbound_anomaly_score_pl1=+N`
-#       and blocking happens once in rule 949110 when the accumulated score
-#       crosses the threshold. prx-waf blocks on the first matching rule. This
-#       distorts in both directions: a single low-severity match that CRS would
-#       merely score becomes a 403 (visible as failing NEGATIVE tests), and a
-#       payload that only crosses the threshold by accumulation is a non-issue
-#       for us because one hit already blocks.
+#   G1  verdict shape (was: "no anomaly-scoring model")
+#       Anomaly scoring landed in c61d652: prx-waf now accumulates
+#       `severity -> score` across every matching rule and blocks once the total
+#       reaches `owasp.inbound_anomaly_score_threshold`, which is what CRS's
+#       rule 949110 does. What is left of this gap is a property of *cloud
+#       mode*, not of the engine: a status code cannot say WHICH rule fired, so
+#       a negative test reads as "nothing blocked" and any unrelated rule fails
+#       it, while a positive test passes on any 403 at all even when the rule
+#       under test never matched. MODE=log removes both distortions by asserting
+#       on rule ids in the audit log; the two columns in baseline.json show what
+#       that is worth.
 #
 #   G2  no ARGS parameter splitter
 #       The engine hands whole query strings / bodies to a rule; upstream

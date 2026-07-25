@@ -6,12 +6,13 @@ use parking_lot::RwLock as ParkingRwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use waf_common::{DetectionResult, OwaspConfig, RequestCtx, WafAction, WafDecision};
+use waf_common::{AuditLogConfig, DetectionResult, OwaspConfig, RequestCtx, WafAction, WafDecision};
 use waf_storage::{
     Database,
     models::{AttackLog, CreateSecurityEvent, CreateSemanticObservation},
 };
 
+use crate::audit_log::{AuditLogSink, spawn_worker_if_runtime as spawn_audit_worker_if_runtime};
 use crate::block_page::render_block_page;
 use crate::checker::{RuleStore, check_ip_blacklist, check_ip_whitelist, check_url_blacklist, check_url_whitelist};
 use crate::checks::{
@@ -40,6 +41,10 @@ pub struct WafEngineConfig {
     /// numbers (critical 5 / error 4 / warning 3 / notice 2, inbound threshold
     /// 5), so a zero-config install decides the way stock CRS decides.
     pub owasp: OwaspConfig,
+    /// Per-request rule-hit audit log. Default = disabled: no file is opened,
+    /// no writer task is started and the request path is byte-for-byte the one
+    /// that existed before the log did.
+    pub audit_log: AuditLogConfig,
 }
 
 /// Main WAF engine — runs all detection phases.
@@ -111,6 +116,10 @@ pub struct WafEngine {
     /// statement — see [`crate::semantic_sink`]). When the lane is off this is
     /// never fed, so it stays idle.
     semantic_sink: Arc<SemanticObservationSink>,
+    /// Rule-hit audit log, or `None` when `audit_log.enabled = false` (the
+    /// default). Held here as well as inside the OWASP check because the marker
+    /// line has to be written once per *request*, not once per rule match.
+    audit_log: Option<Arc<AuditLogSink>>,
 }
 
 impl WafEngine {
@@ -119,7 +128,20 @@ impl WafEngine {
         let custom_rules = Arc::new(CustomRulesEngine::new());
         let sensitive = Arc::new(SensitiveCheck::new());
         let hotlink = Arc::new(AntiHotlinkCheck::new());
-        let owasp = Arc::new(OWASPCheck::new().with_config(&config.owasp));
+
+        // Audit log: only built when enabled, so the default configuration
+        // allocates no channel and starts no task.
+        let audit_log = config.audit_log.enabled.then(|| {
+            let sink = Arc::new(AuditLogSink::new(&config.audit_log));
+            let _ = spawn_audit_worker_if_runtime(&sink);
+            sink
+        });
+
+        let owasp = Arc::new(
+            OWASPCheck::new()
+                .with_config(&config.owasp)
+                .with_audit_log(audit_log.clone()),
+        );
         let geo_check = Arc::new(GeoCheck::new());
 
         // CC is a dedicated field (single counting point — see field docs).
@@ -164,6 +186,7 @@ impl WafEngine {
             synced_registry: OnceLock::new(),
             synced: ArcSwapOption::empty(),
             semantic_sink,
+            audit_log,
         }
     }
 
@@ -673,6 +696,15 @@ impl WafEngine {
     /// across phases (see [`Self::new_content_inspection_state`]). The public
     /// [`Self::inspect`] wraps this with a per-call state.
     pub async fn inspect_with_state(&self, ctx: &mut RequestCtx, state: &mut ContentInspectionState) -> WafDecision {
+        // Audit-log marker, before anything can short-circuit: the marker's
+        // whole job is to delimit a position in the log, so it has to be
+        // written for every request that carries the header, including one the
+        // guard or an early phase would drop. A no-op unless the audit log is
+        // enabled *and* a marker header is configured (both off by default).
+        if let Some(sink) = self.audit_log.as_ref() {
+            sink.record_marker(ctx);
+        }
+
         // Skip WAF if guard is disabled for this host
         if !ctx.host_config.guard_status {
             return WafDecision::allow();

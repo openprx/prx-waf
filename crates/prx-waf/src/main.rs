@@ -1788,6 +1788,7 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         WafEngineConfig {
             content_security,
             owasp: config.owasp.clone(),
+            audit_log: config.audit_log.clone(),
             ..WafEngineConfig::default()
         },
     ));
@@ -1865,6 +1866,8 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
             // Per-host Lane1 detector toggles from the config file (defaults to
             // every detector on when the key is absent).
             defense_config: entry.defense_config.clone(),
+            // Detect-only posture from the config file (defaults to enforce).
+            log_only_mode: entry.log_only_mode,
             ..HostConfig::default()
         });
         router.register(&cfg);

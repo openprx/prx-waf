@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Generate the blocking-mode status expectations the CRS corpus does not carry.
 
+CLOUD MODE ONLY. `run.sh` does not call this in log mode, and it must not: log
+mode reads the corpus's own `expect_ids` / `no_expect_ids` assertions out of
+prx-waf's audit log, which is the whole reason log mode exists. Rewriting them
+into status codes there would throw away the fidelity the mode was added for.
+
 WHY THIS EXISTS — read before touching anything here.
 
 The CRS regression corpus is written against a reference stack that runs

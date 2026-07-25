@@ -9,6 +9,64 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Rule-hit audit log (`[audit_log]`, off by default).** `security_events`
+  records the verdict — one row, one rule, the heaviest contributor. Since
+  anomaly scoring landed, a request can match three rules and still be allowed,
+  and nothing recorded it. The audit log writes one line per matched CRS rule
+  plus one for the anomaly-score verdict, in ModSecurity's bracketed
+  `[id "942100"] [msg "..."] [severity "..."] [score "..."]` error-log shape, so
+  a threshold or a paranoia level can be tuned from evidence.
+
+  Enabling it opens a file, so it is opt-in. Writes go through a bounded
+  channel to a single background task — the request path never waits on the
+  disk, and a flood drops records (counted, logged) rather than applying
+  back-pressure to traffic. Only request *metadata* is recorded (client IP,
+  host, method, URI path — the set `attack_logs` already stores); the query
+  string is opt-in via `include_query` and the matched data is never written.
+  Every attacker-controlled value is sanitised before it reaches a line, so a
+  crafted URI cannot forge a log line or a rule id. `max_size_mb` /
+  `keep_rotations` bound the disk cost and the lifetime of that metadata.
+
+- **`audit_log.marker_header`** echoes a chosen request header to the log and
+  suppresses that request's own rule lines — the same contract as upstream CRS's
+  test-marker rule `999999` with `ctl:ruleRemoveById=1-999999`. Setting it to
+  `X-CRS-Test` is what lets `go-ftw` run against prx-waf in **log mode**.
+
+- **`[[hosts]] log_only_mode`** in the config file. Detect but do not enforce
+  (`SecRuleEngine DetectionOnly`). The flag already existed on API-created
+  hosts; it was unreachable from a config file.
+
+### Fixed
+
+- **`crs_id` was silently discarded.** Every generated file in
+  `rules/owasp-crs/` carries `crs_id: 942100`, and the CRS rule struct had no
+  such field, so serde dropped all of it — leaving the engine unable to name a
+  rule the way every other CRS tool does. It is now parsed (and recovered from
+  the `CRS-` prefix for files that predate the key).
+
+### Changed
+
+- **Enforceable CRS rules: 216 of 328** (112 rejected at load and named
+  individually in the startup `WARN`). Up from the 215 the 0.2.31 notes
+  quote: evaluating `ARGS` per parameter made `CRS-942130`'s chained
+  `TX:1 @streq %{TX.2}` mean what upstream means — the equality is only a
+  tautology when the head sees a whole query string, where the `name=value`
+  separator forms it by itself — so the rule is enforced instead of refused.
+  The counts are asserted in
+  `waf-engine::checks::owasp::tests::shipped_crs_inventory_is_fully_accounted_for`,
+  which is the number to quote; the figures in the released sections below
+  are the state as of those releases.
+
+- **The CRS regression harness (`tests/ftw/`) runs in either mode.**
+  `MODE=log` (new default) runs the corpus as written with the WAF in
+  DetectionOnly and takes its verdicts from rule ids in the audit log — the
+  posture ModSecurity v2 + CRS and Coraza are measured in. `MODE=cloud` keeps
+  the previous status-code behaviour. Measured at `c3eb2dd`, CRS v4.25.0,
+  4674 tests: log mode **57.15% / 77.41% / 87.57%** at PL1/PL2/PL4, cloud mode
+  68.12% / 80.21% / 85.43%. `baseline.json` is keyed by mode, and CI runs both.
+
 ---
 
 ## [0.2.31] — 2026-07-25
@@ -98,9 +156,10 @@ an older release.
   indefinitely.
 - CRS rules now carry their declared surface's transformation and
   decoding behavior; the total number of rules the engine can enforce is
-  unchanged by this release (still 215 of 328, see 0.2.30), but which
-  specific traffic those 215 rules match against has changed per the
-  Security entries above — expect some previously-passing encoded or
+  unchanged by this release (215 of 328 as of 0.2.31, see 0.2.30 — it is
+  216 since the per-parameter `ARGS` change, recorded under Unreleased),
+  but which specific traffic those rules match against has changed per
+  the Security entries above — expect some previously-passing encoded or
   obfuscated payloads to now be caught, and some previously-blocked
   plain-text lookalikes to now pass.
 
@@ -174,9 +233,10 @@ an older release.
   back to `Field::All` for an unmapped variable. Verified against a
   running proxy: false positives 9 → 0, all 13 attack probes still
   blocked. **Enforceable CRS rules move from 224 to 215 of 328** as a
-  result of this fix (113 rules are now explicitly rejected at load and
-  named individually in a startup `WARN`, versus the previous silent
-  mismatch).
+  result of this fix (113 rules were from then on explicitly rejected at
+  load and named individually in a startup `WARN`, versus the previous
+  silent mismatch). Both figures are the state as of 0.2.30; the current
+  count is under Unreleased.
 
 ### Changed (breaking / behavior)
 
