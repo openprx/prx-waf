@@ -61,6 +61,22 @@
 //! with holdout calibration data — not silently here. Fixed by
 //! `blind_decoded_participates_in_weighted_threshold_but_not_enforce_safe`.
 //!
+//! **Cross-family aggregation is `max`, not `+` (no double counting).** One
+//! payload routinely produces evidence in more than one family — `cat /etc/passwd`
+//! fires `rce.sensitive_read` (70) and `rce_ast.sensitive_read` (70) in `Rce` *and*
+//! `traversal.sensitive_abs` (68) in `Traversal`. Only the first pair combines:
+//! the group key is `(scope, field, attack)`, so weighted summation is confined
+//! **inside** a family (that is the deliberate two-detector corroboration), and the
+//! request roll-up across families is `request_score = max_g group_score` with a
+//! **single** winning group supplying the one recommendation and the one
+//! `primary_result`. A second family can therefore only *replace* the winner by
+//! scoring higher; it can never add to another family's score, and two sub-block
+//! families can never sum their way to a Block. Fixed by
+//! `cross_family_evidence_rolls_up_by_max_not_by_sum` and
+//! `cross_family_pair_cannot_manufacture_a_block`. (Severity is compared before
+//! score in [`WinnerKey`], so a family that reached Block always outranks one that
+//! only reached Log — a Block is never masked by a higher-scoring Log.)
+//!
 //! **Primary/`request_score` contract (codex A-1).** `request_score` is the max
 //! group score and is computed independently of the primary family. The
 //! `primary_result` is chosen by a *total, `HashMap`-order-independent*
@@ -1172,5 +1188,200 @@ mod tests {
                 "the highest-scoring group must always be primary"
             );
         }
+    }
+
+    /// The SHIPPED `rce` (rce 0.5 / `rce_ast` 0.5) + `traversal` (traversal 1.0)
+    /// families, both `log_threshold = 40` / `block_threshold = 80`.
+    fn shipped_rce_traversal_cfg() -> RuntimeScoringConfig {
+        let mut attacks = HashMap::new();
+        let mut rce_weights = HashMap::new();
+        rce_weights.insert(DetectorId::Rce, 0.5);
+        rce_weights.insert(DetectorId::RceAst, 0.5);
+        attacks.insert(
+            AttackKind::Rce,
+            RuntimeAttackConfig {
+                enabled: true,
+                weights: rce_weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: HashSet::new(),
+            },
+        );
+        let mut trav_weights = HashMap::new();
+        trav_weights.insert(DetectorId::Traversal, 1.0);
+        attacks.insert(
+            AttackKind::Traversal,
+            RuntimeAttackConfig {
+                enabled: true,
+                weights: trav_weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: HashSet::new(),
+            },
+        );
+        RuntimeScoringConfig { attacks }
+    }
+
+    /// **Cross-family roll-up is `max`, never a sum — one payload cannot be
+    /// counted twice.**
+    ///
+    /// `cat /etc/passwd` legitimately fires three rules: `rce.sensitive_read` (70)
+    /// and `rce_ast.sensitive_read` (70) inside the `Rce` family — the designed
+    /// 0.5/0.5 corroboration — and `traversal.sensitive_abs` (68) inside the
+    /// `Traversal` family. The concern that this is "one piece of evidence voting
+    /// twice" would only be true if family scores combined additively. They do not:
+    /// the group key is `(scope, field, attack)`, weighted summation happens
+    /// **inside** a group, and the request roll-up is
+    /// `request_score = max_g group_score` with a **single** winning group
+    /// supplying the one recommendation and the one `primary_result`.
+    ///
+    /// So the traversal hit can never lift the RCE score (or vice versa); it can
+    /// only *replace* it as the winner if it scores higher. Here it does not:
+    /// 70 > 68, so the verdict is one `Log` attributed to `Rce` with
+    /// `request_score = 70` — not 138, and not a second independent verdict.
+    #[test]
+    fn cross_family_evidence_rolls_up_by_max_not_by_sum() {
+        let signals = [
+            sig(
+                AttackKind::Rce,
+                DetectorId::Rce,
+                "body",
+                70,
+                "rce.sensitive_read",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Rce,
+                DetectorId::RceAst,
+                "body",
+                70,
+                "rce_ast.sensitive_read",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Traversal,
+                DetectorId::Traversal,
+                "body",
+                68,
+                "traversal.sensitive_abs",
+                Provenance::Raw,
+            ),
+        ];
+        let cfg = shipped_rce_traversal_cfg();
+        let v = score(&signals, &cfg, false);
+        // Rce group  = 0.5·70 + 0.5·70 = 70 (in-family corroboration, by design).
+        // Trav group = 1.0·68        = 68.
+        // Request    = max(70, 68)   = 70. NOT 70 + 68 = 138, and NOT 100.
+        assert_eq!(v.request_score, 70, "request score is the max group score, never a sum");
+        assert_eq!(
+            v.recommendation,
+            SemanticAction::Log,
+            "70 ≥ log(40) but < block(80): one Log, not two votes toward a Block"
+        );
+        assert_eq!(
+            v.primary_result.as_ref().and_then(|r| r.rule_id.as_deref()),
+            Some("rce.sensitive_read"),
+            "a single winning group supplies the single primary"
+        );
+
+        // Removing the traversal signal entirely changes nothing about the RCE
+        // verdict — the proof that the second family contributes zero score to the
+        // first (i.e. it is not a second vote, only a second attribution).
+        let without_traversal = score(&signals[..2], &cfg, false);
+        assert_eq!(without_traversal.request_score, v.request_score);
+        assert_eq!(without_traversal.recommendation, v.recommendation);
+
+        // And the traversal group on its own is likewise unaffected by the RCE one.
+        let traversal_only = score(&signals[2..], &cfg, false);
+        assert_eq!(traversal_only.request_score, 68);
+        assert_eq!(traversal_only.recommendation, SemanticAction::Log);
+    }
+
+    /// A same-field cross-family pair can never manufacture a Block that neither
+    /// family reached on its own — the `max` roll-up makes the worst case "the
+    /// higher of the two", not "their sum".
+    #[test]
+    fn cross_family_pair_cannot_manufacture_a_block() {
+        // Two sub-block groups: Rce 0.5·78 = 39 (below its own Log bar) and
+        // Traversal 1.0·68 = 68 (Log). Sum would be 107 → Block; max is 68 → Log.
+        let signals = [
+            sig(
+                AttackKind::Rce,
+                DetectorId::Rce,
+                "body",
+                78,
+                "rce.piped_shell",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Traversal,
+                DetectorId::Traversal,
+                "body",
+                68,
+                "traversal.sensitive_abs",
+                Provenance::Raw,
+            ),
+        ];
+        let v = score(&signals, &shipped_rce_traversal_cfg(), false);
+        assert_eq!(v.request_score, 68);
+        assert_eq!(v.recommendation, SemanticAction::Log);
+    }
+
+    /// The confidence budget the new AST rules were chosen against: in the shipped
+    /// `rce` family (two detectors at 0.5) a **single** detector hit at confidence
+    /// 80 lands exactly on `log_threshold` and stays strictly below
+    /// `block_threshold`. A false positive from a lone AST rule therefore costs one
+    /// shadow log line and can never drop a request; reaching Block still requires
+    /// the structural detector to corroborate independently.
+    #[test]
+    fn lone_ast_hit_at_conf_80_logs_but_cannot_block() {
+        let lone = [sig(
+            AttackKind::Rce,
+            DetectorId::RceAst,
+            "body",
+            80,
+            "rce_ast.cmd_chain_injection",
+            Provenance::Raw,
+        )];
+        let v = score(&lone, &shipped_rce_traversal_cfg(), false);
+        assert_eq!(v.request_score, 40, "0.5 × 80 = 40");
+        assert_eq!(v.recommendation, SemanticAction::Log);
+
+        // conf 60 (`rce_ast.param_indirect`) is below the Log bar by construction:
+        // observable in `semantic_observations`, never a verdict on its own.
+        let quiet = [sig(
+            AttackKind::Rce,
+            DetectorId::RceAst,
+            "body",
+            60,
+            "rce_ast.param_indirect",
+            Provenance::Raw,
+        )];
+        let q = score(&quiet, &shipped_rce_traversal_cfg(), false);
+        assert_eq!(q.request_score, 30, "0.5 × 60 = 30");
+        assert_eq!(q.recommendation, SemanticAction::None);
+
+        // Corroborated by the structural detector, the same chain reaches Block.
+        let corroborated = [
+            sig(
+                AttackKind::Rce,
+                DetectorId::RceAst,
+                "body",
+                80,
+                "rce_ast.cmd_chain_injection",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Rce,
+                DetectorId::Rce,
+                "body",
+                80,
+                "rce.shell_exec_flag",
+                Provenance::Raw,
+            ),
+        ];
+        let c = score(&corroborated, &shipped_rce_traversal_cfg(), false);
+        assert_eq!(c.request_score, 80);
+        assert_eq!(c.recommendation, SemanticAction::Block);
     }
 }
