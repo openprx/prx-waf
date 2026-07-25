@@ -3,7 +3,8 @@
 > High-performance WAF built on Pingora
 
 <!-- Badges placeholder -->
-![Build](https://img.shields.io/badge/build-passing-brightgreen)
+[![CI](https://github.com/openprx/prx-waf/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/openprx/prx-waf/actions/workflows/ci.yml)
+[![Sec Audit](https://github.com/openprx/prx-waf/actions/workflows/sec-audit.yml/badge.svg?branch=main)](https://github.com/openprx/prx-waf/actions/workflows/sec-audit.yml)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![Rust](https://img.shields.io/badge/rust-2024--edition-orange)
 ![PostgreSQL](https://img.shields.io/badge/postgresql-16%2B-blue)
