@@ -12,8 +12,8 @@ static TRAVERSAL_DESCS: &[&str] = &[
     "Unicode-encoded traversal",
     "Windows backslash traversal (..\\)",
     "null byte injection (%00)",
-    "absolute path to sensitive directory",
-    "Windows drive-letter path (C:\\)",
+    "absolute path to a sensitive file",
+    "Windows system path (C:\\Windows\\…)",
 ];
 
 /// Fail-closed compile result (Low-1): see the equivalent comment in
@@ -35,10 +35,40 @@ static TRAVERSAL_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
         r"\.\.\\",
         // Null byte
         r"%00",
-        // Absolute path to known sensitive Unix directories
-        r"(?i)/(etc|proc|var/log|usr/local|root|home|tmp|dev|sys)(/|$)",
-        // Windows drive-letter path
-        r"(?i)[A-Za-z]:\\",
+        // ── TRAV-007 — absolute path to a sensitive file ─────────────────────
+        //
+        // The original pattern was `/(etc|proc|var/log|usr/local|root|home|tmp|
+        // dev|sys)(/|$)`, i.e. *any* absolute path under one of nine very
+        // ordinary directories. Because `request_targets` also feeds it the
+        // request path, a site whose own routes are `/home`, `/dev/api/v1` or
+        // `/tmp/preview` returned 403 for its own pages, and any ops/config
+        // payload mentioning `/etc/nginx/nginx.conf`, `/etc/resolv.conf`,
+        // `/var/log/nginx` or `/home/deploy/app` was blocked as well. An
+        // absolute path is not by itself a traversal attempt — the traversal
+        // *sequence* is what TRAV-001..006 detect — so this rule is now the
+        // narrow net for the handful of targets that have no benign reason to
+        // appear in a request: credential stores, private keys, process
+        // memory/env, and the bash `/dev/tcp` reverse-shell pseudo-device.
+        // `/etc/hosts`, `/etc/resolv.conf`, `/etc/nginx/**`, `/var/log/**`,
+        // `/usr/local/**`, `/tmp/**`, `/sys/**` and plain `/home/<user>/…`
+        // deliberately no longer match: they are normal content in runbooks,
+        // config-management payloads and log shippers.
+        concat!(
+            r"(?i)/(?:etc/(?:passwd|shadow|gshadow|master\.passwd|sudoers|ssh/|ssl/private|security/opasswd)",
+            r"|proc/(?:self|version|cmdline|environ|net/|[0-9]{1,10}/)",
+            r"|root/\.[a-z_]",
+            r"|home/[^/\s]{1,32}/\.(?:ssh|bash_history|aws|config|npmrc|docker|git-credentials|mysql_history)",
+            r"|var/log/(?:auth\.log|secure)",
+            r"|dev/(?:tcp|udp)/",
+            r"|windows/(?:win\.ini|system32/config)",
+            r"|winnt/win\.ini",
+            r"|boot\.ini)",
+        ),
+        // ── TRAV-008 — Windows system path ───────────────────────────────────
+        // `[A-Za-z]:\` matched every Windows path a user ever pastes into a bug
+        // report or a log shipper sends (`C:\Users\alice\Desktop\report.xlsx`).
+        // Windows LFI targets the system tree, so that is all this matches now.
+        r"(?i)[a-z]:[\\/]{1,2}(?:windows|winnt|inetpub|xampp|wamp|boot\.ini)\b",
     ]) {
         Ok(set) => Some(set),
         Err(e) => {
@@ -173,6 +203,70 @@ mod tests {
         ctx.body_preview = Bytes::from_static(b"file=../../../etc/passwd");
         // M-5: body is now scanned via request_targets.
         assert!(checker.check(&ctx).is_some());
+    }
+
+    /// The reported production false positives: ordinary absolute paths.
+    /// A site route named `/home` must not 403 its own page.
+    #[test]
+    fn ordinary_absolute_paths_are_allowed() {
+        let checker = DirTraversalCheck::new();
+        for (path, query) in [
+            ("/home", ""),
+            ("/dev/api/v1/status", ""),
+            ("/tmp/preview/abc", ""),
+            ("/p", "path=%2Fetc%2F"),
+            ("/p", "file=%2Fetc%2Fhosts"),
+        ] {
+            let ctx = make_ctx(path, query);
+            assert!(
+                checker.check(&ctx).is_none(),
+                "ordinary absolute path must not fire: {path}?{query}"
+            );
+        }
+        for body in [
+            r#"{"path":"/etc/nginx/nginx.conf","action":"review"}"#,
+            r#"{"path":"/etc/resolv.conf"}"#,
+            r#"{"note":"ran cat /etc/{hosts,resolv.conf} to confirm dns"}"#,
+            r#"{"logdir":"/var/log/nginx","rotate":true}"#,
+            r#"{"deploy_dir":"/home/deploy/app/current"}"#,
+            r#"{"path":"/usr/local/bin/app","user":"/home/app"}"#,
+            r#"{"text":"check /proc/cpuinfo and /sys/class/net"}"#,
+            r#"{"attachment":"C:\\Users\\alice\\Desktop\\report.xlsx"}"#,
+        ] {
+            let mut ctx = make_ctx("/upload", "");
+            ctx.body_preview = Bytes::from(body.to_string());
+            ctx.content_length = body.len() as u64;
+            assert!(
+                checker.check(&ctx).is_none(),
+                "ops/config payload must not fire: {body}"
+            );
+        }
+    }
+
+    /// The disclosure targets the narrowed rule must keep blocking.
+    #[test]
+    fn sensitive_absolute_paths_still_detected() {
+        let checker = DirTraversalCheck::new();
+        for query in [
+            "f=%2Fetc%2Fpasswd",
+            "f=%2Fetc%2Fshadow",
+            "f=%2Fetc%2Fsudoers",
+            "f=%2Fetc%2Fssh%2Fssh_host_rsa_key",
+            "f=%2Fproc%2Fself%2Fenviron",
+            "f=%2Fproc%2Fversion",
+            "f=%2Froot%2F.ssh%2Fid_rsa",
+            "f=%2Froot%2F.bash_history",
+            "f=%2Fhome%2Falice%2F.ssh%2Fid_rsa",
+            "f=%2Fdev%2Ftcp%2F1.2.3.4%2F4444",
+            "f=C%3A%5CWindows%5Cwin.ini",
+            "f=%2Fvar%2Flog%2Fauth.log",
+        ] {
+            let ctx = make_ctx("/p", query);
+            assert!(
+                checker.check(&ctx).is_some(),
+                "sensitive path disclosure must still fire: {query}"
+            );
+        }
     }
 
     #[test]

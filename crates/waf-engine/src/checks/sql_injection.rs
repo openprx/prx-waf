@@ -36,10 +36,40 @@ static SQLI_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
     match RegexSet::new([
         // UNION … SELECT
         r"(?i)\bunion\b[\s/\*]+select\b",
-        // Comment sequences followed by DML keywords
-        r"(?i)(--|#|/\*[\s\S]*?\*/)[\s]*?(select|union|drop|insert|update|delete|exec|xp_)",
-        // Stacked queries: '; <keyword>
-        r"(?i)'[\s]*;[\s]*(drop|delete|insert|update|exec|select|truncate)\b",
+        // ── SQLI-002 — comment-based injection ───────────────────────────────
+        //
+        // The original `(--|#|/*…*/)\s*?(select|union|drop|…)` blocked every
+        // markdown heading that happens to start with a DML verb — `# Update
+        // the billing schema`, `## Delete stale rows` — i.e. a 403 on any
+        // docs / issue / comment API. That branch also had close to zero
+        // detection value: text *after* a `--` or `#` comment marker is inert,
+        // so `-- select` is not an injection at all. What is worth matching is
+        // the comment used as a *query terminator* right behind an injected
+        // quote (`admin'--`, `admin'#`), and inline `/*…*/` comments used to
+        // split a keyword (`/*!50000union*/select`). The `'#` form additionally
+        // requires the value to end there, because `'#…'` is also how every
+        // jQuery/CSS id selector is written (`$('#app')`).
+        concat!(
+            r"(?i)(?:'\s{0,4}--",
+            r#"|'\s{0,4}#[ \t]{0,4}(?:$|[&"'\]}])"#,
+            r"|/\*[\s\S]{0,64}?\*/\s*(?:select|union|drop|insert|update|delete|exec|xp_)",
+            r"|(?:select|union|drop|insert|update|delete)\s*/\*[\s\S]{0,64}?\*/)",
+        ),
+        // ── SQLI-003 — stacked query ─────────────────────────────────────────
+        // The quoted form (`'; DROP …`) plus the unquoted structural forms: a
+        // numeric injection point (`?id=1; DROP TABLE users--`) never carries a
+        // quote and was previously missed entirely. Each unquoted alternative
+        // requires the full statement shape (`DROP TABLE`, `DELETE FROM`,
+        // `INSERT INTO`, `UPDATE … SET`), so ordinary prose with a semicolon
+        // ("update shipped; delete request pending") does not match.
+        concat!(
+            r"(?i)(?:'[\s]*;[\s]*(?:drop|delete|insert|update|exec|select|truncate)\b",
+            r"|;\s*(?:drop|truncate)\s+(?:table|database)\b",
+            r"|;\s*delete\s+from\b",
+            r"|;\s*insert\s+into\b",
+            r"|;\s*update\s+\w{1,64}\s+set\b",
+            r"|;\s*exec(?:ute)?\s)",
+        ),
         // Time-based blind
         r"(?i)\b(sleep|benchmark|waitfor[\s]+delay|pg_sleep)\s*\(",
         // xp_cmdshell
@@ -61,8 +91,21 @@ static SQLI_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
         // / delimiter). A bare long hex run in free text (colour codes, hashes)
         // no longer fires — only hex used as an SQL operand does.
         r"(?i)[=(,<>]\s*0x[0-9a-f]{4,}\b",
-        // Single-quote escapes common in error-based injection
-        r"'[\s]*(or|and|union|select|drop|insert|update|delete)\b",
+        // ── SQLI-011 — quote followed by an SQL keyword ──────────────────────
+        // `'\s*(or|and|union|…)` fires on any language that writes an elided
+        // article: `l'union fait la force`, `l'and…`, `d'insert…`. The keyword
+        // alone is not the signal — the *statement shape* behind it is, so each
+        // alternative now demands the syntax that actually makes it SQL.
+        concat!(
+            r"(?i)(?:'\s*(?:or|and)\s+[^']{0,32}[=<>]",
+            r"|'\s*union\s+(?:all\s+)?select\b",
+            r"|'\s*(?:drop|truncate)\s+(?:table|database)\b",
+            r"|'\s*insert\s+into\b",
+            r"|'\s*update\s+\w{1,64}\s+set\b",
+            r"|'\s*delete\s+from\b",
+            r"|'\s*exec(?:ute)?\b",
+            r"|'\s*select\s+[\w*])",
+        ),
         // MySQL/MSSQL catalog tables
         r"(?i)\b(mysql\.(user|db)|master\.\.(sysdatabases|sysobjects))\b",
     ]) {
@@ -248,6 +291,55 @@ mod tests {
             checker.check(&ctx).is_some(),
             "hex literal used as an SQL operand must still fire"
         );
+    }
+
+    /// Markdown headings, elided articles and jQuery selectors are ordinary
+    /// content, not SQL.
+    #[test]
+    fn benign_text_with_sql_shaped_tokens_is_allowed() {
+        let checker = SqlInjectionCheck::new();
+        for body in [
+            "# Update the billing schema\n\n## Delete stale rows before insert\n",
+            r##"{"md":"# Update\n## Delete rows"}"##,
+            r#"{"fr":"l'union fait la force"}"#,
+            r#"{"note":"user's order and admin's report"}"#,
+            r#"{"jq":"$(document).ready(function(){ $('#a').val(1); });"}"#,
+            r#"{"desc":"Order #1234 update shipped; delete request pending"}"#,
+            r#"{"body":"Please run the migration; then verify the report"}"#,
+            r#"{"query":"SELECT name FROM users WHERE id = $1"}"#,
+        ] {
+            let ctx = make_ctx("", body);
+            assert!(checker.check(&ctx).is_none(), "benign text must not fire: {body}");
+        }
+    }
+
+    /// The injection shapes those narrowings must keep — plus the unquoted
+    /// stacked query that Lane1 used to miss entirely.
+    #[test]
+    fn narrowed_rules_still_detect_injection() {
+        let checker = SqlInjectionCheck::new();
+        for (query, body) in [
+            // unquoted stacked query — previously undetected
+            ("id=1; DROP TABLE users--", ""),
+            ("id=1; DELETE FROM users", ""),
+            // quoted stacked query
+            ("", r#"{"x":"';drop table users--"}"#),
+            // comment used as a query terminator
+            ("u=admin'--", ""),
+            ("", r#"{"u":"admin'#"}"#),
+            // inline comment keyword splitting
+            ("", r#"{"x":"1/*!50000union*/select 1"}"#),
+            // quote + statement shape
+            ("", r#"{"x":"' union all select password from users"}"#),
+            ("", r#"{"x":"' or 1=1"}"#),
+            ("", r#"{"x":"admin';exec xp_cmdshell 'dir'"}"#),
+        ] {
+            let ctx = make_ctx(query, body);
+            assert!(
+                checker.check(&ctx).is_some(),
+                "sql injection must still fire: {query:?} {body:?}"
+            );
+        }
     }
 
     #[test]
