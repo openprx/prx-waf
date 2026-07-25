@@ -1,3 +1,24 @@
+# Supply-chain gate. Every job here is blocking on purpose — see the note on the
+# `deny` job about why `continue-on-error` must never come back.
+#
+# REPRODUCING THIS LOCALLY (do not skip — version skew hides real failures):
+# EmbarkStudios/cargo-deny-action@v2 pins cargo-deny in its own Dockerfile
+# (0.20.2 as of 2026-07-25), which is usually NEWER than whatever
+# `cargo install cargo-deny` put on a developer machine. The versions disagree on
+# how `[advisories] unsound` is evaluated: cargo-deny 0.19.x reported
+# "advisories ok" on a tree that 0.20.2 correctly fails. A green local run
+# therefore proves nothing. Reproduce with the pinned binary instead:
+#
+#   ver=$(curl -s https://raw.githubusercontent.com/EmbarkStudios/cargo-deny-action/v2/Dockerfile \
+#           | sed -n 's/^ENV deny_version="\(.*\)"/\1/p')
+#   curl -sL "https://github.com/EmbarkStudios/cargo-deny/releases/download/$ver/cargo-deny-$ver-x86_64-unknown-linux-musl.tar.gz" \
+#     | tar -xz --strip-components=1 -C /tmp cargo-deny
+#   /tmp/cargo-deny --log-level warn --manifest-path ./Cargo.toml --all-features check advisories
+#
+# That argv is exactly what the action runs. Note the advisory database lives in
+# ~/.cargo/advisory-dbs/ (plural, hashed subdirectory) — clearing
+# ~/.cargo/advisory-db does nothing.
+
 name: Sec Audit
 
 on:
@@ -47,14 +68,95 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     strategy:
+      # Do not cancel the sibling leg when one fails: a licence/ban regression and
+      # an advisory regression are independent, and we want to see both at once.
+      fail-fast: false
       matrix:
         checks:
           - advisories
           - bans licenses sources
-    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    # NOTE: this job deliberately has no `continue-on-error`. It used to carry
+    # `continue-on-error: ${{ matrix.checks == 'advisories' }}`, which made the
+    # workflow (and the README badge) report success while the advisories leg had
+    # been failing on main for weeks — the failure was still a required check, so
+    # it silently blocked every dependabot PR while looking green from the outside.
+    # If the advisories leg goes red, that is a real finding: fix the dependency or
+    # add a justified, dated per-ID ignore to deny.toml. Never re-add this key, and
+    # never widen the severity levels in deny.toml to get past it.
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check ${{ matrix.checks }}
           arguments: --all-features
+
+  # Every `ignore` entry in deny.toml is a security exemption. Exemptions rot:
+  # the dependency gets fixed, the reasoning stops holding, and nobody notices
+  # because the gate stays green. This job enforces the `# review-by: YYYY-MM-DD`
+  # tag that each entry must carry, so an exemption cannot outlive its review date.
+  ignore-expiry:
+    name: Ignore Expiry Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check deny.toml ignore review dates
+        run: |
+          python3 - <<'PY'
+          import datetime, re, sys
+
+          config = "deny.toml"
+          with open(config, encoding="utf-8") as handle:
+              lines = handle.readlines()
+
+          tag = re.compile(r"^\s*#\s*review-by:\s*(\d{4}-\d{2}-\d{2})\s*$")
+          entry = re.compile(r'^\s*\{\s*id\s*=\s*"([^"]+)"')
+
+          # Pair each review-by tag with the first ignore entry that follows it.
+          pending, reviews = [], []
+          for number, line in enumerate(lines, start=1):
+              found = tag.match(line)
+              if found:
+                  pending.append((number, found.group(1)))
+                  continue
+              found = entry.match(line)
+              if found and pending:
+                  number_of_tag, date = pending.pop()
+                  pending.clear()
+                  reviews.append((number_of_tag, date, found.group(1)))
+
+          ignores = [m.group(1) for m in map(entry.match, lines) if m]
+          tagged = {advisory for _, _, advisory in reviews}
+          untagged = [advisory for advisory in ignores if advisory not in tagged]
+          if untagged:
+              for advisory in untagged:
+                  print(f"::error file={config}::{advisory} has no '# review-by: YYYY-MM-DD' tag")
+              sys.exit(1)
+
+          today = datetime.date.today()
+          overdue = False
+          for number, raw, advisory in reviews:
+              try:
+                  due = datetime.date.fromisoformat(raw)
+              except ValueError:
+                  print(f"::error file={config},line={number}::{advisory}: unparsable review-by '{raw}'")
+                  overdue = True
+                  continue
+              remaining = (due - today).days
+              if remaining < 0:
+                  print(
+                      f"::error file={config},line={number}::{advisory} exemption expired on {due} "
+                      f"({-remaining} days ago). Re-verify that it is still unreachable, then either "
+                      f"delete it or push the review-by date with fresh evidence."
+                  )
+                  overdue = True
+              elif remaining <= 30:
+                  print(
+                      f"::warning file={config},line={number}::{advisory} exemption is due for "
+                      f"review on {due} (in {remaining} days)."
+                  )
+              else:
+                  print(f"ok: {advisory} review-by {due} ({remaining} days left)")
+
+          sys.exit(1 if overdue else 0)
+          PY
