@@ -5706,6 +5706,7 @@ dependencies = [
  "quinn",
  "rand 0.8.5",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde",

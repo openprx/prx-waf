@@ -50,6 +50,9 @@ lz4_flex = { workspace = true }
 # X.509 parsing — peer certificate SAN → authenticated node identity (H-9)
 x509-parser = { workspace = true }
 
+# Ed25519 sign/verify — signed vote grants / election quorum certificates (H-12)
+ring = { workspace = true }
+
 [lints]
 workspace = true
 

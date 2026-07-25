@@ -111,6 +111,10 @@ parking_lot = "0.12"
 
 # Signature verification
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+# Ed25519 sign/verify for cluster election quorum certificates. Already the sole
+# crypto provider in the tree (rustls/quinn/rcgen all build on it), and rcgen
+# mints the node keys through it, so the PKCS#8 encoding round-trips exactly.
+ring = "0.17"
 zstd = "0.13"
 
 # X.509 parsing (cluster peer certificate SAN → node identity binding, H-9)

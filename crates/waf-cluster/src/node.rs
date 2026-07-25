@@ -19,6 +19,7 @@ use waf_engine::{Rule, RuleRegistry, RuleReloader};
 
 use crate::cluster_forward::PendingForwards;
 use crate::crypto::token::{JoinTokenClaims, UsedJoinTokens};
+use crate::crypto::vote::ClusterIdentity;
 use crate::election::ElectionManager;
 use crate::health::HeartbeatTracker;
 use crate::protocol::{ChangeOp, ClusterMessage, ConfigSync, RuleChange, RuleSyncResponse, SyncType};
@@ -367,6 +368,17 @@ impl NodeState {
         Arc::clone(&self.rule_reloader.lock())
     }
 
+    /// Attach the certificate identity that signs this node's vote grants and
+    /// verifies everybody else's (H-12).
+    ///
+    /// Until this is attached the node can neither win an election nor accept
+    /// one: ballots are unsigned and unverifiable, so the election path fails
+    /// closed. Wired from [`crate::ClusterNode::run`] once the node's
+    /// certificate material is available.
+    pub fn attach_cluster_identity(&self, identity: Arc<ClusterIdentity>) {
+        self.election.attach_identity(identity);
+    }
+
     /// Attach the handler that executes forwarded API writes on the main node.
     pub fn attach_api_forward_handler(&self, handler: Arc<dyn ApiForwardHandler>) {
         *self.api_forward_handler.lock() = Some(handler);
@@ -401,7 +413,7 @@ impl NodeState {
     /// Drives the re-join loop (see [`crate::discovery::run_rejoin_loop`]): a
     /// node whose Main is unknown, evicted, or phi-dead re-runs the join
     /// handshake to re-learn the current Main instead of adopting an
-    /// uncorroborated `ElectionResult` (H-11).
+    /// unverifiable `ElectionResult` (H-12).
     pub async fn verified_main_is_live(&self) -> bool {
         let Some(main_id) = self.main_node_id().await else {
             return false;

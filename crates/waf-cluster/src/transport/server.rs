@@ -345,12 +345,25 @@ async fn dispatch_message(msg: ClusterMessage, node_state: &NodeState, auth_id: 
             // Process a vote request from a candidate.
             match node_state.election.process_vote(&vote) {
                 Ok(true) => {
-                    // Grant — echo back with our node_id as voter.
+                    // Grant — echo back with our node_id as voter, plus the
+                    // signature that lets every node recount the ballot (H-12).
+                    // Without a certificate identity we cannot produce one, and
+                    // an unsigned grant is worthless to the candidate, so the
+                    // echo is suppressed rather than sent unprovable.
+                    let Some(grant) = node_state.election.sign_grant(vote.term, &vote.candidate_id) else {
+                        warn!(
+                            candidate = %vote.candidate_id,
+                            term = vote.term,
+                            "Cannot sign vote grant: no cluster certificate identity attached"
+                        );
+                        return None;
+                    };
                     Some(ClusterMessage::ElectionVote(ElectionVote {
                         term: vote.term,
                         candidate_id: vote.candidate_id,
                         last_log_index: vote.last_log_index,
                         voter_id: Some(node_state.node_id.clone()),
+                        grant: Some(grant),
                     }))
                 }
                 Ok(false) => None,
@@ -515,7 +528,8 @@ fn unix_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::node::StorageMode;
-    use crate::protocol::{ElectionVote, Heartbeat, JoinRequest};
+    use crate::protocol::{ElectionVote, Heartbeat, JoinRequest, SignedGrant};
+    use crate::test_support::TestPki;
     use waf_common::config::{ClusterConfig, ClusterCryptoConfig, NodeRole};
 
     fn node(id: &str) -> Arc<NodeState> {
@@ -524,6 +538,25 @@ mod tests {
             ..ClusterConfig::default()
         };
         Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"))
+    }
+
+    /// A node wired to a signing identity minted under `pki`.
+    fn node_with_identity(id: &str, pki: &TestPki) -> Arc<NodeState> {
+        let n = node(id);
+        n.attach_cluster_identity(pki.identity(id));
+        n
+    }
+
+    /// A node with a declared membership and a signing identity.
+    fn member_node(id: &str, members: &[&str], pki: &TestPki) -> Arc<NodeState> {
+        let cfg = ClusterConfig {
+            node_id: id.to_string(),
+            members: members.iter().map(|s| (*s).to_string()).collect(),
+            ..ClusterConfig::default()
+        };
+        let n = Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"));
+        n.attach_cluster_identity(pki.identity(id));
+        n
     }
 
     const TEST_CA_KEY: &str = "fake-ca-private-key-pem-material-for-tests";
@@ -604,12 +637,14 @@ mod tests {
 
     #[tokio::test]
     async fn vote_request_with_forged_candidate_is_dropped() {
-        let n = node("self");
+        let pki = TestPki::new();
+        let n = node_with_identity("self", &pki);
         let forged = ClusterMessage::ElectionVote(ElectionVote {
             term: 1,
             candidate_id: "impersonated".to_string(),
             last_log_index: 0,
             voter_id: None,
+            grant: None,
         });
         // Authenticated as "peer-P" but claims candidacy for "impersonated".
         let resp = dispatch_message(forged, &n, "peer-P").await;
@@ -618,30 +653,43 @@ mod tests {
 
     #[tokio::test]
     async fn vote_request_from_authenticated_candidate_is_granted() {
-        let n = node("self");
-        let genuine = ClusterMessage::ElectionVote(ElectionVote {
-            term: 1,
-            candidate_id: "peer-P".to_string(),
-            last_log_index: 0,
-            voter_id: None,
-        });
-        let resp = dispatch_message(genuine, &n, "peer-P").await;
+        let pki = TestPki::new();
+        let n = node_with_identity("self", &pki);
+        let resp = dispatch_message(vote_request(1, "peer-P"), &n, "peer-P").await;
         match resp {
             Some(ClusterMessage::ElectionVote(v)) => {
                 assert_eq!(v.candidate_id, "peer-P");
                 assert_eq!(v.voter_id.as_deref(), Some("self"));
+                let grant = v.grant.expect("a granted vote must carry its signature");
+                // Anybody under the cluster CA can recount it — including the
+                // candidate, which is exactly the point.
+                let signer = pki
+                    .identity("bystander")
+                    .verify_grant(&grant, 1, "peer-P")
+                    .expect("the grant must verify against the cluster CA");
+                assert_eq!(signer, "self");
             }
             other => panic!("expected a vote grant, got {other:?}"),
         }
     }
 
+    /// A node with no certificate identity cannot produce a provable grant, so
+    /// it withholds the echo rather than send one nobody can count.
+    #[tokio::test]
+    async fn vote_grant_is_withheld_without_a_signing_identity() {
+        let n = node("self");
+        let resp = dispatch_message(vote_request(1, "peer-P"), &n, "peer-P").await;
+        assert!(resp.is_none(), "an unsigned grant must not be sent");
+    }
+
     #[tokio::test]
     async fn election_result_with_forged_winner_is_dropped() {
-        let n = node("self");
+        let pki = TestPki::new();
+        let n = node_with_identity("self", &pki);
         let forged = ClusterMessage::ElectionResult(crate::protocol::ElectionResult {
             term: 5,
             elected_id: "usurper".to_string(),
-            voter_ids: vec!["a".to_string(), "b".to_string()],
+            grants: pki.grants(&["a", "b"], 5, "usurper"),
         });
         let resp = dispatch_message(forged, &n, "peer-P").await;
         assert!(resp.is_none());
@@ -649,13 +697,23 @@ mod tests {
         assert_eq!(n.current_role().await, NodeRole::Worker);
     }
 
-    // ── H-11: ElectionResult over the real dispatch path ─────────────────────
+    // ── H-12: ElectionResult over the real dispatch path ─────────────────────
 
-    fn election_result(term: u64, elected: &str, voters: &[&str]) -> ClusterMessage {
+    fn vote_request(term: u64, candidate: &str) -> ClusterMessage {
+        ClusterMessage::ElectionVote(ElectionVote {
+            term,
+            candidate_id: candidate.to_string(),
+            last_log_index: 0,
+            voter_id: None,
+            grant: None,
+        })
+    }
+
+    fn election_result(term: u64, elected: &str, grants: Vec<SignedGrant>) -> ClusterMessage {
         ClusterMessage::ElectionResult(crate::protocol::ElectionResult {
             term,
             elected_id: elected.to_string(),
-            voter_ids: voters.iter().map(|s| (*s).to_string()).collect(),
+            grants,
         })
     }
 
@@ -665,7 +723,8 @@ mod tests {
     /// not be able to pin the term.
     #[tokio::test]
     async fn self_declared_main_with_empty_ballot_is_not_adopted() {
-        let n = node("victim");
+        let pki = TestPki::new();
+        let n = node_with_identity("victim", &pki);
         n.add_or_update_peer(PeerInfo {
             node_id: "usurper".to_string(),
             addr: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
@@ -674,7 +733,7 @@ mod tests {
         })
         .await;
 
-        let resp = dispatch_message(election_result(u64::MAX, "usurper", &[]), &n, "usurper").await;
+        let resp = dispatch_message(election_result(u64::MAX, "usurper", Vec::new()), &n, "usurper").await;
         assert!(resp.is_none());
         assert!(
             !n.is_current_main("usurper").await,
@@ -688,98 +747,160 @@ mod tests {
         );
     }
 
-    /// **Attack ①f** — the usurper first wins our vote, then lies about the rest
-    /// of the ballot to claim a quorum it never had.
+    /// **Attack ①f (H-12 core)** — the usurper really did win our vote, and
+    /// fabricates the rest of the ballot to reach a quorum it never had. This is
+    /// exactly the minority-usurpation case the H-11 local-vote anchor could not
+    /// stop: our own anchor holds, so only a recount of the *other* votes can
+    /// refuse it.
     #[tokio::test]
-    async fn self_declared_main_with_forged_quorum_is_not_adopted() {
-        let cfg = ClusterConfig {
-            node_id: "victim".to_string(),
-            members: ["victim", "main-A", "n3", "n4", "usurper"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
-            ..ClusterConfig::default()
+    async fn minority_winner_cannot_fabricate_the_rest_of_the_quorum() {
+        let pki = TestPki::new();
+        let n = member_node("victim", &["victim", "n3", "n4", "n5", "usurper"], &pki);
+
+        // We genuinely grant our vote to the usurper this term.
+        let granted = dispatch_message(vote_request(1, "usurper"), &n, "usurper").await;
+        let Some(ClusterMessage::ElectionVote(echo)) = granted else {
+            panic!("the victim must grant its vote");
         };
-        let n = Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"));
+        let real_grant = echo.grant.expect("our own grant");
 
-        // We voted for main-A this term, not for the usurper.
-        let granted = dispatch_message(
-            ClusterMessage::ElectionVote(ElectionVote {
-                term: 1,
-                candidate_id: "main-A".to_string(),
-                last_log_index: 0,
-                voter_id: None,
-            }),
-            &n,
-            "main-A",
-        )
-        .await;
-        assert!(granted.is_some(), "the honest candidate gets our vote");
+        // Two real grants (the usurper's own and ours) plus three fabrications.
+        // 3 of 5 would be a quorum; only the two real ones survive the recount.
+        let forged_ballot = vec![
+            pki.grant("usurper", 1, "usurper"),
+            real_grant,
+            // Valid certificate, signature taken from a different key.
+            SignedGrant {
+                cert_b64: pki.grant("n3", 1, "usurper").cert_b64,
+                chain_b64: Vec::new(),
+                signature_b64: pki.grant("n3", 1, "usurper").signature_b64,
+            },
+            // A grant the usurper collected in an earlier term, replayed here.
+            pki.grant("n4", 0, "usurper"),
+            // Pure garbage.
+            SignedGrant {
+                cert_b64: "not-a-certificate".to_string(),
+                chain_b64: Vec::new(),
+                signature_b64: "not-a-signature".to_string(),
+            },
+        ];
+        dispatch_message(election_result(1, "usurper", forged_ballot), &n, "usurper").await;
 
-        dispatch_message(
-            election_result(1, "usurper", &["usurper", "victim", "n3", "n4"]),
-            &n,
-            "usurper",
-        )
-        .await;
         assert!(
             !n.is_current_main("usurper").await,
-            "a stuffed ballot must not install the usurper as Main"
-        );
-    }
-
-    /// Positive control: a winner this node actually voted for, with a real
-    /// quorum, is adopted as Main over the same dispatch path.
-    #[tokio::test]
-    async fn genuine_election_winner_is_adopted_as_main() {
-        let cfg = ClusterConfig {
-            node_id: "voter".to_string(),
-            members: ["voter", "winner", "n3"].into_iter().map(String::from).collect(),
-            ..ClusterConfig::default()
-        };
-        let n = Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"));
-
-        let granted = dispatch_message(
-            ClusterMessage::ElectionVote(ElectionVote {
-                term: 1,
-                candidate_id: "winner".to_string(),
-                last_log_index: 0,
-                voter_id: None,
-            }),
-            &n,
-            "winner",
-        )
-        .await;
-        assert!(granted.is_some());
-
-        dispatch_message(election_result(1, "winner", &["winner", "voter"]), &n, "winner").await;
-        assert!(
-            n.is_current_main("winner").await,
-            "the corroborated winner becomes the authoritative Main"
+            "a minority winner must not be installed as Main by fabricating the rest of the ballot"
         );
         assert_eq!(n.current_role().await, NodeRole::Worker);
+        assert_eq!(
+            n.election.current_term_sync(),
+            1,
+            "the term we voted in stands; the forged result does not advance it further"
+        );
     }
 
-    /// Split-vote resolution: an incumbent Main that voted for the *losing*
-    /// candidate cannot corroborate the real winner's announcement. It must
-    /// stand down (otherwise two nodes believe they are Main) — but it must not
-    /// adopt the claimant as its Main either.
+    /// The same attack, where the usurper's own grant is genuine but the
+    /// remaining "voters" are certificates minted by a CA of its own.
     #[tokio::test]
-    async fn incumbent_main_stands_down_for_an_unverifiable_claim() {
+    async fn ballot_padded_with_foreign_ca_grants_is_not_a_quorum() {
+        let pki = TestPki::new();
+        let foreign = TestPki::new();
+        let n = member_node("victim", &["victim", "n3", "n4", "n5", "usurper"], &pki);
+
+        let mut ballot = pki.grants(&["usurper"], 1, "usurper");
+        ballot.extend(foreign.grants(&["victim", "n3", "n4"], 1, "usurper"));
+        dispatch_message(election_result(1, "usurper", ballot), &n, "usurper").await;
+
+        assert!(
+            !n.is_current_main("usurper").await,
+            "grants signed under a foreign CA must not count toward quorum"
+        );
+    }
+
+    /// Duplicate entries for the same voter are counted once.
+    #[tokio::test]
+    async fn repeated_grants_from_one_voter_do_not_make_a_quorum() {
+        let pki = TestPki::new();
+        let n = member_node("victim", &["victim", "n3", "n4", "n5", "usurper"], &pki);
+
+        let mut ballot = pki.grants(&["usurper"], 1, "usurper");
+        // Four more grants, all from the same voter (fresh certificates, same SAN).
+        for _ in 0..4 {
+            ballot.push(pki.grant("n3", 1, "usurper"));
+        }
+        dispatch_message(election_result(1, "usurper", ballot), &n, "usurper").await;
+
+        assert!(
+            !n.is_current_main("usurper").await,
+            "one voter stuffing the ballot must count as a single vote"
+        );
+    }
+
+    /// Positive control: a real majority, signed, is adopted as Main over the
+    /// same dispatch path — including by a node that voted for somebody else.
+    #[tokio::test]
+    async fn genuine_signed_quorum_is_adopted_as_main() {
+        let pki = TestPki::new();
+        let n = member_node("voter", &["voter", "winner", "n3"], &pki);
+
+        let granted = dispatch_message(vote_request(1, "winner"), &n, "winner").await;
+        assert!(granted.is_some());
+
+        let ballot = pki.grants(&["winner", "voter"], 1, "winner");
+        dispatch_message(election_result(1, "winner", ballot), &n, "winner").await;
+        assert!(
+            n.is_current_main("winner").await,
+            "a verified quorum certificate installs the winner as the authoritative Main"
+        );
+        assert_eq!(n.current_role().await, NodeRole::Worker);
+        assert_eq!(n.election.current_term_sync(), 1, "the winner's term is adopted");
+    }
+
+    /// Liveness case that H-11 could not serve: this node voted for the *losing*
+    /// candidate, so it holds no supporting local evidence — yet the winner's
+    /// quorum certificate is self-evident and is accepted.
+    #[tokio::test]
+    async fn node_that_voted_for_the_loser_still_accepts_the_winner() {
+        let pki = TestPki::new();
+        let n = member_node("voter", &["voter", "winner", "loser", "n4", "n5"], &pki);
+
+        let granted = dispatch_message(vote_request(1, "loser"), &n, "loser").await;
+        assert!(granted.is_some(), "our vote went to the losing candidate");
+
+        // The winner carried n4 and n5: a 3-of-5 majority that does not include us.
+        let ballot = pki.grants(&["winner", "n4", "n5"], 1, "winner");
+        dispatch_message(election_result(1, "winner", ballot), &n, "winner").await;
+        assert!(
+            n.is_current_main("winner").await,
+            "a node in the losing minority must still follow the proven winner"
+        );
+    }
+
+    /// An incumbent Main keeps its role when an unprovable claim arrives: with
+    /// verifiable ballots a real leader is always provable, so an unverifiable
+    /// claim is simply false. This is what removes the deposition denial of
+    /// service that the H-11 compensating step-down created.
+    #[tokio::test]
+    async fn incumbent_main_ignores_an_unverifiable_claim() {
         let (n, _token) = main_node_with_token(false, "");
+        let pki = TestPki::new();
+        n.attach_cluster_identity(pki.identity("main"));
         assert_eq!(n.current_role().await, NodeRole::Main);
 
-        dispatch_message(election_result(7, "challenger", &["challenger"]), &n, "challenger").await;
+        for _ in 0..3 {
+            dispatch_message(
+                election_result(7, "challenger", pki.grants(&["challenger"], 7, "challenger")),
+                &n,
+                "challenger",
+            )
+            .await;
+        }
 
         assert_eq!(
             n.current_role().await,
-            NodeRole::Worker,
-            "the incumbent stands down rather than forming a second Main"
+            NodeRole::Main,
+            "an unprovable claim must not be able to depose the real Main"
         );
-        assert!(
-            n.main_node_id().await.is_none(),
-            "standing down must not hand authority to the unverified claimant"
-        );
+        assert!(n.main_node_id().await.is_none());
         assert_eq!(
             n.election.current_term_sync(),
             0,
@@ -787,12 +908,40 @@ mod tests {
         );
     }
 
-    /// A worker is unaffected by the same claim: it keeps its recorded Main.
+    /// A deposed Main does stand down once the challenger proves its quorum.
+    #[tokio::test]
+    async fn incumbent_main_stands_down_for_a_proven_winner() {
+        let pki = TestPki::new();
+        let cfg = ClusterConfig {
+            node_id: "old-main".to_string(),
+            role: "main".to_string(),
+            members: ["old-main", "challenger", "n3"].into_iter().map(String::from).collect(),
+            ..ClusterConfig::default()
+        };
+        let n = Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"));
+        n.attach_cluster_identity(pki.identity("old-main"));
+        assert_eq!(n.current_role().await, NodeRole::Main);
+
+        let ballot = pki.grants(&["challenger", "n3"], 4, "challenger");
+        dispatch_message(election_result(4, "challenger", ballot), &n, "challenger").await;
+
+        assert_eq!(n.current_role().await, NodeRole::Worker);
+        assert!(n.is_current_main("challenger").await);
+        assert_eq!(n.election.current_term_sync(), 4);
+    }
+
+    /// A worker is unaffected by an unprovable claim: it keeps its recorded Main.
     #[tokio::test]
     async fn worker_keeps_its_main_when_an_unverifiable_claim_arrives() {
-        let n = node("worker-1");
+        let pki = TestPki::new();
+        let n = node_with_identity("worker-1", &pki);
         n.set_main_node_id("main-A".to_string()).await;
-        dispatch_message(election_result(7, "challenger", &["challenger"]), &n, "challenger").await;
+        dispatch_message(
+            election_result(7, "challenger", pki.grants(&["challenger"], 7, "challenger")),
+            &n,
+            "challenger",
+        )
+        .await;
         assert_eq!(n.main_node_id().await.as_deref(), Some("main-A"));
         assert_eq!(n.current_role().await, NodeRole::Worker);
     }

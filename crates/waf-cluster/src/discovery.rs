@@ -58,16 +58,19 @@ pub(crate) fn join_request_for(node_state: &NodeState) -> ClusterMessage {
 /// Periodically re-run the join handshake while this node has no live, verified
 /// Main.
 ///
-/// # Why (H-11 liveness)
+/// # Why (H-12 liveness)
 ///
-/// Since H-11 a node only recognises a new Main from an `ElectionResult` it can
-/// corroborate with its own vote. A node that missed the vote round (message
-/// loss, or it voted for the losing candidate in a split vote) therefore keeps
-/// running with the rules it has instead of adopting an unprovable leader — but
-/// it must be able to catch up without forcing a disruptive new election.
+/// A node only recognises a new Main from an `ElectionResult` whose quorum
+/// certificate it can verify. Verification no longer depends on this node having
+/// taken part in the ballot, so a node that voted for the losing candidate keeps
+/// up on its own — but a node that never *received* the announcement (message
+/// loss, a partition that healed after the election, or a process that started
+/// afterwards) still holds no leader at all, and must be able to catch up
+/// without forcing a disruptive new election.
 ///
 /// The join handshake is that catch-up path: it is answered only by a node that
-/// really is the Main (N-M), it is cheap, idempotent, and invisible to the rest
+/// really is the Main (N-M) and that holds the cluster CA private key needed to
+/// validate the join token, it is cheap, idempotent, and invisible to the rest
 /// of the cluster. Runs until the tokio task is cancelled.
 pub async fn run_rejoin_loop(node_state: Arc<NodeState>, interval_ms: u64) {
     let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(interval_ms.max(500)));

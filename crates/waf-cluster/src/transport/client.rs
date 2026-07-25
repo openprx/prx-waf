@@ -118,8 +118,8 @@ impl ClusterClient {
 
         // Re-run the join handshake on every (re)connection rather than only
         // once at process start. This is what lets a node that has no verified
-        // Main — a fresh node, a restarted one, or one that could not
-        // corroborate the last `ElectionResult` (H-11) — re-learn the Main
+        // Main — a fresh node, a restarted one, or one that never received the
+        // last `ElectionResult` (H-12) — re-learn the Main
         // identity from a seed without having to disrupt the cluster with a new
         // election. Idempotent on the Main side, and the join token stays
         // re-presentable by the same node (AUD-L4).
@@ -344,9 +344,19 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState, auth_id:
                 }
                 // This is a vote-grant echo addressed to us as the candidate.
                 if vote.candidate_id == node_state.node_id {
-                    let recorded = node_state.election.record_vote_for_me(vote.term, voter_id.clone());
-                    if recorded {
-                        debug!(voter = %voter_id, term = vote.term, "Vote grant received");
+                    // H-12: a grant only counts with its signature attached. An
+                    // unsigned echo — a pre-H-12 peer, or a peer trying to have
+                    // its bare word counted — adds nothing to the ballot.
+                    let Some(grant) = vote.grant.as_ref() else {
+                        warn!(
+                            voter = %voter_id,
+                            term = vote.term,
+                            "Ignoring unsigned vote grant; the peer must be upgraded to a signed-ballot build"
+                        );
+                        return;
+                    };
+                    if node_state.election.record_grant(vote.term, grant, &voter_id) {
+                        debug!(voter = %voter_id, term = vote.term, "Signed vote grant received");
                     }
                 }
             } else {
@@ -412,7 +422,8 @@ fn unix_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::node::StorageMode;
-    use crate::protocol::{ElectionVote, Heartbeat};
+    use crate::protocol::{ElectionVote, Heartbeat, SignedGrant};
+    use crate::test_support::TestPki;
     use waf_common::config::{ClusterConfig, NodeRole};
 
     fn node(id: &str) -> Arc<NodeState> {
@@ -423,23 +434,38 @@ mod tests {
         Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new"))
     }
 
-    fn vote_grant(candidate: &str, voter: &str, term: u64) -> ClusterMessage {
+    fn node_with_identity(id: &str, pki: &TestPki) -> Arc<NodeState> {
+        let n = node(id);
+        n.attach_cluster_identity(pki.identity(id));
+        n
+    }
+
+    fn vote_grant(candidate: &str, voter: &str, term: u64, grant: Option<SignedGrant>) -> ClusterMessage {
         ClusterMessage::ElectionVote(ElectionVote {
             term,
             candidate_id: candidate.to_string(),
             last_log_index: 0,
             voter_id: Some(voter.to_string()),
+            grant,
         })
     }
 
     #[tokio::test]
     async fn forged_voter_id_vote_grant_is_dropped() {
-        let c = node("candidate-C");
+        let pki = TestPki::new();
+        let c = node_with_identity("candidate-C", &pki);
         let term = c.election.increment_term_and_vote_for_self();
         assert_eq!(c.election.vote_count_for_term(term), 1, "self-vote only");
 
-        // Peer authenticated as "peer-P" forges a grant from "ghost-majority".
-        dispatch_incoming(vote_grant("candidate-C", "ghost-majority", term), &c, "peer-P").await;
+        // Peer authenticated as "peer-P" forges a grant from "ghost-majority" —
+        // and signs it with a real key, so only the H-9 binding catches it.
+        let ghost = pki.grant("ghost-majority", term, "candidate-C");
+        dispatch_incoming(
+            vote_grant("candidate-C", "ghost-majority", term, Some(ghost)),
+            &c,
+            "peer-P",
+        )
+        .await;
         assert_eq!(
             c.election.vote_count_for_term(term),
             1,
@@ -447,11 +473,38 @@ mod tests {
         );
 
         // A grant genuinely attributable to the authenticated peer IS counted.
-        dispatch_incoming(vote_grant("candidate-C", "peer-P", term), &c, "peer-P").await;
+        let real = pki.grant("peer-P", term, "candidate-C");
+        dispatch_incoming(vote_grant("candidate-C", "peer-P", term, Some(real)), &c, "peer-P").await;
         assert_eq!(
             c.election.vote_count_for_term(term),
             2,
             "authenticated voter must be counted"
+        );
+    }
+
+    /// A peer whose `voter_id` matches its certificate but whose grant is not
+    /// signed (a pre-H-12 build, or a peer hoping its word is enough) adds
+    /// nothing to the ballot.
+    #[tokio::test]
+    async fn unsigned_vote_grant_is_not_counted() {
+        let pki = TestPki::new();
+        let c = node_with_identity("candidate-C", &pki);
+        let term = c.election.increment_term_and_vote_for_self();
+
+        dispatch_incoming(vote_grant("candidate-C", "peer-P", term, None), &c, "peer-P").await;
+        assert_eq!(
+            c.election.vote_count_for_term(term),
+            1,
+            "an unsigned grant must not be counted"
+        );
+
+        // …nor does a signature for a different candidate, replayed at us.
+        let elsewhere = pki.grant("peer-P", term, "another-candidate");
+        dispatch_incoming(vote_grant("candidate-C", "peer-P", term, Some(elsewhere)), &c, "peer-P").await;
+        assert_eq!(
+            c.election.vote_count_for_term(term),
+            1,
+            "a grant addressed to another candidate must not be counted"
         );
     }
 

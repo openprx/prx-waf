@@ -39,6 +39,30 @@ pub struct Heartbeat {
     pub config_version: u64,
 }
 
+/// One voter's cryptographic proof that it granted its vote (H-12).
+///
+/// The voter signs `(term, candidate_id)` with the Ed25519 key behind its mTLS
+/// identity and ships its cluster-CA-issued leaf certificate alongside, so any
+/// node holding the CA certificate can validate the chain, recover the voter's
+/// `node_id` from the certificate SAN and check the signature. There is
+/// deliberately no self-declared voter field: the identity is whatever the
+/// certificate proves.
+///
+/// See [`crate::crypto::vote`] for the signed payload and its domain separation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedGrant {
+    /// Voter's leaf certificate, DER, base64.
+    pub cert_b64: String,
+    /// Any intermediate CA certificates between the leaf and the cluster root,
+    /// DER, base64. Empty for the single-level PKI this crate generates; carried
+    /// so an externally provisioned two-level PKI still verifies. Untrusted
+    /// input — path validation still has to end at the configured root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chain_b64: Vec<String>,
+    /// Ed25519 signature over the grant payload, base64.
+    pub signature_b64: String,
+}
+
 /// Vote cast by a candidate during an election, or a vote-grant echo from a peer.
 ///
 /// When `voter_id` is `None` → this is a vote **request** from the candidate.
@@ -52,14 +76,29 @@ pub struct ElectionVote {
     /// Present only in vote-grant responses; identifies the voter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voter_id: Option<String>,
+    /// Present only in vote-grant responses: the signed proof of the grant.
+    ///
+    /// Optional on the wire so that a grant from a pre-H-12 peer still parses
+    /// and can be rejected with a diagnosable reason instead of tearing down the
+    /// stream on a deserialization error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<SignedGrant>,
 }
 
-/// Broadcast by the winner after receiving a majority of votes
+/// Broadcast by the winner after receiving a majority of votes.
+///
+/// `grants` is the election's **quorum certificate**: one [`SignedGrant`] per
+/// voter, including the winner's own vote for itself. It replaces the pre-H-12
+/// `voter_ids` name list, which was an unverifiable self-declaration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElectionResult {
     pub term: u64,
     pub elected_id: String,
-    pub voter_ids: Vec<String>,
+    /// Defaults to empty so a pre-H-12 announcement still parses — and is then
+    /// rejected for want of a quorum, which is the intended fail-closed
+    /// behaviour for a partially upgraded cluster.
+    #[serde(default)]
+    pub grants: Vec<SignedGrant>,
 }
 
 /// Initial join handshake from a new worker to main

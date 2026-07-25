@@ -20,12 +20,15 @@ use waf_cluster::{
     ClusterMessage, NodeState, RuleReloader, StorageMode,
     crypto::{ca::CertificateAuthority, node_cert::NodeCertificate, token::generate_token},
     node::PeerInfo,
-    protocol::{ChangeOp, ElectionResult, RuleSyncRequest, RuleSyncResponse, SyncType},
+    protocol::{ChangeOp, ElectionResult, ElectionVote, RuleSyncRequest, RuleSyncResponse, SyncType},
     sync::rules::{RuleChangelog, apply_sync_response, handle_sync_request, snapshot_rules},
     transport::{client::ClusterClient, server::ClusterServer},
 };
 use waf_common::config::{ClusterConfig, NodeRole};
 use waf_engine::{Rule, RuleRegistry, SyncedRuleStore, cluster_sync};
+
+mod common;
+use common::{TestPki, signature_forgery};
 
 // ─── Shared test helpers ───────────────────────────────────────────────────────
 
@@ -76,6 +79,14 @@ fn make_node_state(node_id: &str, config: ClusterConfig) -> Arc<NodeState> {
     let mut cfg = config;
     cfg.node_id = node_id.to_string();
     Arc::new(NodeState::new(cfg, StorageMode::Full).expect("NodeState::new failed"))
+}
+
+/// Helper: a `NodeState` wired to an election signing identity under `pki`,
+/// exactly as `ClusterNode::run` wires it in production.
+fn make_signing_node_state(node_id: &str, config: ClusterConfig, pki: &TestPki) -> Arc<NodeState> {
+    let node = make_node_state(node_id, config);
+    node.attach_cluster_identity(pki.identity(node_id));
+    node
 }
 
 // ─── QUIC transport tests ──────────────────────────────────────────────────────
@@ -541,14 +552,14 @@ async fn e2e_rule_sync_applied_only_from_authenticated_main() {
 #[tokio::test]
 async fn e2e_forged_election_result_cannot_hijack_the_rule_registry() {
     install_crypto_provider();
+    let pki = TestPki::new();
 
     let victim_addr = random_loopback_addr();
-    let ca = CertificateAuthority::generate(365).expect("CA generate");
-    let ca_cert_der = ca.cert_der().expect("CA DER");
-    let victim_cert = NodeCertificate::generate("victim", &ca, 1).expect("victim cert");
-    let rogue_cert = NodeCertificate::generate("rogue", &ca, 1).expect("rogue cert");
+    let ca_cert_der = pki.ca().cert_der().expect("CA DER");
+    let victim_cert = pki.node_cert("victim");
+    let rogue_cert = pki.node_cert("rogue");
 
-    let victim_state = make_node_state("victim", minimal_config(victim_addr));
+    let victim_state = make_signing_node_state("victim", minimal_config(victim_addr), &pki);
     let server = ClusterServer::new(
         victim_addr,
         ca_cert_der.clone(),
@@ -563,7 +574,7 @@ async fn e2e_forged_election_result_cannot_hijack_the_rule_registry() {
     });
     tokio::time::sleep(Duration::from_millis(60)).await;
 
-    let rogue_state = make_node_state("rogue", minimal_config(random_loopback_addr()));
+    let rogue_state = make_signing_node_state("rogue", minimal_config(random_loopback_addr()), &pki);
     let (tx, rx) = mpsc::channel::<ClusterMessage>(16);
     let client = ClusterClient::new(
         victim_addr,
@@ -583,7 +594,7 @@ async fn e2e_forged_election_result_cannot_hijack_the_rule_registry() {
     tx.send(ClusterMessage::ElectionResult(ElectionResult {
         term: u64::MAX,
         elected_id: "rogue".to_string(),
-        voter_ids: vec![],
+        grants: vec![],
     }))
     .await
     .expect("send forged result");
@@ -622,6 +633,227 @@ async fn e2e_forged_election_result_cannot_hijack_the_rule_registry() {
         "a forged term must not pin the victim's term"
     );
     assert_eq!(*victim_state.rules_version.read().await, 0);
+}
+
+/// **Attack ①f end to end (H-12)** — minority usurpation over live QUIC mTLS.
+///
+/// The rogue does not fake anything up front: it runs a real election round,
+/// really wins the victim's vote and really holds the victim's signature. Only
+/// then does it pad the ballot to the quorum it never reached. The victim's own
+/// anchor ("I voted for this node in this term") is genuinely satisfied, so this
+/// is precisely the case the H-11 design could not refuse — and it is refused
+/// here by recounting the signatures.
+#[tokio::test]
+async fn e2e_minority_usurper_cannot_forge_a_quorum() {
+    install_crypto_provider();
+    let pki = TestPki::new();
+    let foreign = TestPki::new();
+
+    let victim_addr = random_loopback_addr();
+    let ca_cert_der = pki.ca().cert_der().expect("CA DER");
+    let victim_cert = pki.node_cert("victim");
+    let rogue_cert = pki.node_cert("rogue");
+
+    // Five declared members: three signatures are needed to elect.
+    let mut victim_cfg = minimal_config(victim_addr);
+    victim_cfg.members = ["victim", "rogue", "n3", "n4", "n5"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let victim_state = make_signing_node_state("victim", victim_cfg, &pki);
+
+    let server = ClusterServer::new(
+        victim_addr,
+        ca_cert_der.clone(),
+        victim_cert.cert_pem.clone(),
+        victim_cert.key_pem.clone(),
+    );
+    let victim_srv = Arc::clone(&victim_state);
+    tokio::spawn(async move {
+        if let Err(e) = server.serve(victim_srv).await {
+            tracing::error!("victim server error: {e}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let mut rogue_cfg = minimal_config(random_loopback_addr());
+    rogue_cfg.members = ["victim", "rogue", "n3", "n4", "n5"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let rogue_state = make_signing_node_state("rogue", rogue_cfg, &pki);
+    let (tx, rx) = mpsc::channel::<ClusterMessage>(16);
+    let client = ClusterClient::new(
+        victim_addr,
+        "rogue".to_string(),
+        ca_cert_der,
+        rogue_cert.cert_pem,
+        rogue_cert.key_pem,
+    );
+    let rogue_for_task = Arc::clone(&rogue_state);
+    tokio::spawn(async move {
+        if let Err(e) = client.run_with_reconnect(rogue_for_task, rx).await {
+            tracing::error!("rogue client error: {e}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // ── A real election round: the rogue stands and asks for votes ──────────
+    let term = rogue_state.election.increment_term_and_vote_for_self();
+    tx.send(ClusterMessage::ElectionVote(ElectionVote {
+        term,
+        candidate_id: "rogue".to_string(),
+        last_log_index: 0,
+        voter_id: None,
+        grant: None,
+    }))
+    .await
+    .expect("send vote request");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let real_grants = rogue_state.election.grants_for_term(term);
+    assert_eq!(
+        real_grants.len(),
+        2,
+        "the rogue really holds its own vote and the victim's — a genuine minority"
+    );
+
+    // ── …then pads that minority out to a "quorum" ─────────────────────────
+    let mut ballot = real_grants;
+    ballot.push(signature_forgery(&pki, "n3", term, "rogue"));
+    ballot.push(foreign.grant("n4", term, "rogue"));
+    ballot.push(pki.grant("n5", term + 1, "rogue"));
+
+    tx.send(ClusterMessage::ElectionResult(ElectionResult {
+        term,
+        elected_id: "rogue".to_string(),
+        grants: ballot,
+    }))
+    .await
+    .expect("send padded result");
+
+    tx.send(ClusterMessage::RuleSyncResponse(RuleSyncResponse {
+        version: 999,
+        sync_type: SyncType::Full,
+        changes: vec![],
+        snapshot_lz4: snapshot_rules(&[make_test_rule("attacker-owns-you")]).expect("snapshot"),
+    }))
+    .await
+    .expect("send forged rule push");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    assert!(
+        !victim_state.is_current_main("rogue").await,
+        "two real votes out of five must not install a Main, however the ballot is padded"
+    );
+    assert!(victim_state.main_node_id().await.is_none());
+    assert!(
+        !victim_state
+            .rule_registry
+            .read()
+            .rules
+            .contains_key("attacker-owns-you"),
+        "the minority usurper must not reach the rule registry"
+    );
+}
+
+/// **Positive control (H-12)** — the same wire path, with a ballot that really
+/// does carry a majority of cluster signatures, installs the winner and lets its
+/// rule push through.
+///
+/// The absent members' grants are minted from the test CA; in production each
+/// node signs with its own key, which is why holding the CA private key is the
+/// residual trust assumption documented for this design.
+#[tokio::test]
+async fn e2e_proven_quorum_installs_the_new_main() {
+    install_crypto_provider();
+    let pki = TestPki::new();
+
+    let victim_addr = random_loopback_addr();
+    let ca_cert_der = pki.ca().cert_der().expect("CA DER");
+    let victim_cert = pki.node_cert("follower");
+    let winner_cert = pki.node_cert("winner");
+
+    let members: Vec<String> = ["follower", "winner", "n3", "n4", "n5"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let mut follower_cfg = minimal_config(victim_addr);
+    follower_cfg.members = members.clone();
+    let follower_state = make_signing_node_state("follower", follower_cfg, &pki);
+
+    let server = ClusterServer::new(
+        victim_addr,
+        ca_cert_der.clone(),
+        victim_cert.cert_pem.clone(),
+        victim_cert.key_pem.clone(),
+    );
+    let follower_srv = Arc::clone(&follower_state);
+    tokio::spawn(async move {
+        if let Err(e) = server.serve(follower_srv).await {
+            tracing::error!("follower server error: {e}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let mut winner_cfg = minimal_config(random_loopback_addr());
+    winner_cfg.members = members;
+    let winner_state = make_signing_node_state("winner", winner_cfg, &pki);
+    let (tx, rx) = mpsc::channel::<ClusterMessage>(16);
+    let client = ClusterClient::new(
+        victim_addr,
+        "winner".to_string(),
+        ca_cert_der,
+        winner_cert.cert_pem,
+        winner_cert.key_pem,
+    );
+    tokio::spawn(async move {
+        if let Err(e) = client.run_with_reconnect(winner_state, rx).await {
+            tracing::error!("winner client error: {e}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // Three of five members signed for the winner — a genuine quorum, and one
+    // that does not include the follower, which never voted at all.
+    tx.send(ClusterMessage::ElectionResult(ElectionResult {
+        term: 1,
+        elected_id: "winner".to_string(),
+        grants: pki.grants(&["winner", "n3", "n4"], 1, "winner"),
+    }))
+    .await
+    .expect("send genuine result");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(
+        follower_state.is_current_main("winner").await,
+        "a verified quorum certificate installs the winner as the authoritative Main"
+    );
+    assert_eq!(
+        follower_state.election.current_term_sync(),
+        1,
+        "the follower adopts the proven term"
+    );
+
+    // …and the new Main's rule pushes are now accepted on the data plane.
+    tx.send(ClusterMessage::RuleSyncResponse(RuleSyncResponse {
+        version: 7,
+        sync_type: SyncType::Full,
+        changes: vec![],
+        snapshot_lz4: snapshot_rules(&[make_test_rule("from-the-real-main")]).expect("snapshot"),
+    }))
+    .await
+    .expect("send rule push");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    assert!(
+        follower_state
+            .rule_registry
+            .read()
+            .rules
+            .contains_key("from-the-real-main"),
+        "the elected Main's rules reach the data plane"
+    );
 }
 
 /// **Positive control** — the whole legitimate path over real QUIC: a worker

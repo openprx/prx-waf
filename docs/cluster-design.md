@@ -383,18 +383,34 @@ pub struct Heartbeat {
     pub config_version: u64,
 }
 
+/// A vote grant, verifiable by any holder of the cluster CA certificate.
+/// The voter signs `(term, candidate_id)` with the Ed25519 key behind its mTLS
+/// identity; the voter's node_id is read from the certificate SAN, never from a
+/// self-declared field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedGrant {
+    pub cert_b64: String,       // voter leaf certificate, DER, base64
+    pub chain_b64: Vec<String>, // intermediates, if any (empty for the built-in single-level PKI)
+    pub signature_b64: String,  // Ed25519 signature over "prx-waf/cluster/vote-grant/v1\n{term:016x}\n{candidate}"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElectionVote {
     pub term: u64,
     pub candidate_id: String,
     pub last_log_index: u64,
+    pub voter_id: Option<String>,  // Some(id) => this is a grant echo
+    pub grant: Option<SignedGrant>, // present on grant echoes
 }
 
+/// `grants` is the election's quorum certificate — one signature per voter,
+/// including the winner's vote for itself. Receivers recount it; an announcement
+/// without a verifiable majority is rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElectionResult {
     pub term: u64,
     pub elected_id: String,
-    pub voter_ids: Vec<String>,
+    pub grants: Vec<SignedGrant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -6,6 +6,8 @@ pub mod health;
 pub mod node;
 pub mod protocol;
 pub mod sync;
+#[cfg(test)]
+mod test_support;
 pub mod transport;
 
 pub use cluster_forward::PendingForwards;
@@ -161,6 +163,16 @@ impl ClusterNode {
             (ca_cert_der, node_cert)
         };
 
+        // ── Election signing identity (H-12) ─────────────────────────────────
+        // Built from the same certificate material the QUIC transport presents,
+        // so a signed vote grant and an mTLS connection prove the same node.
+        // Fail fast: without it this node can neither win nor accept an
+        // election, which is far harder to diagnose at 03:00 than a startup
+        // error naming the broken certificate.
+        let identity = crate::crypto::vote::ClusterIdentity::new(&node_cert.cert_pem, &node_cert.key_pem, &ca_cert_der)
+            .context("failed to build the cluster election signing identity from the node certificate")?;
+        node_state.attach_cluster_identity(Arc::new(identity));
+
         info!(
             node_id = %node_state.node_id,
             listen = %listen_addr,
@@ -190,8 +202,8 @@ impl ClusterNode {
 
             // The JoinRequest is no longer queued here: `ClusterClient` sends it
             // on every (re)connection, so a node that drops its link — or that
-            // could not corroborate the last ElectionResult (H-11) — re-learns
-            // the Main identity instead of never joining again.
+            // never received the last ElectionResult (H-12) — re-learns the Main
+            // identity instead of never joining again.
 
             let client = ClusterClient::new(
                 seed_addr,
