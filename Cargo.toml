@@ -85,7 +85,7 @@ totp-lite = "2"
 data-encoding = "2"
 
 # Phase 5 additions
-wasmtime = { version = "44.0.0", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "anyhow"] }
+wasmtime = { version = "47.0.2", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "anyhow"] }
 moka = { version = "0.12", features = ["future"] }
 quinn = { version = "0.11", features = ["rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
