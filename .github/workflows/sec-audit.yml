@@ -158,5 +158,37 @@ jobs:
               else:
                   print(f"ok: {advisory} review-by {due} ({remaining} days left)")
 
+          # deny.toml is the single source of truth, but cargo-audit cannot read
+          # it and has no include mechanism, so .cargo/audit.toml has to repeat
+          # the same IDs. Assert the two sets are identical: a silent divergence
+          # means one of the two gates is exempting something the other is not.
+          mirror = ".cargo/audit.toml"
+          quoted = re.compile(r'"(RUSTSEC-\d{4}-\d{4})"')
+          with open(mirror, encoding="utf-8") as handle:
+              mirror_lines = handle.readlines()
+          in_list, mirrored = False, set()
+          for line in mirror_lines:
+              stripped = line.strip()
+              if stripped.startswith("#"):
+                  continue
+              if stripped.startswith("ignore"):
+                  in_list = True
+              if in_list:
+                  mirrored.update(quoted.findall(line))
+                  if "]" in stripped:
+                      in_list = False
+          declared = set(ignores)
+          for advisory in sorted(declared - mirrored):
+              print(f"::error file={mirror}::{advisory} is ignored in deny.toml but missing here")
+              overdue = True
+          for advisory in sorted(mirrored - declared):
+              print(
+                  f"::error file={mirror}::{advisory} is ignored here but not in deny.toml — "
+                  f"deny.toml is the source of truth; add it there with evidence or drop it here"
+              )
+              overdue = True
+          if declared == mirrored:
+              print(f"ok: deny.toml and {mirror} agree on {len(declared)} ignore(s)")
+
           sys.exit(1 if overdue else 0)
           PY

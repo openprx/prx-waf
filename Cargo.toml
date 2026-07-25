@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.34"
+version = "0.2.35"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -32,7 +32,7 @@ pingora-timeout = { version = "0.8" }
 # API framework
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -63,7 +63,7 @@ aho-corasick = "1"
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 instant-acme = "0.7"
 rcgen = "0.13"
-base64 = "0.22"
+base64 = "0.23"
 # HTML5 parser (Servo html5ever core) for the Lane 2 XSS DOM semantic detector
 # (P-XSS-1). WHATWG-compliant fragment parsing + tree walk; no C toolchain. Our
 # own code stays zero-unsafe (the transitive tendril/ego-tree unsafe is mature,
@@ -85,7 +85,7 @@ totp-lite = "2"
 data-encoding = "2"
 
 # Phase 5 additions
-wasmtime = { version = "43.0.0", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "anyhow"] }
+wasmtime = { version = "44.0.0", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "anyhow"] }
 moka = { version = "0.12", features = ["future"] }
 quinn = { version = "0.11", features = ["rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
@@ -118,7 +118,22 @@ ring = "0.17"
 zstd = "0.13"
 
 # X.509 parsing (cluster peer certificate SAN → node identity binding, H-9)
-x509-parser = "0.16"
+#
+# 0.16 -> 0.18 behaviour note, relevant to node_id_from_cert_der() in
+# crates/waf-cluster/src/transport/identity.rs: 0.18 added a `GeneralName::Invalid`
+# variant "so an invalid entry does not stop parsing". Before, a leaf whose SAN
+# held a malformed entry made subject_alternative_name() error and the peer was
+# rejected; now parsing continues and the loop simply skips the bad entry, so a
+# later well-formed DNS SAN still yields a node id. The `if let
+# GeneralName::DNSName(..)` match still compiles unchanged. This is a
+# fail-closed -> fail-open relaxation, bounded by the fact that rustls has
+# already path-validated the leaf against our own single-level cluster CA before
+# that function runs, and the CA only ever mints certs via
+# NodeCertificate::generate. 0.17 also tightened X509StructureValidator (date
+# encoding, version > 1 for issuer/subjectUniqueID) and added RSA-PSS
+# verification. Transitives asn1-rs 0.7 / der-parser 10 / oid-registry 0.8 are
+# consumed only by x509-parser, so no duplicate parser stack; nom stays at v7.
+x509-parser = "0.18"
 
 # Lane 2 (semantic) structured-body field extraction (Lane B). All forbid unsafe
 # in their own code; each parser/walk is depth-bounded by our own guards.

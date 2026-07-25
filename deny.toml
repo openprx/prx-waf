@@ -30,12 +30,27 @@ unsound = "workspace"
 # review-by tags and fails the build once one is past due, so an exemption can
 # never silently outlive its justification.
 #
+# SINGLE SOURCE OF TRUTH. This list is the only place an exemption is argued.
+# `.cargo/audit.toml` must carry the exact same set of IDs — cargo-audit cannot
+# read this file and has no include mechanism, so the duplication is forced by
+# the tooling, not a second opinion. Its entries are a bare ID list plus a
+# pointer back here; never add an ID there that is missing here, or vice versa.
+# The "Ignore expiry review" job asserts the two sets are identical.
+#
 # Verification baseline: every entry below was re-checked against the live
 # dependency tree on 2026-07-25 using cargo-deny 0.20.2 — the version pinned by
 # EmbarkStudios/cargo-deny-action@v2, which is what CI actually runs. Older
 # local cargo-deny builds (0.19.x) evaluate `unsound = "workspace"` differently
 # and will under-report; reproduce CI with the pinned version, not with
 # whatever `cargo install cargo-deny` left on your machine.
+#
+# Removed on 2026-07-25 after a semver-compatible `cargo update` (lockfile only):
+#   RUSTSEC-2026-0190 (anyhow)          — fixed by anyhow 1.0.102 -> 1.0.104
+#   RUSTSEC-2026-0097 (rand)            — fixed by rand   0.8.5   -> 0.8.7
+#   RUSTSEC-2026-0173 (proc-macro-error2) — crate left the graph when
+#       getset 0.1.6 -> 0.1.7 dropped it under pingora-cache -> ... -> neli.
+# cargo-deny 0.20.2 confirmed all three with `warning[advisory-not-detected]`
+# before they were deleted.
 ignore = [
     # protobuf 2.28.0 recursive-parsing stack overflow — path: prometheus 0.13.4 -> protobuf v2,
     # pulled by pingora-core 0.8.0. protobuf v2 has no fix; pingora 0.8 pins prometheus 0.13.
@@ -53,12 +68,6 @@ ignore = [
     # review-by: 2026-10-01
     # remove-when: pingora-core migrates off derivative (e.g. to derive-where / educe).
     { id = "RUSTSEC-2024-0388", reason = "derivative: unmaintained build-time derive macro, pingora 0.8 transitive" },
-    # proc-macro-error2 2.0.1 unmaintained — path: pingora-cache 0.8.0 -> cf-rustracing-jaeger ->
-    # local-ip-address -> neli -> getset -> proc-macro-error2. Build-time proc-macro only, never
-    # linked into the runtime binary; pingora-locked. Verified present.
-    # review-by: 2026-10-01
-    # remove-when: the getset/neli chain under pingora-cache stops pulling proc-macro-error2.
-    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: unmaintained build-time proc-macro, pingora 0.8 transitive; not in runtime" },
     # rsa 0.9.10 Marvin timing sidechannel — NO fixed release exists upstream (patched = []).
     # Real path: rsa -> jsonwebtoken (rust_crypto) -> waf-api, so the crate IS compiled. However
     # waf-api signs and verifies JWTs exclusively with HMAC (EncodingKey/DecodingKey::from_secret
@@ -84,79 +93,6 @@ ignore = [
     # remove-when: the rsa crate ships a constant-time release, or jsonwebtoken exposes an
     #              HMAC-only feature that drops rsa from the tree without re-adding aws-lc-rs.
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: compiled via jsonwebtoken(rust_crypto) but waf-api uses only HMAC/HS256; RSA code path unreachable; no upstream fix; removal via aws_lc_rs rejected (reverses ring-only commit 1b7e23f), feature-trim impossible (rust_crypto bundles rsa+hmac), lib swap risks auth regression" },
-
-    # ------------------------------------------------------------------------
-    # Bridge entries — a fixed upstream release EXISTS for both of the advisories
-    # below. They are ignored here only because the fix is a pure Cargo.lock bump
-    # that this change is not permitted to make (Cargo.lock is owned by a
-    # concurrent workstream / dependabot). Both are short-fused on purpose: they
-    # are the first things to delete, not entries to be renewed.
-    # ------------------------------------------------------------------------
-
-    # anyhow 1.0.102 — Stacked Borrows UB in `Error::downcast_mut()` (unsound).
-    # Trigger per the advisory: build an error with `Error::context(..)` and then call
-    # `downcast_mut()` on the resulting `anyhow::Error`. BOTH steps are required.
-    #
-    # Reachability in this project — NOT REACHABLE:
-    #   * The workspace never calls `downcast_mut` at all: `grep -rn downcast --include=*.rs crates/`
-    #     returns exactly one hit, crates/waf-cluster/src/transport/identity.rs:37, and that is
-    #     `Box<dyn Any>::downcast::<Vec<CertificateDer>>()` on a rustls value — a different method
-    #     on a different type, not `anyhow::Error`.
-    #   * Dependency scan: every .rs file of every crate in Cargo.lock was grepped for
-    #     `downcast_mut` (56 hits). All but one are `Box<dyn Any>` / `AnyMap` downcasts
-    #     (http::Extensions, wasmtime ResourceTable, cranelift compiler, tracing-subscriber
-    #     registry, rhai, zerocopy, ...) and have nothing to do with anyhow. The single genuine
-    #     `anyhow::Error::downcast_mut` is wit-parser 0.245.1 src/ast.rs:1836/1840/1858
-    #     (`use anyhow::{Context, Result, bail}` at ast.rs:7).
-    #   * wit-parser is reachable only through `wasmtime-internal-component-macro` (a proc-macro):
-    #     wit-parser -> wasmtime-internal-component-macro (proc-macro) -> wasmtime 43.0.2 ->
-    #     waf-engine. Proc-macros execute inside rustc at compile time and are never linked into
-    #     the shipped prx-waf binary, so no request-handling path can reach it. Worst case is UB
-    #     in the compiler on a build host, not in the WAF at runtime.
-    #
-    # review-by: 2026-09-01
-    # remove-when: Cargo.lock carries anyhow >= 1.0.103 — ALREADY STAGED in dependabot PR #40
-    #              (anyhow 1.0.102 -> 1.0.104, "Fix Stacked Borrows violation (UB) in
-    #              Error::downcast_mut"). That PR was itself blocked by this advisory, so this
-    #              entry exists to break the deadlock and MUST be deleted once #40 lands.
-    { id = "RUSTSEC-2026-0190", reason = "anyhow Error::downcast_mut UB: workspace calls downcast_mut zero times; the only real anyhow downcast_mut in the graph is wit-parser 0.245.1, reachable solely via the wasmtime component-macro proc-macro (compile-time, never linked into the binary). Fix 1.0.104 exists and is staged in dependabot PR #40 — bridge entry only, delete on merge" },
-
-    # rand 0.8.5 — ThreadRng aliasing UB when re-entered from a custom logger (unsound).
-    # rand 0.8.5 is a direct workspace dependency (Cargo.toml:83, `rand = "0.8"`); rand 0.9.2 and
-    # 0.10.2 are also in the tree but 0.10.2 is already >= the patched 0.10.1, and cargo-deny
-    # flags only 0.8.5 under `unsound = "workspace"`.
-    #
-    # The advisory requires ALL FIVE conditions to hold simultaneously. Two independent ones fail:
-    #   1. "The `log` and `thread_rng` features are enabled" — NOT MET. `log` is an *optional*
-    #      dependency of rand (rand-0.8.5/Cargo.toml:33-35, `[dependencies.log] optional = true`)
-    #      and it is not activated anywhere in the graph: the `rand 0.8.5` entry in Cargo.lock
-    #      lists exactly `libc`, `rand_chacha 0.3.1`, `rand_core 0.6.4` — no `log`. Confirmed
-    #      independently with `cargo tree --all-features -e features -i log`, which shows no rand
-    #      parent. With the feature off, rand's trace!/warn! macros expand to nothing
-    #      (rand-0.8.5/src/lib.rs:64-88, each arm gated on `#[cfg(feature = "log")]`), so
-    #      ThreadRng physically cannot call back into a logger while reseeding.
-    #   3. "The custom logger accesses rand::rng() ... and calls RngCore methods on ThreadRng" —
-    #      NOT MET. The workspace implements no `log::Log` and never calls `log::set_logger`
-    #      (grep for `impl log::Log` / `set_logger` over crates/ returns nothing). Logging is
-    #      tracing, initialised at crates/prx-waf/src/main.rs:298 via
-    #      `tracing_subscriber::registry().with(fmt::layer())...init()`.
-    #      NOTE on "does tracing count as a custom logger": the graph does contain one
-    #      `log::Log` implementation — tracing-log 0.2.0's `LogTracer`, pulled in by
-    #      tracing-subscriber 0.3.23. It qualifies as a custom logger for condition 2, but it only
-    #      forwards `log` records into `tracing` and never touches rand, so condition 3 still
-    #      fails. The workspace's own `rand::thread_rng()` call sites — crates/waf-api/src/auth.rs
-    #      lines 164 and 243, crates/waf-cluster/src/election/mod.rs:291 — are ordinary code
-    #      paths, not logger callbacks, and therefore cannot produce the reentrancy the advisory
-    #      describes.
-    #   5. "Trace-level logging enabled, or warn-level plus a getrandom failure" — moot once (1)
-    #      fails, since the logging calls are compiled out entirely.
-    #
-    # review-by: 2026-09-01
-    # remove-when: Cargo.lock carries rand >= 0.8.6 (0.8.7 is published and semver-compatible
-    #              with the `rand = "0.8"` requirement, so `cargo update -p rand` is sufficient
-    #              and needs no manifest change). No open PR stages this bump — whoever owns
-    #              Cargo.lock next should run it and delete this entry.
-    { id = "RUSTSEC-2026-0097", reason = "rand ThreadRng/logger UB needs rand's optional `log` feature (NOT enabled: Cargo.lock lists only libc/rand_chacha/rand_core for rand 0.8.5, and lib.rs:64-88 compiles the log calls out) AND a custom log::Log that itself draws from thread_rng (workspace defines none; the only log::Log in the graph is tracing-log's LogTracer, which never touches rand). Fix 0.8.7 exists via a lockfile-only `cargo update -p rand` — bridge entry only" },
 ]
 
 [licenses]

@@ -1,46 +1,40 @@
-# Audit policy for prx-waf
-# Advisories ignored here are from upstream transitive dependencies
-# that we cannot directly control. Re-verified against the live tree on 2026-07-19.
-# Next review: 2026-10-01. Kept in sync with deny.toml.
-
+# Audit policy for prx-waf.
+#
+# THIS FILE IS NOT THE SOURCE OF TRUTH. Every exemption is argued in `deny.toml`
+# under `[advisories] ignore`, with the evidence, a `review-by:` date and a
+# `remove-when:` condition. cargo-audit cannot read deny.toml and offers no
+# include mechanism, so the ID list below is a forced duplicate — keep it byte-
+# for-byte in sync with the IDs in deny.toml and put the reasoning THERE, not
+# here. The "Ignore expiry review" job in .github/workflows/sec-audit.yml fails
+# the build if the two sets diverge.
+#
+# Why the two files used to disagree: cargo-audit only *denies* what
+# `severity_threshold` + `[output] deny` select (vulnerabilities and
+# `unmaintained`), while cargo-deny additionally fails on `unsound = "workspace"`.
+# Advisories that are unsound-only therefore had to be listed in deny.toml but
+# were invisible to cargo-audit, and the lists drifted apart. Syncing the IDs
+# unconditionally is harmless — an ID cargo-audit never raises is simply inert —
+# and it removes the drift.
+#
+# Re-verified against the live tree on 2026-07-25 with cargo-audit 0.22.1 and
+# cargo-deny 0.20.2 (the version pinned by cargo-deny-action@v2).
+#
+# Current entries — full reasoning in deny.toml:
+#   RUSTSEC-2023-0071  rsa 0.9.10 Marvin timing sidechannel. Compiled via
+#                      jsonwebtoken(rust_crypto) -> waf-api, but waf-api signs
+#                      and verifies JWTs only with HMAC/HS256, so the RSA
+#                      private-key path is never invoked. No upstream fix
+#                      (patched = []). jsonwebtoken 11.0.0 still declares
+#                      `rsa ^0.9.6` under rust_crypto, so upgrading it does not
+#                      remove the crate.
+#   RUSTSEC-2024-0437  protobuf 2.28.0 recursive-parsing crash, via
+#                      pingora-core -> prometheus 0.13 -> protobuf v2.
+#   RUSTSEC-2025-0069  daemonize 0.5.0 unmaintained, via pingora-core.
+#   RUSTSEC-2024-0388  derivative 2.2.0 unmaintained, via pingora-core
+#                      (build-time derive macro only).
 [advisories]
-# RUSTSEC-2023-0071: rsa 0.9 Marvin timing sidechannel — no fixed release exists (patched = []).
-# The real, compiled path is:
-#     rsa 0.9.10 -> jsonwebtoken 10 (rust_crypto) -> waf-api
-# (sqlx uses postgres only, so sqlx-mysql is indeed not compiled, but that is not the reachable path.)
-# rsa IS linked into waf-api. It is nonetheless not exploitable here: waf-api creates and validates
-# JWTs exclusively with HMAC — EncodingKey/DecodingKey::from_secret => HS256, Validation::default()
-# locks the algorithm to HS256 (crates/waf-api/src/auth.rs). The RSA private-key operations that the
-# Marvin timing attack targets are never invoked.
-#
-# REMOVAL PATHS EVALUATED & REJECTED (2026-07-19) — goal was to drop rsa from Cargo.lock entirely:
-#   1. jsonwebtoken HMAC-only feature trim: IMPOSSIBLE. jsonwebtoken 10.3/10.4 bundle every
-#      RustCrypto algorithm behind one monolithic `rust_crypto` feature (ed25519-dalek, hmac,
-#      p256, p384, rand, rsa, sha2); no HMAC-only sub-feature exists, so rsa cannot be dropped
-#      while retaining HS256.
-#   2. jsonwebtoken `aws_lc_rs` backend: works (rsa leaves the tree, all 13 auth tests pass with
-#      auth.rs unchanged) but REJECTED — it re-adds aws-lc-rs/aws-lc-sys, reversing commit 1b7e23f
-#      which purged aws-lc-rs to make `ring` the sole crypto provider, and adds a cmake/C build dep.
-#   3. Swap jsonwebtoken for the `jwt` crate or a hand-rolled HS256: REJECTED — rewrites
-#      security-critical auth signing/verification (auth-regression risk) or adds an unmaintained
-#      crate, to silence an advisory that is already unexploitable with no upstream fix.
-# Conclusion: keeping this documented ignore is the lowest-real-risk option.
-#
-# RUSTSEC-2026-0173: proc-macro-error2 2.0.1 unmaintained — build-time proc-macro reached via
-# pingora-cache -> cf-rustracing-jaeger -> local-ip-address -> neli -> getset. Compile-time only,
-# not linked into the runtime binary; pingora 0.8-locked, no replacement until pingora upgrades.
-#
-# RUSTSEC-2024-0437: protobuf 2.28.0 recursive parsing crash — via pingora-core -> prometheus -> protobuf
-# No fixed release for protobuf v2; pingora 0.8 pins prometheus 0.13. Awaiting a safe pingora release.
-#
-# RUSTSEC-2025-0069: daemonize 0.5.0 unmaintained — via pingora-core
-# No alternative available until pingora drops this dependency.
-#
-# RUSTSEC-2024-0388: derivative 2.2.0 unmaintained — via pingora-core (build-time derive macro)
-# No alternative available until pingora drops this dependency.
 ignore = [
     "RUSTSEC-2023-0071",
-    "RUSTSEC-2026-0173",
     "RUSTSEC-2024-0437",
     "RUSTSEC-2025-0069",
     "RUSTSEC-2024-0388",

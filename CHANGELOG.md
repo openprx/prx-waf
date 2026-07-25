@@ -9,6 +9,46 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Three advisory exemptions retired instead of renewed.** A
+  semver-compatible `cargo update` fixes RUSTSEC-2026-0190 (anyhow 1.0.104) and
+  RUSTSEC-2026-0097 (rand 0.8.7), and drops RUSTSEC-2026-0173 outright: getset
+  0.1.7 no longer pulls `proc-macro-error2` under the
+  `pingora-cache → cf-rustracing-jaeger → local-ip-address → neli` chain, so
+  the crate leaves the dependency graph. cargo-deny 0.20.2 — the version
+  `cargo-deny-action@v2` actually pins, not the weaker 0.19.x a local
+  `cargo install` leaves behind — reported all three as
+  `advisory-not-detected` before they were deleted. Four remain, every one of
+  them upstream-unfixable and argued by reachability.
+
+- **`deny.toml` is now the single source of truth for advisory exemptions.** It
+  and `.cargo/audit.toml` had drifted apart, and nothing would have reported
+  it: cargo-deny fails on `unsound = "workspace"` while cargo-audit's
+  `severity_threshold` + `[output] deny` never consider unsound at all, so an
+  unsound-only exemption had to exist in one file and was invisible to the
+  other. cargo-audit cannot read `deny.toml` and has no include mechanism, so
+  the duplication is forced by the tooling; `.cargo/audit.toml` is now a bare
+  ID mirror pointing back, and the `ignore-expiry` job fails the build if the
+  two sets diverge.
+
+### Changed
+
+- **Four low-risk dependency majors:** tower-http 0.7, base64 0.23, wasmtime 44
+  (fixes GHSA-p8xm-42r7-89xg, a panic when allocating a table larger than the
+  host address space; the two WASI advisories in that release do not apply —
+  `wasmtime-wasi` is not in the tree) and x509-parser 0.18.
+
+  x509-parser 0.18 adds `GeneralName::Invalid` so a malformed SAN entry no
+  longer aborts parsing. In `node_id_from_cert_der()` that turns a
+  fail-closed into a fail-open: a leaf whose SAN holds one bad entry used to be
+  rejected outright, and now the bad entry is skipped and a later well-formed
+  DNS SAN still yields a node id. The `if let GeneralName::DNSName(..)` match
+  compiles unchanged, so neither the compiler nor any test can catch it — it is
+  recorded in `Cargo.toml` next to the version. It is bounded by rustls having
+  already path-validated the leaf against our own single-level cluster CA,
+  which only ever mints certificates through `NodeCertificate::generate`.
+
 ### Fixed
 
 - **The CrowdSec bouncer no longer starts fail-open when LAPI is unreachable.**
