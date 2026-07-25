@@ -118,7 +118,7 @@ ring = "0.17"
 zstd = "0.13"
 
 # X.509 parsing (cluster peer certificate SAN → node identity binding, H-9)
-x509-parser = "0.16"
+x509-parser = "0.18"
 
 # Lane 2 (semantic) structured-body field extraction (Lane B). All forbid unsafe
 # in their own code; each parser/walk is depth-bounded by our own guards.
