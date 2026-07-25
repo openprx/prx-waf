@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -33,9 +33,18 @@ use regex::Regex;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
-use waf_common::{DetectionResult, Phase, RequestCtx, is_form_urlencoded, split_form_args};
+use waf_common::{DetectionResult, OwaspConfig, Phase, RequestCtx, is_form_urlencoded, split_form_args};
 
 use super::Check;
+
+/// How many contributing rules are named in the `detail` of a score-triggered
+/// block before the list is elided.
+///
+/// The *score* is always the full sum over every contributing rule; only the
+/// rendered list is capped, so a request that trips a hundred rules cannot turn
+/// one `security_events` row into a hundred-entry blob. The elision is
+/// explicit in the text, never silent.
+const MAX_NAMED_CONTRIBUTORS: usize = 12;
 
 /// Default on-disk location of the converted CRS rule set.
 const DEFAULT_RULES_DIR: &str = "rules/owasp-crs";
@@ -120,7 +129,8 @@ struct YamlRule {
     #[allow(dead_code)]
     #[serde(default)]
     category: String,
-    #[allow(dead_code)]
+    /// `ModSecurity` `severity:`, which decides how much this rule adds to the
+    /// inbound anomaly score. See [`Severity`].
     #[serde(default)]
     severity: String,
     paranoia: u8,
@@ -394,6 +404,17 @@ pub struct LoadSummary {
     /// `true` when the minimal compiled-in rule set was used instead of the
     /// on-disk CRS.
     pub used_embedded_fallback: bool,
+    /// Rules whose `severity:` was absent or not a name this engine knows.
+    ///
+    /// They are still enforced, scored at `critical` — the fail-closed choice,
+    /// because the alternative (the lowest weight) would quietly weaken a rule
+    /// that a typo made unreadable. Recorded so the typo is visible instead of
+    /// being absorbed into the scoring model.
+    pub severity_defaulted: Vec<String>,
+    /// Rules whose `action:` was not a name this engine knows. Enforced as
+    /// scoring rules (the CRS `block` semantics), and recorded for the same
+    /// reason as [`Self::severity_defaulted`].
+    pub action_defaulted: Vec<String>,
 }
 
 impl LoadSummary {
@@ -457,6 +478,22 @@ impl LoadSummary {
             error!(
                 "OWASP CRS source '{}' failed to load ({}) — every rule it declares is NOT enforced",
                 err.source, err.error
+            );
+        }
+
+        if !self.severity_defaulted.is_empty() {
+            warn!(
+                "OWASP CRS {} rule(s) declare an unknown severity and are scored as 'critical' \
+                 (fail-closed): {}",
+                self.severity_defaulted.len(),
+                self.severity_defaulted.join(", ")
+            );
+        }
+        if !self.action_defaulted.is_empty() {
+            warn!(
+                "OWASP CRS {} rule(s) declare an unknown action and are treated as scoring rules: {}",
+                self.action_defaulted.len(),
+                self.action_defaulted.join(", ")
             );
         }
 
@@ -2369,6 +2406,154 @@ impl Condition {
     }
 }
 
+/// The four `ModSecurity` severities CRS actually uses, in the order that
+/// decides how much a matching rule contributes to the anomaly score.
+///
+/// Upstream pairs each one with a fixed `tx.*_anomaly_score` variable — the
+/// pairing is not a convention, it is exhaustive across all 625 rules of CRS
+/// v4.25.0: every `severity:'CRITICAL'` rule adds `%{tx.critical_anomaly_score}`,
+/// every `severity:'WARNING'` rule adds `%{tx.warning_anomaly_score}`, and so
+/// on, with no cross terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    /// `severity:'NOTICE'` — upstream weight 2.
+    Notice,
+    /// `severity:'WARNING'` — upstream weight 3.
+    Warning,
+    /// `severity:'ERROR'` — upstream weight 4.
+    Error,
+    /// `severity:'CRITICAL'` — upstream weight 5.
+    Critical,
+}
+
+impl Severity {
+    /// Parse the `severity:` field of a rule.
+    ///
+    /// The four CRS names are the canonical spellings. `high` / `medium` /
+    /// `low` are accepted because an earlier generation of the converter
+    /// emitted them for the response-phase rule files (`high` was its rendering
+    /// of upstream `ERROR`); they map onto the CRS scale rather than being
+    /// silently dropped.
+    ///
+    /// Returns `None` for anything else so the caller can decide — and record —
+    /// what an unrecognised severity means, instead of guessing quietly.
+    fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "critical" | "emergency" | "alert" => Some(Self::Critical),
+            "error" | "high" => Some(Self::Error),
+            "warning" | "medium" => Some(Self::Warning),
+            "notice" | "info" | "debug" | "low" => Some(Self::Notice),
+            _ => None,
+        }
+    }
+
+    /// Canonical CRS spelling, used in operator-facing diagnostics.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Notice => "notice",
+        }
+    }
+}
+
+/// What a matching rule does, mirroring the `ModSecurity` disruptive actions
+/// CRS actually uses.
+///
+/// The distinction is the whole point of the scoring model and it is easy to
+/// get backwards: in `ModSecurity` the `block` keyword does **not** mean
+/// "deny". It means "apply whatever `SecDefaultAction` says", and CRS ships
+/// `SecDefaultAction "phase:2,log,auditlog,pass"`, so a `block` rule
+/// contributes its severity to the anomaly score and lets the request
+/// continue. Only `deny` is unconditional, and across CRS v4.25.0 exactly six
+/// rules use it — `901001`, `901500` (configuration errors) and the four
+/// blocking-evaluation rules `949110` / `949111` / `959100` / `959101`, which
+/// are the threshold comparison itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleAction {
+    /// `block` upstream: add this rule's severity score, keep evaluating.
+    Score,
+    /// `deny` upstream: block immediately, whatever the score is. Reserved for
+    /// hand-written rules that must be unconditional (CVE virtual patches);
+    /// no converted CRS rule carries it.
+    Deny,
+    /// `log` / `pass` upstream: record the match, contribute nothing.
+    Log,
+}
+
+impl RuleAction {
+    fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "block" | "score" => Some(Self::Score),
+            "deny" | "drop" | "reject" => Some(Self::Deny),
+            "log" | "pass" | "alert" => Some(Self::Log),
+            _ => None,
+        }
+    }
+}
+
+/// The severity-to-score map and the blocking threshold, resolved once at load
+/// time from [`OwaspConfig`].
+///
+/// Held by value inside [`OWASPCheck`] so the request path reads plain `u32`s
+/// with no indirection and no lock.
+#[derive(Debug, Clone, Copy)]
+struct AnomalyScoring {
+    enabled: bool,
+    critical: u32,
+    error: u32,
+    warning: u32,
+    notice: u32,
+    inbound_threshold: u32,
+}
+
+impl AnomalyScoring {
+    const fn score_for(self, severity: Severity) -> u32 {
+        match severity {
+            Severity::Critical => self.critical,
+            Severity::Error => self.error,
+            Severity::Warning => self.warning,
+            Severity::Notice => self.notice,
+        }
+    }
+
+    /// `true` when one rule of this severity reaches the threshold on its own.
+    const fn blocks_alone(self, severity: Severity) -> bool {
+        self.score_for(severity) >= self.inbound_threshold
+    }
+}
+
+impl From<&OwaspConfig> for AnomalyScoring {
+    fn from(cfg: &OwaspConfig) -> Self {
+        Self {
+            enabled: cfg.anomaly_scoring,
+            critical: cfg.critical_anomaly_score,
+            error: cfg.error_anomaly_score,
+            warning: cfg.warning_anomaly_score,
+            notice: cfg.notice_anomaly_score,
+            // A zero threshold is rejected by `OwaspConfig::validate`, but this
+            // type is also reachable from `Default`, so clamp rather than trust:
+            // 0 would be reached by a request that matched nothing at all.
+            inbound_threshold: cfg.inbound_anomaly_score_threshold.max(1),
+        }
+    }
+}
+
+impl Default for AnomalyScoring {
+    fn default() -> Self {
+        Self::from(&OwaspConfig::default())
+    }
+}
+
+/// One rule's contribution to a request's anomaly score.
+struct Contribution<'r> {
+    id: &'r str,
+    name: &'r str,
+    severity: Severity,
+    score: u32,
+}
+
 struct CompiledRule {
     id: String,
     name: String,
@@ -2377,8 +2562,10 @@ struct CompiledRule {
     /// Additional conditions that must all hold (`ModSecurity` `chain`).
     /// Empty for an ordinary rule.
     chain: Vec<Condition>,
-    #[allow(dead_code)]
-    action: String,
+    /// Weight this rule adds to the inbound anomaly score when it matches.
+    severity: Severity,
+    /// Whether a match scores, denies outright, or is recorded only.
+    action: RuleAction,
 }
 
 impl CompiledRule {
@@ -2533,13 +2720,26 @@ impl Loader {
             chain.push(condition);
         }
 
+        // Severity and action decide *how* a match is enforced, so an
+        // unreadable value must not silently pick a weaker enforcement. Both
+        // fall back to the strongest CRS-compatible reading and are recorded.
+        let severity = Severity::parse(&rule.severity).unwrap_or_else(|| {
+            self.summary.severity_defaulted.push(rule.id.clone());
+            Severity::Critical
+        });
+        let action = RuleAction::parse(&rule.action).unwrap_or_else(|| {
+            self.summary.action_defaulted.push(rule.id.clone());
+            RuleAction::Score
+        });
+
         Ok(CompiledRule {
             id: rule.id,
             name: rule.name,
             paranoia: rule.paranoia,
             head,
             chain,
-            action: rule.action,
+            severity,
+            action,
         })
     }
 
@@ -2713,6 +2913,7 @@ impl Loader {
         OWASPCheck {
             rules: self.rules,
             summary: self.summary,
+            scoring: AnomalyScoring::default(),
         }
     }
 }
@@ -2793,6 +2994,9 @@ fn build_automaton(patterns: &[&str]) -> Result<Arc<AhoCorasick>, String> {
 pub struct OWASPCheck {
     rules: Vec<CompiledRule>,
     summary: LoadSummary,
+    /// Severity weights and the blocking threshold. Defaults to the upstream
+    /// CRS v4.25.0 numbers; [`Self::with_config`] replaces them from the TOML.
+    scoring: AnomalyScoring,
 }
 
 impl OWASPCheck {
@@ -2930,6 +3134,146 @@ impl OWASPCheck {
     pub const fn load_summary(&self) -> &LoadSummary {
         &self.summary
     }
+
+    /// Install the operator-configured anomaly-scoring model and announce it.
+    ///
+    /// Kept separate from the constructors because they are infallible and run
+    /// during engine wiring, before the TOML is threaded down. Consumes and
+    /// returns `self` so the call site reads as one expression.
+    #[must_use]
+    pub fn with_config(mut self, cfg: &OwaspConfig) -> Self {
+        self.scoring = AnomalyScoring::from(cfg);
+        for line in self.scoring_broadcast() {
+            info!("{line}");
+        }
+        self
+    }
+
+    /// Human-readable description of the active decision model, for the startup
+    /// log.
+    ///
+    /// An operator reading this must be able to answer two questions without
+    /// opening the rule set: *what does it take to get blocked*, and *which of
+    /// my rules can do it on their own*. The second is the part that changes
+    /// behaviour, so it is stated as a count per severity rather than implied.
+    #[must_use]
+    pub fn scoring_broadcast(&self) -> Vec<String> {
+        if !self.scoring.enabled {
+            return vec![format!(
+                "OWASP CRS anomaly scoring DISABLED (owasp.anomaly_scoring=false): the first \
+                 matching rule of {} blocks, regardless of its severity. This is STRICTER than \
+                 upstream CRS and is a known false-positive source.",
+                self.rules.len()
+            )];
+        }
+
+        let mut alone = 0usize;
+        let mut needs_help = 0usize;
+        let mut by_severity: BTreeMap<&str, usize> = BTreeMap::new();
+        for rule in &self.rules {
+            *by_severity.entry(rule.severity.label()).or_default() += 1;
+            if rule.action == RuleAction::Deny || self.scoring.blocks_alone(rule.severity) {
+                alone += 1;
+            } else {
+                needs_help += 1;
+            }
+        }
+        let breakdown = by_severity
+            .iter()
+            .map(|(label, count)| format!("{label}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        vec![
+            format!(
+                "OWASP CRS anomaly scoring ACTIVE: block when the inbound score reaches {} \
+                 (critical=+{} error=+{} warning=+{} notice=+{}), matching upstream CRS 949110.",
+                self.scoring.inbound_threshold,
+                self.scoring.critical,
+                self.scoring.error,
+                self.scoring.warning,
+                self.scoring.notice,
+            ),
+            format!(
+                "OWASP CRS enforced rules: {} ({breakdown}). {alone} reach the threshold alone and \
+                 still block on a single match; {needs_help} now need corroboration from another \
+                 rule in the same request.",
+                self.rules.len(),
+            ),
+        ]
+    }
+
+    /// Evaluate every in-scope rule and return the score plus the rules that
+    /// produced it, or `Err` with the rule that denied outright.
+    ///
+    /// # Why this does not stop at the threshold
+    ///
+    /// Stopping as soon as `score >= threshold` cannot change the verdict —
+    /// every contribution is non-negative, so the sum only grows — and it would
+    /// be a real saving if the loop were normally cut short. It is not: traffic
+    /// that matches nothing (all ordinary traffic) already walks the whole rule
+    /// set today, because there is no match to return on. The short-circuit
+    /// would therefore only ever fire on requests that are about to be blocked,
+    /// where the marginal work is bounded by the same rule count the benign path
+    /// already pays, and its cost is a truncated answer to "which rules did
+    /// this?" — precisely the question an operator asks about a block.
+    /// Upstream has the same property: CRS logs every rule that fired and
+    /// evaluates 949110 afterwards.
+    ///
+    /// A `deny` rule *does* short-circuit, because there the verdict is settled
+    /// and no further rule can add to it.
+    fn evaluate<'r>(
+        &'r self,
+        view: &RequestView<'_>,
+        paranoia: u8,
+    ) -> Result<(u32, Vec<Contribution<'r>>), &'r CompiledRule> {
+        let mut score: u32 = 0;
+        let mut contributions = Vec::new();
+
+        for rule in &self.rules {
+            if rule.paranoia > paranoia || !rule.matches(view) {
+                continue;
+            }
+            match rule.action {
+                RuleAction::Deny => return Err(rule),
+                RuleAction::Log => {
+                    debug!(
+                        "OWASP rule {} matched with action=log: recorded, contributes no score ({})",
+                        rule.id, rule.name
+                    );
+                }
+                RuleAction::Score => {
+                    let points = self.scoring.score_for(rule.severity);
+                    score = score.saturating_add(points);
+                    contributions.push(Contribution {
+                        id: &rule.id,
+                        name: &rule.name,
+                        severity: rule.severity,
+                        score: points,
+                    });
+                }
+            }
+        }
+
+        Ok((score, contributions))
+    }
+}
+
+/// Render the contributing rules for the block `detail`, capped at
+/// [`MAX_NAMED_CONTRIBUTORS`] with the elision spelled out.
+fn render_contributions(contributions: &[Contribution<'_>]) -> String {
+    let mut rendered = contributions
+        .iter()
+        .take(MAX_NAMED_CONTRIBUTORS)
+        .map(|c| format!("{} {} +{} ({})", c.id, c.severity.label(), c.score, c.name))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if let Some(hidden) = contributions.len().checked_sub(MAX_NAMED_CONTRIBUTORS)
+        && hidden > 0
+    {
+        let _ = write!(rendered, "; and {hidden} more");
+    }
+    rendered
 }
 
 impl Default for OWASPCheck {
@@ -2939,6 +3283,29 @@ impl Default for OWASPCheck {
 }
 
 impl Check for OWASPCheck {
+    /// Decide the request the way upstream CRS decides it: accumulate an
+    /// anomaly score across every rule that matches, then compare the total
+    /// against the threshold (`REQUEST-949-BLOCKING-EVALUATION.conf`, rule
+    /// `949110`).
+    ///
+    /// # Relationship to the other phases
+    ///
+    /// The score is **local to this check**. Lane 1's detectors (`sql_injection`,
+    /// `xss`, `rce`, `dir_traversal`, …) are not CRS rules, carry no CRS
+    /// severity, and keep their own first-match-wins semantics in
+    /// `engine.rs`; nothing here reads or writes their verdicts, and a Lane 1
+    /// block still short-circuits before this check is reached. The change is
+    /// confined to how the OWASP phase turns its own matches into one verdict.
+    ///
+    /// # Relationship to the header / body phases
+    ///
+    /// `engine.rs` runs this check twice per request — once with the headers
+    /// and once with the body populated — and the score is computed
+    /// independently each time. That is not a lost accumulation: the body-phase
+    /// pass re-evaluates every rule the header-phase pass evaluated, over a
+    /// strictly larger request, so its score is at least the header-phase
+    /// score. Carrying a running total between the two would double-count every
+    /// header-surface rule.
     fn check(&self, ctx: &RequestCtx) -> Option<DetectionResult> {
         if !ctx.host_config.defense_config.owasp_set {
             return None;
@@ -2951,21 +3318,81 @@ impl Check for OWASPCheck {
         // that reads the query reads the same decoded query.
         let view = RequestView::new(ctx);
 
-        for rule in &self.rules {
-            if rule.paranoia > paranoia {
-                continue;
-            }
-            if rule.matches(&view) {
+        if !self.scoring.enabled {
+            // Escape hatch: pre-scoring behaviour, first match wins.
+            let rule = self
+                .rules
+                .iter()
+                .find(|rule| rule.paranoia <= paranoia && rule.matches(&view))?;
+            return Some(DetectionResult {
+                rule_id: Some(rule.id.clone()),
+                rule_name: rule.name.clone(),
+                phase: Phase::Owasp,
+                detail: format!("OWASP rule {} triggered ({})", rule.id, rule.name),
+            });
+        }
+
+        let (score, contributions) = match self.evaluate(&view, paranoia) {
+            Err(rule) => {
                 return Some(DetectionResult {
                     rule_id: Some(rule.id.clone()),
                     rule_name: rule.name.clone(),
                     phase: Phase::Owasp,
-                    detail: format!("OWASP rule {} triggered ({})", rule.id, rule.name),
+                    detail: format!(
+                        "OWASP rule {} triggered with action=deny ({}) — blocked unconditionally, \
+                         outside the anomaly score",
+                        rule.id, rule.name
+                    ),
                 });
             }
+            Ok(evaluated) => evaluated,
+        };
+
+        let threshold = self.scoring.inbound_threshold;
+        if score < threshold {
+            // The negative case needs to be as legible as the positive one: an
+            // operator chasing a miss has to be able to see that rules *did*
+            // fire and how far short they fell.
+            if !contributions.is_empty() {
+                debug!(
+                    "OWASP CRS inbound anomaly score {score} is below the threshold {threshold} at \
+                     paranoia {paranoia}: allowed. {} rule(s) contributed: {}",
+                    contributions.len(),
+                    render_contributions(&contributions)
+                );
+            }
+            return None;
         }
 
-        None
+        // Name the heaviest contributor: it is the most useful single answer to
+        // "what got me blocked", it is what the block page renders, and it keeps
+        // a per-rule verdict meaningful. The full account lives in `detail`.
+        //
+        // Ties go to the rule that comes first in load order, which is the same
+        // precedence the pre-scoring first-match-wins check had. `max_by_key`
+        // would hand back the *last* maximum and silently renumber the verdict
+        // of every request where two rules of equal severity match.
+        let leader = contributions
+            .iter()
+            .fold(None::<&Contribution<'_>>, |best, candidate| match best {
+                Some(best) if best.score >= candidate.score => Some(best),
+                _ => Some(candidate),
+            })
+            .map(|c| (c.id.to_owned(), c.name.to_owned()));
+        let (rule_id, rule_name) =
+            leader.unwrap_or_else(|| ("CRS-949110".to_owned(), "Inbound Anomaly Score Exceeded".to_owned()));
+
+        Some(DetectionResult {
+            rule_id: Some(rule_id),
+            rule_name,
+            phase: Phase::Owasp,
+            detail: format!(
+                "OWASP CRS inbound anomaly score {score} reached the threshold {threshold} at \
+                 paranoia {paranoia} (CRS-949110); {} rule(s) contributed: {}",
+                contributions.len(),
+                render_contributions(&contributions)
+            ),
+        })
     }
 }
 
@@ -4637,8 +5064,31 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
 
         for (id, ctx) in &cases {
             assert!(fires(&checker, id, ctx), "{id} must still fire on its own attack");
-            assert!(checker.check(ctx).is_some(), "{id}'s attack must be blocked");
+
+            // Matching and blocking are no longer the same statement. Under the
+            // anomaly-score model a lone match blocks only when the rule's
+            // severity reaches the threshold by itself. Every rule in this set
+            // is `critical` (+5 against a threshold of 5) except CRS-920200,
+            // which upstream declares `severity:'WARNING'` (+3) — upstream does
+            // not deny on it alone either, it scores it and waits for a second
+            // rule. See `evaluate` / `AnomalyScoring::blocks_alone`.
+            let expected_block = *id != "CRS-920200";
+            assert_eq!(
+                checker.check(ctx).is_some(),
+                expected_block,
+                "{id}: a lone match must block iff its severity reaches the threshold on its own"
+            );
         }
+
+        // Pin the reason CRS-920200 is the exception, so a severity change in
+        // the rule file cannot quietly turn this into "the engine regressed".
+        let range_rule = checker
+            .rules
+            .iter()
+            .find(|r| r.id == "CRS-920200")
+            .expect("CRS-920200 must be an enforced rule");
+        assert_eq!(range_rule.severity, Severity::Warning);
+        assert!(!checker.scoring.blocks_alone(Severity::Warning));
     }
 
     /// A chain stops at the first condition that fails, and the whole rule is
@@ -6249,5 +6699,327 @@ rules:
         assert!(names.check(&in_value).is_none());
         assert!(values.check(&in_value).is_some());
         assert!(values.check(&in_name).is_none());
+    }
+
+    // ── Anomaly scoring (upstream CRS 949110) ────────────────────────────────
+
+    /// A rule set of `n` rules, each matching a distinct query parameter, at
+    /// the given severity.  `severities[i]` backs parameter `p{i}`.
+    fn scored_rules_yaml(severities: &[&str]) -> String {
+        let mut yaml = String::from("version: \"1.0\"\nrules:\n");
+        for (index, severity) in severities.iter().enumerate() {
+            let _ = write!(
+                yaml,
+                "  - id: TEST-{index}\n    name: probe {index}\n    category: test\n    \
+                 severity: {severity}\n    paranoia: 1\n    field: query\n    operator: contains\n    \
+                 value: \"p{index}\"\n    action: block\n"
+            );
+        }
+        yaml
+    }
+
+    fn scoring_ctx(query: &str) -> RequestCtx {
+        make_ctx_with_query(query)
+    }
+
+    /// The four CRS severity names carry the weights upstream gives them in
+    /// `REQUEST-901-INITIALIZATION.conf` (901320..901330).
+    #[test]
+    fn severity_names_carry_the_upstream_weights() {
+        let scoring = AnomalyScoring::default();
+        assert_eq!(scoring.score_for(Severity::Critical), 5);
+        assert_eq!(scoring.score_for(Severity::Error), 4);
+        assert_eq!(scoring.score_for(Severity::Warning), 3);
+        assert_eq!(scoring.score_for(Severity::Notice), 2);
+        assert_eq!(scoring.inbound_threshold, 5);
+
+        assert_eq!(Severity::parse("CRITICAL"), Some(Severity::Critical));
+        assert_eq!(Severity::parse("Error"), Some(Severity::Error));
+        assert_eq!(Severity::parse("warning"), Some(Severity::Warning));
+        assert_eq!(Severity::parse("notice"), Some(Severity::Notice));
+        // The converter's earlier response-phase vocabulary, kept readable
+        // rather than silently defaulted: upstream 953100 is `severity:'ERROR'`.
+        assert_eq!(Severity::parse("high"), Some(Severity::Error));
+        assert_eq!(Severity::parse("nonsense"), None);
+    }
+
+    /// The point that decides whether this change is safe: a single `critical`
+    /// rule scores 5 against a threshold of 5, so it still blocks alone.
+    #[test]
+    fn one_critical_rule_still_blocks_on_its_own() {
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["critical"]));
+        let hit = checker.check(&scoring_ctx("x=p0")).expect("critical must block alone");
+        assert_eq!(hit.rule_id.as_deref(), Some("TEST-0"));
+        assert!(hit.detail.contains("score 5 reached the threshold 5"), "{}", hit.detail);
+    }
+
+    /// …and the mirror image: a single `warning` rule is 3 of the 5 needed, so
+    /// it no longer blocks — which is exactly what upstream does with it.
+    #[test]
+    fn one_warning_rule_scores_but_does_not_block() {
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["warning"]));
+        assert!(checker.check(&scoring_ctx("x=p0")).is_none());
+    }
+
+    /// A single `error` rule is 4 of 5 — also short on its own.
+    #[test]
+    fn one_error_rule_scores_but_does_not_block() {
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["error"]));
+        assert!(checker.check(&scoring_ctx("x=p0")).is_none());
+    }
+
+    /// Two sub-threshold rules corroborate each other and cross the line. This
+    /// is the case the old first-match-wins engine could not express at all in
+    /// one direction and over-expressed in the other.
+    #[test]
+    fn two_warning_rules_accumulate_past_the_threshold() {
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["warning", "warning"]));
+        assert!(checker.check(&scoring_ctx("x=p0")).is_none(), "one warning is 3");
+        let both = checker
+            .check(&scoring_ctx("x=p0&y=p1"))
+            .expect("3 + 3 must reach the threshold of 5");
+        assert!(
+            both.detail.contains("score 6 reached the threshold 5"),
+            "{}",
+            both.detail
+        );
+        assert!(both.detail.contains("TEST-0"), "{}", both.detail);
+        assert!(both.detail.contains("TEST-1"), "{}", both.detail);
+    }
+
+    /// A notice (2) and a warning (3) also add up to exactly the threshold.
+    #[test]
+    fn a_notice_and_a_warning_reach_the_threshold_together() {
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["notice", "warning"]));
+        assert!(checker.check(&scoring_ctx("x=p0")).is_none());
+        assert!(checker.check(&scoring_ctx("x=p1")).is_none());
+        assert!(checker.check(&scoring_ctx("x=p0&y=p1")).is_some());
+    }
+
+    /// The verdict names the heaviest contributor, and ties keep load order —
+    /// the same precedence the pre-scoring check had.
+    #[test]
+    fn the_verdict_names_the_heaviest_contributor_and_ties_keep_load_order() {
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["warning", "critical"]));
+        let hit = checker.check(&scoring_ctx("x=p0&y=p1")).expect("3 + 5 blocks");
+        assert_eq!(hit.rule_id.as_deref(), Some("TEST-1"), "critical outweighs warning");
+
+        let tied = OWASPCheck::from_yaml(&scored_rules_yaml(&["critical", "critical"]));
+        let hit = tied.check(&scoring_ctx("x=p0&y=p1")).expect("5 + 5 blocks");
+        assert_eq!(hit.rule_id.as_deref(), Some("TEST-0"), "a tie goes to the first rule");
+    }
+
+    /// `deny` is unconditional: it does not wait for a score, and it says so.
+    #[test]
+    fn a_deny_rule_blocks_regardless_of_the_score() {
+        let yaml = "version: \"1.0\"\nrules:\n  - id: TEST-DENY\n    name: virtual patch\n    \
+                    category: test\n    severity: notice\n    paranoia: 1\n    field: query\n    \
+                    operator: contains\n    value: \"p0\"\n    action: deny\n";
+        let checker = OWASPCheck::from_yaml(yaml);
+        let hit = checker.check(&scoring_ctx("x=p0")).expect("deny must block alone");
+        assert_eq!(hit.rule_id.as_deref(), Some("TEST-DENY"));
+        assert!(hit.detail.contains("action=deny"), "{}", hit.detail);
+    }
+
+    /// `log` records the match and contributes nothing, so it can never block
+    /// by itself or push another rule over the line.
+    #[test]
+    fn a_log_rule_contributes_no_score() {
+        let yaml = "version: \"1.0\"\nrules:\n  - id: TEST-LOG\n    name: observation\n    \
+                    category: test\n    severity: critical\n    paranoia: 1\n    field: query\n    \
+                    operator: contains\n    value: \"p0\"\n    action: log\n";
+        let checker = OWASPCheck::from_yaml(yaml);
+        assert!(checker.check(&scoring_ctx("x=p0")).is_none());
+    }
+
+    /// The threshold is the operator's dial. Lowering it to 3 lets a lone
+    /// warning block again; raising it to 6 stops a lone critical.
+    #[test]
+    fn the_threshold_is_configurable() {
+        let permissive = OwaspConfig {
+            inbound_anomaly_score_threshold: 6,
+            ..OwaspConfig::default()
+        };
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["critical"])).with_config(&permissive);
+        assert!(checker.check(&scoring_ctx("x=p0")).is_none(), "5 < 6");
+
+        let strict = OwaspConfig {
+            inbound_anomaly_score_threshold: 3,
+            ..OwaspConfig::default()
+        };
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["warning"])).with_config(&strict);
+        assert!(checker.check(&scoring_ctx("x=p0")).is_some(), "3 >= 3");
+    }
+
+    /// A threshold of 0 would be reached by a request that matched nothing.
+    /// The config rejects it, and the runtime clamps it as a second line.
+    #[test]
+    fn a_zero_threshold_is_rejected_and_clamped() {
+        let broken = OwaspConfig {
+            inbound_anomaly_score_threshold: 0,
+            ..OwaspConfig::default()
+        };
+        assert!(broken.validate().is_err());
+
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["critical"])).with_config(&broken);
+        assert!(
+            checker.check(&scoring_ctx("nothing=matches")).is_none(),
+            "a clamped threshold must not turn an empty match set into a block"
+        );
+    }
+
+    /// Turning scoring off restores the pre-scoring behaviour exactly: the
+    /// first matching rule blocks whatever its severity.
+    #[test]
+    fn disabling_scoring_restores_first_match_wins() {
+        let cfg = OwaspConfig {
+            anomaly_scoring: false,
+            ..OwaspConfig::default()
+        };
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["notice"])).with_config(&cfg);
+        let hit = checker
+            .check(&scoring_ctx("x=p0"))
+            .expect("first match wins when scoring is off");
+        assert_eq!(hit.rule_id.as_deref(), Some("TEST-0"));
+        assert!(hit.detail.contains("triggered"), "{}", hit.detail);
+    }
+
+    /// The paranoia gate applies to the *score*, not only to the match: an
+    /// out-of-scope rule contributes nothing, so it cannot push an in-scope
+    /// rule over the threshold.
+    #[test]
+    fn an_out_of_scope_rule_contributes_nothing() {
+        let yaml = "version: \"1.0\"\nrules:\n  - id: TEST-PL1\n    name: pl1\n    category: test\n    \
+                    severity: warning\n    paranoia: 1\n    field: query\n    operator: contains\n    \
+                    value: \"p0\"\n    action: block\n  - id: TEST-PL2\n    name: pl2\n    \
+                    category: test\n    severity: warning\n    paranoia: 2\n    field: query\n    \
+                    operator: contains\n    value: \"p1\"\n    action: block\n";
+        let checker = OWASPCheck::from_yaml(yaml);
+
+        let at_paranoia = |level: u8| {
+            let mut ctx = scoring_ctx("x=p0&y=p1");
+            ctx.host_config = Arc::new(HostConfig {
+                code: "test".into(),
+                host: "example.com".into(),
+                defense_config: DefenseConfig {
+                    owasp_set: true,
+                    owasp_paranoia: level,
+                    ..DefenseConfig::default()
+                },
+                ..HostConfig::default()
+            });
+            ctx
+        };
+
+        assert!(
+            checker.check(&at_paranoia(1)).is_none(),
+            "at PL1 only the PL1 rule scores: 3 < 5"
+        );
+        assert!(
+            checker.check(&at_paranoia(2)).is_some(),
+            "at PL2 both score: 3 + 3 >= 5"
+        );
+    }
+
+    /// An unreadable severity is scored `critical` (fail-closed) and the rule
+    /// id is recorded, so a typo shows up as a diagnostic rather than as a
+    /// quietly weakened rule.
+    #[test]
+    fn an_unknown_severity_is_scored_critical_and_recorded() {
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["definitely-not-a-severity"]));
+        assert_eq!(checker.load_summary().severity_defaulted, vec!["TEST-0".to_owned()]);
+        assert!(
+            checker.check(&scoring_ctx("x=p0")).is_some(),
+            "the fail-closed default must still block alone"
+        );
+    }
+
+    /// The `detail` an operator reads has to account for the whole score, and
+    /// say so explicitly when it stops naming rules.
+    #[test]
+    fn the_detail_accounts_for_every_contributing_rule() {
+        let many = vec!["notice"; MAX_NAMED_CONTRIBUTORS + 3];
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&many));
+        let query = (0..many.len())
+            .map(|i| format!("a{i}=p{i}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let hit = checker.check(&scoring_ctx(&query)).expect("15 notices must block");
+
+        let expected_score = 2 * many.len();
+        assert!(
+            hit.detail.contains(&format!("score {expected_score} reached")),
+            "the score must be the full sum, not the truncated list: {}",
+            hit.detail
+        );
+        assert!(
+            hit.detail.contains(&format!("{} rule(s) contributed", many.len())),
+            "{}",
+            hit.detail
+        );
+        assert!(
+            hit.detail.contains("and 3 more"),
+            "elision must be explicit: {}",
+            hit.detail
+        );
+    }
+
+    /// The startup broadcast has to answer "what does it take to get blocked"
+    /// and "which of my rules can do it alone" without opening the rule set.
+    #[test]
+    fn the_startup_broadcast_states_the_model_and_the_rules_that_block_alone() {
+        let checker = OWASPCheck::from_yaml(&scored_rules_yaml(&["critical", "warning", "warning"]));
+        let lines = checker.scoring_broadcast().join("\n");
+        assert!(lines.contains("threshold"), "{lines}");
+        assert!(lines.contains("critical=+5"), "{lines}");
+        assert!(lines.contains("1 reach the threshold alone"), "{lines}");
+        assert!(lines.contains("2 now need corroboration"), "{lines}");
+
+        let off = OwaspConfig {
+            anomaly_scoring: false,
+            ..OwaspConfig::default()
+        };
+        let disabled = OWASPCheck::from_yaml(&scored_rules_yaml(&["warning"])).with_config(&off);
+        assert!(
+            disabled.scoring_broadcast().join("\n").contains("DISABLED"),
+            "an operator must be told when the stricter mode is on"
+        );
+    }
+
+    /// The shipped rule set, stated as the numbers the scoring model turns on.
+    /// This is the inventory the change is judged against: it is *not* mostly
+    /// low-severity rules, so scoring is not mostly a relaxation.
+    #[test]
+    fn the_shipped_rule_set_is_almost_entirely_critical() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for rule in &checker.rules {
+            *counts.entry(rule.severity.label()).or_default() += 1;
+        }
+        let critical = counts.get("critical").copied().unwrap_or_default();
+        let warning = counts.get("warning").copied().unwrap_or_default();
+
+        assert_eq!(
+            critical + warning,
+            checker.rule_count(),
+            "the enforced set is only critical and warning rules: {counts:?}"
+        );
+        // 206 critical / 10 warning. The scoring model changes the verdict of a
+        // lone match for the 10 only — 95% of the enforced set still blocks on a
+        // single hit — so this is a false-positive control, not a relaxation of
+        // detection. Pinned so a rule-file change that shifts the balance has to
+        // be argued for in the diff.
+        assert_eq!(warning, 10, "the rules that stop blocking alone: {counts:?}");
+        assert_eq!(critical, 206, "the rules that still block alone: {counts:?}");
+        assert!(
+            checker.load_summary().severity_defaulted.is_empty(),
+            "every shipped rule must declare a severity this engine understands: {:?}",
+            checker.load_summary().severity_defaulted
+        );
+        assert!(
+            checker.load_summary().action_defaulted.is_empty(),
+            "every shipped rule must declare an action this engine understands: {:?}",
+            checker.load_summary().action_defaulted
+        );
     }
 }

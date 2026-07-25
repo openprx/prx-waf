@@ -6,7 +6,7 @@ use parking_lot::RwLock as ParkingRwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use waf_common::{DetectionResult, RequestCtx, WafAction, WafDecision};
+use waf_common::{DetectionResult, OwaspConfig, RequestCtx, WafAction, WafDecision};
 use waf_storage::{
     Database,
     models::{AttackLog, CreateSecurityEvent, CreateSemanticObservation},
@@ -36,6 +36,10 @@ pub struct WafEngineConfig {
     /// Compiled Lane 2 semantic content-security config. Default = lane off
     /// (zero-config never activates the semantic lane).
     pub content_security: RuntimeContentSecurityConfig,
+    /// OWASP CRS anomaly-scoring model. Default = the upstream CRS v4.25.0
+    /// numbers (critical 5 / error 4 / warning 3 / notice 2, inbound threshold
+    /// 5), so a zero-config install decides the way stock CRS decides.
+    pub owasp: OwaspConfig,
 }
 
 /// Main WAF engine — runs all detection phases.
@@ -115,7 +119,7 @@ impl WafEngine {
         let custom_rules = Arc::new(CustomRulesEngine::new());
         let sensitive = Arc::new(SensitiveCheck::new());
         let hotlink = Arc::new(AntiHotlinkCheck::new());
-        let owasp = Arc::new(OWASPCheck::new());
+        let owasp = Arc::new(OWASPCheck::new().with_config(&config.owasp));
         let geo_check = Arc::new(GeoCheck::new());
 
         // CC is a dedicated field (single counting point — see field docs).

@@ -6,7 +6,7 @@ rules:
 - id: CRS-RESP-954100
   name: Disclosure of IIS install location
   category: data-leakage
-  severity: high
+  severity: error
   paranoia: 1
   field: response_body
   operator: regex
@@ -19,7 +19,7 @@ rules:
 - id: CRS-RESP-954110
   name: Application Availability Error
   category: data-leakage
-  severity: high
+  severity: error
   paranoia: 1
   field: response_body
   operator: regex
@@ -34,7 +34,7 @@ rules:
 - id: CRS-RESP-954120
   name: IIS Information Leakage
   category: data-leakage
-  severity: high
+  severity: error
   paranoia: 1
   field: response_body
   operator: pm_from_file
@@ -47,7 +47,7 @@ rules:
 - id: CRS-RESP-954130
   name: IIS Information Leakage
   category: data-leakage
-  severity: high
+  severity: error
   paranoia: 1
   field: response_status
   operator: regex
@@ -60,7 +60,7 @@ rules:
 - id: CRS-RESP-954101
   name: Disclosure of IIS install location
   category: data-leakage
-  severity: high
+  severity: error
   paranoia: 2
   field: response_body
   operator: regex

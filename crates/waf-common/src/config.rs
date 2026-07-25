@@ -48,16 +48,139 @@ pub struct AppConfig {
     /// [`crate::content_security_config::ContentSecurityConfig`].
     #[serde(default)]
     pub content_security: crate::content_security_config::ContentSecurityConfig,
+    /// OWASP CRS anomaly-scoring model (severity weights + blocking threshold).
+    ///
+    /// Defaults reproduce upstream CRS v4.25.0 exactly, so a zero-config
+    /// install behaves like a stock CRS deployment. See [`OwaspConfig`].
+    #[serde(default)]
+    pub owasp: OwaspConfig,
 }
 
 impl AppConfig {
     /// Cross-field semantic validation applied after deserialisation.
     ///
-    /// Currently this only validates the Lane 2 semantic content-security
-    /// config (plan §6.2 strict loader rule). Returns a human-readable error
-    /// on the first violation.
+    /// Validates the Lane 2 semantic content-security config (plan §6.2 strict
+    /// loader rule) and the OWASP anomaly-scoring model. Returns a
+    /// human-readable error on the first violation.
     pub fn validate(&self) -> Result<(), String> {
-        self.content_security.validate()
+        self.content_security.validate()?;
+        self.owasp.validate()
+    }
+}
+
+/// OWASP CRS anomaly-scoring configuration.
+///
+/// # Why this exists
+///
+/// Upstream CRS does **not** block on the first rule that matches. Almost every
+/// rule carries `pass` (via `SecDefaultAction "phase:2,log,auditlog,pass"` in
+/// `crs-setup.conf.example:98-99`) plus a
+/// `setvar:tx.inbound_anomaly_score_plN=+%{tx.<severity>_anomaly_score}`, and a
+/// single dedicated rule — `949110` in `REQUEST-949-BLOCKING-EVALUATION.conf` —
+/// denies the request when the accumulated score reaches
+/// `tx.inbound_anomaly_score_threshold`.
+///
+/// The defaults below are the values that rule set actually ships, read from
+/// `rules/REQUEST-901-INITIALIZATION.conf`: rules `901140`..`901143` set the
+/// four severity scores (lines 146-180) and `901100` / `901110` set the inbound
+/// and outbound thresholds (lines 76-93). `crs-setup.conf.example:275-278` and
+/// `:336-337` show the same numbers as the commented operator-facing knobs.
+///
+/// # What a threshold of 5 means
+///
+/// A `CRITICAL` rule alone scores 5, which already reaches the default
+/// threshold — so the change is **not** "nothing blocks any more". It is
+/// specifically that a `WARNING` (3) or `NOTICE` (2) rule no longer blocks on
+/// its own, which is CRS's own false-positive control.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwaspConfig {
+    /// Accumulate per-rule scores and block on the threshold (upstream CRS
+    /// semantics). When `false` the check reverts to "first matching rule
+    /// blocks", which is stricter than upstream and a documented source of
+    /// false positives — kept only as an escape hatch.
+    #[serde(default = "default_true")]
+    pub anomaly_scoring: bool,
+    /// Score contributed by a rule with `severity: critical`
+    /// (`tx.critical_anomaly_score`, upstream default 5).
+    #[serde(default = "default_critical_anomaly_score")]
+    pub critical_anomaly_score: u32,
+    /// Score contributed by a rule with `severity: error`
+    /// (`tx.error_anomaly_score`, upstream default 4).
+    #[serde(default = "default_error_anomaly_score")]
+    pub error_anomaly_score: u32,
+    /// Score contributed by a rule with `severity: warning`
+    /// (`tx.warning_anomaly_score`, upstream default 3).
+    #[serde(default = "default_warning_anomaly_score")]
+    pub warning_anomaly_score: u32,
+    /// Score contributed by a rule with `severity: notice`
+    /// (`tx.notice_anomaly_score`, upstream default 2).
+    #[serde(default = "default_notice_anomaly_score")]
+    pub notice_anomaly_score: u32,
+    /// Block when the accumulated inbound score reaches this value
+    /// (`tx.inbound_anomaly_score_threshold`, upstream default 5).
+    ///
+    /// Must be at least 1: a threshold of 0 is reached by every request,
+    /// including one that matched nothing, and would deny all traffic.
+    #[serde(default = "default_inbound_anomaly_score_threshold")]
+    pub inbound_anomaly_score_threshold: u32,
+}
+
+const fn default_critical_anomaly_score() -> u32 {
+    5
+}
+const fn default_error_anomaly_score() -> u32 {
+    4
+}
+const fn default_warning_anomaly_score() -> u32 {
+    3
+}
+const fn default_notice_anomaly_score() -> u32 {
+    2
+}
+const fn default_inbound_anomaly_score_threshold() -> u32 {
+    5
+}
+
+impl Default for OwaspConfig {
+    fn default() -> Self {
+        Self {
+            anomaly_scoring: true,
+            critical_anomaly_score: default_critical_anomaly_score(),
+            error_anomaly_score: default_error_anomaly_score(),
+            warning_anomaly_score: default_warning_anomaly_score(),
+            notice_anomaly_score: default_notice_anomaly_score(),
+            inbound_anomaly_score_threshold: default_inbound_anomaly_score_threshold(),
+        }
+    }
+}
+
+impl OwaspConfig {
+    /// Reject a scoring model that cannot express a decision.
+    ///
+    /// A zero threshold denies every request (the score starts at 0 and `>=`
+    /// holds immediately), and a threshold no severity can ever reach makes the
+    /// check unable to block at all. Both are configuration mistakes that would
+    /// otherwise only surface as a production outage or a silent hole.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.anomaly_scoring {
+            return Ok(());
+        }
+        if self.inbound_anomaly_score_threshold == 0 {
+            return Err(
+                "owasp.inbound_anomaly_score_threshold must be >= 1: a threshold of 0 is reached by \
+                 every request, including one that matched no rule, and would deny all traffic"
+                    .to_owned(),
+            );
+        }
+        let highest = self.critical_anomaly_score;
+        if highest == 0 {
+            return Err(
+                "owasp.critical_anomaly_score must be >= 1: with a zero weight no rule can ever \
+                 contribute to the anomaly score and the CRS check can never block"
+                    .to_owned(),
+            );
+        }
+        Ok(())
     }
 }
 

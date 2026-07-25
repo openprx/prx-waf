@@ -411,9 +411,41 @@ def map_operator(op: str) -> str:
 
 
 # ── Severity mapping ──────────────────────────────────────────────────────────
+#
+# `severity:` is not decoration: in CRS it *is* the rule's weight. Every rule
+# pairs its severity with a matching `setvar:tx.inbound_anomaly_score_plN=
+# +%{tx.<severity>_anomaly_score}`, and `REQUEST-949-BLOCKING-EVALUATION.conf`
+# denies the request once those add up to `tx.inbound_anomaly_score_threshold`.
+# The pairing is exhaustive across CRS v4.25.0 — CRITICAL always adds
+# `critical_anomaly_score`, WARNING always adds `warning_anomaly_score`, with no
+# cross terms — so carrying the severity through verbatim is enough for the
+# engine to reconstruct the score without parsing `setvar`.
+#
+# The four names below are the only ones CRS uses. The rest of the syslog scale
+# is mapped onto them rather than passed through, because the engine scores what
+# it is given and an unrecognised name would be scored `critical` by its
+# fail-closed default.
+
+SEVERITY_MAP = {
+    "emergency": "critical",
+    "alert":     "critical",
+    "critical":  "critical",
+    "error":     "error",
+    "warning":   "warning",
+    "notice":    "notice",
+    "info":      "notice",
+    "debug":     "notice",
+}
+
 
 def map_severity(sev: str) -> str:
-    return sev.lower()
+    """Map a ModSecurity `severity:` onto the four names CRS scores with.
+
+    Defaults to `critical` — fail-closed. A rule whose severity we cannot read
+    must not end up cheaper than the author intended; the engine records the
+    default in its load summary so the gap is visible.
+    """
+    return SEVERITY_MAP.get(sev.strip().strip("'\"").lower(), "critical")
 
 
 # ── Rule parser ───────────────────────────────────────────────────────────────
@@ -914,9 +946,8 @@ def extract_rule(variables: str, operator_str: str, opts: dict,
     msg = opts.get("msg", f"Rule {rule_id}")
     msg = msg.strip("'\"")
 
-    # severity
-    severity_raw = opts.get("severity", "medium")
-    severity = map_severity(severity_raw.strip("'\""))
+    # severity — the rule's anomaly-score weight, see map_severity()
+    severity = map_severity(opts.get("severity", ""))
 
     # paranoia level from tags
     paranoia = 1
@@ -954,10 +985,24 @@ def extract_rule(variables: str, operator_str: str, opts: dict,
     value = op_value
 
     # action
-    action = "block"
-    if "pass" in opts and "block" not in opts and "deny" not in opts:
+    #
+    # `block` and `deny` are not synonyms and collapsing them was the bug this
+    # replaces. In ModSecurity `block` means "apply SecDefaultAction", and CRS
+    # ships `SecDefaultAction "phase:2,log,auditlog,pass"`
+    # (crs-setup.conf.example:98-99) — so a `block` rule contributes its
+    # severity to the anomaly score and lets the request through. Only `deny`
+    # is unconditional, and in CRS v4.25.0 exactly six rules use it: 901001,
+    # 901500 (config errors) and 949110/949111/959100/959101, which *are* the
+    # threshold comparison. None of them survives the conversion, so a converted
+    # CRS rule should never come out as `deny`; the branch exists for
+    # hand-written virtual patches that legitimately must bypass the score.
+    if "deny" in opts or "drop" in opts:
+        action = "deny"
+    elif "block" in opts:
+        action = "block"
+    elif "pass" in opts:
         action = "log"
-    elif "deny" in opts:
+    else:
         action = "block"
 
     # build tags list

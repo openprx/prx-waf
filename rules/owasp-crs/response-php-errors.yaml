@@ -6,7 +6,7 @@ rules:
 - id: CRS-RESP-953100
   name: PHP Information Leakage
   category: data-leakage
-  severity: high
+  severity: error
   paranoia: 1
   field: response_body
   operator: pm_from_file
@@ -19,7 +19,7 @@ rules:
 - id: CRS-RESP-953110
   name: PHP source code leakage
   category: data-leakage
-  severity: high
+  severity: error
   paranoia: 1
   field: response_body
   operator: regex
@@ -32,7 +32,7 @@ rules:
 - id: CRS-RESP-953120
   name: PHP source code leakage
   category: data-leakage
-  severity: high
+  severity: error
   paranoia: 1
   field: response_body
   operator: regex

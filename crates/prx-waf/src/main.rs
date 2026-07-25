@@ -1787,6 +1787,7 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         Arc::clone(&db),
         WafEngineConfig {
             content_security,
+            owasp: config.owasp.clone(),
             ..WafEngineConfig::default()
         },
     ));
