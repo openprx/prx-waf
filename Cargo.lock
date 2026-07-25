@@ -5786,6 +5786,7 @@ name = "waf-storage"
 version = "0.2.29"
 dependencies = [
  "chrono",
+ "parking_lot",
  "serde",
  "serde_json",
  "sqlx",

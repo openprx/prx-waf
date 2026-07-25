@@ -376,13 +376,36 @@ pub struct StorageConfig {
     /// pruner deletes rows older than this window.
     ///
     /// `0` disables pruning entirely (rows are kept forever); startup logs a
-    /// warning in that case so the choice is never silent. Values above
-    /// 2160 (90 days) are clamped by the repository layer.
+    /// warning in that case so the choice is never silent.
     #[serde(default = "default_semantic_observation_retention_days")]
     pub semantic_observation_retention_days: i64,
+    /// Retention window, in days, for `security_events` — the rule-detection
+    /// feed behind the dashboard. Rows carry `client_ip`, method, path and geo.
+    /// `0` keeps rows forever and warns at startup.
+    #[serde(default = "default_security_event_retention_days")]
+    pub security_event_retention_days: i64,
+    /// Retention window, in days, for `attack_logs` — blocked / logged requests
+    /// including `client_ip`, query string and captured request headers. `0`
+    /// keeps rows forever and warns at startup.
+    #[serde(default = "default_attack_log_retention_days")]
+    pub attack_log_retention_days: i64,
+    /// Retention window, in days, for `audit_log` — the record of every mutating
+    /// admin API call. `0` keeps rows forever and warns at startup.
+    #[serde(default = "default_audit_log_retention_days")]
+    pub audit_log_retention_days: i64,
+    /// Retention window, in days, for `crowdsec_events` — the local echo of
+    /// `CrowdSec` decisions, carrying `client_ip`. `0` keeps rows forever and
+    /// warns at startup.
+    #[serde(default = "default_crowdsec_event_retention_days")]
+    pub crowdsec_event_retention_days: i64,
     /// How often the retention pruner runs, in hours. Clamped to at least 1.
     #[serde(default = "default_retention_prune_interval_hours")]
     pub retention_prune_interval_hours: u64,
+    /// Rows deleted per `DELETE` statement while draining a table. Bounding the
+    /// statement keeps each transaction short instead of locking millions of
+    /// rows at once. Clamped to `1..=100000`; `0` falls back to the default.
+    #[serde(default = "default_retention_prune_batch_size")]
+    pub retention_prune_batch_size: i64,
 }
 
 /// Default `semantic_observations` retention: 30 days.
@@ -396,9 +419,68 @@ const fn default_semantic_observation_retention_days() -> i64 {
     30
 }
 
+/// Default `security_events` retention: 90 days.
+///
+/// This is the attack-telemetry feed operators actually work from: tuning a
+/// noisy rule, judging whether a campaign is new or recurring, and writing up an
+/// incident all need more than a month of history — a quarter is the shortest
+/// window that contains a full "is this seasonal?" comparison. 90 days is also
+/// the conventional hot window for security logs (PCI DSS 10.5.1 asks for three
+/// months immediately available). It stops there rather than going longer
+/// because every row carries `client_ip`: past a quarter the personal-data cost
+/// outgrows the analytical value, and long-term trends belong in an aggregated
+/// export, not in raw per-request rows.
+const fn default_security_event_retention_days() -> i64 {
+    90
+}
+
+/// Default `attack_logs` retention: 90 days.
+///
+/// Kept in lockstep with `security_events`: the two tables are the same incident
+/// viewed from the request side and the rule side, and an investigation that can
+/// see one but not the other is worse than useless. `attack_logs` is the more
+/// sensitive of the pair — it stores the query string and captured request
+/// headers, which can contain tokens and session cookies — so it gets the same
+/// ceiling and not a day more.
+const fn default_attack_log_retention_days() -> i64 {
+    90
+}
+
+/// Default `audit_log` retention: 365 days.
+///
+/// Deliberately far longer than the telemetry tables, for two reasons. First,
+/// content: this table records *administrator* actions — who changed a rule,
+/// disabled a host, rotated a certificate — keyed by `admin_username` and the
+/// admin's source IP. That is a small, known, internal population, not the open
+/// internet, so the privacy argument for aggressive deletion is much weaker
+/// while the accountability argument for keeping it is much stronger. Second,
+/// compliance: one year of retained audit history is the common floor (PCI DSS
+/// 10.5.1, and what SOC 2 / ISO 27001 auditors sample against), and a
+/// misconfiguration is routinely discovered months after it was made. Volume is
+/// a non-issue — this table grows with admin activity, not with traffic.
+const fn default_audit_log_retention_days() -> i64 {
+    365
+}
+
+/// Default `crowdsec_events` retention: 30 days.
+///
+/// A local echo of decisions owned by the `CrowdSec` LAPI, which keeps its own
+/// authoritative history. These rows exist to answer "did the bouncer act on
+/// this IP?" while an integration is being verified or a block is being
+/// disputed — a days-to-weeks question. They carry `client_ip` and duplicate
+/// data held elsewhere, so the shortest useful window applies.
+const fn default_crowdsec_event_retention_days() -> i64 {
+    30
+}
+
 /// Default retention sweep interval: every 6 hours.
 const fn default_retention_prune_interval_hours() -> u64 {
     6
+}
+
+/// Default rows per `DELETE` statement: 5000.
+const fn default_retention_prune_batch_size() -> i64 {
+    5_000
 }
 
 impl Default for StorageConfig {
@@ -407,7 +489,12 @@ impl Default for StorageConfig {
             database_url: "postgresql://prx_waf:prx_waf@127.0.0.1:5432/prx_waf".to_string(),
             max_connections: 20,
             semantic_observation_retention_days: default_semantic_observation_retention_days(),
+            security_event_retention_days: default_security_event_retention_days(),
+            attack_log_retention_days: default_attack_log_retention_days(),
+            audit_log_retention_days: default_audit_log_retention_days(),
+            crowdsec_event_retention_days: default_crowdsec_event_retention_days(),
             retention_prune_interval_hours: default_retention_prune_interval_hours(),
+            retention_prune_batch_size: default_retention_prune_batch_size(),
         }
     }
 }

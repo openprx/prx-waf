@@ -9,16 +9,42 @@ listen_addr = "0.0.0.0:9527"
 database_url = "postgresql://prx_waf:prx_waf@postgres:5432/prx_waf"
 max_connections = 20
 
-# Retention (TTL) for the Lane 2 `semantic_observations` shadow-telemetry table.
-# Those rows carry client_ip + req_id for every semantic detection and the lane
-# is shadow-enabled by default, so a background pruner deletes rows older than
-# the window below. 30 days is deliberately at the low end of the usual 30–90 day
-# security-log range: the table exists to tune detection / false-positive rates
-# (a short-horizon activity) and holding client IPs longer buys nothing.
-# 0 disables pruning entirely — the table then grows without bound and startup
-# logs a warning. Values above 2160 (90 days) are clamped by the storage layer.
+# ── Retention (TTL) for the observability / PII tables ────────────────────────
+# Five tables accumulate rows on the request or admin path and every one of them
+# stores an IP address. One background task sweeps them all on the cadence below
+# and deletes rows older than each table's own window. Setting any window to 0
+# keeps that table's rows forever — the table then grows without bound and
+# startup logs a WARN naming the personal data being retained.
+
+# Lane 2 semantic shadow telemetry (client_ip + req_id per detection). Exists to
+# tune detection / false-positive rates, a short-horizon activity, so it sits at
+# the low end of the usual 30–90 day security-log range.
 semantic_observation_retention_days = 30
+
+# Rule detections behind the dashboard (client_ip, method, path, geo). A quarter
+# is the shortest window that still answers "new campaign or recurring?" and is
+# the conventional hot window for security logs (PCI DSS 10.5.1: three months
+# immediately available). Not longer, because every row carries a client IP.
+security_event_retention_days = 90
+
+# Blocked/logged requests (client_ip, path, query, captured request headers).
+# Kept in lockstep with security_events — the same incident from the request
+# side — and no longer, since headers can contain tokens and session cookies.
+attack_log_retention_days = 90
+
+# Admin API mutations (admin_username, admin source ip_addr). Deliberately much
+# longer: this is accountability data about a small known internal population,
+# not end-user PII, and one year is the common compliance floor (PCI DSS 10.5.1,
+# what SOC 2 / ISO 27001 auditors sample). Grows with admin activity, not traffic.
+audit_log_retention_days = 365
+
+# CrowdSec decision echoes (client_ip, scenario). The CrowdSec LAPI keeps the
+# authoritative history; these rows only answer "did the bouncer act on this IP?"
+# during integration checks or a block dispute.
+crowdsec_event_retention_days = 30
+
 retention_prune_interval_hours = 6      # sweep cadence; clamped to >= 1
+retention_prune_batch_size = 5000       # rows per DELETE; clamped to 1..=100000
 
 # ── Phase 5: Response Caching ─────────────────────────────────────────────────
 [cache]

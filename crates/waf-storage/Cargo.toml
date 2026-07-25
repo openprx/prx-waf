@@ -19,6 +19,9 @@ tracing = { workspace = true }
 # Test-only: `#[tokio::test(start_paused = true)]` drives the retention
 # scheduler's multi-hour timers deterministically without real sleeps.
 tokio = { workspace = true, features = ["test-util"] }
+# Test-only: shared call log for the retention scheduler tests. `parking_lot`
+# (never `std::sync::Mutex`) per the crate's mutex rule.
+parking_lot = { workspace = true }
 
 [lints]
 workspace = true

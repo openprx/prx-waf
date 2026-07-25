@@ -6,4 +6,6 @@ pub mod retention;
 
 pub use db::Database;
 pub use error::StorageError;
-pub use retention::{RetentionConfig, spawn_semantic_observation_pruner};
+pub use retention::{
+    DEFAULT_DELETE_BATCH_SIZE, RetentionConfig, RetentionTable, TableRetention, spawn_retention_pruner,
+};

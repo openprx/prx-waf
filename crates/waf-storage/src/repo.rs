@@ -15,6 +15,7 @@ use crate::models::{
     UpdateCertificatePem, UpdateHost, UpdateNotificationConfig, UpsertCrowdSecConfig, UpsertHotlinkConfig,
     WasmPluginRow,
 };
+use crate::retention::{DEFAULT_DELETE_BATCH_SIZE, RetentionTable, prune_in_batches};
 
 /// Column projection for every `hosts` read.
 ///
@@ -663,18 +664,35 @@ impl Database {
         Ok(chrono::Utc::now() - delta)
     }
 
-    /// Prune Lane 2 semantic observations older than `retention_days` — the
-    /// retention / TTL enforcement for the shadow telemetry table (plan §13.1).
+    /// Delete rows older than `retention_days` from one observability / PII
+    /// table, in bounded batches.
     ///
-    /// The cutoff is computed in Rust (`now() - retention_days`) and bound as a
-    /// single `$1` parameter, so the `DELETE` is fully parameterised — no
-    /// `INTERVAL` string interpolation. Returns the number of rows deleted.
+    /// This is the statement behind the retention scheduler
+    /// ([`crate::retention`]). Safety properties:
+    ///
+    /// * **No dynamic SQL.** The table name cannot be a bind parameter, so it
+    ///   comes from the closed [`RetentionTable`] enum and the statement text is
+    ///   a compile-time literal. No configuration value reaches it.
+    /// * **Fully parameterised bounds.** The cutoff is computed in Rust
+    ///   (`now() - retention_days`) and bound as `$1`; the batch size is bound as
+    ///   `$2`. No `INTERVAL` or `LIMIT` string interpolation.
+    /// * **Bounded lock hold.** Each statement deletes at most `batch_size` rows
+    ///   (`ctid IN (SELECT … LIMIT $2)`) and commits, so a multi-million-row
+    ///   backlog never becomes one long-running transaction. The loop repeats
+    ///   until a short batch proves the expired set is drained.
     ///
     /// `retention_days` must be positive: a zero or negative window would delete
     /// every row, so it is rejected as invalid input rather than silently wiping
     /// the table. An out-of-range day count (would overflow the timestamp
     /// arithmetic) is likewise rejected instead of panicking.
-    pub async fn prune_semantic_observations(&self, retention_days: i64) -> Result<u64, StorageError> {
+    ///
+    /// Returns the total number of rows deleted across all batches.
+    pub async fn prune_retention_table(
+        &self,
+        table: RetentionTable,
+        retention_days: i64,
+        batch_size: i64,
+    ) -> Result<u64, StorageError> {
         if retention_days <= 0 {
             return Err(StorageError::InvalidInput(format!(
                 "retention_days must be positive, got {retention_days}"
@@ -683,11 +701,28 @@ impl Database {
         let delta = chrono::TimeDelta::try_days(retention_days)
             .ok_or_else(|| StorageError::InvalidInput(format!("retention_days {retention_days} is out of range")))?;
         let cutoff = chrono::Utc::now() - delta;
-        let result = sqlx::query("DELETE FROM semantic_observations WHERE created_at < $1")
-            .bind(cutoff)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
+        let sql = table.delete_batch_sql();
+        let pool = &self.pool;
+
+        prune_in_batches(table.name(), batch_size, move |limit| async move {
+            let result = sqlx::query(sql).bind(cutoff).bind(limit).execute(pool).await?;
+            Ok(result.rows_affected())
+        })
+        .await
+    }
+
+    /// Prune Lane 2 semantic observations older than `retention_days` — the
+    /// retention / TTL enforcement for the shadow telemetry table (plan §13.1).
+    ///
+    /// Thin wrapper over [`Self::prune_retention_table`] with the default batch
+    /// size, kept as the named entry point for the Lane 2 table.
+    pub async fn prune_semantic_observations(&self, retention_days: i64) -> Result<u64, StorageError> {
+        self.prune_retention_table(
+            RetentionTable::SemanticObservations,
+            retention_days,
+            DEFAULT_DELETE_BATCH_SIZE,
+        )
+        .await
     }
 
     // ─── Certificates ─────────────────────────────────────────────────────────

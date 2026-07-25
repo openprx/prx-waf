@@ -1542,6 +1542,83 @@ fn content_security_startup_broadcast(
     lines
 }
 
+/// Map `[storage]` into one retention policy per prunable table.
+///
+/// Every table in [`waf_storage::RetentionTable::ALL`] is represented, including
+/// the ones an operator has switched off (`0`), so
+/// [`retention_startup_broadcast`] can name them in its warning instead of
+/// silently omitting them.
+fn retention_policies(storage: &waf_common::config::StorageConfig) -> Vec<waf_storage::TableRetention> {
+    use waf_storage::{RetentionTable, TableRetention};
+    RetentionTable::ALL
+        .iter()
+        .map(|table| {
+            let days = match table {
+                RetentionTable::SemanticObservations => storage.semantic_observation_retention_days,
+                RetentionTable::SecurityEvents => storage.security_event_retention_days,
+                RetentionTable::AttackLogs => storage.attack_log_retention_days,
+                RetentionTable::AuditLog => storage.audit_log_retention_days,
+                RetentionTable::CrowdsecEvents => storage.crowdsec_event_retention_days,
+            };
+            TableRetention::new(*table, days)
+        })
+        .collect()
+}
+
+/// Build the retention startup broadcast.
+///
+/// The operator-facing question at boot is: **which tables are being cleaned,
+/// for how long, and when is the next sweep?** One INFO line answers that per
+/// table; a WARN line per switched-off table names the personal data that will
+/// now accumulate forever and the exact config key that re-enables cleanup.
+fn retention_startup_broadcast(
+    config: &waf_storage::RetentionConfig,
+    policies: &[waf_storage::TableRetention],
+) -> Vec<BroadcastLine> {
+    let interval_hours = config.interval.as_secs() / 3600;
+    let first_sweep_secs = config.initial_delay.as_secs();
+    let (enabled, disabled): (Vec<&waf_storage::TableRetention>, Vec<&waf_storage::TableRetention>) =
+        policies.iter().partition(|p| p.is_enabled());
+
+    if enabled.is_empty() {
+        return vec![BroadcastLine::warn(format!(
+            "Retention pruner NOT STARTED — all {} observability tables are set to keep rows forever. Every table below grows without bound and retains client / admin IP addresses indefinitely: {}. Set a positive day count on any of them to start cleaning.",
+            policies.len(),
+            policies
+                .iter()
+                .map(|p| p.table.config_key())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))];
+    }
+
+    let mut lines = vec![BroadcastLine::info(format!(
+        "Retention pruner ACTIVE: {}/{} tables have a TTL, first sweep in {first_sweep_secs}s then every {interval_hours}h, deleting up to {} rows per DELETE batch",
+        enabled.len(),
+        policies.len(),
+        config.batch_size
+    ))];
+    for policy in &enabled {
+        lines.push(BroadcastLine::info(format!(
+            "Retention: {} keeps {} days, then rows are deleted ({})",
+            policy.table.name(),
+            policy.retention_days,
+            policy.table.contents()
+        )));
+    }
+    for policy in &disabled {
+        lines.push(BroadcastLine::warn(format!(
+            "Retention DISABLED for {} ({}={}): the table grows without bound, and its rows — {} — are retained indefinitely. Set {} to a positive day count to clean it.",
+            policy.table.name(),
+            policy.table.config_key(),
+            policy.retention_days,
+            policy.table.contents(),
+            policy.table.config_key()
+        )));
+    }
+    lines
+}
+
 /// Shutdown guards that keep background-task sender halves alive.
 ///
 /// Each field is a `tokio::sync::watch::Sender<bool>`.  Dropping this struct
@@ -1552,7 +1629,7 @@ struct ShutdownGuards {
     _crowdsec: Option<tokio::sync::watch::Sender<bool>>,
     /// Keeps the Community background worker alive while the server runs.
     _community: Option<tokio::sync::watch::Sender<bool>>,
-    /// Keeps the `semantic_observations` retention pruner alive while the server
+    /// Keeps the observability-table retention pruner alive while the server
     /// runs.
     _retention: Option<tokio::sync::watch::Sender<bool>>,
 }
@@ -1862,36 +1939,32 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         None
     };
 
-    // Retention / TTL enforcement for the Lane 2 `semantic_observations` shadow
-    // telemetry table. Those rows carry `client_ip` + `req_id` and the semantic
-    // lane ships shadow-enabled, so without this the table grows without bound
-    // and holds personal data forever. The sender is returned to the caller so
-    // it lives until the server exits; dropping it stops the pruner.
+    // Retention / TTL enforcement for the observability tables. All five carry
+    // an IP address (`semantic_observations`, `security_events`, `attack_logs`
+    // and `crowdsec_events` a client IP; `audit_log` the admin's), and none of
+    // them had a cleanup path, so without this they grow without bound and hold
+    // personal data forever. One task sweeps every table on its own window. The
+    // sender is returned to the caller so it lives until the server exits;
+    // dropping it stops the pruner.
     let retention_shutdown_guard = {
         let retention = waf_storage::RetentionConfig::from_settings(
-            config.storage.semantic_observation_retention_days,
             config.storage.retention_prune_interval_hours,
+            config.storage.retention_prune_batch_size,
         );
+        let policies = retention_policies(&config.storage);
+        for line in retention_startup_broadcast(&retention, &policies) {
+            match line.level {
+                BroadcastLevel::Info => info!("{}", line.text),
+                BroadcastLevel::Warn => tracing::warn!("{}", line.text),
+            }
+        }
         let (retention_shutdown_tx, retention_shutdown_rx) = tokio::sync::watch::channel(false);
-        waf_storage::spawn_semantic_observation_pruner(Arc::clone(&db), retention, retention_shutdown_rx).map_or_else(
-            || {
-                tracing::warn!(
-                    "semantic_observations retention DISABLED (storage.semantic_observation_retention_days={}): the table grows without bound and keeps client_ip / req_id indefinitely",
-                    config.storage.semantic_observation_retention_days
-                );
-                None
-            },
+        waf_storage::spawn_retention_pruner(Arc::clone(&db), retention, &policies, retention_shutdown_rx).map(
             |handle| {
                 // Keep the task alive for the process lifetime; shutdown is
                 // driven by the watch sender held in `ShutdownGuards`.
                 std::mem::forget(handle);
-                info!(
-                    "semantic_observations retention active: {} day window, swept every {}h (first sweep in {}s)",
-                    retention.retention_days,
-                    retention.interval.as_secs() / 3600,
-                    retention.initial_delay.as_secs()
-                );
-                Some(retention_shutdown_tx)
+                retention_shutdown_tx
             },
         )
     };
@@ -2236,6 +2309,163 @@ mod tests {
             FallbackAction::Allow,
             "default AppSec failure_action must remain Allow regardless of fallback_action"
         );
+    }
+
+    // ── retention startup broadcast ──────────────────────────────────────────
+
+    /// Render the retention broadcast for a given `[storage]` section, exactly
+    /// as `init_async` does.
+    fn retention_broadcast(storage: &waf_common::config::StorageConfig) -> Vec<BroadcastLine> {
+        let cfg = waf_storage::RetentionConfig::from_settings(
+            storage.retention_prune_interval_hours,
+            storage.retention_prune_batch_size,
+        );
+        retention_startup_broadcast(&cfg, &retention_policies(storage))
+    }
+
+    /// Join a broadcast into one searchable blob.
+    fn rendered(lines: &[BroadcastLine]) -> String {
+        lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn policies_cover_every_prunable_table_exactly_once() {
+        let policies = retention_policies(&waf_common::config::StorageConfig::default());
+        assert_eq!(
+            policies.len(),
+            waf_storage::RetentionTable::ALL.len(),
+            "a table added to RetentionTable::ALL must also be mapped from [storage]"
+        );
+        for table in waf_storage::RetentionTable::ALL {
+            let matched = policies.iter().filter(|p| p.table == table).count();
+            assert_eq!(matched, 1, "{} must map to exactly one policy", table.name());
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_give_every_table_a_positive_window() {
+        // The whole point of the change: a stock deployment must not retain any
+        // of these tables forever.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/default.toml");
+        let storage = load_config(path).expect("shipped default.toml must load").storage;
+        for policy in retention_policies(&storage) {
+            assert!(
+                policy.is_enabled(),
+                "shipped default.toml leaves {} retaining rows forever",
+                policy.table.name()
+            );
+        }
+        // The audit trail must outlive the telemetry, not match it.
+        assert!(
+            storage.audit_log_retention_days > storage.security_event_retention_days,
+            "the admin audit window must be longer than the attack-telemetry window"
+        );
+        assert!(
+            storage.security_event_retention_days > storage.crowdsec_event_retention_days,
+            "attack telemetry must outlive the third-party decision echo"
+        );
+    }
+
+    #[test]
+    fn the_broadcast_names_every_active_table_its_window_and_the_schedule() {
+        let storage = waf_common::config::StorageConfig::default();
+        let lines = retention_broadcast(&storage);
+        let text = rendered(&lines);
+
+        assert!(
+            lines.iter().all(|l| l.level == BroadcastLevel::Info),
+            "an all-enabled config must not warn: {text}"
+        );
+        assert!(text.contains("Retention pruner ACTIVE: 5/5 tables"), "{text}");
+        // "when is the next sweep" must be answerable from the broadcast alone.
+        assert!(text.contains("first sweep in 300s then every 6h"), "{text}");
+        assert!(text.contains("up to 5000 rows per DELETE batch"), "{text}");
+
+        for table in waf_storage::RetentionTable::ALL {
+            assert!(
+                text.contains(table.name()),
+                "{} is missing from the broadcast: {text}",
+                table.name()
+            );
+        }
+        assert!(text.contains("security_events keeps 90 days"), "{text}");
+        assert!(text.contains("audit_log keeps 365 days"), "{text}");
+    }
+
+    #[test]
+    fn a_table_set_to_zero_warns_and_names_the_data_and_the_knob() {
+        let storage = waf_common::config::StorageConfig {
+            attack_log_retention_days: 0,
+            ..waf_common::config::StorageConfig::default()
+        };
+        let lines = retention_broadcast(&storage);
+
+        let warnings: Vec<&BroadcastLine> = lines.iter().filter(|l| l.level == BroadcastLevel::Warn).collect();
+        assert_eq!(warnings.len(), 1, "exactly the disabled table warns");
+        let warning = warnings.first().expect("one warning").text.as_str();
+        assert!(warning.contains("Retention DISABLED for attack_logs"), "{warning}");
+        assert!(
+            warning.contains("storage.attack_log_retention_days=0"),
+            "the warning must name the exact knob and its value: {warning}"
+        );
+        assert!(
+            warning.contains("grows without bound"),
+            "the warning must state the disk consequence: {warning}"
+        );
+        assert!(
+            warning.contains("client_ip"),
+            "the warning must state the personal data retained: {warning}"
+        );
+
+        // The four still-enabled tables are unaffected and still announced.
+        let text = rendered(&lines);
+        assert!(text.contains("Retention pruner ACTIVE: 4/5 tables"), "{text}");
+        assert!(text.contains("security_events keeps 90 days"), "{text}");
+    }
+
+    #[test]
+    fn a_zeroed_table_is_never_swept() {
+        // The broadcast warning and the scheduler must agree: a `0` table is
+        // absent from the policy set the pruner actually runs.
+        let storage = waf_common::config::StorageConfig {
+            audit_log_retention_days: 0,
+            ..waf_common::config::StorageConfig::default()
+        };
+        let enabled = waf_storage::retention::enabled_policies(&retention_policies(&storage));
+        assert_eq!(enabled.len(), 4, "the zeroed table must not be swept");
+        assert!(
+            !enabled.iter().any(|p| p.table == waf_storage::RetentionTable::AuditLog),
+            "audit_log was zeroed but is still in the sweep set"
+        );
+    }
+
+    #[test]
+    fn an_all_zero_config_warns_that_nothing_is_cleaned() {
+        let storage = waf_common::config::StorageConfig {
+            semantic_observation_retention_days: 0,
+            security_event_retention_days: 0,
+            attack_log_retention_days: 0,
+            audit_log_retention_days: 0,
+            crowdsec_event_retention_days: 0,
+            ..waf_common::config::StorageConfig::default()
+        };
+        let lines = retention_broadcast(&storage);
+        assert_eq!(lines.len(), 1, "one decisive line, not five near-identical ones");
+        let line = lines.first().expect("one line");
+        assert_eq!(
+            line.level,
+            BroadcastLevel::Warn,
+            "no retention at all must be a warning"
+        );
+        assert!(line.text.contains("Retention pruner NOT STARTED"), "{}", line.text);
+        for table in waf_storage::RetentionTable::ALL {
+            assert!(
+                line.text.contains(table.config_key()),
+                "{} is not named in the all-disabled warning: {}",
+                table.name(),
+                line.text
+            );
+        }
     }
 
     // ── startup restart wiring (regression: THIRD log_only_mode projection) ──
