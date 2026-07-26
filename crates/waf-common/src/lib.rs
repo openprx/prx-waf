@@ -1,6 +1,7 @@
 pub mod config;
 pub mod content_security_config;
 pub mod crypto;
+pub mod net;
 pub mod notify;
 pub mod types;
 pub mod url_validator;

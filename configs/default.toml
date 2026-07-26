@@ -1,3 +1,10 @@
+# Binding a listener to the IPv6 wildcard "[::]" also serves IPv4 on most
+# kernels (net.ipv6.bindv6only=0), and those IPv4 clients arrive as IPv4-mapped
+# addresses, ::ffff:a.b.c.d. prx-waf normalizes them back to plain IPv4 before
+# any IP decision (blocklists, threat feeds, CrowdSec, admin_ip_allowlist,
+# trusted_proxies, GeoIP), so write every IP/CIDR rule in plain IPv4 form.
+# Rules written as "::ffff:x.x.x.x" match nothing and are named in a startup
+# WARN. Genuine IPv6 clients are matched as IPv6 and are unaffected.
 [proxy]
 listen_addr = "0.0.0.0:80"
 listen_addr_tls = "0.0.0.0:443"
@@ -167,6 +174,7 @@ cache_policy = "full_memory"
 # ── Phase 5: Security Hardening ───────────────────────────────────────────────
 [security]
 # List of IPs/CIDRs allowed to access the admin API.  Empty = allow all.
+# Plain IPv4 form only for IPv4 entries — see the note above [proxy].
 admin_ip_allowlist = []
 # Maximum request body size (bytes).  Default 10 MB.
 max_request_body_bytes = 10485760

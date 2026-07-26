@@ -13,7 +13,31 @@ use ipnet::IpNet;
 use std::net::IpAddr;
 use tracing::debug;
 
-/// In-memory IP rule store with CIDR support
+/// Warn when an operator-supplied entry is written in IPv4-mapped IPv6 form.
+///
+/// Client addresses are folded to plain IPv4 at ingress (see
+/// [`waf_common::net`]), so a `::ffff:1.2.3.4` entry is now dead: it can never
+/// match anything. Historically it *was* the only spelling that worked on a
+/// `[::]` listener, so deployments that hit the old lockout may well have such
+/// entries. They are reported, never rewritten — silently editing an operator's
+/// blocklist is worse than telling them a line of it is inert.
+fn warn_if_ipv4_mapped(entry: &str) {
+    if let Some(fixed) = waf_common::net::ipv4_mapped_entry_rewrite(entry) {
+        tracing::warn!(
+            "IP rule '{entry}' is written in IPv4-mapped IPv6 form and will never match: client \
+             addresses are normalized to plain IPv4 before matching. Rewrite it as '{fixed}'."
+        );
+    }
+}
+
+/// In-memory IP rule store with CIDR support.
+///
+/// Matching is exact-family: an entry and a client address must be in the same
+/// address family for [`IpNet::contains`] to have any chance of returning
+/// `true`. That is safe here only because every client address has already been
+/// folded to its canonical family at ingress — see [`waf_common::net`] for the
+/// invariant. This type deliberately does **not** normalize; it only warns
+/// about entries whose spelling makes them unreachable.
 #[derive(Default)]
 pub struct IpRuleSet {
     /// Exact IP entries and CIDR ranges per `host_code`
@@ -31,6 +55,7 @@ impl IpRuleSet {
         let nets: Vec<IpNet> = cidrs
             .iter()
             .filter_map(|s| {
+                warn_if_ipv4_mapped(s);
                 // Try parsing as CIDR first, then as plain IP
                 s.parse::<IpNet>()
                     .or_else(|_| s.parse::<IpAddr>().map(IpNet::from))
@@ -90,6 +115,7 @@ impl IpRuleSet {
 
     /// Insert a single rule
     pub fn insert(&self, host_code: &str, cidr: &str) {
+        warn_if_ipv4_mapped(cidr);
         let net = cidr
             .parse::<IpNet>()
             .or_else(|_| cidr.parse::<IpAddr>().map(IpNet::from));
@@ -755,6 +781,53 @@ mod tests {
         let out_of_range: IpAddr = "2001:db9::1".parse().unwrap();
         assert!(set.matches("h1", in_range));
         assert!(!set.matches("h1", out_of_range));
+    }
+
+    /// The fail-**open** half of the IPv4-mapped defect, at the exact place it
+    /// used to be a bypass: a `[::]` listener handed `::ffff:203.0.113.9` to a
+    /// blacklist holding `203.0.113.0/24`, `IpNet::contains` returned `false`
+    /// across address families, and a banned attacker was let through.
+    ///
+    /// Canonicalization at ingress is what closes it — asserted here against
+    /// the real `IpRuleSet` so the guarantee is tested where it is consumed,
+    /// not only where the helper is defined.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn ip_rule_set_blocks_canonicalized_mapped_client() {
+        let set = IpRuleSet::new();
+        set.load("h1", &["203.0.113.0/24".to_string()]);
+
+        let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+        // Raw, as it arrives from a dual-stack socket: no match — the bypass.
+        assert!(!set.matches("h1", mapped));
+        // Canonicalized at ingress, as the gateway now always does: blocked.
+        assert!(set.matches("h1", waf_common::net::canonicalize_client_ip(mapped)));
+
+        // A genuine IPv6 client is not swept up by the fold.
+        let real_v6: IpAddr = "2001:db8::203.0.113.9".parse().unwrap();
+        assert!(!set.matches("h1", waf_common::net::canonicalize_client_ip(real_v6)));
+    }
+
+    /// The mirror image on the allow side, and the reason mapped-form entries
+    /// now warn at load: an operator who wrote `::ffff:10.0.0.1` to survive the
+    /// old behaviour has an entry that matches nothing at all once clients are
+    /// canonical.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn ip_rule_set_mapped_entry_is_dead_after_normalization() {
+        let set = IpRuleSet::new();
+        set.load("h1", &["::ffff:10.0.0.1".to_string()]);
+
+        let client = waf_common::net::canonicalize_client_ip("::ffff:10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(client, "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert!(
+            !set.matches("h1", client),
+            "mapped entry must be reported, not silently work"
+        );
+        assert_eq!(
+            waf_common::net::ipv4_mapped_entry_rewrite("::ffff:10.0.0.1").as_deref(),
+            Some("10.0.0.1")
+        );
     }
 
     #[test]

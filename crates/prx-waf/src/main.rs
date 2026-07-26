@@ -1749,7 +1749,18 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     // Report the admin-API reachable surface before anything else binds, so
     // the very first thing an operator sees is whether the management API is
     // exposed and what to do about it.
-    for line in admin_exposure_startup_broadcast(&config.api, &config.security) {
+    for line in admin_exposure_startup_broadcast(&config.api, &config.security)
+        .into_iter()
+        // Right after the bind-scope broadcast, because it is about the same
+        // two settings: a `[::]` bind is what turns IPv4 clients into
+        // IPv4-mapped addresses in the first place.
+        .chain(ipv4_mapped_config_startup_broadcast(
+            &config.proxy,
+            &config.api,
+            &config.http3,
+            &config.security,
+        ))
+    {
         match line.level {
             BroadcastLevel::Info => info!("{}", line.text),
             BroadcastLevel::Warn => tracing::warn!("{}", line.text),
@@ -2247,6 +2258,86 @@ fn admin_exposure_startup_broadcast(api: &ApiConfig, security: &SecurityConfig) 
             }
         }
     }
+}
+
+/// Report configuration that the IPv4-mapped-address normalization changed the
+/// meaning of.
+///
+/// # What changed
+///
+/// A listener bound to the IPv6 wildcard `[::]` accepts IPv4 connections too
+/// (Linux `net.ipv6.bindv6only=0`) and reports their peer address in
+/// IPv4-mapped form, `::ffff:a.b.c.d`. That form used to travel unfolded all the
+/// way to every IP decision, where it matched nothing: blocklists, threat feeds
+/// and `CrowdSec` failed **open** (a banned IPv4 client got in), while the admin
+/// allowlist, `trusted_proxies` and `GeoIP` `AllowOnly` failed **closed** (a
+/// legitimate one was refused). Client addresses are now folded to plain IPv4 at
+/// ingress, which fixes both — and, as a breaking consequence, retires every
+/// config entry an operator wrote in mapped form to work around the old
+/// fail-closed half.
+///
+/// # What this broadcast does
+///
+/// Names those entries, per list, with the plain-IPv4 spelling to replace them
+/// with. Nothing is rewritten automatically: an IP allowlist is a perimeter, and
+/// editing one on the operator's behalf during startup is not a decision this
+/// process gets to make silently.
+///
+/// Only config-file lists can be checked here. Blocklist entries stored in the
+/// database are checked as they load, by
+/// `waf_engine::rules::IpRuleSet::{load, insert}`; addresses arriving from
+/// `CrowdSec` LAPI, threat-intel feeds, cluster peers or existing
+/// `security_events` rows are outside both and are covered in the release note.
+fn ipv4_mapped_config_startup_broadcast(
+    proxy: &waf_common::config::ProxyConfig,
+    api: &ApiConfig,
+    http3: &waf_common::config::Http3Config,
+    security: &SecurityConfig,
+) -> Vec<BroadcastLine> {
+    use waf_common::net::ipv4_mapped_entries;
+
+    let mut lines = Vec::new();
+
+    for (setting, entries) in [
+        ("[security] admin_ip_allowlist", &security.admin_ip_allowlist),
+        ("[proxy] trusted_proxies", &proxy.trusted_proxies),
+    ] {
+        let offenders = ipv4_mapped_entries(entries);
+        if !offenders.is_empty() {
+            lines.push(BroadcastLine::warn(format!(
+                "IPv4-mapped entries in {setting} are now DEAD and will never match: {}. Client addresses are normalized to plain IPv4 before every IP decision, so the `::ffff:` spelling — which used to be the only one that worked on a \"[::]\" listener — no longer matches anything. Rewrite each entry to the plain-IPv4 form shown in parentheses. Nothing was changed automatically.",
+                offenders.join("; ")
+            )));
+        }
+    }
+
+    // Only relevant when a listener can actually produce mapped addresses.
+    let v6_wildcard = |addr: &str| {
+        addr.parse::<std::net::SocketAddr>()
+            .is_ok_and(|s| s.ip().is_unspecified() && s.ip().is_ipv6())
+    };
+    let mut v6_listeners: Vec<&str> = Vec::new();
+    for (setting, addr) in [
+        ("[proxy] listen_addr", proxy.listen_addr.as_str()),
+        ("[proxy] listen_addr_tls", proxy.listen_addr_tls.as_str()),
+        ("[api] listen_addr", api.listen_addr.as_str()),
+    ] {
+        if v6_wildcard(addr) {
+            v6_listeners.push(setting);
+        }
+    }
+    if http3.enabled && v6_wildcard(&http3.listen_addr) {
+        v6_listeners.push("[http3] listen_addr");
+    }
+
+    if !v6_listeners.is_empty() {
+        lines.push(BroadcastLine::info(format!(
+            "IPv6 wildcard bind on {}: IPv4 clients reach these listeners as IPv4-mapped addresses (::ffff:a.b.c.d) and are normalized to plain IPv4 before IP blocklists, threat feeds, CrowdSec, the admin allowlist, trusted_proxies and GeoIP see them. Write every IP/CIDR rule in plain IPv4 form; genuine IPv6 clients are matched as IPv6 and are unaffected. Upgrading from a release before this normalization existed: any rule you wrote as \"::ffff:x.x.x.x\" to work around the previous behaviour must be rewritten, and historical client_ip values already stored in the database keep whichever form they were recorded with.",
+            v6_listeners.join(", ")
+        )));
+    }
+
+    lines
 }
 
 /// Map `[storage]` into one retention policy per prunable table.
@@ -3296,6 +3387,129 @@ mod tests {
         let l = lines.first().expect("broadcast is never empty");
         assert_eq!(l.level, BroadcastLevel::Warn, "{}", l.text);
         assert!(l.text.contains("UNKNOWN"), "{}", l.text);
+    }
+
+    // ── IPv4-mapped config broadcast ─────────────────────────────────────────
+
+    fn proxy_cfg(listen: &str, trusted: &[&str]) -> waf_common::config::ProxyConfig {
+        waf_common::config::ProxyConfig {
+            listen_addr: listen.to_string(),
+            trusted_proxies: trusted.iter().map(|s| (*s).to_string()).collect(),
+            ..waf_common::config::ProxyConfig::default()
+        }
+    }
+
+    fn http3_off() -> waf_common::config::Http3Config {
+        waf_common::config::Http3Config {
+            enabled: false,
+            ..waf_common::config::Http3Config::default()
+        }
+    }
+
+    fn mapped_broadcast(
+        proxy: &waf_common::config::ProxyConfig,
+        api: &ApiConfig,
+        security: &SecurityConfig,
+    ) -> Vec<BroadcastLine> {
+        ipv4_mapped_config_startup_broadcast(proxy, api, &http3_off(), security)
+    }
+
+    /// The shipped defaults are IPv4-only with empty lists: nothing to say.
+    #[test]
+    fn ipv4_only_defaults_say_nothing_about_mapping() {
+        let lines = mapped_broadcast(
+            &proxy_cfg("0.0.0.0:80", &[]),
+            &api_cfg("0.0.0.0:9527"),
+            &security_cfg(&["127.0.0.1", "10.0.0.0/8"]),
+        );
+        assert!(lines.is_empty(), "{}", rendered(&lines));
+    }
+
+    /// A mapped allowlist entry is named, with its replacement, and warned
+    /// about — this is the entry an operator most plausibly added to work
+    /// around the old fail-closed behaviour.
+    #[test]
+    fn mapped_allowlist_entry_is_named() {
+        let lines = mapped_broadcast(
+            &proxy_cfg("0.0.0.0:80", &[]),
+            &api_cfg("0.0.0.0:9527"),
+            &security_cfg(&["::ffff:127.0.0.1", "10.0.0.1"]),
+        );
+        let warn = lines
+            .iter()
+            .find(|l| l.level == BroadcastLevel::Warn)
+            .unwrap_or_else(|| panic!("expected a warning, got: {}", rendered(&lines)));
+        assert!(warn.text.contains("admin_ip_allowlist"), "{}", warn.text);
+        assert!(warn.text.contains("::ffff:127.0.0.1 (use 127.0.0.1)"), "{}", warn.text);
+        // The correctly-written entry must not be dragged in.
+        assert!(!warn.text.contains("10.0.0.1 (use"), "{}", warn.text);
+    }
+
+    #[test]
+    fn mapped_trusted_proxy_entry_is_named() {
+        let lines = mapped_broadcast(
+            &proxy_cfg("0.0.0.0:80", &["::ffff:10.0.0.0/104"]),
+            &api_cfg("0.0.0.0:9527"),
+            &security_cfg(&[]),
+        );
+        let warn = lines
+            .iter()
+            .find(|l| l.level == BroadcastLevel::Warn)
+            .unwrap_or_else(|| panic!("expected a warning, got: {}", rendered(&lines)));
+        assert!(warn.text.contains("trusted_proxies"), "{}", warn.text);
+        assert!(
+            warn.text.contains("::ffff:10.0.0.0/104 (use 10.0.0.0/8)"),
+            "{}",
+            warn.text
+        );
+    }
+
+    /// Genuine IPv6 entries are correct and must never be flagged.
+    #[test]
+    fn genuine_ipv6_entries_are_not_flagged() {
+        let lines = mapped_broadcast(
+            &proxy_cfg("0.0.0.0:80", &["2001:db8::/32"]),
+            &api_cfg("0.0.0.0:9527"),
+            &security_cfg(&["::1", "fe80::1"]),
+        );
+        assert!(lines.is_empty(), "{}", rendered(&lines));
+    }
+
+    /// A `[::]` bind is what produces mapped addresses, so it gets an
+    /// explanatory line naming exactly which listeners are affected.
+    #[test]
+    fn ipv6_wildcard_listener_explains_normalization() {
+        let lines = mapped_broadcast(&proxy_cfg("[::]:80", &[]), &api_cfg("0.0.0.0:9527"), &security_cfg(&[]));
+        let text = rendered(&lines);
+        assert!(text.contains("[proxy] listen_addr"), "{text}");
+        assert!(!text.contains("[api] listen_addr"), "{text}");
+        assert!(text.contains("normalized to plain IPv4"), "{text}");
+    }
+
+    /// A disabled HTTP/3 listener is not reported even if it is v6-wildcard.
+    #[test]
+    fn disabled_http3_listener_is_not_reported() {
+        let http3 = waf_common::config::Http3Config {
+            enabled: false,
+            listen_addr: "[::]:443".to_string(),
+            ..waf_common::config::Http3Config::default()
+        };
+        let lines = ipv4_mapped_config_startup_broadcast(
+            &proxy_cfg("0.0.0.0:80", &[]),
+            &api_cfg("0.0.0.0:9527"),
+            &http3,
+            &security_cfg(&[]),
+        );
+        assert!(lines.is_empty(), "{}", rendered(&lines));
+
+        let enabled = waf_common::config::Http3Config { enabled: true, ..http3 };
+        let lines = ipv4_mapped_config_startup_broadcast(
+            &proxy_cfg("0.0.0.0:80", &[]),
+            &api_cfg("0.0.0.0:9527"),
+            &enabled,
+            &security_cfg(&[]),
+        );
+        assert!(rendered(&lines).contains("[http3] listen_addr"), "{}", rendered(&lines));
     }
 
     // ── retention startup broadcast ──────────────────────────────────────────

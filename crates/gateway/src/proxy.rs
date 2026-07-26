@@ -95,12 +95,28 @@ impl WafProxy {
     /// **and** the TCP peer address falls within `trusted_proxies` (or the
     /// list is empty, which means "trust any peer" for backwards compat).
     /// Otherwise always uses the TCP peer address.
+    ///
+    /// # Normalization boundary
+    ///
+    /// This is **the** point where a client address enters the HTTP/1.1 +
+    /// HTTP/2 data plane, so it is also the only place that folds IPv4-mapped
+    /// IPv6 (`::ffff:a.b.c.d`) down to plain IPv4 — see
+    /// [`waf_common::net`] for why that matters and what breaks without it.
+    /// An address can arrive here from exactly two sources, the TCP peer and a
+    /// trusted `X-Forwarded-For` entry, and both are folded below. Everything
+    /// downstream (`RequestCtx::client_ip`, blocklists, `CrowdSec`, `GeoIP`, the CC
+    /// limiter) receives a canonical address and must not fold again.
+    ///
+    /// The peer fold has to happen *before* the `trusted_proxies` containment
+    /// test, not merely on the return value: a `10.0.0.0/8` entry does not
+    /// contain `::ffff:10.0.0.1`, so an unfolded peer would silently stop
+    /// trusting a correctly configured IPv4 front proxy.
     fn extract_client_ip(&self, session: &Session) -> std::net::IpAddr {
         // Always resolve peer address first
-        let peer_ip = session.client_addr().and_then(|a| a.as_inet()).map_or(
+        let peer_ip = waf_common::net::canonicalize_client_ip(session.client_addr().and_then(|a| a.as_inet()).map_or(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             std::net::SocketAddr::ip,
-        );
+        ));
 
         if self.trust_proxy_headers {
             // When a trusted_proxies list is configured, only honour XFF from
@@ -121,7 +137,10 @@ impl WafProxy {
                 && let Some(rightmost) = rightmost_forwarded_for(&session.req_header().headers)
                 && let Ok(ip) = rightmost.parse()
             {
-                return ip;
+                // A dual-stack front proxy may write the mapped form into XFF
+                // even when this listener is IPv4-only, so this fold is not
+                // redundant with the peer one above.
+                return waf_common::net::canonicalize_client_ip(ip);
             }
         }
 

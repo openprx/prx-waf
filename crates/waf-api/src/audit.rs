@@ -160,10 +160,21 @@ pub async fn audit_log_middleware(State(state): State<Arc<AppState>>, req: Reque
         .extensions()
         .get::<Claims>()
         .map(|c| clamp(&c.username, MAX_USERNAME_LEN));
+    // Canonicalized like every other client address (see `waf_common::net`) so
+    // that an audit row and the allowlist / blocklist decision taken on the
+    // same request name the client identically. Without the fold, one IPv4
+    // client on a `[::]` listener would be adjudicated as `a.b.c.d` but
+    // recorded as `::ffff:a.b.c.d`, which is exactly the correlation an audit
+    // trail exists to support.
     let ip = req
         .extensions()
         .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| clamp(&ci.0.ip().to_string(), MAX_IP_LEN));
+        .map(|ci| {
+            clamp(
+                &waf_common::net::canonicalize_client_ip(ci.0.ip()).to_string(),
+                MAX_IP_LEN,
+            )
+        });
 
     let response = next.run(req).await;
     let status = response.status();

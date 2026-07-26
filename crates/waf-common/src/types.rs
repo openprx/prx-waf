@@ -18,6 +18,15 @@ pub struct GeoIpInfo {
 #[derive(Debug, Clone)]
 pub struct RequestCtx {
     pub req_id: String,
+    /// Client address, **already canonical**.
+    ///
+    /// Every producer folds an IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`, what a
+    /// `[::]` listener reports for an IPv4 client) down to plain IPv4 via
+    /// [`crate::net::canonicalize_client_ip`] before filling this field. See
+    /// that module for the invariant and the list of normalization points.
+    ///
+    /// Consumers must therefore **not** normalize again — compare against it
+    /// directly.
     pub client_ip: IpAddr,
     pub client_port: u16,
     pub method: String,

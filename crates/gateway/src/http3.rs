@@ -258,6 +258,15 @@ async fn handle_h3_request<C>(
 where
     C: h3::quic::BidiStream<Bytes>,
 {
+    // ── Normalization boundary for the HTTP/3 data plane ─────────────────────
+    // The QUIC listener has the same dual-stack behaviour as the TCP one: bound
+    // to `[::]`, an IPv4 client's `remote_address()` comes back as
+    // `::ffff:a.b.c.d`. Fold it once, here, and use `client_ip` from this point
+    // on instead of `peer.ip()` — see `waf_common::net` for the invariant.
+    // H3 has no X-Forwarded-For path, so unlike the HTTP/1.1 + HTTP/2 plane the
+    // socket peer is the only source an address can arrive from.
+    let client_ip = waf_common::net::canonicalize_client_ip(peer.ip());
+
     let (parts, ()) = req.into_parts();
     let path_and_query = parts.uri.path_and_query().map_or("/", |p| p.as_str()).to_string();
     let path = parts.uri.path().to_string();
@@ -270,7 +279,7 @@ where
     // represent faithfully are refused outright.
     let folded = fold_request_headers(&parts.headers);
     if folded.duplicate_host {
-        warn!("Rejecting H3 request with duplicate Host headers: ip={}", peer.ip());
+        warn!("Rejecting H3 request with duplicate Host headers: ip={}", client_ip);
         return respond_simple(
             &mut stream,
             http::StatusCode::BAD_REQUEST,
@@ -282,7 +291,7 @@ where
     if let Some(name) = &folded.overflow {
         warn!(
             "Rejecting H3 request: header '{name}' exceeds the fold limits: ip={}",
-            peer.ip()
+            client_ip
         );
         return respond_simple(
             &mut stream,
@@ -327,7 +336,7 @@ where
     if smuggling_detection {
         let findings = crate::smuggling::detect(&parts.headers);
         if !findings.is_empty() {
-            crate::smuggling::log_findings(&findings, peer.ip(), host_header, &path);
+            crate::smuggling::log_findings(&findings, client_ip, host_header, &path);
         }
     }
 
@@ -351,7 +360,7 @@ where
     // Build RequestCtx for WAF inspection.
     let mut request_ctx = RequestCtx {
         req_id: Uuid::new_v4().to_string(),
-        client_ip: peer.ip(),
+        client_ip,
         client_port: peer.port(),
         method,
         host: host_config.host.clone(),

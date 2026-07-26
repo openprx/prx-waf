@@ -148,10 +148,38 @@ impl ApiRateLimiter {
     }
 }
 
+// ─── Client address extraction ────────────────────────────────────────────────
+
+/// Canonical client address of a management-API request.
+///
+/// # Normalization boundary
+///
+/// This is **the** point where a client address enters the management API, and
+/// therefore the only place in this crate that folds IPv4-mapped IPv6
+/// (`::ffff:a.b.c.d` — what a `[::]` listener reports for an IPv4 client) down
+/// to plain IPv4. Both middlewares below go through it; neither
+/// [`is_admin_ip_allowed`] nor [`ApiRateLimiter::check`] folds again. See
+/// [`waf_common::net`] for the invariant and for what this fixes.
+///
+/// Falls back to `0.0.0.0` when axum did not attach `ConnectInfo`, which only
+/// happens for synthetically constructed requests — a real connection always
+/// has a peer.
+fn request_client_ip(req: &Request<Body>) -> IpAddr {
+    let raw = req
+        .extensions()
+        .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
+        .map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |ci| ci.0.ip());
+    waf_common::net::canonicalize_client_ip(raw)
+}
+
 // ─── IP allowlist check ───────────────────────────────────────────────────────
 
 /// Returns `true` when the IP is permitted by the allowlist.
 /// An empty allowlist allows all addresses.
+///
+/// `ip` is expected to be canonical (see [`request_client_ip`]): an
+/// IPv4-mapped IPv6 address will not match a plain-IPv4 entry, because neither
+/// string equality nor `ipnet` containment crosses address families.
 pub fn is_admin_ip_allowed(ip: &IpAddr, allowlist: &[String]) -> bool {
     if allowlist.is_empty() {
         return true;
@@ -193,10 +221,7 @@ pub async fn admin_ip_check_middleware(
     req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    let ip = req
-        .extensions()
-        .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
-        .map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |ci| ci.0.ip());
+    let ip = request_client_ip(&req);
 
     if !is_admin_ip_allowed(&ip, &state.security_config.admin_ip_allowlist) {
         return (
@@ -219,10 +244,7 @@ pub async fn rate_limit_middleware(
     next: Next,
 ) -> impl IntoResponse {
     if let Some(ref limiter) = state.rate_limiter {
-        let ip = req
-            .extensions()
-            .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
-            .map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |ci| ci.0.ip());
+        let ip = request_client_ip(&req);
 
         if !limiter.check(ip) {
             return (
@@ -541,10 +563,31 @@ mod tests {
         assert!(!is_admin_ip_allowed(&IpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)), &allowlist));
     }
 
-    /// IPv4-mapped IPv6 address `::ffff:192.168.1.1` does NOT match allowlist
-    /// entry "192.168.1.1" because `IpAddr::to_string()` produces different
-    /// strings and `ipnet` does not cross-map IPv4-mapped IPv6 to IPv4 CIDRs.
-    /// This test documents the actual behavior.
+    /// An IPv4 client reaching a `[::]` listener must be allowlisted by the
+    /// plain-IPv4 entry an operator wrote.
+    ///
+    /// # Why this test used to assert the opposite
+    ///
+    /// Its previous form was named the same, asserted
+    /// `!is_admin_ip_allowed(::ffff:192.168.1.1, ["192.168.1.1"])`, and said in
+    /// its doc comment that it "documents the actual behavior". That was true
+    /// of [`is_admin_ip_allowed`] read in isolation — neither string equality
+    /// nor `ipnet` containment crosses address families — and, taken alone, the
+    /// resulting lockout is merely annoying: the operator adds the mapped
+    /// spelling and moves on.
+    ///
+    /// What made it the wrong thing to freeze into a test is that the *same*
+    /// unfolded address flows into the IP blacklist, the threat-intel feeds and
+    /// the `CrowdSec` decision cache, where the identical non-match fails **open**
+    /// instead of closed: a banned IPv4 attacker is admitted the moment a
+    /// listener is switched to `[::]`. One mechanism, two directions, and only
+    /// the harmless direction had ever been examined.
+    ///
+    /// So the fold now happens at ingress ([`request_client_ip`] here,
+    /// `gateway::proxy::WafProxy::extract_client_ip` and
+    /// `gateway::http3` on the data plane) and this test asserts the
+    /// end-to-end property that matters: the address this function actually
+    /// receives is canonical, and it matches.
     #[test]
     fn admin_ip_ipv4_mapped_ipv6() {
         let allowlist = vec!["192.168.1.1".to_owned()];
@@ -556,12 +599,39 @@ mod tests {
             "Plain IPv4 192.168.1.1 should match"
         );
 
-        // IPv4-mapped IPv6 — does NOT match the plain IPv4 allowlist entry
-        // because its string representation is "::ffff:192.168.1.1", not "192.168.1.1".
+        // What a `[::]` listener hands up for that same IPv4 client. After
+        // canonicalization it is indistinguishable from the line above.
         let ipv4_mapped: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc0a8, 0x0101));
+        let canonical = waf_common::net::canonicalize_client_ip(ipv4_mapped);
+        assert_eq!(canonical, ipv4, "the mapped form must fold to plain IPv4");
+        assert!(
+            is_admin_ip_allowed(&canonical, &allowlist),
+            "an IPv4 client on a [::] listener must match its plain-IPv4 allowlist entry"
+        );
+
+        // The un-normalized form still does not match, and that is deliberate:
+        // this function is not the fold point. If a mapped address ever reaches
+        // it, some producer skipped the boundary and the invariant is broken —
+        // better a loud lockout here than a silent blocklist bypass elsewhere.
         assert!(
             !is_admin_ip_allowed(&ipv4_mapped, &allowlist),
-            "IPv4-mapped IPv6 ::ffff:192.168.1.1 should NOT match plain IPv4 entry"
+            "is_admin_ip_allowed must not fold; normalization belongs at ingress"
         );
+    }
+
+    /// A genuine IPv6 client is unaffected by the fold: it still needs an IPv6
+    /// allowlist entry, and a plain-IPv4 entry still does not admit it.
+    #[test]
+    fn admin_ip_genuine_ipv6_unaffected() {
+        let v6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        assert_eq!(waf_common::net::canonicalize_client_ip(v6), v6);
+        assert!(!is_admin_ip_allowed(&v6, &["192.168.1.1".to_owned()]));
+        assert!(is_admin_ip_allowed(&v6, &["2001:db8::1".to_owned()]));
+        assert!(is_admin_ip_allowed(&v6, &["2001:db8::/32".to_owned()]));
+
+        let loopback6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert_eq!(waf_common::net::canonicalize_client_ip(loopback6), loopback6);
+        assert!(is_admin_ip_allowed(&loopback6, &["::1".to_owned()]));
+        assert!(!is_admin_ip_allowed(&loopback6, &["127.0.0.1".to_owned()]));
     }
 }
