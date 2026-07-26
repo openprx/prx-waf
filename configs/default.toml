@@ -62,6 +62,31 @@ listen_addr_tls = "0.0.0.0:443"
 # timeouts would be the precise answer — one value for an API backend, another
 # for an SSE backend — but the host table lives in the database and the admin UI,
 # so that is a later change; today the setting is global.
+#
+# HTTP/3 honours the same block, with two documented differences. The H3
+# forwarder does not use Pingora; it dials upstreams with reqwest, which offers
+# a smaller set of timers:
+#
+#   total_connect_ms -> reqwest connect_timeout (exact: DNS + TCP + TLS)
+#   connect_ms       -> connect_timeout, but ONLY when total_connect_ms is 0.
+#                       reqwest has no per-TCP-attempt timer, so in that
+#                       fallback connect_ms also has to cover DNS and TLS —
+#                       stricter on H3 than on HTTP/1.1.
+#   read_ms          -> reqwest read_timeout (exact: same inactivity semantics)
+#   write_ms         -> NOT ENFORCED. reqwest 0.13 has no write timeout. Setting
+#                       it logs a WARN at H3 startup so the gap is visible.
+#   idle_ms          -> reqwest pool_idle_timeout. NOTE: 0 does NOT mean
+#                       unlimited here. Every other reqwest timer defaults to
+#                       off, but pool_idle_timeout defaults to 90 SECONDS, so 0
+#                       leaves that 90 s default in place — which is exactly the
+#                       behaviour H3 has always had. Only a non-zero value moves
+#                       it.
+#   stream_exempt    -> applies to read_ms only (there is no write timer to
+#                       exempt). reqwest's read timeout is per-client, not
+#                       per-request, so H3 builds a second client for exempt
+#                       requests — and only when the exemption can actually bite.
+#
+# Leaving the whole block unset leaves the H3 client byte-for-byte as it was.
 
 [api]
 listen_addr = "0.0.0.0:9527"

@@ -139,6 +139,32 @@ node_key      = "/certs/node-b.key"
 auto_generate = false
 ```
 
+### IPv6
+
+Both address forms are supported, and the two keys are independent — a node may
+listen on one family and dial peers on the other.
+
+```toml
+[cluster]
+listen_addr = "[::]:16851"                 # or "[2001:db8::10]:16851"
+seeds       = ["[2001:db8::1]:16851"]      # brackets are required
+```
+
+* `listen_addr` is parsed with `SocketAddr::parse`, so `[::]`, `[::1]` and a
+  bracketed global literal all work. On a host with `net.ipv6.bindv6only = 0`
+  (the Linux default) a `[::]` listener also accepts IPv4 peers, which then
+  appear as `::ffff:a.b.c.d`.
+* `seeds` entries are resolved with `getaddrinfo`, so a bracketed IPv6 literal,
+  an IPv4 literal or a hostname are all accepted. **Use the brackets.**
+  Unbracketed `2001:db8::1:16851` is ambiguous with `host:port`; glibc happens
+  to split it at the last colon, other resolvers reject it and the seed is
+  skipped with a warning.
+* The outbound QUIC socket binds to the address family of the seed being
+  dialled — `0.0.0.0:0` for an IPv4 peer, `[::]:0` for an IPv6 one. Each seed
+  gets its own client and its own socket, so a cluster whose members are split
+  across both families needs no special configuration. (Before v0.2.58 this
+  socket was hardcoded to `0.0.0.0:0`, which made every IPv6 seed undialable.)
+
 ### Auto-generate mode (development / single-node testing)
 
 Set `auto_generate = true` to have each node generate its own in-memory CA and

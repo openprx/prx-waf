@@ -350,4 +350,57 @@ mod tests {
         let cfg = config(false, &["10.0.0.2:16851"]);
         assert!(validate_crypto_topology(&cfg).is_ok());
     }
+
+    // ── IPv6 address surface ────────────────────────────────────────────────
+
+    /// `listen_addr` goes through `SocketAddr::parse` (`lib.rs:100`), which is
+    /// bracket-aware, so a v6 wildcard listener is expressible.
+    #[test]
+    fn cluster_listen_addr_accepts_ipv6_forms() {
+        for s in ["[::]:16851", "[::1]:16851", "[2001:db8::1]:16851", "0.0.0.0:16851"] {
+            let parsed: SocketAddr = s.parse().unwrap_or_else(|e| panic!("{s} must parse: {e}"));
+            assert_eq!(parsed.to_string(), s, "{s} must round-trip through Display");
+        }
+        // Unbracketed v6 is correctly refused rather than silently mis-parsed.
+        assert!("2001:db8::1:16851".parse::<SocketAddr>().is_err());
+    }
+
+    /// Seeds are resolved with `tokio::net::lookup_host`, which accepts a
+    /// bracketed v6 literal as well as a hostname.
+    #[tokio::test]
+    async fn seed_resolution_accepts_bracketed_ipv6_literals() {
+        assert_eq!(
+            resolve_seed_addr("[2001:db8::1]:16851").await,
+            Some("[2001:db8::1]:16851".parse().expect("v6 seed"))
+        );
+        assert_eq!(
+            resolve_seed_addr("10.0.0.2:16851").await,
+            Some("10.0.0.2:16851".parse().expect("v4 seed"))
+        );
+        // An unbracketed v6 literal is *resolver-dependent*: glibc's
+        // `getaddrinfo` splits at the last colon and happens to accept
+        // `2001:db8::1:16851`, other resolvers reject it. Do not assert which —
+        // assert only that it can never resolve to some *other* address, so an
+        // operator who omits the brackets is either served correctly or skipped
+        // with a warning, never silently pointed somewhere else.
+        if let Some(addr) = resolve_seed_addr("2001:db8::1:16851").await {
+            assert_eq!(addr, "[2001:db8::1]:16851".parse().expect("v6 seed"));
+        }
+    }
+
+    /// A peer address survives the round trip the cluster actually performs:
+    /// `SocketAddr` → `String` (`transport/server.rs:504`, `discovery.rs:52`)
+    /// → `parse` (`transport/client.rs:306`). `Display` brackets v6, so no
+    /// hand-rolled `format!("{host}:{port}")` exists on this path to break it.
+    #[test]
+    fn peer_address_round_trips_through_the_wire_string() {
+        for s in ["[2001:db8::1]:16851", "[::1]:16851", "10.0.0.2:16851"] {
+            let addr: SocketAddr = s.parse().unwrap_or_else(|e| panic!("{s}: {e}"));
+            let on_the_wire = addr.to_string();
+            assert_eq!(
+                on_the_wire.parse::<SocketAddr>().unwrap_or_else(|e| panic!("{s}: {e}")),
+                addr
+            );
+        }
+    }
 }

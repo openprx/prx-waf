@@ -3,7 +3,7 @@
 //! Implements exponential back-off reconnection and bidirectional framed
 //! JSON messaging over a long-lived QUIC control stream.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -17,6 +17,36 @@ use crate::crypto::ca::CLUSTER_SERVER_NAME;
 use crate::node::NodeState;
 use crate::protocol::ClusterMessage;
 use crate::transport::{apply_election_result, frame, identity};
+
+/// The wildcard address to bind this node's ephemeral QUIC socket to when
+/// dialling `peer`.
+///
+/// A UDP socket is bound to one address family, and `quinn` sends on the socket
+/// it was given: an `0.0.0.0`-bound endpoint cannot carry a datagram to an IPv6
+/// peer, so every dial to a `[2001:db8::1]:16851` seed failed at the socket
+/// layer before this existed. The bind therefore follows the family of the
+/// address being dialled.
+///
+/// **Per-target, not dual-stack**, for two reasons:
+///
+/// * Binding `[::]` unconditionally would make a v4-only cluster depend on the
+///   host having IPv6 at all. On a kernel booted with `ipv6.disable=1` the bind
+///   itself fails, and with `net.ipv6.bindv6only=1` the resulting socket cannot
+///   reach a v4 peer. Both would be regressions for deployments that work
+///   today; selecting per target leaves the v4 path on the exact
+///   `0.0.0.0:0` it has always used.
+/// * There is nothing to trade away. Each seed gets its own [`ClusterClient`]
+///   (`crates/waf-cluster/src/lib.rs:186-210`) and each connection attempt
+///   builds its own `quinn::Endpoint`, so a node with both v4 and v6 peers
+///   already holds one socket per peer. Mixed-family membership needs no
+///   dual-stack socket — it gets a correctly-bound socket per peer for free.
+const fn ephemeral_bind_for(peer: SocketAddr) -> SocketAddr {
+    if peer.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    }
+}
 
 /// Minimum reconnect back-off delay (ms).
 const BACKOFF_MIN_MS: u64 = 500;
@@ -93,8 +123,9 @@ impl ClusterClient {
             .map_err(|e| anyhow::anyhow!("QUIC client TLS config error: {e:?}"))?;
         let client_config = quinn::ClientConfig::new(Arc::new(quic_config));
 
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().context("failed to parse ephemeral bind addr")?)
-            .context("failed to bind QUIC client endpoint")?;
+        let bind_addr = ephemeral_bind_for(self.peer_addr);
+        let mut endpoint = quinn::Endpoint::client(bind_addr)
+            .with_context(|| format!("failed to bind QUIC client endpoint on {bind_addr}"))?;
         endpoint.set_default_client_config(client_config);
 
         let conn = endpoint
@@ -570,6 +601,57 @@ mod tests {
         dispatch_incoming(join_response(false, "main-A", 9), &n, "main-A").await;
         assert!(n.main_node_id().await.is_none());
         assert_eq!(n.election.current_term_sync(), 0);
+    }
+
+    // ── Dial-time socket family ─────────────────────────────────────────────
+
+    #[test]
+    fn ephemeral_bind_follows_the_peer_family() {
+        let v4: SocketAddr = "192.0.2.10:16851".parse().expect("v4 peer");
+        assert_eq!(
+            ephemeral_bind_for(v4).to_string(),
+            "0.0.0.0:0",
+            "the v4 path must keep the exact bind it has always used"
+        );
+
+        let v6: SocketAddr = "[2001:db8::1]:16851".parse().expect("v6 peer");
+        assert_eq!(ephemeral_bind_for(v6).to_string(), "[::]:0");
+
+        // A v4-mapped literal parses as IPv6 and must be dialled from a v6
+        // socket — a v4 socket cannot send to `::ffff:a.b.c.d` at all.
+        let mapped: SocketAddr = "[::ffff:192.0.2.10]:16851".parse().expect("mapped peer");
+        assert!(mapped.is_ipv6());
+        assert_eq!(ephemeral_bind_for(mapped).to_string(), "[::]:0");
+    }
+
+    /// The bind must be usable, not merely well-formed: bind both families for
+    /// real and confirm the socket that comes back is in the family the peer
+    /// needs. This is the step that failed before the fix — a `0.0.0.0` socket
+    /// has no route to any v6 address.
+    #[test]
+    fn ephemeral_bind_produces_a_socket_that_can_reach_the_peer() {
+        use std::net::UdpSocket;
+
+        let v4_peer: SocketAddr = "127.0.0.1:16851".parse().expect("v4 peer");
+        let sock = UdpSocket::bind(ephemeral_bind_for(v4_peer)).expect("bind v4 ephemeral socket");
+        assert!(sock.connect(v4_peer).is_ok(), "v4 socket must reach a v4 peer");
+
+        // On a kernel booted with `ipv6.disable=1` there are no v6 sockets at
+        // all, so the v6 half simply does not apply — and nothing is broken
+        // there, because the v4 assertion above already proved the path in use
+        // on such a host is untouched.
+        let v6_peer: SocketAddr = "[::1]:16851".parse().expect("v6 peer");
+        if let Ok(sock) = UdpSocket::bind(ephemeral_bind_for(v6_peer)) {
+            assert!(sock.connect(v6_peer).is_ok(), "v6 socket must reach a v6 peer");
+            // The regression itself: the address the code used to hardcode
+            // cannot reach this peer.
+            let legacy = UdpSocket::bind("0.0.0.0:0").expect("bind legacy v4 socket");
+            assert!(
+                legacy.connect(v6_peer).is_err(),
+                "a v4-bound socket must not be able to reach a v6 peer; \
+                 if this ever passes the fix is no longer load-bearing"
+            );
+        }
     }
 
     #[tokio::test]

@@ -544,16 +544,56 @@ Scope is **global**, not per-host. The precise answer is per-host — a 2-second
 in the database and the admin UI, so that is a schema and interface change;
 the global knob is what exists today.
 
-The HTTP/3 path is **unchanged and still unbounded**:
-`reqwest::Client::builder()` at `crates/gateway/src/http3.rs:176-178` sets
-neither `.timeout()` nor `.connect_timeout()`, reqwest's default is no timeout,
-and `[proxy.upstream_timeouts]` does not reach it.
+**The HTTP/3 path honours the same block**, with two documented divergences.
+The H3 forwarder does not go through Pingora — it dials the upstream with
+`reqwest` (`crates/gateway/src/http3.rs`), which exposes a smaller set of
+timers. `UpstreamTimeouts::apply_to_reqwest`
+(`crates/gateway/src/upstream_timeout.rs`) does the mapping, and the resolved
+value reaches the H3 runtime from the same
+`gateway::UpstreamTimeouts::from_config(&config.proxy.upstream_timeouts)` the
+Pingora path uses (`crates/prx-waf/src/main.rs`, H3 spawn block).
+
+| Key | reqwest | Fidelity |
+|---|---|---|
+| `total_connect_ms` | `connect_timeout` | **Exact.** reqwest wraps the whole connector — DNS + TCP + TLS — in one `TimeoutLayer` (`reqwest-0.13.4/src/connect.rs:141-155`), which is what `total_connection_timeout` means. |
+| `connect_ms` | `connect_timeout`, **only when `total_connect_ms` is `0`** | **Approximate, in the strict direction.** reqwest has no per-TCP-attempt timer, so in the fallback `connect_ms` also covers DNS and TLS. When both keys are set `total_connect_ms` wins; taking the minimum was rejected because `connect_ms=1s, total_connect_ms=5s` authorises five seconds of setup and cutting at one would break a slow-TLS origin the operator explicitly allowed for. |
+| `read_ms` | `read_timeout` | **Exact.** Per-read, re-armed on success — the same inactivity semantics as Pingora's. |
+| `write_ms` | — | **Not enforced.** reqwest 0.13 has no write timeout, on `ClientBuilder` or `RequestBuilder`. Setting it emits a `WARN` at H3 startup naming the stage, so the gap is visible rather than assumed closed. |
+| `idle_ms` | `pool_idle_timeout` | **Exact when set — but `0` is not "unlimited" here.** See below. |
+| `stream_exempt` | a second client | Applies to `read_ms` only; there is no write timer to exempt. |
+
+**`idle_ms = 0` deliberately leaves reqwest's own default in place.**
+`connect_timeout`, `timeout` and `read_timeout` all default to `None`
+(`reqwest-0.13.4/src/async_impl/client.rs:1444/1456/1469`), so not setting them
+reproduces the historical behaviour exactly. `pool_idle_timeout` is the one
+exception: its default is **90 seconds** (`.../client.rs:1492-1499`), not
+unlimited. Calling `.pool_idle_timeout(None)` so that `0` could mean
+"unlimited" would therefore *change* H3 behaviour in the name of preserving it.
+`0` means "reqwest's 90 s default", which is what H3 has always done; only a
+non-zero `idle_ms` moves it.
+
+**`stream_exempt` needs two clients** because reqwest's read timeout is a
+per-*client* setting while the exemption is a per-*request* decision. H3
+therefore builds a second, read-unbounded client — but only when the exemption
+could change something (`stream_exempt` on **and** `read_ms` set), so the
+shipped default still constructs exactly one client, as before. Both planes
+answer "is this streaming?" with the same predicate
+(`upstream_timeout::headers_are_streaming`), so they cannot drift.
+
+An H3 expiry writes one `WARN` at target `waf.upstream_timeout` — the same
+target the Pingora path uses — and the client gets a 502. This covers both the
+send phase and a `read_ms` expiry part-way through the response body; the latter
+previously dropped the H3 stream with no response at all.
+
+**Left at the defaults, H3 is exactly as unbounded as it always was.**
+`apply_to_reqwest` returns the builder untouched when nothing is configured.
 
 ### 5.2 Timeouts that do exist
 
 | What | Value | On expiry | Tunable |
 |---|---|---|---|
-| Upstream connect / total-connect / read / write / idle | **none** (0 = unlimited) | 502 + `WARN waf.upstream_timeout` | `proxy.upstream_timeouts.*` (§5.1) |
+| Upstream connect / total-connect / read / write / idle (HTTP/1.1 + HTTP/2) | **none** (0 = unlimited) | 502 + `WARN waf.upstream_timeout` | `proxy.upstream_timeouts.*` (§5.1) |
+| Upstream connect / read / idle (**HTTP/3**) | **none**, except a 90 s reqwest connection-pool idle default | 502 + `WARN waf.upstream_timeout` | same block; `write_ms` not enforced (§5.1) |
 | CrowdSec AppSec (**on the request path**) | 500 ms | `Unavailable` → `appsec_failure_action`, default **allow** (fail-open) | `crowdsec.appsec_timeout_ms` |
 | CrowdSec LAPI client (background) | 10 s | poll retried at the same cadence | no |
 | CrowdSec mirror restore at startup | 10 s | start with empty cache (fail-open), logged | no |
@@ -625,7 +665,13 @@ are recorded here as findings; none has been changed by this document.
    streams (SSE, WebSocket) unless `stream_exempt` is also on, which is itself
    opt-out-able by any client that sends the right header. Read §5.1 before
    setting a value.
-2. **HTTP/3 upstream client has no timeout at all** (§5.1).
+2. ~~**HTTP/3 upstream client has no timeout at all.**~~ **Now covered by the
+   same `[proxy.upstream_timeouts]`** (§5.1), and so it inherits entry 1's
+   caveat: off by default, therefore still unbounded for anyone who leaves it
+   alone. Two residual gaps are specific to H3 and remain even when the block
+   *is* set: `write_ms` has no reqwest equivalent and is not enforced (a startup
+   `WARN` says so), and `idle_ms = 0` means reqwest's 90 s pool default rather
+   than unlimited.
 3. **Proxy is single-threaded and not configurable** (§5.3). Throughput does not
    scale with cores.
 4. **No proxy connection-concurrency limit**, and no QUIC transport config

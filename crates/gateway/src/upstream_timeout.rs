@@ -96,6 +96,126 @@ impl UpstreamTimeouts {
         }
     }
 
+    // ── HTTP/3 (reqwest) ────────────────────────────────────────────────────
+    //
+    // The H3 forwarder does not go through Pingora at all: it dials the
+    // upstream with `reqwest` (`crate::http3`), which arms its own timers and
+    // exposes a different, smaller set of stages. The mapping below is
+    // deliberately conservative — a stage reqwest cannot express is reported by
+    // [`Self::reqwest_unenforced`] rather than approximated with something that
+    // would cut at a different moment than the operator asked for.
+    //
+    // | `[proxy.upstream_timeouts]` | reqwest                | fidelity |
+    // |-----------------------------|------------------------|----------|
+    // | `total_connect_ms`          | `connect_timeout`      | exact    |
+    // | `connect_ms`                | `connect_timeout` only when `total_connect_ms` is unset — see [`Self::reqwest_connect_timeout`] |
+    // | `read_ms`                   | `read_timeout`         | exact    |
+    // | `write_ms`                  | —                      | **not enforced** |
+    // | `idle_ms`                   | `pool_idle_timeout`    | exact, but the *default* differs — see [`Self::apply_to_reqwest`] |
+    // | `stream_exempt`             | a second client        | read only (there is no write timer to exempt) |
+
+    /// The single connection-setup deadline reqwest offers, chosen from the two
+    /// setup stages Pingora distinguishes.
+    ///
+    /// `ClientBuilder::connect_timeout` installs one `tower` `TimeoutLayer`
+    /// around the *whole* connector — DNS, TCP and, for an `https` upstream,
+    /// the TLS handshake (`reqwest-0.13.4/src/connect.rs:141-155`; the TLS
+    /// connector sits inside the wrapped service). That is precisely
+    /// `total_connect_ms`, so when it is set it is used verbatim.
+    ///
+    /// `connect_ms` bounds *one TCP connect attempt* and has no reqwest
+    /// equivalent, so it is only used as a fallback, when the operator bounded
+    /// the TCP attempt but left the total unbounded. In that fallback it is
+    /// **stricter** than on the Pingora path: it then also has to cover DNS and
+    /// TLS. Erring strict is the right direction for a `DoS` budget, and it is
+    /// the only way an operator who configured `connect_ms` alone gets any
+    /// setup bound on H3 at all.
+    ///
+    /// When both are set, `total_connect_ms` wins. Taking the minimum of the
+    /// two was rejected: `connect_ms = 1s, total_connect_ms = 5s` authorises
+    /// five seconds of setup, and cutting that install at one second would
+    /// break a slow-TLS upstream that the operator explicitly allowed for.
+    pub const fn reqwest_connect_timeout(&self) -> Option<Duration> {
+        match self.total_connect {
+            Some(d) => Some(d),
+            None => self.connect,
+        }
+    }
+
+    /// The configured stage that the H3 path cannot enforce, if any.
+    ///
+    /// reqwest 0.13 has no write timeout — neither on `ClientBuilder` nor on
+    /// `RequestBuilder` (`reqwest-0.13.4/src/async_impl/request.rs:294` offers
+    /// only a total per-request deadline) — so `write_ms` is silently absent
+    /// from the H3 data path. The caller logs this once at startup rather than
+    /// letting an operator believe a bound is in force that is not.
+    pub const fn reqwest_unenforced(&self) -> Option<&'static str> {
+        if self.write.is_some() { Some("write_ms") } else { None }
+    }
+
+    /// Write the configured stages onto a `reqwest` client builder.
+    ///
+    /// Like [`Self::apply`], this returns the builder untouched when nothing is
+    /// configured, so the shipped default is byte-for-byte the client the H3
+    /// forwarder has always built.
+    ///
+    /// **`idle_ms = 0` deliberately does not disable the pool timer.** Every
+    /// other reqwest stage defaults to `None` = no timeout
+    /// (`reqwest-0.13.4/src/async_impl/client.rs:1444/1456/1469`), so leaving
+    /// them unset reproduces the old behaviour exactly. `pool_idle_timeout` is
+    /// the exception: its default is **90 seconds**
+    /// (`.../client.rs:1492-1499`), not unlimited. Calling
+    /// `.pool_idle_timeout(None)` to make `0` mean "unlimited" here would
+    /// therefore *change* the shipped behaviour in the name of preserving it.
+    /// `0` is left as "reqwest's own default", and only a non-zero `idle_ms`
+    /// moves it.
+    ///
+    /// `exempt` is [`is_streaming_request`] for the request about to be sent;
+    /// combined with `stream_exempt` it drops `read_timeout`, mirroring
+    /// [`Self::apply`]. Only the read timer can be exempted because there is no
+    /// write timer to drop. reqwest has no per-request read timeout, so the
+    /// caller builds one client per exemption state
+    /// ([`crate::http3::UpstreamClients`]).
+    pub fn apply_to_reqwest(&self, mut builder: reqwest::ClientBuilder, exempt: bool) -> reqwest::ClientBuilder {
+        if self.is_unlimited() {
+            return builder;
+        }
+
+        if let Some(d) = self.reqwest_connect_timeout() {
+            builder = builder.connect_timeout(d);
+        }
+        if let Some(d) = self.read
+            && !(exempt && self.stream_exempt)
+        {
+            builder = builder.read_timeout(d);
+        }
+        if let Some(d) = self.idle {
+            builder = builder.pool_idle_timeout(d);
+        }
+
+        builder
+    }
+
+    /// One-line rendering of what the H3 forwarder actually armed, for the
+    /// startup log. Deliberately separate from [`Self::summary`]: the stages
+    /// differ, and reporting the Pingora set on the H3 line would overstate it.
+    pub fn reqwest_summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::with_capacity(4);
+        if let Some(d) = self.reqwest_connect_timeout() {
+            parts.push(format!("connect_timeout={}ms", d.as_millis()));
+        }
+        if let Some(d) = self.read {
+            parts.push(format!("read_timeout={}ms", d.as_millis()));
+            if self.stream_exempt {
+                parts.push("stream_exempt=on (Upgrade / Accept: text/event-stream skip read_timeout)".to_string());
+            }
+        }
+        if let Some(d) = self.idle {
+            parts.push(format!("pool_idle_timeout={}ms", d.as_millis()));
+        }
+        parts.join(", ")
+    }
+
     /// One-line rendering of the armed stages for the startup log. Only
     /// non-`None` stages appear, so the line says what is actually in force
     /// rather than repeating the defaults.
@@ -145,10 +265,20 @@ const fn millis(ms: u64) -> Option<Duration> {
 /// under this predicate an attacker can hand themselves the exemption with one
 /// header.
 pub fn is_streaming_request(req: &RequestHeader) -> bool {
-    if req.headers.contains_key(http::header::UPGRADE) {
+    headers_are_streaming(&req.headers)
+}
+
+/// [`is_streaming_request`] over a bare [`http::HeaderMap`].
+///
+/// The HTTP/3 plane never builds a Pingora `RequestHeader` — it holds
+/// `http::request::Parts` straight from `h3` — so the predicate has to be
+/// reachable without one. Both planes must answer identically, hence one
+/// implementation rather than two.
+pub fn headers_are_streaming(headers: &http::HeaderMap) -> bool {
+    if headers.contains_key(http::header::UPGRADE) {
         return true;
     }
-    req.headers
+    headers
         .get_all(http::header::ACCEPT)
         .iter()
         .any(|v| contains_ignore_ascii_case(v.as_bytes(), b"text/event-stream"))
@@ -169,6 +299,15 @@ mod tests {
 
     fn cfg() -> UpstreamTimeoutConfig {
         UpstreamTimeoutConfig::default()
+    }
+
+    /// The workspace builds `reqwest` with `rustls-no-provider`, so
+    /// `ClientBuilder::build` panics unless a process-level `CryptoProvider`
+    /// was installed first. The daemon does this at startup
+    /// (`crates/prx-waf/src/main.rs:344`); tests must do the same.
+    /// `install_default` errors only when one is already set — idempotent.
+    fn install_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
     /// The shipped config must resolve to "no timer anywhere".
@@ -323,6 +462,224 @@ mod tests {
         assert!(!is_streaming_request(&req(&[("accept", "application/json")])));
         // `Connection: upgrade` without an `Upgrade` header is not a handshake.
         assert!(!is_streaming_request(&req(&[("connection", "upgrade")])));
+    }
+
+    // ── HTTP/3 (reqwest) mapping ────────────────────────────────────────────
+
+    /// The shipped config must hand reqwest a builder it never touched, so the
+    /// H3 client stays exactly the one the forwarder has always built.
+    #[test]
+    fn default_config_does_not_touch_the_reqwest_builder() {
+        install_crypto_provider();
+        let t = UpstreamTimeouts::from_config(&cfg());
+        let untouched = format!("{:?}", reqwest::Client::builder());
+        let applied = format!("{:?}", t.apply_to_reqwest(reqwest::Client::builder(), false));
+        assert_eq!(applied, untouched);
+        assert_eq!(t.reqwest_summary(), "");
+        assert_eq!(t.reqwest_unenforced(), None);
+    }
+
+    /// `total_connect_ms` is the exact reqwest analogue and wins outright;
+    /// `connect_ms` is only the fallback when no total was configured.
+    #[test]
+    fn reqwest_connect_timeout_prefers_the_total() {
+        let both = UpstreamTimeouts::from_config(&UpstreamTimeoutConfig {
+            connect_ms: 1000,
+            total_connect_ms: 5000,
+            ..cfg()
+        });
+        assert_eq!(both.reqwest_connect_timeout(), Some(Duration::from_secs(5)));
+
+        let tcp_only = UpstreamTimeouts::from_config(&UpstreamTimeoutConfig {
+            connect_ms: 1000,
+            ..cfg()
+        });
+        assert_eq!(tcp_only.reqwest_connect_timeout(), Some(Duration::from_secs(1)));
+
+        let total_only = UpstreamTimeouts::from_config(&UpstreamTimeoutConfig {
+            total_connect_ms: 5000,
+            ..cfg()
+        });
+        assert_eq!(total_only.reqwest_connect_timeout(), Some(Duration::from_secs(5)));
+
+        assert_eq!(UpstreamTimeouts::from_config(&cfg()).reqwest_connect_timeout(), None);
+    }
+
+    /// The connect deadline must actually land on the builder — `connect_timeout`
+    /// is one of the few fields reqwest renders in its `Debug` output.
+    #[test]
+    fn reqwest_connect_timeout_reaches_the_builder() {
+        install_crypto_provider();
+        let t = UpstreamTimeouts::from_config(&UpstreamTimeoutConfig {
+            total_connect_ms: 2500,
+            ..cfg()
+        });
+        let rendered = format!("{:?}", t.apply_to_reqwest(reqwest::Client::builder(), false));
+        assert!(rendered.contains("connect_timeout"), "{rendered}");
+        assert!(rendered.contains("2.5s"), "{rendered}");
+    }
+
+    /// `write_ms` has no reqwest equivalent; it must be reported, never faked.
+    #[test]
+    fn write_ms_is_reported_as_unenforced_on_the_h3_path() {
+        let t = UpstreamTimeouts::from_config(&UpstreamTimeoutConfig {
+            write_ms: 2000,
+            ..cfg()
+        });
+        assert_eq!(t.reqwest_unenforced(), Some("write_ms"));
+        // …and it must not leak into the H3 summary as if it were armed.
+        assert_eq!(t.reqwest_summary(), "");
+    }
+
+    #[test]
+    fn reqwest_summary_lists_only_what_h3_arms() {
+        let t = UpstreamTimeouts::from_config(&UpstreamTimeoutConfig {
+            connect_ms: 1000,
+            total_connect_ms: 3000,
+            read_ms: 2000,
+            write_ms: 4000,
+            idle_ms: 60_000,
+            stream_exempt: false,
+        });
+        assert_eq!(
+            t.reqwest_summary(),
+            "connect_timeout=3000ms, read_timeout=2000ms, pool_idle_timeout=60000ms"
+        );
+
+        let exempt = UpstreamTimeouts::from_config(&UpstreamTimeoutConfig {
+            read_ms: 2000,
+            stream_exempt: true,
+            ..cfg()
+        });
+        assert!(
+            exempt.reqwest_summary().contains("stream_exempt=on"),
+            "{}",
+            exempt.reqwest_summary()
+        );
+
+        // The exemption exempts nothing when no read bound exists; do not claim it.
+        let no_read = UpstreamTimeouts::from_config(&UpstreamTimeoutConfig {
+            connect_ms: 1000,
+            stream_exempt: true,
+            ..cfg()
+        });
+        assert_eq!(no_read.reqwest_summary(), "connect_timeout=1000ms");
+    }
+
+    /// Accept a TCP connection and then never write a byte: the shape of a
+    /// wedged upstream. Returns the bound address; the task lives as long as
+    /// the returned guard.
+    async fn stalling_upstream() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalling upstream");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                // Hold the socket open, read nothing, answer nothing. Parking
+                // it in its own task keeps it alive without ever polling it.
+                tokio::spawn(async move {
+                    let _held = sock;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        (addr, handle)
+    }
+
+    /// `read_ms` must sever a stalled upstream response…
+    #[tokio::test]
+    async fn read_ms_cuts_a_stalled_upstream() {
+        install_crypto_provider();
+        let (addr, guard) = stalling_upstream().await;
+        let t = UpstreamTimeouts::from_config(&UpstreamTimeoutConfig { read_ms: 250, ..cfg() });
+        let client = t
+            .apply_to_reqwest(reqwest::Client::builder(), false)
+            .build()
+            .expect("build client");
+
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("a stalled upstream must not succeed");
+        assert!(err.is_timeout(), "expected a timeout error, got: {err}");
+        guard.abort();
+    }
+
+    /// …and with nothing configured the very same upstream must still be
+    /// waited on, which is the whole point of the zero default.
+    #[tokio::test]
+    async fn default_config_waits_on_the_same_stalled_upstream() {
+        install_crypto_provider();
+        let (addr, guard) = stalling_upstream().await;
+        let client = UpstreamTimeouts::from_config(&cfg())
+            .apply_to_reqwest(reqwest::Client::builder(), false)
+            .build()
+            .expect("build client");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(1500),
+            client.get(format!("http://{addr}/")).send(),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "unconfigured client must still be waiting, but it returned: {:?}",
+            outcome.map(|r| r.map(|resp| resp.status()))
+        );
+        guard.abort();
+    }
+
+    /// With `stream_exempt` on, a streaming request keeps the unbounded
+    /// behaviour while an ordinary one is still cut.
+    #[tokio::test]
+    async fn stream_exempt_drops_the_read_timeout_for_exempt_requests() {
+        install_crypto_provider();
+        let (addr, guard) = stalling_upstream().await;
+        let t = UpstreamTimeouts::from_config(&UpstreamTimeoutConfig {
+            read_ms: 250,
+            stream_exempt: true,
+            ..cfg()
+        });
+
+        let bounded = t
+            .apply_to_reqwest(reqwest::Client::builder(), false)
+            .build()
+            .expect("build bounded client");
+        let err = bounded
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("non-exempt request must be cut");
+        assert!(err.is_timeout(), "expected a timeout error, got: {err}");
+
+        let exempt = t
+            .apply_to_reqwest(reqwest::Client::builder(), true)
+            .build()
+            .expect("build exempt client");
+        let outcome = tokio::time::timeout(Duration::from_secs(1), exempt.get(format!("http://{addr}/")).send()).await;
+        assert!(outcome.is_err(), "exempt request must not be cut by read_ms");
+        guard.abort();
+    }
+
+    /// The exemption only exists when it was asked for.
+    #[tokio::test]
+    async fn streaming_request_is_still_bounded_without_the_exemption() {
+        install_crypto_provider();
+        let (addr, guard) = stalling_upstream().await;
+        let t = UpstreamTimeouts::from_config(&UpstreamTimeoutConfig { read_ms: 250, ..cfg() });
+        let client = t
+            .apply_to_reqwest(reqwest::Client::builder(), true)
+            .build()
+            .expect("build client");
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("stream_exempt is off, so the bound still applies");
+        assert!(err.is_timeout(), "expected a timeout error, got: {err}");
+        guard.abort();
     }
 
     #[test]

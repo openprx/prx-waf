@@ -24,6 +24,7 @@ use waf_engine::WafEngine;
 
 use crate::context::{BodyOverflowAction, BodyWindows, body_inspection_policy, fold_request_headers};
 use crate::router::HostRouter;
+use crate::upstream_timeout::{UpstreamTimeouts, headers_are_streaming};
 
 // ─── Limits ───────────────────────────────────────────────────────────────────
 
@@ -85,6 +86,56 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
+// ─── Upstream clients ─────────────────────────────────────────────────────────
+
+/// The `reqwest` clients this connection dials upstreams with.
+///
+/// `[proxy.upstream_timeouts]` reaches the H3 forwarder through
+/// [`UpstreamTimeouts::apply_to_reqwest`]; see that method for the
+/// stage-by-stage mapping and for the two places reqwest's semantics differ
+/// from Pingora's.
+///
+/// There are two clients rather than one because `stream_exempt` is a
+/// *per-request* decision while reqwest's read timeout is a *per-client*
+/// setting (`ClientBuilder::read_timeout`; `RequestBuilder` offers only a total
+/// deadline). The second client is built only when the exemption can actually
+/// bite, so the default install still constructs exactly one client, as before.
+struct UpstreamClients {
+    /// Carries every configured bound. Used for all ordinary requests.
+    bounded: reqwest::Client,
+    /// `bounded` minus the read timeout, for requests that
+    /// [`headers_are_streaming`] flags while `stream_exempt` is on.
+    exempt: Option<reqwest::Client>,
+}
+
+impl UpstreamClients {
+    /// Build the client(s) for one QUIC connection.
+    ///
+    /// `danger_accept_invalid_certs` only relaxes verification for `https`
+    /// upstreams; `http` backends are unaffected.
+    fn build(upstream_tls_verify: bool, timeouts: UpstreamTimeouts) -> reqwest::Result<Self> {
+        let base = || reqwest::Client::builder().danger_accept_invalid_certs(!upstream_tls_verify);
+
+        let bounded = timeouts.apply_to_reqwest(base(), false).build()?;
+        // Only worth a second client when an exemption would change something.
+        let exempt = if timeouts.stream_exempt && timeouts.read.is_some() {
+            Some(timeouts.apply_to_reqwest(base(), true).build()?)
+        } else {
+            None
+        };
+
+        Ok(Self { bounded, exempt })
+    }
+
+    /// The client to use for a request with these headers.
+    fn select(&self, headers: &http::HeaderMap) -> &reqwest::Client {
+        match &self.exempt {
+            Some(exempt) if headers_are_streaming(headers) => exempt,
+            _ => &self.bounded,
+        }
+    }
+}
+
 // ─── TLS config builder ───────────────────────────────────────────────────────
 
 /// Build a `rustls::ServerConfig` suitable for QUIC (ALPN "h3").
@@ -117,6 +168,10 @@ pub fn build_tls_config(cert_pem: &str, key_pem: &str) -> anyhow::Result<rustls:
 /// WAF inspection pipeline and per-host routing as HTTP/1.1 traffic handled by
 /// Pingora.  `upstream_tls_verify` controls whether upstream TLS certificates
 /// are validated when a host's backend uses `https`.
+///
+/// `upstream_timeouts` is the resolved `[proxy.upstream_timeouts]`, shared with
+/// the Pingora path. It defaults to unlimited, in which case the upstream
+/// clients are built exactly as they always were.
 pub async fn start_http3_server(
     listen_addr: SocketAddr,
     cert_pem: String,
@@ -125,7 +180,18 @@ pub async fn start_http3_server(
     smuggling_detection: bool,
     engine: Arc<WafEngine>,
     router: Arc<HostRouter>,
+    upstream_timeouts: UpstreamTimeouts,
 ) -> anyhow::Result<()> {
+    if !upstream_timeouts.is_unlimited() {
+        info!("HTTP/3 upstream timeouts: {}", upstream_timeouts.reqwest_summary());
+        if let Some(stage) = upstream_timeouts.reqwest_unenforced() {
+            warn!(
+                "[proxy.upstream_timeouts] {stage} is NOT enforced on the HTTP/3 path: the H3 forwarder dials \
+                 upstreams with reqwest, which has no write timeout. HTTP/1.1 and HTTP/2 are unaffected."
+            );
+        }
+    }
+
     let tls_config = build_tls_config(&cert_pem, &key_pem)?;
     let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
         .map_err(|e| anyhow::anyhow!("QUIC TLS config error: {e:?}"))?;
@@ -142,7 +208,9 @@ pub async fn start_http3_server(
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
-                    if let Err(e) = handle_quic_connection(conn, verify_tls, smuggling_detection, eng, rtr).await {
+                    if let Err(e) =
+                        handle_quic_connection(conn, verify_tls, smuggling_detection, eng, rtr, upstream_timeouts).await
+                    {
                         warn!("HTTP/3 connection error: {e}");
                     }
                 }
@@ -161,6 +229,7 @@ async fn handle_quic_connection(
     smuggling_detection: bool,
     engine: Arc<WafEngine>,
     router: Arc<HostRouter>,
+    upstream_timeouts: UpstreamTimeouts,
 ) -> anyhow::Result<()> {
     let peer = conn.remote_address();
     debug!(%peer, "HTTP/3 connection accepted");
@@ -171,16 +240,12 @@ async fn handle_quic_connection(
         .await
         .context("h3 handshake failed")?;
 
-    // `danger_accept_invalid_certs` only relaxes verification for `https`
-    // upstreams; `http` backends are unaffected.
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(!upstream_tls_verify)
-        .build()?;
+    let clients = Arc::new(UpstreamClients::build(upstream_tls_verify, upstream_timeouts)?);
 
     loop {
         match server_conn.accept().await {
             Ok(Some(resolver)) => {
-                let client = client.clone();
+                let clients = Arc::clone(&clients);
                 let eng = Arc::clone(&engine);
                 let rtr = Arc::clone(&router);
                 let remote = peer;
@@ -189,7 +254,7 @@ async fn handle_quic_connection(
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
                             if let Err(e) =
-                                handle_h3_request(req, stream, &client, &eng, &rtr, remote, smuggling_detection).await
+                                handle_h3_request(req, stream, &clients, &eng, &rtr, remote, smuggling_detection).await
                             {
                                 warn!("HTTP/3 request error: {e}");
                             }
@@ -249,7 +314,7 @@ where
 async fn handle_h3_request<C>(
     req: http::Request<()>,
     mut stream: h3::server::RequestStream<C, Bytes>,
-    client: &reqwest::Client,
+    clients: &UpstreamClients,
     engine: &WafEngine,
     router: &HostRouter,
     peer: SocketAddr,
@@ -482,7 +547,7 @@ where
     debug!(method = %request_ctx.method, %target, "HTTP/3 → upstream");
 
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).context("invalid H3 method")?;
-    let mut req_builder = client.request(method, &target);
+    let mut req_builder = clients.select(&parts.headers).request(method, &target);
     for (name, value) in &parts.headers {
         let key = name.as_str();
         // Skip hop-by-hop headers and content-length (reqwest sets it from the
@@ -499,10 +564,7 @@ where
     let resp = match req_builder.send().await {
         Ok(r) => r,
         Err(e) => {
-            warn!(
-                "H3 upstream request failed: host={} target={target} err={e}",
-                request_ctx.host
-            );
+            log_upstream_failure(&e, &request_ctx.host, &target, "request");
             return respond_simple(
                 &mut stream,
                 http::StatusCode::BAD_GATEWAY,
@@ -516,7 +578,22 @@ where
     // ── Relay the upstream response (status + headers + body) ───────────────
     let status = http::StatusCode::from_u16(resp.status().as_u16()).context("invalid upstream status")?;
     let upstream_headers = resp.headers().clone();
-    let body_bytes = resp.bytes().await.context("reading upstream body")?;
+    // A `read_ms` expiry mid-body lands here. Answer it the same way as a
+    // failed send — one 502, one record — rather than dropping the stream with
+    // no response at all.
+    let body_bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            log_upstream_failure(&e, &request_ctx.host, &target, "response body");
+            return respond_simple(
+                &mut stream,
+                http::StatusCode::BAD_GATEWAY,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"Bad Gateway"),
+            )
+            .await;
+        }
+    };
 
     let mut builder = http::Response::builder().status(status);
     for (name, value) in &upstream_headers {
@@ -540,6 +617,24 @@ where
     stream.finish().await.context("h3 finish")?;
 
     Ok(())
+}
+
+/// Record an upstream failure on the H3 path.
+///
+/// A timeout is separated out and logged at target `waf.upstream_timeout` —
+/// the same target the Pingora path uses (`crate::proxy`) — so one query finds
+/// every expiry regardless of which protocol the client spoke. `phase` names
+/// where it bit ("request" covers connect + send, "response body" the relay).
+fn log_upstream_failure(err: &reqwest::Error, host: &str, target: &str, phase: &str) {
+    if err.is_timeout() {
+        warn!(
+            target: "waf.upstream_timeout",
+            "H3 upstream timed out during {phase}: host={host} target={target} err={err}; \
+             bound by [proxy.upstream_timeouts]"
+        );
+    } else {
+        warn!("H3 upstream {phase} failed: host={host} target={target} err={err}");
+    }
 }
 
 /// Emit the client response for a non-allow WAF decision.
@@ -648,6 +743,103 @@ mod tests {
         let b = router.resolve("b.com").expect("b route");
         assert_eq!(upstream_target(&a, "/"), "http://10.0.0.1:1111/");
         assert_eq!(upstream_target(&b, "/"), "http://10.0.0.2:2222/");
+    }
+
+    // ── Upstream client selection ───────────────────────────────────────────
+
+    /// `reqwest` builds panic without a process-level `CryptoProvider` under
+    /// the workspace's `rustls-no-provider` feature; the daemon installs one at
+    /// `crates/prx-waf/src/main.rs:344`.
+    fn install_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn timeouts(cfg: waf_common::UpstreamTimeoutConfig) -> UpstreamTimeouts {
+        UpstreamTimeouts::from_config(&cfg)
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (k, v) in pairs {
+            let name = http::HeaderName::from_bytes(k.as_bytes()).expect("valid header name");
+            let value = http::HeaderValue::from_str(v).expect("valid header value");
+            map.insert(name, value);
+        }
+        map
+    }
+
+    /// The shipped default must build exactly one client, as it always has —
+    /// no second client, and therefore no possible change of behaviour.
+    #[test]
+    fn default_config_builds_a_single_unbounded_client() {
+        install_crypto_provider();
+        let clients =
+            UpstreamClients::build(true, timeouts(waf_common::UpstreamTimeoutConfig::default())).expect("build");
+        assert!(clients.exempt.is_none());
+        assert!(std::ptr::eq(
+            clients.select(&headers(&[("accept", "text/event-stream")])),
+            &raw const clients.bounded
+        ));
+    }
+
+    /// A read bound without the exemption also needs only one client: every
+    /// request, streaming or not, is bounded.
+    #[test]
+    fn read_bound_without_exemption_builds_a_single_client() {
+        install_crypto_provider();
+        let clients = UpstreamClients::build(
+            true,
+            timeouts(waf_common::UpstreamTimeoutConfig {
+                read_ms: 2000,
+                ..waf_common::UpstreamTimeoutConfig::default()
+            }),
+        )
+        .expect("build");
+        assert!(clients.exempt.is_none());
+    }
+
+    /// `stream_exempt` on with a read bound: two clients, and the streaming
+    /// request is routed to the exempt one while everything else is not.
+    #[test]
+    fn stream_exempt_routes_streaming_requests_to_the_exempt_client() {
+        install_crypto_provider();
+        let clients = UpstreamClients::build(
+            true,
+            timeouts(waf_common::UpstreamTimeoutConfig {
+                read_ms: 2000,
+                stream_exempt: true,
+                ..waf_common::UpstreamTimeoutConfig::default()
+            }),
+        )
+        .expect("build");
+        let exempt = clients.exempt.as_ref().expect("exempt client must exist");
+
+        for streaming in [
+            headers(&[("upgrade", "websocket")]),
+            headers(&[("accept", "text/html, text/event-stream;q=0.9")]),
+        ] {
+            assert!(std::ptr::eq(clients.select(&streaming), exempt));
+        }
+        for ordinary in [headers(&[]), headers(&[("accept", "application/json")])] {
+            assert!(std::ptr::eq(clients.select(&ordinary), &raw const clients.bounded));
+        }
+    }
+
+    /// The exemption is pointless without a read bound to exempt from, so no
+    /// second client is built for it.
+    #[test]
+    fn stream_exempt_without_a_read_bound_builds_a_single_client() {
+        install_crypto_provider();
+        let clients = UpstreamClients::build(
+            true,
+            timeouts(waf_common::UpstreamTimeoutConfig {
+                connect_ms: 1000,
+                stream_exempt: true,
+                ..waf_common::UpstreamTimeoutConfig::default()
+            }),
+        )
+        .expect("build");
+        assert!(clients.exempt.is_none());
     }
 
     #[test]

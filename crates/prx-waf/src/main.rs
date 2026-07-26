@@ -1893,6 +1893,9 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     if http3_enabled {
         let h3_config = config.http3.clone();
         let h3_smuggling_detection = config.proxy.smuggling_detection;
+        // Same `[proxy.upstream_timeouts]` the Pingora path resolves below; the
+        // H3 forwarder maps it onto reqwest (see `UpstreamTimeouts::apply_to_reqwest`).
+        let h3_upstream_timeouts = gateway::UpstreamTimeouts::from_config(&config.proxy.upstream_timeouts);
         let h3_engine = Arc::clone(&engine);
         let h3_router = Arc::clone(&router);
         std::thread::spawn(move || {
@@ -1946,6 +1949,7 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
                     h3_smuggling_detection,
                     Arc::clone(&h3_engine),
                     Arc::clone(&h3_router),
+                    h3_upstream_timeouts,
                 )
                 .await
                 {
