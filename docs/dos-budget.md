@@ -496,7 +496,9 @@ so an operator can confirm from the log which stages are armed.
 
 **So the gap is closed only for operators who close it.** Left at the defaults,
 a slow or black-holed upstream still pins proxy connections indefinitely, and
-that still compounds with the single worker thread of §5.3.
+that still compounds with the finite worker-thread pool of §5.3 — a larger pool
+raises the number of stalled upstreams needed to wedge the data plane without
+bounding it.
 
 Measured end-to-end (debug build, real proxy + Postgres, a scripted upstream
 that stalls on demand; each figure includes ~0.5 s of fixed WAF processing in
@@ -613,17 +615,33 @@ budget, not against AppSec's typical response time.
 
 ### 5.3 Concurrency — the throughput ceiling
 
-`crates/prx-waf/src/main.rs:1389` calls `Server::new(None)`, so Pingora falls
+`crates/prx-waf/src/main.rs` used to call `Server::new(None)`, so Pingora fell
 back to `ServerConf::default()`, which sets **`threads: 1`**
-(`pingora-core-0.8.1/src/server/configuration/mod.rs:137`). The proxy service is
-added with a bare `add_tcp` and no thread override
-(`main.rs:1450-1452`).
+(`pingora-core-0.8.1/src/server/configuration/mod.rs:137`), and the proxy
+service was added with a bare `add_tcp` and no thread override. The data path
+therefore ran on a single worker thread on every machine, with no configuration
+key to change it: measured under saturation, the process held 13 OS threads and
+consumed **0.99 cores** on a 16-core host.
 
-**The proxy data path therefore runs on a single worker thread, on every
-machine, and there is no configuration key to change it.** Adding cores does not
-add proxy throughput. This is confirmed empirically in
-[`tests/perf/RESULTS.md`](../tests/perf/RESULTS.md): under saturation the
-process holds 13 OS threads but consumes **0.99 cores**, on a 16-core host.
+**`[proxy] worker_threads` now sizes it** (`crates/waf-common/src/config.rs`,
+resolved by `ProxyConfig::worker_thread_plan`, written onto `ServerConf::threads`
+in `main.rs`). Unset — the shipped default — it follows
+`std::thread::available_parallelism`, i.e. the cgroup CPU quota and CPU affinity
+mask this process actually has, not the host's core count; `0` says that
+explicitly; `N > 0` fixes it. The effective count and its origin are logged at
+startup, and a single-threaded data plane on a wider host is a startup `WARN`.
+Confirmed by measurement — the same 16-core host, same pinning, goes from 0.99
+to 3.87 cores consumed — but
+[`tests/perf/RESULTS.md`](../tests/perf/RESULTS.md) has **not** been re-run on
+multiple threads and still records the single-threaded throughput; the
+multi-threaded RPS figures taken here are provisional, since another pinned
+benchmark shared these cores while they were measured.
+
+Two consequences survive the change. The count is still **static** — there is no
+autoscaling, so a machine that grows CPUs needs a restart to use them — and
+every per-thread stall (§5.1: an upstream that accepts and goes silent) still
+consumes one of exactly `worker_threads` slots. A bigger data plane raises the
+number of connections needed to wedge it; it does not bound them.
 
 There is likewise **no configurable connection-concurrency limit** for the proxy
 listener, and no `quinn::TransportConfig` for HTTP/3 — no `max_idle_timeout`,
@@ -672,8 +690,10 @@ are recorded here as findings; none has been changed by this document.
    *is* set: `write_ms` has no reqwest equivalent and is not enforced (a startup
    `WARN` says so), and `idle_ms = 0` means reqwest's 90 s pool default rather
    than unlimited.
-3. **Proxy is single-threaded and not configurable** (§5.3). Throughput does not
-   scale with cores.
+3. ~~**Proxy is single-threaded and not configurable** (§5.3).~~ **Now sized by
+   `[proxy] worker_threads`**, defaulting to the CPUs the process may use
+   (§5.3). The count is static — chosen at startup, never adjusted — and each
+   thread is still individually stallable by a silent upstream (§5.1).
 4. **No proxy connection-concurrency limit**, and no QUIC transport config
    (§5.3).
 5. **Response cache byte budget is not enforced** — nominal 256 MB, worst case

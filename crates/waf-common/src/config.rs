@@ -724,6 +724,24 @@ const fn default_appsec_timeout() -> u64 {
 pub struct ProxyConfig {
     pub listen_addr: String,
     pub listen_addr_tls: String,
+    /// Worker threads for the Pingora proxy data plane — the runtime every
+    /// request is accepted, inspected and relayed on.
+    ///
+    /// * **absent** (the shipped default) — follow the CPUs this process is
+    ///   allowed to run on, i.e. [`std::thread::available_parallelism`].
+    /// * **`0`** — the same thing, said explicitly.
+    /// * **`N > 0`** — exactly `N` threads, whatever the machine has.
+    ///
+    /// "The CPUs this process is allowed to run on" is deliberately not "the
+    /// host's core count": on Linux `available_parallelism` honours the cgroup
+    /// CPU quota and the process's CPU affinity mask, so a container limited to
+    /// `cpus: 2` gets 2 and a `taskset -c 0-3` run gets 4 — which is the number
+    /// that can actually do work. Detection failing is not fatal: the proxy
+    /// falls back to a single thread and says so at startup.
+    ///
+    /// Resolution lives in [`ProxyConfig::worker_thread_plan`]; the value
+    /// reaches Pingora as `ServerConf::threads`.
+    #[serde(default)]
     pub worker_threads: Option<usize>,
     /// Trust X-Forwarded-For / X-Real-IP headers from upstream proxies.
     /// When `false` (default), the client IP is always taken from the TCP
@@ -761,6 +779,91 @@ impl Default for ProxyConfig {
             smuggling_detection: true,
             upstream_timeouts: UpstreamTimeoutConfig::default(),
         }
+    }
+}
+
+/// Where the effective proxy worker-thread count came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerThreadSource {
+    /// `[proxy] worker_threads` is not set, so the count follows the CPUs this
+    /// process may run on.
+    DefaultFollowsCpus,
+    /// `[proxy] worker_threads = 0` — follow the CPUs, stated explicitly.
+    ExplicitFollowsCpus,
+    /// `[proxy] worker_threads = N`, `N > 0` — a fixed count, independent of
+    /// the machine.
+    Fixed,
+}
+
+/// The resolved worker-thread decision: how many threads the proxy data plane
+/// will run on, and why.
+///
+/// Kept separate from the raw config value because the *why* is what the
+/// startup broadcast has to say. An operator reading `worker_threads: 4` in a
+/// log cannot tell whether the box has four cores, whether a container quota
+/// cut it to four, or whether someone pinned it — and those have different
+/// remedies when throughput is short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerThreadPlan {
+    /// Threads to hand Pingora. Always at least 1.
+    pub threads: usize,
+    /// How [`Self::threads`] was decided.
+    pub source: WorkerThreadSource,
+    /// CPUs this process may run on, when they could be detected.
+    pub available_cpus: Option<usize>,
+}
+
+impl WorkerThreadPlan {
+    /// Resolve a plan from the configured value and an already-detected CPU
+    /// count. `available_cpus` is `None` when detection failed.
+    ///
+    /// Split out from [`Self::detect`] so the decision table is testable
+    /// without depending on the number of cores the test host happens to have.
+    #[must_use]
+    pub fn resolve(configured: Option<usize>, available_cpus: Option<usize>) -> Self {
+        let source = match configured {
+            None => WorkerThreadSource::DefaultFollowsCpus,
+            Some(0) => WorkerThreadSource::ExplicitFollowsCpus,
+            Some(_) => WorkerThreadSource::Fixed,
+        };
+        let threads = match configured {
+            Some(n) if n > 0 => n,
+            // Follow the CPUs. A failed detection falls back to one thread
+            // rather than to a guess: one thread is the behaviour every release
+            // before this key had, so an unreadable affinity mask degrades to
+            // the old, known-safe posture instead of oversubscribing a machine
+            // nothing can currently measure.
+            _ => available_cpus.unwrap_or(1),
+        };
+        Self {
+            threads,
+            source,
+            available_cpus,
+        }
+    }
+
+    /// Resolve a plan, detecting the CPUs this process may run on.
+    #[must_use]
+    pub fn detect(configured: Option<usize>) -> Self {
+        let available = std::thread::available_parallelism()
+            .ok()
+            .map(std::num::NonZeroUsize::get);
+        Self::resolve(configured, available)
+    }
+
+    /// True when the proxy ends up on one thread on a host that offered more —
+    /// the shape of the throughput ceiling this key exists to lift.
+    #[must_use]
+    pub fn is_single_threaded_on_a_wider_host(&self) -> bool {
+        self.threads == 1 && self.available_cpus.is_none_or(|cpus| cpus > 1)
+    }
+}
+
+impl ProxyConfig {
+    /// Resolve [`ProxyConfig::worker_threads`] into the count Pingora is given.
+    #[must_use]
+    pub fn worker_thread_plan(&self) -> WorkerThreadPlan {
+        WorkerThreadPlan::detect(self.worker_threads)
     }
 }
 
@@ -1392,6 +1495,17 @@ fn parse_env_bool(key: &str, raw: &str) -> anyhow::Result<bool> {
     }
 }
 
+/// Parse a non-negative integer environment value.
+///
+/// Returns an explicit error (never panics) on a value that is not a
+/// non-negative integer, so a typo becomes a hard startup failure rather than a
+/// silently ignored override.
+fn parse_env_usize(key: &str, raw: &str) -> anyhow::Result<usize> {
+    raw.trim()
+        .parse::<usize>()
+        .map_err(|e| anyhow::anyhow!("environment variable {key} has invalid integer value '{raw}': {e}"))
+}
+
 /// Split a comma-separated environment value into trimmed, non-empty entries.
 fn parse_env_list(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -1418,6 +1532,7 @@ fn parse_env_list(raw: &str) -> Vec<String> {
 /// | `DATABASE_URL` | `storage.database_url` | string |
 /// | `PRXWAF_TRUST_PROXY_HEADERS` | `proxy.trust_proxy_headers` | bool |
 /// | `PRXWAF_TRUSTED_PROXIES` | `proxy.trusted_proxies` | comma-separated CIDRs |
+/// | `PRXWAF_WORKER_THREADS` | `proxy.worker_threads` | integer, `0` = follow available CPUs |
 /// | `PRXWAF_CLUSTER_JOIN_TOKEN` | `cluster.join_token` | string |
 /// | `PRXWAF_CLUSTER_MEMBERS` | `cluster.members` | comma-separated node ids |
 /// | `PRXWAF_CLUSTER_SEEDS` | `cluster.seeds` | comma-separated host:port |
@@ -1453,6 +1568,14 @@ where
     }
     if let Some(v) = get("PRXWAF_TRUSTED_PROXIES") {
         config.proxy.trusted_proxies = parse_env_list(&v);
+    }
+
+    // Sizing the data plane is a per-deployment decision, not a per-image one:
+    // the same container image runs under a 1-CPU quota on a laptop and 32 CPUs
+    // in production. Overriding from the environment keeps that out of the
+    // baked-in TOML.
+    if let Some(v) = get("PRXWAF_WORKER_THREADS") {
+        config.proxy.worker_threads = Some(parse_env_usize("PRXWAF_WORKER_THREADS", &v)?);
     }
 
     // Cluster overrides only when a [cluster] section is present.
@@ -1847,6 +1970,74 @@ mod load_config_tests {
 }
 
 #[cfg(test)]
+mod worker_thread_tests {
+    use super::*;
+
+    /// The shipped posture: no `worker_threads` key, so the data plane spreads
+    /// over every CPU the process may use. This is the whole point of the key —
+    /// a default install must not be pinned to one core.
+    #[test]
+    fn worker_threads_absent_follows_available_cpus() {
+        let plan = WorkerThreadPlan::resolve(None, Some(16));
+        assert_eq!(plan.threads, 16);
+        assert_eq!(plan.source, WorkerThreadSource::DefaultFollowsCpus);
+        assert!(!plan.is_single_threaded_on_a_wider_host());
+    }
+
+    /// `0` is the explicit spelling of the default, so an operator can write
+    /// the key down without freezing a number into it.
+    #[test]
+    fn worker_threads_zero_follows_available_cpus() {
+        let plan = WorkerThreadPlan::resolve(Some(0), Some(8));
+        assert_eq!(plan.threads, 8);
+        assert_eq!(plan.source, WorkerThreadSource::ExplicitFollowsCpus);
+    }
+
+    /// A positive value is taken verbatim — above the CPU count as well as
+    /// below it. Oversubscribing is a legitimate ask (blocking work in the
+    /// path) and second-guessing it would make the key mean something other
+    /// than what it says.
+    #[test]
+    fn worker_threads_positive_is_taken_verbatim() {
+        for (configured, cpus) in [(4_usize, 16_usize), (32, 4)] {
+            let plan = WorkerThreadPlan::resolve(Some(configured), Some(cpus));
+            assert_eq!(plan.threads, configured);
+            assert_eq!(plan.source, WorkerThreadSource::Fixed);
+        }
+    }
+
+    /// Detection failing must degrade to the pre-`worker_threads` behaviour —
+    /// one thread — and never panic or guess.
+    #[test]
+    fn worker_threads_falls_back_to_one_when_cpu_detection_fails() {
+        let plan = WorkerThreadPlan::resolve(None, None);
+        assert_eq!(plan.threads, 1);
+        assert_eq!(plan.available_cpus, None);
+        assert!(
+            plan.is_single_threaded_on_a_wider_host(),
+            "must be broadcast as a warning"
+        );
+    }
+
+    /// A fixed `1` on a multi-core host is the ceiling this key exists to lift,
+    /// so it has to be recognisable as such by the startup broadcast.
+    #[test]
+    fn fixed_single_thread_on_a_multicore_host_is_flagged() {
+        assert!(WorkerThreadPlan::resolve(Some(1), Some(16)).is_single_threaded_on_a_wider_host());
+        assert!(
+            !WorkerThreadPlan::resolve(Some(1), Some(1)).is_single_threaded_on_a_wider_host(),
+            "one thread on a one-CPU host is not a ceiling worth warning about"
+        );
+    }
+
+    /// Detection on the test host must produce a usable, positive count.
+    #[test]
+    fn detection_yields_at_least_one_thread() {
+        assert!(ProxyConfig::default().worker_thread_plan().threads >= 1);
+    }
+}
+
+#[cfg(test)]
 mod env_override_tests {
     use std::collections::HashMap;
 
@@ -1935,6 +2126,36 @@ mod env_override_tests {
         assert!(c.replicate_ca_key);
         assert!(!c.crypto.auto_generate);
         assert_eq!(c.crypto.ca_passphrase, "env-pass");
+    }
+
+    /// `PRXWAF_WORKER_THREADS` sizes the data plane from the environment, so
+    /// one container image can run under different CPU budgets. `0` survives as
+    /// `Some(0)` — "follow the CPUs" — and is not confused with "unset".
+    #[test]
+    fn worker_threads_env_override_applies() {
+        let mut cfg = AppConfig::default();
+        apply_env_overrides_from(&mut cfg, getter(&[("PRXWAF_WORKER_THREADS", "6")])).expect("override should apply");
+        assert_eq!(cfg.proxy.worker_threads, Some(6));
+        assert_eq!(cfg.proxy.worker_thread_plan().threads, 6);
+
+        let mut cfg = AppConfig::default();
+        apply_env_overrides_from(&mut cfg, getter(&[("PRXWAF_WORKER_THREADS", "0")])).expect("override should apply");
+        assert_eq!(cfg.proxy.worker_threads, Some(0));
+        assert_eq!(
+            cfg.proxy.worker_thread_plan().source,
+            WorkerThreadSource::ExplicitFollowsCpus
+        );
+    }
+
+    /// A typo must fail startup rather than be dropped: a silently ignored
+    /// `PRXWAF_WORKER_THREADS=eight` would leave the operator believing the
+    /// data plane is sized when it is not.
+    #[test]
+    fn worker_threads_env_override_rejects_non_numeric() {
+        let mut cfg = AppConfig::default();
+        let err = apply_env_overrides_from(&mut cfg, getter(&[("PRXWAF_WORKER_THREADS", "eight")]))
+            .expect_err("non-numeric must be rejected");
+        assert!(err.to_string().contains("PRXWAF_WORKER_THREADS"), "unhelpful: {err}");
     }
 
     #[test]

@@ -135,6 +135,36 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`[proxy] worker_threads` — the proxy data plane is no longer pinned to one
+  core.** `Server::new(None)` took Pingora's `ServerConf::default()`, whose
+  `threads: 1` sized the runtime every request is accepted, inspected and
+  relayed on. Measured under saturation, the process held 13 OS threads and
+  consumed 0.99 cores on a 16-core host, and no configuration key could change
+  it; `README.md` documented a `worker_threads` key that the config struct
+  carried but nothing ever read.
+
+  It is read now. **Unset — the shipped default — the data plane follows the
+  CPUs the process may use**, so an existing install gets its machine on the
+  next restart without editing anything. `0` says that explicitly, `N > 0` fixes
+  the count, and `PRXWAF_WORKER_THREADS` overrides it for images that serve
+  several CPU budgets. The count comes from
+  `std::thread::available_parallelism`, which honours the cgroup CPU quota and
+  the process's CPU affinity mask — **in a container that is the quota, not the
+  host's core count**, which is the number that can actually do work but will
+  not match `nproc` on the host. Startup logs the effective count and where it
+  came from; a single-threaded data plane on a wider host, however it arose,
+  is a `WARN` naming the ceiling.
+
+  Verified by measurement, one binary, 1 thread versus the default, with the
+  harness's own pinning: the process goes from **0.99 cores to 3.87** and
+  throughput rises with it, sublinearly — the multi-threaded runtime costs
+  something per request, and that cost lands on the 1 → 2 thread step rather
+  than on each thread after it. Detection cost per request is unchanged; this
+  buys cores, nothing else. **The throughput figures are provisional**: a second
+  pinned benchmark was running on the same cores of the same host, so absolute
+  RPS is not comparable with the baseline in `tests/perf/RESULTS.md`, which has
+  not been re-run and still records the single-threaded numbers.
+
 - **The CRS rules this WAF runs are now visible, and each of them can be turned
   down or off without a restart.** `OWASPCheck` compiled 285 rules out of 288
   declared and exposed nothing but the counts: there was no way to ask which

@@ -208,7 +208,7 @@ Configuration is loaded from a TOML file (default: `configs/default.toml`).
 [proxy]
 listen_addr     = "0.0.0.0:80"
 listen_addr_tls = "0.0.0.0:443"
-worker_threads  = 4          # optional, defaults to CPU count
+worker_threads  = 4          # optional; unset or 0 = the CPUs this process may use
 
 [api]
 listen_addr = "127.0.0.1:9527"
@@ -430,9 +430,12 @@ HTTP/1.1, `oha` at 50 connections against a near-zero-work origin:
 
 Three things an operator should know before deploying:
 
-* **These are per-core numbers, and one core is all you get.** The proxy service
-  runs on a single Pingora worker thread (`Server::new(None)` → `threads: 1`)
-  and there is no configuration key to change it. Scale horizontally.
+* **These are per-thread numbers.** The table was measured on a single Pingora
+  worker thread, which is all any release before `[proxy] worker_threads` could
+  use. That key now sizes the data plane and defaults to the CPUs the process
+  may use, so a default install multiplies these figures — by less than the
+  thread count, since the multi-threaded runtime costs something per request.
+  The table has not been re-run on multiple threads yet.
 * **Cost is driven by request-body size, not request rate.** A small GET costs
   ~216 µs of CPU; a 64 KiB upload costs ~21 ms. Almost all of that is the Lane 1
   regex detectors, and 94% of *that* is the `sqli` and `xss` detectors.

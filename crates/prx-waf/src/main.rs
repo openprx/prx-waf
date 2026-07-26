@@ -13,7 +13,10 @@ use gateway::{
 };
 use waf_api::notify_runtime::{MonitoredPool, NotifyRuntime};
 use waf_api::{AppState, start_api_server};
-use waf_common::config::{ApiConfig, AppConfig, ConfigError, SecurityConfig, apply_env_overrides, load_config};
+use waf_common::config::{
+    ApiConfig, AppConfig, ConfigError, SecurityConfig, WorkerThreadPlan, WorkerThreadSource, apply_env_overrides,
+    load_config,
+};
 use waf_engine::checks::ResponseCheckSet;
 use waf_engine::{
     BUILTIN_BAD_BOTS, BUILTIN_GOOD_BOTS, BotAction, BotCheck, CrowdSecClient, CrowdSecConfig, EnforcementMode,
@@ -1835,6 +1838,10 @@ fn app_config_to_crowdsec(config: &AppConfig) -> CrowdSecConfig {
 fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     use pingora_core::server::Server;
 
+    // Resolved once, then both broadcast and handed to Pingora, so the line the
+    // operator reads is the count the data plane is actually built with.
+    let worker_threads = config.proxy.worker_thread_plan();
+
     // Report the admin-API reachable surface before anything else binds, so
     // the very first thing an operator sees is whether the management API is
     // exposed and what to do about it.
@@ -1849,6 +1856,10 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
             &config.http3,
             &config.security,
         ))
+        // How many cores the data plane can actually use. Announced before the
+        // listeners come up, because it is the one capacity figure an operator
+        // cannot read back off a default config file.
+        .chain(worker_thread_startup_broadcast(worker_threads))
     {
         match line.level {
             BroadcastLevel::Info => info!("{}", line.text),
@@ -1995,8 +2006,15 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
         });
     }
 
-    // Build and run Pingora proxy (blocks forever)
-    let mut server = Server::new(None)?;
+    // Build and run Pingora proxy (blocks forever).
+    //
+    // The thread count is global to the server rather than set per service:
+    // Pingora resolves each service's runtime as
+    // `service.threads().unwrap_or(conf.threads)`
+    // (`pingora-core-0.8.1/src/server/mod.rs:705`), so leaving every service's
+    // own override at `None` keeps one lever for the whole data plane instead
+    // of a per-listener count that has to be kept in sync.
+    let mut server = Server::new_with_opt_and_conf(None, proxy_server_conf(worker_threads.threads)?);
     server.bootstrap();
 
     // ── Response-phase detectors ──────────────────────────────────────────────
@@ -2296,6 +2314,82 @@ fn render_admin_allowlist(allowlist: &[String]) -> String {
             if allowlist.len() == 1 { "y" } else { "ies" },
             allowlist.join(", ")
         )
+    }
+}
+
+/// Build the Pingora server configuration the proxy data plane runs under.
+///
+/// This exists so the worker-thread count has somewhere to be written. The
+/// previous `Server::new(None)` silently took `ServerConf::default()`, whose
+/// `threads: 1` (`pingora-core-0.8.1/src/server/configuration/mod.rs:137`) is
+/// what pinned the whole data plane to one core regardless of the machine.
+/// `ServerConf::new()` is the same conf `Server::new(None)` would have built,
+/// so nothing else about the server changes.
+fn proxy_server_conf(threads: usize) -> anyhow::Result<pingora_core::server::configuration::ServerConf> {
+    use pingora_core::server::configuration::ServerConf;
+
+    let mut conf =
+        ServerConf::new().ok_or_else(|| anyhow::anyhow!("failed to build the default Pingora server configuration"))?;
+    conf.threads = threads;
+    Ok(conf)
+}
+
+/// Report how many threads the proxy data plane will run on, and why.
+///
+/// Worth a startup line because the count is invisible from anywhere else: it
+/// is not in the config file on a default install (the key is optional and the
+/// default is derived), `ps` shows a thread count that has never matched it —
+/// the process holds background-worker threads for the API, HTTP/3, the cluster
+/// and the storage pool — and the number an operator actually needs is "how
+/// many cores can serve traffic", which only this decision answers.
+///
+/// Takes the resolved plan rather than the config so it reports the same
+/// decision the server is actually built with, not a second resolution of it.
+fn worker_thread_startup_broadcast(plan: WorkerThreadPlan) -> Vec<BroadcastLine> {
+    let detected = plan.available_cpus.map_or_else(
+        || "the CPUs available to this process could not be detected".to_string(),
+        |cpus| format!("{cpus} CPU(s) available to this process"),
+    );
+    // Said once, wherever the count came from: the detected number is an
+    // affinity/quota number, and an operator comparing it against `nproc` on
+    // the host will otherwise read a correct value as a bug.
+    let caveat = "The detected figure comes from std::thread::available_parallelism, which honours the cgroup CPU \
+                  quota and this process's CPU affinity mask — in a container it is the quota, not the host's core \
+                  count, and under taskset it is the pinned set.";
+
+    let text = match plan.source {
+        WorkerThreadSource::DefaultFollowsCpus => format!(
+            "Proxy worker threads: {} — [proxy] worker_threads is unset, so the data plane follows the CPUs it may \
+             run on ({detected}). {caveat} Set [proxy] worker_threads = N (or PRXWAF_WORKER_THREADS=N) to fix the \
+             count.",
+            plan.threads
+        ),
+        WorkerThreadSource::ExplicitFollowsCpus => format!(
+            "Proxy worker threads: {} — [proxy] worker_threads = 0 means follow the CPUs this process may run on \
+             ({detected}). {caveat}",
+            plan.threads
+        ),
+        WorkerThreadSource::Fixed => format!(
+            "Proxy worker threads: {} — fixed by [proxy] worker_threads ({detected}). {caveat}",
+            plan.threads
+        ),
+    };
+
+    // One thread on a host that offered more is the throughput ceiling this
+    // key exists to lift: the data plane cannot exceed one core no matter how
+    // many the machine has, so it is stated as a warning rather than buried in
+    // an informational line.
+    if plan.is_single_threaded_on_a_wider_host() {
+        let remedy = match plan.source {
+            WorkerThreadSource::Fixed => "Raise [proxy] worker_threads, or set it to 0 to follow the available CPUs.",
+            _ => "Set [proxy] worker_threads = N explicitly to pick a count without relying on detection.",
+        };
+        vec![BroadcastLine::warn(format!(
+            "{text} THROUGHPUT CEILING: the proxy data plane is running on a single thread, so it cannot use more \
+             than one core however many this machine has, and adding cores will not add throughput. {remedy}"
+        ))]
+    } else {
+        vec![BroadcastLine::info(text)]
     }
 }
 
@@ -4232,5 +4326,90 @@ mod tests {
         assert_eq!(admin_api_origin("[::1]:9527"), "http://[::1]:9527");
         // Not a socket address: echoed back rather than replaced with a guess.
         assert_eq!(admin_api_origin("waf.internal:9527"), "http://waf.internal:9527");
+    }
+
+    /// The thread count must reach Pingora, not merely land in the WAF's own
+    /// config struct: `ServerConf::threads` is the single field the proxy
+    /// service's runtime is sized from
+    /// (`pingora-core-0.8.1/src/server/mod.rs:705`).
+    #[test]
+    fn proxy_server_conf_carries_the_worker_thread_count() {
+        let conf = proxy_server_conf(12).expect("default Pingora conf must build");
+        assert_eq!(conf.threads, 12);
+        // Pingora's own default is the value this whole change exists to stop
+        // inheriting; assert it is what we would have got, so the test fails if
+        // an upstream bump ever makes the wiring redundant without saying so.
+        assert_eq!(
+            pingora_core::server::configuration::ServerConf::new()
+                .expect("default conf")
+                .threads,
+            1
+        );
+    }
+
+    /// A default install must be told the count, since it appears in no config
+    /// file, and must be told that the figure is an affinity/quota number
+    /// rather than the host's core count.
+    #[test]
+    fn worker_thread_broadcast_names_the_count_and_its_source() {
+        let lines = worker_thread_startup_broadcast(WorkerThreadPlan::resolve(None, Some(16)));
+        let line = lines.first().expect("broadcast is never empty");
+        assert_eq!(line.level, BroadcastLevel::Info);
+        assert!(line.text.contains("Proxy worker threads: 16"), "{}", line.text);
+        assert!(line.text.contains("worker_threads is unset"), "{}", line.text);
+        assert!(line.text.contains("available_parallelism"), "{}", line.text);
+        assert!(line.text.contains("cgroup CPU quota"), "{}", line.text);
+    }
+
+    /// One thread on a host that offered more is the ceiling the key exists to
+    /// lift, so it is a warning with a remedy — whether it was asked for or
+    /// arrived by a failed detection.
+    #[test]
+    fn worker_thread_broadcast_warns_on_a_single_thread_data_plane() {
+        let fixed = worker_thread_startup_broadcast(WorkerThreadPlan::resolve(Some(1), Some(16)));
+        let line = fixed.first().expect("broadcast is never empty");
+        assert_eq!(line.level, BroadcastLevel::Warn);
+        assert!(line.text.contains("THROUGHPUT CEILING"), "{}", line.text);
+        assert!(line.text.contains("Raise [proxy] worker_threads"), "{}", line.text);
+
+        let undetected = worker_thread_startup_broadcast(WorkerThreadPlan::resolve(None, None));
+        let line = undetected.first().expect("broadcast is never empty");
+        assert_eq!(line.level, BroadcastLevel::Warn);
+        assert!(line.text.contains("could not be detected"), "{}", line.text);
+        assert!(line.text.contains("THROUGHPUT CEILING"), "{}", line.text);
+    }
+
+    /// A multi-threaded data plane is not a warning — on a single-CPU host,
+    /// one thread is not one either.
+    #[test]
+    fn worker_thread_broadcast_stays_informational_when_there_is_no_ceiling() {
+        for plan in [
+            WorkerThreadPlan::resolve(Some(4), Some(16)),
+            WorkerThreadPlan::resolve(Some(0), Some(2)),
+            WorkerThreadPlan::resolve(None, Some(1)),
+        ] {
+            let lines = worker_thread_startup_broadcast(plan);
+            assert_eq!(
+                lines.first().expect("broadcast is never empty").level,
+                BroadcastLevel::Info,
+                "unexpected warning for {plan:?}"
+            );
+        }
+    }
+
+    /// The shipped `configs/default.toml` must not pin the data plane: an
+    /// operator who edits nothing gets every CPU the process may use.
+    #[test]
+    fn shipped_default_config_does_not_pin_the_data_plane() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/default.toml");
+        let cfg = load_config(path).expect("shipped default.toml must load");
+        assert_eq!(
+            cfg.proxy.worker_threads, None,
+            "the shipped config must leave worker_threads unset so it follows the available CPUs"
+        );
+        assert_eq!(
+            cfg.proxy.worker_thread_plan().source,
+            WorkerThreadSource::DefaultFollowsCpus
+        );
     }
 }

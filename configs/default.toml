@@ -9,13 +9,41 @@
 listen_addr = "0.0.0.0:80"
 listen_addr_tls = "0.0.0.0:443"
 
+# ── Worker threads — the size of the proxy data plane ─────────────────────────
+# How many threads accept, inspect and relay requests. This is the one knob that
+# decides whether the WAF can use the machine it is on.
+#
+#   unset (shipped)  follow the CPUs this process may run on
+#   0                the same thing, said explicitly
+#   N > 0            exactly N threads, whatever the machine has
+#
+# "The CPUs this process may run on" is std::thread::available_parallelism, and
+# that is deliberately NOT the host's core count: on Linux it honours the cgroup
+# CPU quota and the process's CPU affinity mask. IN A CONTAINER YOU GET THE
+# QUOTA — a `cpus: 2` limit on a 64-core host resolves to 2, and under
+# `taskset -c 0-3` it resolves to 4. That is the number that can actually do
+# work, so it is the right one to size against, but it will not match `nproc`
+# run on the host and it is not a bug when it does not. The effective count and
+# where it came from are logged at startup.
+#
+# Set a fixed N when the box runs other work you do not want the data plane
+# competing with, or when you are pinning cores deliberately. Setting N = 1 on a
+# multi-core host caps throughput at one core and is warned about at startup.
+# If the CPU count cannot be detected at all, the proxy falls back to a single
+# thread — the behaviour every release before this key had — and says so.
+#
+# PRXWAF_WORKER_THREADS overrides this, for when one image serves several
+# deployments with different CPU budgets.
+#
+# worker_threads = 4
+
 # ── Upstream timeouts — ALL OFF BY DEFAULT (0 = no timeout) ───────────────────
 # Pingora arms no upstream timer on its own: HttpPeer::new() leaves every stage
 # of PeerOptions at None (pingora-core-0.8.1/src/upstreams/peer.rs:471-478) and
-# None means wait forever. The proxy data path is also single-threaded
-# (Server::new(None) → threads: 1, no config key changes it), so an upstream
-# that accepts a connection and then goes silent holds a worker slot until the
-# client gives up. That is the exposure these keys close.
+# None means wait forever. So an upstream that accepts a connection and then
+# goes silent holds a worker thread until the client gives up — and there are
+# only `worker_threads` of those, so enough such connections stall the data
+# plane whatever its size. That is the exposure these keys close.
 #
 # Leaving them at 0 keeps exactly the behaviour every previous release had —
 # nothing is written to the peer at all, one boolean test per request. Setting
@@ -662,10 +690,11 @@ max_decode_rounds = 3
 #   CRS PL1       +88        +487            +199         +4,667
 #   Lane 2        +41        +127             +74            +20
 #
-# The proxy is single-threaded (no config key changes that), so a default install
-# serves ~47 rps of 64 KiB uploads and ~9 rps of 1 MiB bodies PER PROCESS. Body
-# size, not request rate, is what exhausts prx-waf — and it is reachable by any
-# unauthenticated client that can POST.
+# Those figures were measured on one worker thread, so read them PER CORE: ~47
+# rps of 64 KiB uploads and ~9 rps of 1 MiB bodies per thread. `worker_threads`
+# above multiplies that, it does not change it — body size, not request rate, is
+# what exhausts prx-waf, and it is reachable by any unauthenticated client that
+# can POST.
 #
 # WHAT IT COSTS YOU TO TURN IT ON. A body larger than `max_body_bytes` is SKIPPED
 # by those four detectors — not truncated. Zero body bytes are examined, so a

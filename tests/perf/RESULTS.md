@@ -32,7 +32,7 @@ only the noise level differed.
 
 ## Headline
 
-### 1. The proxy is single-threaded. Throughput does not scale with cores.
+### 1. The proxy was single-threaded when this was measured. Throughput did not scale with cores.
 
 At saturation the prx-waf process holds **13 OS threads** but consumes
 **0.99 cores** — on a 16-core machine. Adding cores adds nothing.
@@ -42,10 +42,19 @@ The cause is in the source, not in the configuration: `Server::new(None)`
 `ServerConf::default()`, which sets `threads: 1`
 (`pingora-core-0.8.1/src/server/configuration/mod.rs:137`), and the proxy
 service is added with a bare `add_tcp` and no thread override
-(`main.rs:1450-1452`). **There is no config key to change it.**
+(`main.rs:1450-1452`). **On tree `87aa1bc` there is no config key to change
+it.**
 
-Everything else on this page is therefore a *per-core* number. Horizontal
-scaling — more processes, more nodes — is the only lever available.
+Everything else on this page is therefore a *per-thread* number. On tree
+`87aa1bc`, horizontal scaling — more processes, more nodes — is the only lever
+available.
+
+> **Fixed after this page was recorded, and not yet re-measured.** `[proxy]
+> worker_threads` now sizes the data plane and defaults to the CPUs the process
+> may use, so the ceiling described in this section no longer applies to the
+> shipped default. **No figure on this page has been re-run for it**, and none
+> should be read as the multi-threaded number. The re-measurement is pending;
+> until it lands, treat every table here as one thread's worth of work.
 
 ### 2. Detection cost is dominated by body size, and Lane 1's budget is off by default
 
