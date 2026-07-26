@@ -868,10 +868,28 @@ impl ProxyHttp for WafProxy {
             return Ok(None);
         }
 
+        // Buffer only up to what is actually cacheable: the global per-request
+        // bound, or the cache's own per-entry admission cap when that is
+        // smaller (a small `cache.max_size_mb` makes it smaller). Accumulating
+        // past the cap only to have `ResponseCache::put` refuse the entry is
+        // per-request memory spent for nothing.
+        let body_limit = self.cache.as_ref().map_or(CACHE_BODY_LIMIT, |cache| {
+            usize::try_from(cache.max_entry_bytes())
+                .unwrap_or(CACHE_BODY_LIMIT)
+                .min(CACHE_BODY_LIMIT)
+        });
+
         if let Some(chunk) = body {
-            if ctx.cache_body.len().saturating_add(chunk.len()) > CACHE_BODY_LIMIT {
+            if ctx.cache_body.len().saturating_add(chunk.len()) > body_limit {
                 // Response too large to cache: abandon and release the buffer.
-                debug!("Response exceeds {CACHE_BODY_LIMIT} byte cache limit; not caching");
+                // The body still streams to the client untouched — refused, not
+                // truncated. Counted here because this short-circuit runs
+                // before `ResponseCache::put`, which is where refusals are
+                // otherwise tallied.
+                debug!("Response exceeds {body_limit} byte cache limit; not caching");
+                if let Some(cache) = &self.cache {
+                    cache.note_oversize_reject();
+                }
                 ctx.cache_store = false;
                 ctx.cache_key = None;
                 ctx.cache_body.clear();

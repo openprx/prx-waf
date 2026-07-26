@@ -361,24 +361,63 @@ Notes an operator needs:
 
 ### 4.1 Response cache
 
-`crates/gateway/src/cache.rs:67-75`. Config: `cache.max_size_mb = 256`,
+`crates/gateway/src/cache.rs:168-212`. Config: `cache.max_size_mb = 256`,
 `default_ttl_secs = 60`, `max_ttl_secs = 3600`.
 
-**The byte budget is not enforced.** The moka cache is built with
-`.max_capacity(max_size_mb * 16)` — an **entry count**, with no `weigher`, so
-every cached response counts as 1 regardless of size. With the shipped defaults
-that is 4 096 entries, and the per-entry body cap is `CACHE_BODY_LIMIT = 8 MiB`
-(`crates/gateway/src/context.rs:445`).
+**The byte budget is enforced.** The moka cache is built with
+`.max_capacity(max_size_mb × 1 MiB)` and a `weigher`, so each entry is charged
+the memory it actually holds — body + headers + cache key + a fixed 256 B of
+per-entry bookkeeping (`entry_weight`, `cache.rs:73-85`) — and moka evicts until
+the total is inside the budget. The weight is computed once at insert and stored
+on the entry, so the weigher on moka's bookkeeping path is a `u32` field read,
+not a walk over the headers.
 
-Worst case is therefore **4 096 × 8 MiB ≈ 32 GiB**, against a nominal
-`max_size_mb = 256`. Treat `cache.max_size_mb` as "entries ÷ 16", not as
-megabytes, and size it against your actual response-size distribution.
+Worst case for the shipped default is therefore **~256 MiB** of cached response
+bodies. Measured on a live node (real origin, `oha` driving distinct URLs,
+`max_size_mb = 256`, RSS summed over the Pingora process tree):
+
+| workload | before | after |
+|---|---|---|
+| 8 000 × 1 MiB distinct (8 GiB unique) | **4 510 MiB** RSS, 4 096 entries | **458 MiB** RSS, 255 entries |
+| 60 000 req × 64 KiB over 100 k URLs | — | **321 MiB** RSS, 4 060 entries |
+
+In both post-fix runs `bytes_used` settled just inside the budget — 267 533 760
+and 268 406 600 bytes against `max_bytes` 268 435 456 — and never above it. The
+RSS above the 256 MiB of cache is the ~56 MiB process baseline plus per-request
+body buffers and allocator retention.
+
+The pre-fix 4 096 entries is exactly `max_size_mb × 16`: proof the number was an
+entry count. At 1 MiB per response that is 4 GiB of cache for a "256 MiB"
+setting, on a node an operator sized for 256 MiB.
+
+> **Changed in this version.** This used to be `.max_capacity(max_size_mb * 16)`
+> — an **entry count**, no weigher, so every response counted as 1 regardless of
+> size. With the same defaults that was 4 096 entries × the 8 MiB
+> `CACHE_BODY_LIMIT` = **~32 GiB** against a nominal 256 MiB. If you had
+> compensated by setting `max_size_mb` low, raise it: the number is now literal
+> megabytes, and the old advice to treat it as "entries ÷ 16" no longer applies.
+
+Two per-entry bounds apply, and both **refuse** an oversized response — it is
+streamed through un-cached, never truncated and stored:
+
+* `CACHE_BODY_LIMIT = 8 MiB` (`crates/gateway/src/context.rs:445`) — the
+  per-request accumulation bound, independent of the cache budget.
+* `max_size_mb / 16` (`MAX_ENTRY_FRACTION`, `cache.rs:59`) — no single entry may
+  take more than 1/16 of the budget, so the cache always holds ≥16 entries and
+  one large object cannot evict the entire working set. At the default that is
+  16 MiB, i.e. *above* the 8 MiB body limit, so **at defaults this cap never
+  binds** and hit rate is unchanged. It only starts refusing below
+  `max_size_mb = 128`. Refusals are counted as `oversize_rejects`.
+
+`GET /api/cache/stats` reports `bytes_used` against `max_bytes`, plus
+`max_entry_bytes`, `evictions` and `oversize_rejects` — the byte figures are
+settled (moka's pending write buffer is drained first), not approximate.
 
 The cache key includes path, query and `Accept-Encoding`
-(`cache.rs:100-111`), all attacker-controlled. Cache-busting query strings let
+(`cache.rs:240-252`), all attacker-controlled. Cache-busting query strings let
 an unauthenticated client churn the whole entry set — bounded, so not a leak,
 but a trivially triggerable cache-flush. The rails that do hold: only 2xx is
-cached (`:132`), never with `Set-Cookie` (`:143-146`), and the request must
+cached (`:277`), never with `Set-Cookie` (`:287-290`), and the request must
 carry neither `Authorization` nor `Cookie` (`proxy.rs:177`).
 
 ### 4.2 CrowdSec decision cache — unbounded
@@ -584,9 +623,12 @@ If you are deploying prx-waf, the short version:
    (more processes / more nodes) is the only lever. **Request-body size, not
    request rate, is what will exhaust you** — budget against your upload
    traffic, not your average RPS.
-3. **Set `cache.max_size_mb` as `entries ÷ 16`** and multiply by your p99
-   response size to get real memory. Or set `cache.enabled = false` if you have
-   a CDN in front.
+3. **`cache.max_size_mb` is literal megabytes** — set it to the memory you are
+   willing to give cached responses and it will be respected (§4.1). It is no
+   longer "entries ÷ 16"; if you had set it low to compensate for that, raise
+   it. Watch `bytes_used` / `evictions` / `oversize_rejects` at
+   `GET /api/cache/stats`. Or set `cache.enabled = false` if you have a CDN in
+   front.
 4. **Keep `persist_decisions = true`** — it is what stops a restart with a dead
    LAPI from serving with an empty decision cache. `crowdsec.fallback_action`
    now works too (`allow` by default), but treat `block` with care: it refuses

@@ -69,6 +69,19 @@ retention_prune_interval_hours = 6      # sweep cadence; clamped to >= 1
 retention_prune_batch_size = 5000       # rows per DELETE; clamped to 1..=100000
 
 # ── Phase 5: Response Caching ─────────────────────────────────────────────────
+# `max_size_mb` is a real byte budget for resident response bodies, not an entry
+# count: each entry is charged its body + headers + cache key + a fixed 256 B of
+# bookkeeping, and the cache evicts (LRU/TinyLFU) to stay within the total. A
+# process running this config will not hold more than ~256 MiB of cached
+# responses. Watch the actual figure at `GET /api/cache/stats` (`bytes_used` vs
+# `max_bytes`); rising `evictions` with a poor hit rate means the budget is
+# smaller than your working set.
+#
+# No single response may occupy more than 1/16 of the budget (16 MiB here) —
+# one object large enough to evict everything else would thrash the cache
+# rather than serve from it. Oversized responses are streamed through
+# un-cached, never truncated, and counted as `oversize_rejects`. Separately the
+# proxy never caches a body over 8 MiB regardless of this setting.
 [cache]
 enabled = true
 max_size_mb = 256

@@ -12,10 +12,16 @@ use serde_json::json;
 
 use crate::state::AppState;
 
-/// GET /api/cache/stats — cache hit/miss/eviction counters
+/// GET /api/cache/stats — cache hit/miss/eviction counters and byte usage
+///
+/// `bytes_used` / `max_bytes` are the real memory bound: `max_bytes` is
+/// `cache.max_size_mb` converted to bytes and `bytes_used` is what the cache
+/// currently holds against it (settled, not approximate — see
+/// `ResponseCache::usage`). `oversize_rejects` counts responses refused for
+/// exceeding `max_entry_bytes`.
 pub async fn cache_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let snap = state.cache.stats();
-    let count = state.cache.entry_count();
+    let (count, bytes_used) = state.cache.usage().await;
     (
         StatusCode::OK,
         Json(json!({
@@ -23,7 +29,11 @@ pub async fn cache_stats(State(state): State<Arc<AppState>>) -> impl IntoRespons
             "misses": snap.misses,
             "evictions": snap.evictions,
             "stores": snap.stores,
+            "oversize_rejects": snap.oversize_rejects,
             "entry_count": count,
+            "bytes_used": bytes_used,
+            "max_bytes": state.cache.max_bytes(),
+            "max_entry_bytes": state.cache.max_entry_bytes(),
         })),
     )
         .into_response()

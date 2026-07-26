@@ -24,7 +24,11 @@ pub struct AppState {
     /// In-process rate limiter for notifications
     pub notif_rate_limiter: NotifRateLimiter,
     // ── Phase 5 ──────────────────────────────────────────────────────────────
-    /// Response cache (moka-backed LRU)
+    /// Response cache (moka-backed, bounded by bytes).
+    ///
+    /// The live proxy cache is built from `[cache]` in the config and assigned
+    /// here by the daemon so the stats/purge endpoints operate on the same
+    /// instance. [`AppState::new`] only installs a placeholder — see there.
     pub cache: Arc<ResponseCache>,
     /// WASM plugin manager
     pub plugin_manager: Arc<PluginManager>,
@@ -126,7 +130,16 @@ impl AppState {
             ws_connections: Arc::new(AtomicU32::new(0)),
             jwt_secret,
             notif_rate_limiter: crate::notifications::new_rate_limiter(),
-            cache: ResponseCache::new(256, 60, 3600),
+            // Placeholder only. The daemon overwrites `cache` with the
+            // config-built instance whenever `[cache] enabled = true`
+            // (`prx-waf/src/main.rs`), and when caching is disabled nothing
+            // ever inserts into it — only the proxy writes to this cache, and
+            // a disabled proxy cache is `None`. It is sized at the floor
+            // instead of a hardcoded 256 so that no path can mistake it for a
+            // configured budget: an empty cache costs nothing either way, but
+            // a number that is never honoured is the bug this file used to
+            // have a copy of.
+            cache: ResponseCache::new(0, 60, 3600),
             plugin_manager: Arc::new(PluginManager::new()),
             tunnel_registry: TunnelRegistry::new(),
             crowdsec_cache: None,

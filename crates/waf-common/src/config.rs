@@ -1027,7 +1027,12 @@ pub struct HostEntry {
 pub struct CacheConfig {
     /// Enable response caching
     pub enabled: bool,
-    /// Maximum cache size in megabytes
+    /// Maximum total cache size in MiB — a real byte budget.
+    ///
+    /// Enforced by weighing every entry (body + headers + key + per-entry
+    /// bookkeeping) and evicting until the total is within budget; see
+    /// `gateway::cache::ResponseCache::new`. Values below 1 MiB are floored at
+    /// 1 MiB. No single response may occupy more than 1/16 of this.
     pub max_size_mb: u64,
     /// Default TTL in seconds (used when Cache-Control is absent)
     pub default_ttl_secs: u64,
