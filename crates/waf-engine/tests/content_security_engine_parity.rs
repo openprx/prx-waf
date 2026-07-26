@@ -31,7 +31,8 @@ use bytes::Bytes;
 use waf_common::content_security_config::{ContentSecurityConfig, SemanticBudgetConfig};
 use waf_common::{HostConfig, Phase, RequestCtx, WafAction};
 use waf_engine::crowdsec::{
-    AppSecClient, AppSecConfig, CrowdSecChecker, CrowdSecConfig, DecisionCache, FallbackAction,
+    AppSecClient, AppSecConfig, CrowdSecChecker, CrowdSecConfig, Decision, DecisionCache, DecisionStream,
+    FallbackAction,
 };
 use waf_engine::rules::engine::{
     Condition, ConditionField, ConditionOp, ConditionValue, CustomRule, Operator, RuleAction,
@@ -465,6 +466,159 @@ async fn fallthrough_appsec_unavailable_blocks_when_failclosed() {
     let r = d.result.expect("appsec result");
     assert_eq!(r.phase, Phase::CrowdSec);
     assert_eq!(r.rule_id.as_deref(), Some("crowdsec:appsec-unavailable"));
+}
+
+// ── Phase 16a: LAPI bouncer `fallback_action` ────────────────────────────────
+//
+// The bouncer's cache lookup answers `Option<DetectionResult>`, which cannot
+// tell "this IP is clean" from "I never got the ban list". These pin the
+// degraded signal that supplies the missing bit, at the real engine's header
+// phase (Phase 16a lives in `inspect`, not `inspect_body`).
+
+/// A bouncer checker wired into `eng`, with the given fallback posture. Returns
+/// the checker so the caller can drive its health flag.
+fn bouncer(eng: &WafEngine, fallback: FallbackAction) -> Arc<CrowdSecChecker> {
+    let checker = Arc::new(CrowdSecChecker::new(
+        Arc::new(DecisionCache::new(0)),
+        CrowdSecConfig {
+            enabled: true,
+            fallback_action: fallback,
+            ..CrowdSecConfig::default()
+        },
+    ));
+    eng.set_crowdsec(Arc::clone(&checker), None);
+    checker
+}
+
+/// The regression this whole feature must not cause: an operator who never set
+/// `fallback_action` gets the historical fail-open even with a blind bouncer.
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn bouncer_default_allow_still_fails_open_when_lapi_is_down() {
+    ensure_crypto_provider();
+    let (eng, _db) = engine_with_db().await;
+    let checker = bouncer(&eng, FallbackAction::Allow);
+    assert!(
+        checker.health().is_degraded(),
+        "precondition: no pull has succeeded and the cache is empty"
+    );
+
+    let mut ctx = base_ctx("198.51.100.60", "h1");
+    ctx.query = "q=hello".to_string();
+    assert!(
+        eng.inspect(&mut ctx).await.is_allowed(),
+        "fallback_action defaults to allow; a blind bouncer must not block"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn bouncer_failclosed_blocks_while_the_decision_cache_is_blind() {
+    ensure_crypto_provider();
+    let (eng, _db) = engine_with_db().await;
+    bouncer(&eng, FallbackAction::Block);
+
+    let mut ctx = base_ctx("198.51.100.61", "h1");
+    ctx.query = "q=hello".to_string();
+    let d = eng.inspect(&mut ctx).await;
+    assert!(
+        matches!(d.action, WafAction::Block { status: 403, .. }),
+        "fail-closed bouncer must Block, got {:?}",
+        d.action
+    );
+    let r = d.result.expect("bouncer fallback result");
+    assert_eq!(r.phase, Phase::CrowdSec);
+    assert_eq!(
+        r.rule_id.as_deref(),
+        Some("crowdsec:lapi-unavailable"),
+        "the block must be attributable to the LAPI outage, not to AppSec or a real ban"
+    );
+}
+
+/// The self-inflicted-outage guard at engine level: a LAPI pull failing while
+/// decisions are still cached is staleness, not blindness, and `block` must not
+/// take the site down for it.
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn bouncer_failclosed_does_not_block_on_a_stale_but_populated_cache() {
+    ensure_crypto_provider();
+    let (eng, _db) = engine_with_db().await;
+    let checker = bouncer(&eng, FallbackAction::Block);
+
+    // One decision arrives, then LAPI goes away: pull failed, cache non-empty.
+    checker.cache.apply_stream(
+        DecisionStream {
+            new: Some(vec![Decision {
+                id: 1,
+                origin: "crowdsec".to_string(),
+                scope: "Ip".to_string(),
+                value: "203.0.113.99".to_string(),
+                type_: "ban".to_string(),
+                scenario: "crowdsecurity/ssh-bf".to_string(),
+                duration: Some("1h".to_string()),
+                created_at: None,
+            }]),
+            deleted: None,
+        },
+        &checker.config,
+    );
+    checker.health().observe(false, checker.cache.stats().total_cached);
+
+    let mut clean = base_ctx("198.51.100.62", "h1");
+    clean.query = "q=hello".to_string();
+    assert!(
+        eng.inspect(&mut clean).await.is_allowed(),
+        "a stale-but-enforcing bouncer must keep serving clean traffic"
+    );
+
+    let mut banned = base_ctx("203.0.113.99", "h1");
+    let d = eng.inspect(&mut banned).await;
+    assert!(
+        matches!(d.action, WafAction::Block { .. }),
+        "the cached ban must still enforce"
+    );
+    assert_eq!(
+        d.result.expect("ban result").rule_id.as_deref(),
+        Some("crowdsec:crowdsecurity/ssh-bf"),
+        "a real ban must be reported as the ban, not as an outage"
+    );
+}
+
+/// `log` records the outage without changing what the client gets.
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn bouncer_log_posture_serves_the_request() {
+    ensure_crypto_provider();
+    let (eng, _db) = engine_with_db().await;
+    bouncer(&eng, FallbackAction::Log);
+
+    let mut ctx = base_ctx("198.51.100.63", "h1");
+    ctx.query = "q=hello".to_string();
+    assert!(
+        eng.inspect(&mut ctx).await.is_allowed(),
+        "log posture must not block; it only records the fail-open window"
+    );
+}
+
+/// Once LAPI answers, the fallback stops applying — even if the answer was an
+/// empty decision set, which is a real "nobody is banned".
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn bouncer_failclosed_stops_blocking_after_lapi_recovers() {
+    ensure_crypto_provider();
+    let (eng, _db) = engine_with_db().await;
+    let checker = bouncer(&eng, FallbackAction::Block);
+
+    let mut before = base_ctx("198.51.100.64", "h1");
+    assert!(!eng.inspect(&mut before).await.is_allowed(), "blind → blocked");
+
+    checker.health().observe(true, 0);
+
+    let mut after = base_ctx("198.51.100.65", "h1");
+    assert!(
+        eng.inspect(&mut after).await.is_allowed(),
+        "LAPI answering 'no bans' is an answer; the fallback must not latch"
+    );
 }
 
 #[tokio::test]

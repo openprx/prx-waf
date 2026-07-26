@@ -956,10 +956,38 @@ impl WafEngine {
         }
 
         // ── Phase 16a: CrowdSec Bouncer — fast cache lookup ───────────────────
-        if let Some(cs) = self.crowdsec_checker.get()
-            && let Some(result) = cs.check(ctx)
-        {
-            return self.record_block(ctx, result, true);
+        if let Some(cs) = self.crowdsec_checker.get() {
+            if let Some(result) = cs.check(ctx) {
+                return self.record_block(ctx, result, true);
+            }
+            // The lookup missed. On the default path that settles it, and
+            // `fallback_for_miss` says so after one comparison against an
+            // immutable config field — no atomic, no branch misprediction, the
+            // pre-existing behaviour byte for byte. It answers `Some` only when
+            // the operator asked for a non-`allow` posture *and* the bouncer
+            // currently has no decision set to have missed against, i.e. the
+            // miss meant "I never got the list", not "this IP is clean".
+            if let Some(action) = cs.fallback_for_miss() {
+                match action {
+                    FallbackAction::Block => {
+                        let result = crate::crowdsec::lapi_unavailable_detection();
+                        // Not reported to the community feed: the outage is ours,
+                        // not evidence about this client (same reasoning as the
+                        // AppSec fallback above).
+                        return self.record_block(ctx, result, false);
+                    }
+                    FallbackAction::Log => {
+                        // Record the outage but let the request continue.
+                        let result = crate::crowdsec::lapi_unavailable_detection();
+                        let decision = WafDecision {
+                            action: WafAction::LogOnly,
+                            result: Some(result),
+                        };
+                        self.log_security_event(ctx, &decision);
+                    }
+                    FallbackAction::Allow => {}
+                }
+            }
         }
 
         // ── Phase 18: Community blocklist ─────────────────────────────────────

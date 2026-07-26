@@ -452,15 +452,22 @@ are recorded here as findings; none has been changed by this document.
     `MAX_FORM_ARGS = 256`.
 12. **No multipart part-payload, part-name or filename length caps** — bounded
     only transitively by the 64 KiB window the parser is handed.
-13. **`crowdsec.fallback_action` is documented and parsed but never read by the
-    bouncer.** It is stored into the config (`crates/prx-waf/src/main.rs:1231`)
-    and there is no read site outside the config definitions; the bouncer check
-    (`crates/waf-engine/src/crowdsec/checker.rs:27-53`) is a pure cache lookup
-    with no outage branch. **Setting `fallback_action = "block"` does nothing** —
-    the LAPI bouncer is unconditionally fail-open when LAPI is down or the cache
-    is cold. `persist_decisions = true` is the mitigation that actually works.
-    (This is distinct from `appsec_failure_action`, which *is* wired and does
-    work — see §5.2.)
+13. ~~**`crowdsec.fallback_action` is documented and parsed but never read by
+    the bouncer.**~~ **Fixed.** The bouncer check was a pure cache lookup whose
+    `Option<DetectionResult>` could not distinguish "this IP is clean" from "I
+    never got the ban list", so there was nothing for the setting to be applied
+    to. It is now wired: the sync task publishes a degraded flag
+    (`crates/waf-engine/src/crowdsec/health.rs`) that
+    `CrowdSecChecker::fallback_for_miss`
+    (`crates/waf-engine/src/crowdsec/checker.rs:57-71`) reads, and the engine
+    applies `block` / `log` / `allow` at
+    `crates/waf-engine/src/engine.rs:983-1010`. **Degraded means the cache is
+    empty *and* LAPI could not be reached** — a pull that fails while decisions
+    are still cached is stale, not blind, and deliberately does not trigger the
+    fallback. The default is still `allow`, so nothing changes unless the
+    setting is changed. `persist_decisions = true` remains the mitigation that
+    keeps the cache populated in the first place, and is what keeps
+    `fallback_action = "block"` from firing on every restart.
 14. **`cluster.sync.events_queue_size` (default 10 000) is a dead knob** —
     declared at `crates/waf-common/src/config.rs:1499`, never read. The
     documented "drop oldest past this bound" behaviour does not exist.
@@ -489,8 +496,12 @@ If you are deploying prx-waf, the short version:
 3. **Set `cache.max_size_mb` as `entries ÷ 16`** and multiply by your p99
    response size to get real memory. Or set `cache.enabled = false` if you have
    a CDN in front.
-4. **Do not rely on `crowdsec.fallback_action`.** Use
-   `persist_decisions = true`. Do rely on `appsec_failure_action`, which works.
+4. **Keep `persist_decisions = true`** — it is what stops a restart with a dead
+   LAPI from serving with an empty decision cache. `crowdsec.fallback_action`
+   now works too (`allow` by default), but treat `block` with care: it refuses
+   *every* request whenever the cache is empty and LAPI is unreachable, which
+   turns a CrowdSec outage into a site outage. `appsec_failure_action` is
+   separate and also works.
 5. **Decide the body-overflow posture deliberately.** The default (413) is
    fail-closed and correct for most deployments. `PRXWAF_BODY_INSPECT_OVERFLOW=log`
    is a decision to stop inspecting past 10 MiB.

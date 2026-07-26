@@ -2337,15 +2337,52 @@ fn crowdsec_startup_broadcast(
     persist_enabled: bool,
     restore: &waf_engine::RestoreOutcome,
 ) -> Vec<BroadcastLine> {
-    use waf_engine::crowdsec::config::CrowdSecMode;
+    use waf_engine::crowdsec::config::{CrowdSecMode, FallbackAction};
 
     if config.mode == CrowdSecMode::Appsec {
         return vec![BroadcastLine::info(
             "CrowdSec mode=appsec: the local decision cache is not consulted on the request path, so the decision mirror is \
-             not used. Every request is judged by the AppSec engine instead.",
+             not used, and crowdsec.fallback_action (which governs the bouncer) does not apply. Every request is judged by \
+             the AppSec engine instead, under its own appsec_failure_action.",
         )];
     }
 
+    let mut lines = crowdsec_mirror_broadcast(config, persist_enabled, restore);
+
+    // What this node does when the bouncer has no decision set at all. `allow`
+    // (the default) is the historical behaviour and needs no announcement; the
+    // other two change what a request gets during a LAPI outage, and `block`
+    // turns an outage into a total refusal of service — an operator must not
+    // discover that from a pager.
+    match config.fallback_action {
+        FallbackAction::Allow => {}
+        FallbackAction::Block => lines.push(BroadcastLine::warn(format!(
+            "CrowdSec fallback_action=BLOCK (fail closed): whenever the LAPI bouncer has an EMPTY decision cache — LAPI at \
+             {} unreachable and nothing restored from the local mirror — this WAF REFUSES EVERY REQUEST with 403 until a \
+             pull succeeds, so a LAPI outage becomes a full outage of every site behind this node. A cache that is merely \
+             stale (a pull failed but decisions are still cached) does NOT trigger it. Set fallback_action=\"allow\" to \
+             fail open instead, or \"log\" to record the window without blocking.",
+            config.lapi_url
+        ))),
+        FallbackAction::Log => lines.push(BroadcastLine::info(format!(
+            "CrowdSec fallback_action=LOG: requests are still allowed while the LAPI bouncer has an EMPTY decision cache \
+             (LAPI at {} unreachable and nothing restored from the local mirror), but each one records a \
+             crowdsec:lapi-unavailable security event so the fail-open window is visible in the event log — one event per \
+             request for as long as the outage lasts.",
+            config.lapi_url
+        ))),
+    }
+
+    lines
+}
+
+/// The decision-mirror half of [`crowdsec_startup_broadcast`]: where this
+/// process's decisions came from and whether anything is enforced yet.
+fn crowdsec_mirror_broadcast(
+    config: &waf_engine::CrowdSecConfig,
+    persist_enabled: bool,
+    restore: &waf_engine::RestoreOutcome,
+) -> Vec<BroadcastLine> {
     let first_pull_note = format!(
         "The first LAPI pull runs on a background task after the proxy starts serving and is retried every {}s until it \
          succeeds; a failure with an empty cache is logged at ERROR.",
@@ -3748,10 +3785,73 @@ mod tests {
         );
     }
 
+    /// `fallback_action = "block"` turns a `CrowdSec` outage into a site outage.
+    /// An operator has to be told at boot, not by a pager.
+    #[test]
+    fn a_fail_closed_fallback_is_announced_at_startup() {
+        let config = waf_engine::CrowdSecConfig {
+            fallback_action: waf_engine::crowdsec::config::FallbackAction::Block,
+            ..bouncer_config()
+        };
+        let restore = waf_engine::RestoreOutcome {
+            enabled: true,
+            restored: 5,
+            ..waf_engine::RestoreOutcome::default()
+        };
+        let line = crowdsec_startup_broadcast(&config, true, &restore)
+            .into_iter()
+            .find(|l| l.text.contains("fallback_action=BLOCK"))
+            .expect("fail-closed must be broadcast");
+        assert_eq!(line.level, BroadcastLevel::Warn);
+        assert!(
+            line.text.contains("REFUSES EVERY REQUEST"),
+            "the consequence must be stated in full: {}",
+            line.text
+        );
+    }
+
+    /// The compatibility guarantee, stated as a test: the default posture adds
+    /// nothing to the broadcast, so nothing about the shipped configuration
+    /// changed.
+    #[test]
+    fn the_default_fallback_adds_no_line() {
+        let restore = waf_engine::RestoreOutcome {
+            enabled: true,
+            restored: 5,
+            ..waf_engine::RestoreOutcome::default()
+        };
+        let lines = crowdsec_startup_broadcast(&bouncer_config(), true, &restore);
+        assert!(
+            !lines.iter().any(|l| l.text.contains("fallback_action=")),
+            "fallback_action=allow is the historical behaviour and needs no announcement"
+        );
+    }
+
+    #[test]
+    fn a_log_fallback_is_announced_without_alarming() {
+        let config = waf_engine::CrowdSecConfig {
+            fallback_action: waf_engine::crowdsec::config::FallbackAction::Log,
+            ..bouncer_config()
+        };
+        let line = crowdsec_startup_broadcast(&config, true, &waf_engine::RestoreOutcome::default())
+            .into_iter()
+            .find(|l| l.text.contains("fallback_action=LOG"))
+            .expect("log posture must be broadcast");
+        assert_eq!(
+            line.level,
+            BroadcastLevel::Info,
+            "log does not block, so it is not a warning"
+        );
+        assert!(line.text.contains("crowdsec:lapi-unavailable"));
+    }
+
     #[test]
     fn appsec_only_mode_does_not_claim_a_bouncer_fail_open_window() {
         let config = waf_engine::CrowdSecConfig {
             mode: waf_engine::crowdsec::config::CrowdSecMode::Appsec,
+            // Set even though it cannot apply: the cache is off the request
+            // path in this mode, so the broadcast must not promise it does.
+            fallback_action: waf_engine::crowdsec::config::FallbackAction::Block,
             ..bouncer_config()
         };
         let lines = crowdsec_startup_broadcast(&config, false, &waf_engine::RestoreOutcome::default());
@@ -3761,6 +3861,10 @@ mod tests {
             line.text.contains("mode=appsec"),
             "unexpected appsec line: {}",
             line.text
+        );
+        assert!(
+            !lines.iter().any(|l| l.text.contains("fallback_action=BLOCK")),
+            "mode=appsec never consults the bouncer cache, so it must not announce a fail-closed bouncer"
         );
     }
 

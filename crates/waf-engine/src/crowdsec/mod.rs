@@ -3,6 +3,7 @@ pub mod cache;
 pub mod checker;
 pub mod client;
 pub mod config;
+pub mod health;
 pub mod models;
 pub mod pusher;
 pub mod store;
@@ -10,9 +11,10 @@ pub mod sync;
 
 pub use appsec::{AppSecClient, AppSecResult, appsec_to_detection};
 pub use cache::DecisionCache;
-pub use checker::CrowdSecChecker;
+pub use checker::{CrowdSecChecker, lapi_unavailable_detection};
 pub use client::CrowdSecClient;
 pub use config::{AppSecConfig, CrowdSecConfig, CrowdSecMode, FallbackAction, PusherConfig};
+pub use health::CrowdSecHealth;
 pub use models::{CacheStats, CachedDecision, Decision, DecisionStream};
 pub use pusher::CrowdSecPusher;
 pub use store::{DecisionStore, RestoreOutcome};
@@ -96,6 +98,15 @@ pub async fn init_crowdsec(
     // Bouncer checker
     let checker = Arc::new(CrowdSecChecker::new(Arc::clone(&cache), config.clone()));
 
+    // Publish the bouncer's posture before the proxy binds a listener. No pull
+    // has been attempted yet, so the only thing that can make a cache miss
+    // meaningful is what the mirror just restored. If that is nothing, the
+    // bouncer matches no IP and `fallback_action` applies from the very first
+    // request — which is precisely the restart window an operator who set
+    // `block` is asking to be protected during.
+    let health = Arc::clone(checker.health());
+    health.observe(false, cache.stats().total_cached);
+
     // AppSec client (only when mode includes appsec)
     let appsec_client = if matches!(config.mode, CrowdSecMode::Appsec | CrowdSecMode::Both) {
         config
@@ -127,7 +138,7 @@ pub async fn init_crowdsec(
     let cache_sync = Arc::clone(&cache);
     let restored = restore.restored;
     let sync_handle = tokio::spawn(async move {
-        sync::run_decision_sync(client_sync, cache_sync, store, config, restored, shutdown_rx).await;
+        sync::run_decision_sync(client_sync, cache_sync, store, config, restored, health, shutdown_rx).await;
     });
 
     Some(CrowdSecComponents {

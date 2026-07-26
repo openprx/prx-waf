@@ -239,7 +239,12 @@ mode                  = "bouncer"   # bouncer | appsec | both
 lapi_url              = "http://127.0.0.1:8080"
 api_key               = ""
 update_frequency_secs = 10
-fallback_action       = "allow"     # allow | block | log
+fallback_action       = "allow"     # allow | block | log — what the bouncer does
+                                    # when LAPI is unreachable AND the decision
+                                    # cache is empty (a stale-but-populated cache
+                                    # keeps enforcing and does not trigger this).
+                                    # "block" refuses every request during a LAPI
+                                    # outage; keep "allow" unless you mean it.
 
 # Optional: AppSec endpoint
 # appsec_endpoint = "http://127.0.0.1:7422"

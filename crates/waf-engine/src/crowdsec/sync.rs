@@ -7,7 +7,8 @@ use tracing::{error, info, warn};
 
 use super::cache::DecisionCache;
 use super::client::CrowdSecClient;
-use super::config::CrowdSecConfig;
+use super::config::{CrowdSecConfig, FallbackAction};
+use super::health::CrowdSecHealth;
 use super::models::Decision;
 use super::store::{DecisionStore, delete_keys_for, report_mirror_failure, rows_for};
 
@@ -34,12 +35,18 @@ use super::store::{DecisionStore, delete_keys_for, report_mirror_failure, rows_f
 /// before this task started; it is reported in the fail-open diagnostics so an
 /// operator reading a failed pull can tell whether anything is still covering
 /// them.
+///
+/// `health` is this task's second output. Every pull outcome is published to it
+/// so the request path can tell a cache miss that means "clean" from one that
+/// means "I never got the list" — the distinction `crowdsec.fallback_action`
+/// acts on. It is written here and nowhere else; see [`CrowdSecHealth`].
 pub async fn run_decision_sync(
     client: Arc<CrowdSecClient>,
     cache: Arc<DecisionCache>,
     store: Option<Arc<dyn DecisionStore>>,
     config: CrowdSecConfig,
     restored: usize,
+    health: Arc<CrowdSecHealth>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     info!(
@@ -85,6 +92,11 @@ pub async fn run_decision_sync(
 
                 cache.apply_stream(stream, &config);
 
+                // LAPI answered. Even an empty decision set is a real answer
+                // ("nobody is banned"), so the bouncer is no longer blind and
+                // `fallback_action` stops applying.
+                health.observe(true, cache.stats().total_cached);
+
                 if need_full_pull {
                     // The full pull is the complete active set, so anything the
                     // mirror put in the cache and this pull did not confirm was
@@ -104,7 +116,7 @@ pub async fn run_decision_sync(
                     persist_delta(store.as_deref(), &new_decisions, &deleted_decisions, &config).await;
                 }
             }
-            Err(e) => report_pull_failure(&e, need_full_pull, &cache, unconfirmed, &config),
+            Err(e) => report_pull_failure(&e, need_full_pull, &cache, unconfirmed, &config, &health),
         }
 
         // Periodic cleanup of expired entries
@@ -180,24 +192,47 @@ fn warn_oversized(oversized: usize) {
 /// state itself — no IP can match, so every previously banned client is being
 /// allowed through — and it is logged at `error!` with that consequence spelled
 /// out, because it is the exact moment an operator needs to see.
+///
+/// That same split drives `health`: the `error!` branch is the definition of
+/// degraded, the `warn!` branch is explicitly not. Publishing it here rather
+/// than only logging it is what lets `crowdsec.fallback_action` do anything at
+/// all.
 fn report_pull_failure(
     error: &anyhow::Error,
     was_full_pull: bool,
     cache: &DecisionCache,
     unconfirmed: usize,
     config: &CrowdSecConfig,
+    health: &CrowdSecHealth,
 ) {
     let cached = cache.stats().total_cached;
+    health.observe(false, cached);
     let kind = if was_full_pull { "full" } else { "incremental" };
     if cached == 0 {
+        // The bouncer matching nothing is a constant; what it *does* about that
+        // is the operator's choice, so name the posture actually in force rather
+        // than assuming the fail-open default.
+        let posture = match config.fallback_action {
+            FallbackAction::Allow => {
+                "FAIL-OPEN: every previously banned client is being allowed through (crowdsec.fallback_action=allow)"
+            }
+            FallbackAction::Block => {
+                "FAIL-CLOSED: crowdsec.fallback_action=block, so every request is being REFUSED until LAPI answers"
+            }
+            FallbackAction::Log => {
+                "FAIL-OPEN: every previously banned client is being allowed through; crowdsec.fallback_action=log records \
+                 one security event per request instead of blocking"
+            }
+        };
         error!(
             error = %error,
             lapi_url = %config.lapi_url,
             pull = kind,
             retry_secs = config.update_frequency_secs.max(5),
-            "CrowdSec is FAIL-OPEN: the {kind} LAPI pull failed and the decision cache is EMPTY, so the bouncer matches no \
-             IP at all and every previously banned client is being allowed through. Nothing was restored from the local \
-             crowdsec_decisions mirror either (it was empty, disabled, or unreadable). Retrying until LAPI answers",
+            fallback_action = ?config.fallback_action,
+            "CrowdSec is {posture}. The {kind} LAPI pull failed and the decision cache is EMPTY, so the bouncer matches no \
+             IP at all. Nothing was restored from the local crowdsec_decisions mirror either (it was empty, disabled, or \
+             unreadable). Retrying until LAPI answers",
         );
     } else {
         warn!(

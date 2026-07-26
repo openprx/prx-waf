@@ -297,6 +297,31 @@ cors_origins = []
 # appsec_failure_action = "allow"    # allow | block | log (AppSec, independent)
 # persist_decisions = true           # mirror decisions to the DB; see below
 #
+# `fallback_action` — WHAT THE BOUNCER DOES WHEN IT HAS NOTHING TO ENFORCE.
+# It applies in exactly one state: the decision cache is EMPTY *and* the last
+# LAPI pull failed (or none has happened yet). In that state a cache miss carries
+# no information — the bouncer is not saying "this IP is clean", it is saying "I
+# never got the list".
+#
+#   allow  (default)  serve the request. The historical behaviour; unchanged.
+#   log               serve the request, but record a `crowdsec:lapi-unavailable`
+#                     security event for it, so the window is auditable. One
+#                     event per request for as long as the outage lasts.
+#   block             refuse the request with 403. Fail closed. A LAPI outage
+#                     then takes down every site behind this node, so only choose
+#                     it where refusing traffic beats admitting unvetted traffic.
+#                     The startup log WARNs when this is set.
+#
+# A pull that fails while decisions ARE cached does NOT trigger it: those
+# decisions are stale, not absent, and the bouncer keeps enforcing them. There is
+# deliberately no staleness deadline — bounding it would need a separate operator
+# -supplied tolerance, and silently inventing one would make `block` fire during
+# ordinary network blips.
+#
+# This is independent of `appsec_failure_action`, which governs the AppSec
+# engine's own outages (mode = "appsec" ignores `fallback_action` entirely,
+# because the decision cache is never consulted there).
+#
 # RESTART FAIL-OPEN AND `persist_decisions`. The bouncer enforces from an
 # in-memory decision cache that starts EMPTY on every process start, and the
 # first LAPI pull runs on a background task *after* the proxy starts serving. If
