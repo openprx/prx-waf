@@ -225,6 +225,18 @@ jobs:
           cp "${sbom}" "dist/prx-waf-${version}-sbom.cdx.json"
           echo "SBOM: dist/prx-waf-${version}-sbom.cdx.json ($(wc -c < "dist/prx-waf-${version}-sbom.cdx.json") bytes)"
 
+      # The container image gets the same SBOM attested to it, and regenerating
+      # it there would mean a second `cargo install cargo-cyclonedx` and a
+      # second dependency resolution that could, in principle, disagree with
+      # this one.
+      - name: Upload SBOM for the image job
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: dist/*.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Generate SHA256SUMS
         working-directory: dist
         run: |
@@ -307,6 +319,18 @@ jobs:
 
           A CycloneDX SBOM (\`prx-waf-${version}-sbom.cdx.json\`) is attached.
 
+          ## Container image
+
+          The same binaries, as a multi-arch (amd64 + arm64) image:
+
+          \`\`\`bash
+          docker pull ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}
+
+          cosign verify ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME} \\
+            --certificate-identity-regexp '^https://github.com/openprx/prx-waf/\.github/workflows/release\.yml@refs/tags/v.*$' \\
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+          \`\`\`
+
           Full procedure: [docs/RELEASING.md](https://github.com/openprx/prx-waf/blob/${GITHUB_REF_NAME}/docs/RELEASING.md)
           EOF
 
@@ -327,3 +351,185 @@ jobs:
             dist/*.sig
             dist/*.pem
             dist/SHA256SUMS
+
+  # Ships the *same* binaries `publish` signed, repackaged as a multi-arch
+  # image. It runs after `publish` so that an image can never exist for a
+  # version whose release failed, and it unpacks the `build` artifacts rather
+  # than compiling: a `cargo build` inside the image would add two full
+  # compiles to the release and would put a binary in front of users that no
+  # signature or provenance statement in this release covers.
+  publish-image:
+    name: Publish container image
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read # checkout only; the Release already exists
+      packages: write # push to ghcr.io
+      id-token: write # OIDC token for cosign keyless signing and attestations
+      attestations: write # store the image's SLSA build provenance
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download release tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom
+
+      # Dockerfile.release reads dist/linux/<TARGETARCH>/prx-waf, so the tarball
+      # for each Rust target has to be unpacked into the matching Docker arch
+      # slot. Getting that mapping backwards produces an image that builds and
+      # pushes cleanly and then fails to exec on someone else's machine, so the
+      # ELF architecture is checked here rather than trusted.
+      - name: Stage released binaries per platform
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for spec in \
+            "x86_64-unknown-linux-gnu:amd64:x86-64" \
+            "aarch64-unknown-linux-gnu:arm64:aarch64"
+          do
+            target="${spec%%:*}"
+            rest="${spec#*:}"
+            arch="${rest%%:*}"
+            elf_arch="${rest#*:}"
+
+            tarball="artifacts/${BIN_NAME}-${version}-${target}.tar.gz"
+            if [ ! -f "${tarball}" ]; then
+              echo "::error::missing build artifact ${tarball}"
+              exit 1
+            fi
+
+            mkdir -p "dist/linux/${arch}"
+            tar -xzf "${tarball}" -C "dist/linux/${arch}" --strip-components=1 \
+              "${BIN_NAME}-${version}-${target}/${BIN_NAME}"
+
+            described="$(file -b "dist/linux/${arch}/${BIN_NAME}")"
+            case "${described}" in
+              *"${elf_arch}"*) ;;
+              *)
+                echo "::error::dist/linux/${arch}/${BIN_NAME} is not ${elf_arch}: ${described}"
+                exit 1
+                ;;
+            esac
+            echo "linux/${arch}: ${described}"
+          done
+
+      # Only the `apt-get` layer runs target-architecture code; the binary is
+      # copied in, never executed at build time. Emulation is therefore needed
+      # for one short layer, not for a compile.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # GITHUB_TOKEN is the run-scoped token GitHub mints for this job, not a
+      # stored repository secret. The project still holds no credentials.
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` must not follow a pre-release. The tag pattern is v*.*.*, so a
+      # '-' in the tag name can only come from a pre-release suffix
+      # (v0.2.31-rc.1) — the same test the Release job uses to set `prerelease`.
+      # Expressed here so that it holds without anyone remembering it.
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ github.ref_name }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=prx-waf
+            org.opencontainers.image.description=High-performance WAF built on Pingora
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+
+      # provenance/sbom are off because both are produced below with the same
+      # tooling the binaries use — buildkit's own attestations would add a
+      # second, differently-shaped set covering the same image, and the SBOM it
+      # generates describes the image's apt packages rather than the crate
+      # dependency tree the release actually documents.
+      - name: Build and push multi-arch image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: false
+          sbom: false
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Signed by digest, not by tag: the digest is what `latest` will stop
+      # pointing at one release from now, and it is the only identifier a
+      # verifier can pin.
+      - name: Sign image with cosign (keyless)
+        env:
+          COSIGN_YES: "true"
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Attest the release SBOM to the image
+        env:
+          COSIGN_YES: "true"
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          sbom="$(find sbom -name '*.cdx.json' | head -n 1)"
+          if [ -z "${sbom}" ]; then
+            echo "::error::no CycloneDX SBOM in the sbom artifact"
+            exit 1
+          fi
+          cosign attest --yes --type cyclonedx --predicate "${sbom}" \
+            "${IMAGE}@${DIGEST}"
+
+      - name: Attest image build provenance (SLSA)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summarise
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Container image"
+            echo
+            echo "Digest: \`${DIGEST}\`"
+            echo
+            echo "Tags:"
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

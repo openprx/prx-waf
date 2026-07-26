@@ -1,0 +1,20 @@
+# Development override: run the WAF you just compiled instead of the published
+# image.
+#
+#   cargo build --release
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# Dockerfile.prebuilt copies target/release/prx-waf and data/ from the working
+# tree, so both have to exist first — `cargo build --release` for the binary,
+# `prx-waf geoip download` (or `mkdir -p data`) for the GeoIP directory.
+#
+# The image is tagged prx-waf:local rather than the ghcr.io name so that a
+# local build can never be mistaken for, or shadow, a pulled release.
+
+services:
+  prx-waf:
+    image: prx-waf:local
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: Dockerfile.prebuilt

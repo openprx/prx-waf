@@ -22,9 +22,17 @@ services:
 
   # ── PRX-WAF ──────────────────────────────────────────────────────────────────
   prx-waf:
-    build:
-      context: .
-      dockerfile: Dockerfile.prebuilt
+    # The published multi-arch image (amd64 + arm64). It carries the same
+    # binary the release tarballs do, cosign-signed and with SLSA provenance;
+    # see docs/RELEASING.md for how to verify it before running it.
+    #
+    # `latest` never points at a pre-release. Pin a version in production:
+    #   PRX_WAF_VERSION=v0.2.60 docker compose up -d
+    #
+    # To run your own build instead of the published one:
+    #   cargo build --release
+    #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+    image: ghcr.io/openprx/prx-waf:${PRX_WAF_VERSION:-latest}
     container_name: prx-waf
     restart: unless-stopped
     depends_on:
@@ -38,6 +46,11 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       DATABASE_URL: ${DATABASE_URL:-postgresql://prx_waf:prx_waf@postgres:5432/prx_waf}
       RUST_LOG: ${RUST_LOG:-info}
+    # The image already contains configs/ and rules/; these mounts shadow them
+    # with this checkout's copies so that edits here take effect. That means
+    # the checkout has to stay on the version you pinned above — a v0.2.60
+    # image running rules from an unrelated commit is a configuration nobody
+    # tested. Remove the two ro mounts to run the image's own copies instead.
     volumes:
       - ./configs:/app/configs:ro
       - ./rules:/app/rules:ro

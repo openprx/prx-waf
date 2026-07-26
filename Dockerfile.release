@@ -1,0 +1,55 @@
+# Runtime image for a tagged release. Built only by the `publish-image` job in
+# .github/workflows/release.yml.
+#
+# It does not compile anything. The binary it installs is the one the `build`
+# job already produced, stripped, tarred, checksummed and signed — unpacked
+# into dist/linux/<arch>/prx-waf before this file is invoked. Rebuilding from
+# source here would produce a different binary than the one the release
+# signatures and provenance cover, and would multiply the release wall clock by
+# the cost of two more full cargo builds.
+#
+# For a local development image built from your own `cargo build --release`
+# output, use Dockerfile.prebuilt (see docker-compose.build.yml).
+
+# trixie, not bookworm, and the difference is not cosmetic: the `build` job
+# links against the glibc on GitHub's ubuntu-latest runner (2.39 as of Ubuntu
+# 24.04), and glibc guarantees forward compatibility only. bookworm ships 2.36,
+# so the same binary that passes every gate in CI dies at exec time with
+# "version `GLIBC_2.38' not found" — verified locally against bookworm-slim.
+# Raising the runner's glibc floor means raising this base image with it.
+FROM debian:trixie-slim
+
+# buildx sets this per platform when building the manifest list, which is what
+# lets one Dockerfile pick the right prebuilt binary for each architecture.
+ARG TARGETARCH
+
+# The binary links only libc, libgcc and libm (no openssl-sys, no aws-lc-sys in
+# the dependency tree), so the runtime needs nothing beyond the base image plus
+# root certificates for outbound TLS and curl for HEALTHCHECK.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --chmod=0755 dist/linux/${TARGETARCH}/prx-waf /usr/local/bin/prx-waf
+
+# Same payload as the release tarball, minus the docs. The admin UI is not
+# copied: rust-embed compiles web/admin-ui/dist into the binary at build time,
+# so a copy on disk would be a second, unread version of it.
+COPY configs/    /app/configs/
+COPY rules/      /app/rules/
+COPY migrations/ /app/migrations/
+
+# The ip2region GeoIP databases are deliberately absent: 46 MB of data that is
+# not in the repository, updated on its own cadence and refreshable without a
+# new image. Fetch them at runtime with `prx-waf geoip download` into a mounted
+# /app/data.
+
+EXPOSE 80 443 9527
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -fsS http://localhost:9527/health || exit 1
+
+CMD ["/usr/local/bin/prx-waf", "--config", "/app/configs/default.toml", "run"]

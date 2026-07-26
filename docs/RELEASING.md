@@ -146,6 +146,7 @@ Release is marked as a pre-release.
 | `gate`     | Verifies tag == workspace version, then `cargo fmt --check`, `clippy` (`-D warnings`), `cargo test --workspace --all-features`. Nothing is published if this fails.  |
 | `build`    | Matrix over `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`. Downloads the UI artifact, `cargo build --release --locked -p prx-waf`, strips, tars.        |
 | `publish`  | SBOM, checksums, cosign signatures, SLSA provenance, GitHub Release.                                                                                                 |
+| `publish-image` | Unpacks the same tarballs into a multi-arch image, pushes it to `ghcr.io/openprx/prx-waf`, signs and attests it.                                               |
 
 Published assets, per release:
 
@@ -154,6 +155,9 @@ prx-waf-<version>-x86_64-unknown-linux-gnu.tar.gz        (+ .sig, .pem)
 prx-waf-<version>-aarch64-unknown-linux-gnu.tar.gz       (+ .sig, .pem)
 prx-waf-<version>-sbom.cdx.json                          (+ .sig, .pem)
 SHA256SUMS                                               (+ .sig, .pem)
+
+ghcr.io/openprx/prx-waf:v<version>                       (linux/amd64 + linux/arm64)
+ghcr.io/openprx/prx-waf:latest                           (stable releases only)
 ```
 
 Each tarball unpacks to `prx-waf-<version>-<target>/` containing the stripped
@@ -167,6 +171,32 @@ nothing to rotate, and nothing to steal. Build provenance is a SLSA attestation
 stored by GitHub, verifiable with `gh attestation verify`.
 
 Typical wall-clock: 15–35 minutes, dominated by the `gate` job.
+
+### The container image
+
+`publish-image` does not compile anything. It downloads the `build` job's
+tarballs, unpacks `prx-waf` out of each into `dist/linux/amd64/` and
+`dist/linux/arm64/`, checks each one's ELF architecture, and feeds them to
+`Dockerfile.release` through buildx's `TARGETARCH`. The bytes in the image are
+therefore the bytes in the tarball the release signed — a `cargo build` inside
+the image would ship users a binary that no signature or provenance statement
+on the release page covers, and would add two full compiles to the release.
+
+Tags are `v<version>` always, and `latest` only when the tag has no `-` in it.
+The tag pattern is `v*.*.*`, so a `-` can only come from a pre-release suffix;
+`v0.2.61-rc.1` publishes `:v0.2.61-rc.1` and moves nothing else. That is the
+same test the Release job uses to set `prerelease`, and it lives in the
+workflow so that it holds whether or not anyone remembers it.
+
+The image is signed by digest with cosign keyless, gets the release's CycloneDX
+SBOM attached as a cosign attestation, and gets a SLSA provenance attestation
+pushed to the registry as an OCI referrer. The job's only credential is the
+run-scoped `GITHUB_TOKEN`; there is still no repository secret anywhere in this
+pipeline.
+
+Emulation note: QEMU is set up because the image's `apt-get` layer runs
+target-architecture code. Nothing else in the build does — the binary is copied
+in, never executed — so arm64 costs one short emulated layer, not a compile.
 
 ---
 
@@ -244,6 +274,33 @@ everything else still passes.
 file prx-waf-${VERSION}-aarch64-unknown-linux-gnu/prx-waf   # ELF 64-bit ARM aarch64
 ```
 
+**f. Container image.** Verify by digest, not by tag — `latest` will point
+somewhere else one release from now, and the digest is the only thing a
+signature can be pinned to.
+
+```bash
+docker pull "ghcr.io/openprx/prx-waf:v${VERSION}"
+
+cosign verify "ghcr.io/openprx/prx-waf:v${VERSION}" \
+  --certificate-identity-regexp '^https://github\.com/openprx/prx-waf/\.github/workflows/release\.yml@refs/tags/v.*$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+
+# SBOM attestation (CycloneDX predicate, same document as the release asset)
+cosign verify-attestation --type cyclonedx "ghcr.io/openprx/prx-waf:v${VERSION}" \
+  --certificate-identity-regexp '^https://github\.com/openprx/prx-waf/\.github/workflows/release\.yml@refs/tags/v.*$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+
+# Build provenance
+gh attestation verify "oci://ghcr.io/openprx/prx-waf:v${VERSION}" --repo openprx/prx-waf
+
+# Both architectures present in one manifest list
+docker buildx imagetools inspect "ghcr.io/openprx/prx-waf:v${VERSION}"
+
+# And it runs. `latest` must not have moved for a pre-release.
+docker run --rm "ghcr.io/openprx/prx-waf:v${VERSION}" /usr/local/bin/prx-waf --version
+docker buildx imagetools inspect ghcr.io/openprx/prx-waf:latest --format '{{.Manifest.Digest}}'
+```
+
 ---
 
 ## 7. When something goes wrong
@@ -282,6 +339,20 @@ days). Otherwise re-run the whole workflow from the tag
 Release now has duplicate assets, delete the *duplicates* only, never the
 originals.
 
+**The Release exists but the image does not.** `publish-image` runs after the
+Release is created, and the release notes name the image unconditionally, so a
+failure here leaves notes pointing at a `docker pull` that 404s. Re-run the
+`publish-image` job alone — it is idempotent and depends only on artifacts that
+are retained for 7 days. If the artifacts have expired, re-run the workflow
+from the tag; the image content is a function of the tag, not of when it is
+built. Never fix this by hand-pushing an image built on a workstation: it would
+carry no provenance and no signature that `cosign verify` would accept.
+
+**A published image is bad but its tarball is fine.** The image tag is
+immutable by convention, not by GHCR policy — do not overwrite it. Roll forward
+exactly as for a bad release, and if the bad image is `latest`, cutting the next
+patch release is what moves `latest` off it.
+
 **Operator downgrade path.** Every release tarball is self-contained, so
 rolling a deployment back is: stop the service, unpack the previous version,
 restore the previous `configs/`, start. Check the previous release's
@@ -294,6 +365,10 @@ that snapshot before every upgrade.
 ## 8. Post-release
 
 - Confirm the OpenSSF Scorecard run on `main` did not regress.
-- Confirm the container images / compose files referencing a pinned version are
-  updated if you ship any.
+- Confirm the pinned versions in the README and `docker-compose.yml` comments
+  still name a version that exists.
+- On the **first** release after this pipeline changed: check that the GHCR
+  package exists and is public (a package created by a workflow push is private
+  until an owner flips it), and that `docker pull` works from a logged-out
+  client. Nothing in the workflow can assert that for you.
 - Close the milestone and thank external reporters credited in the CHANGELOG.

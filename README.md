@@ -39,13 +39,16 @@ PRX-WAF is a production-ready Web Application Firewall proxy built on [Pingora](
 - **Real-time WebSocket monitoring** — live traffic stats and security event stream
 - **Notification system** — Email (SMTP), Webhook, Telegram alerts
 - **AES-256-GCM encryption at rest** — sensitive config values (API keys, passwords) encrypted in PostgreSQL
-- **Docker & systemd deployment** — Docker Compose files and systemd unit examples included
+- **Docker & systemd deployment** — signed multi-arch images on `ghcr.io/openprx/prx-waf`, Docker Compose files and systemd unit examples included
 
 ---
 
 ## Quick Start
 
 ### Docker Compose
+
+Every tagged release publishes a multi-arch (`linux/amd64` + `linux/arm64`)
+image to `ghcr.io/openprx/prx-waf`, so nothing is compiled here.
 
 ```bash
 git clone https://github.com/openprx/prx-waf
@@ -57,11 +60,41 @@ cp .env.example .env
 #   openssl rand -hex 32
 # docker-compose refuses to start if these required secrets are missing.
 
-docker compose up -d
+docker compose up -d          # pulls ghcr.io/openprx/prx-waf:latest
 
 # Admin UI: http://localhost:16827  (docker-compose.yml maps host 16827 -> container 9527)
 # Default credentials: admin / <ADMIN_PASSWORD, or the random one printed to the
 # logs on first start>  (change immediately)
+```
+
+The clone is for the compose file, `configs/` and `rules/`, which the compose
+file bind-mounts; the WAF itself comes from the registry.
+
+`latest` tracks the newest stable release and never a pre-release. Pin an exact
+version in production:
+
+```bash
+PRX_WAF_VERSION=v0.2.60 docker compose up -d
+```
+
+The image is signed with [cosign](https://docs.sigstore.dev/) in keyless mode —
+there is no long-lived signing key — and carries SLSA build provenance. Verify
+before you run it:
+
+```bash
+cosign verify ghcr.io/openprx/prx-waf:v0.2.60 \
+  --certificate-identity-regexp '^https://github\.com/openprx/prx-waf/\.github/workflows/release\.yml@refs/tags/v.*$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+
+gh attestation verify oci://ghcr.io/openprx/prx-waf:v0.2.60 --repo openprx/prx-waf
+```
+
+To run your own build instead of the published image:
+
+```bash
+cargo build --release
+mkdir -p data      # Dockerfile.prebuilt copies data/; `prx-waf geoip download` fills it
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
 All security-critical settings can be configured via `.env` / environment
