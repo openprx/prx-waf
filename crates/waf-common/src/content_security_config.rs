@@ -44,6 +44,9 @@ pub struct ContentSecurityConfig {
     pub rollout_salt: String,
     /// Deterministic `DoS` work-budget caps (plan §12.2).
     pub budget: SemanticBudgetConfig,
+    /// Lane 1 (frozen legacy regex detectors) work budget. **Unlimited by
+    /// default** — see [`Lane1BudgetConfig`].
+    pub lane1: Lane1BudgetConfig,
     /// Anomaly-rate circuit-breaker parameters (plan §13.3).
     pub breaker: SemanticBreakerConfig,
     /// Per-attack-family scoring configuration, keyed by attack family
@@ -136,6 +139,34 @@ impl Default for SemanticBudgetConfig {
     }
 }
 
+/// Lane 1 work budget — the **request-body** admission cap for the four frozen
+/// legacy regex detectors (`SQLi` / XSS / RCE / traversal).
+///
+/// Lane 2 has [`SemanticBudgetConfig`] and the CRS body processors have their
+/// own hardcoded 64 KiB `MAX_BODY_BYTES`; Lane 1 historically had neither, and
+/// its cost therefore tracked body size all the way to the 10 MiB inspection
+/// ceiling. This is the knob that bounds it.
+///
+/// **Default: unlimited (`max_body_bytes = 0`).** An install that never sets it
+/// inspects exactly the same bytes it always did — the only added work on the
+/// request path is one integer comparison.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Lane1BudgetConfig {
+    /// Largest request body, in bytes, that the four Lane 1 detectors will read.
+    ///
+    /// `0` means **unlimited** (the shipped default and the historical
+    /// behaviour). With a non-zero value, a request whose body exceeds it has
+    /// its body **skipped entirely** by Lane 1 — not truncated: zero body bytes
+    /// are examined by `SQLi` / XSS / RCE / traversal. Path, query string,
+    /// cookies and the scanned request headers are unaffected, and CRS + Lane 2
+    /// still see the body under their own budgets.
+    ///
+    /// This is a real reduction in detection coverage, deliberately traded for a
+    /// bound on per-request CPU. See `docs/dos-budget.md`.
+    pub max_body_bytes: usize,
+}
+
 /// Anomaly-rate circuit-breaker parameters (plan §13.3). Values are calibrated
 /// against real traffic later; these are safe starting points.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +203,7 @@ impl Default for ContentSecurityConfig {
             rollout_bps: 0,
             rollout_salt: String::new(),
             budget: SemanticBudgetConfig::default(),
+            lane1: Lane1BudgetConfig::default(),
             breaker: SemanticBreakerConfig::default(),
             attacks: BTreeMap::new(),
             enforcement_overrides: BTreeMap::new(),

@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::RegexSet;
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
-use super::{Check, request_targets};
+use super::{Check, Lane1BodyBudget, request_targets};
 
 /// Pattern descriptions aligned by index with `SQLI_SET` patterns.
 static SQLI_DESCS: &[&str] = &[
@@ -121,11 +121,24 @@ static SQLI_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
 });
 
 /// SQL injection detection checker.
-pub struct SqlInjectionCheck;
+pub struct SqlInjectionCheck {
+    /// How much request body this detector will read. See [`Lane1BodyBudget`].
+    body_budget: Lane1BodyBudget,
+}
 
 impl SqlInjectionCheck {
+    /// The detector with **no** body budget — the historical behaviour, and what
+    /// every caller that does not thread an operator config keeps getting.
     pub const fn new() -> Self {
-        Self
+        Self {
+            body_budget: Lane1BodyBudget::UNLIMITED,
+        }
+    }
+
+    /// The same detector under an operator-configured Lane 1 body budget.
+    #[must_use]
+    pub const fn with_body_budget(body_budget: Lane1BodyBudget) -> Self {
+        Self { body_budget }
     }
 }
 
@@ -151,7 +164,7 @@ impl Check for SqlInjectionCheck {
             });
         };
 
-        for (location, value) in request_targets(ctx) {
+        for (location, value) in request_targets(ctx, self.body_budget) {
             let matches = set.matches(&value);
             if matches.matched_any() {
                 let idx = matches.iter().next().unwrap_or(0);
@@ -340,6 +353,63 @@ mod tests {
                 "sql injection must still fire: {query:?} {body:?}"
             );
         }
+    }
+
+    /// 1 MiB of filler with the injection at the very end — the payload position
+    /// that only a genuinely unbounded scan can reach.
+    fn one_mib_body_with_trailing_sqli() -> String {
+        let mut body = "a".repeat(1024 * 1024);
+        body.push_str("&q=1' UNION SELECT password FROM users--");
+        body
+    }
+
+    /// Default posture: no budget, so the tail of a 1 MiB body is still scanned.
+    /// This is the zero-behaviour-change guarantee at the detector level.
+    #[test]
+    fn default_detector_has_no_body_budget() {
+        let checker = SqlInjectionCheck::new();
+        let ctx = make_ctx("", &one_mib_body_with_trailing_sqli());
+        assert!(
+            checker.check(&ctx).is_some(),
+            "with no budget configured, a 1 MiB body must be scanned to its end"
+        );
+    }
+
+    /// With a budget, the same request is no longer detected — the honest cost of
+    /// turning the knob on, asserted rather than described.
+    #[test]
+    fn body_budget_stops_an_over_cap_body_being_seen() {
+        let checker = SqlInjectionCheck::with_body_budget(Lane1BodyBudget::from_bytes(64 * 1024));
+        let ctx = make_ctx("", &one_mib_body_with_trailing_sqli());
+        assert!(
+            checker.check(&ctx).is_none(),
+            "an over-budget body must not be inspected by the SQLi detector"
+        );
+    }
+
+    /// …while a body inside the budget is inspected exactly as before.
+    #[test]
+    fn body_budget_still_inspects_bodies_under_the_cap() {
+        let checker = SqlInjectionCheck::with_body_budget(Lane1BodyBudget::from_bytes(64 * 1024));
+        let ctx = make_ctx("", "username=admin' OR '1'='1' --");
+        assert!(
+            checker.check(&ctx).is_some(),
+            "a body inside the budget must still be inspected"
+        );
+    }
+
+    /// The budget is a *body* budget: the query string of the same oversized
+    /// request is still scanned.
+    #[test]
+    fn body_budget_does_not_touch_the_query_string() {
+        let checker = SqlInjectionCheck::with_body_budget(Lane1BodyBudget::from_bytes(64 * 1024));
+        let ctx = make_ctx("id=1 UNION SELECT 1,2,3--", &one_mib_body_with_trailing_sqli());
+        let hit = checker.check(&ctx).expect("query-string injection must still fire");
+        assert!(
+            hit.detail.contains("query"),
+            "the surviving detection must come from the query, got: {}",
+            hit.detail
+        );
     }
 
     #[test]

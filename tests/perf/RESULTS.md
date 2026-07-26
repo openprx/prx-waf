@@ -47,7 +47,7 @@ service is added with a bare `add_tcp` and no thread override
 Everything else on this page is therefore a *per-core* number. Horizontal
 scaling — more processes, more nodes — is the only lever available.
 
-### 2. Detection cost is dominated by body size, and Lane 1 has no body budget
+### 2. Detection cost is dominated by body size, and Lane 1's budget is off by default
 
 CPU µs per request, as a delta over `passthrough` (the same binary with
 detection off):
@@ -102,8 +102,14 @@ behaviour documented in [`docs/dos-budget.md`](../../docs/dos-budget.md) are the
 same fact seen from two sides.** CRS still pays for raw-body scanning, which is
 why the 1 MiB column is +4,667 µs.
 
-Lane 1 has no equivalent budget. Its only bounds are the 64 KiB scan window and
-the 10 MiB total ceiling, and its cost tracks body size all the way up.
+Lane 1 had no equivalent budget when these numbers were taken, which is what
+the 1 MiB column measures: its only bounds were the 64 KiB scan window and the
+10 MiB total ceiling, so cost tracked body size all the way up.
+`[content_security.lane1] max_body_bytes` now exists, but it defaults to 0
+(unlimited), so **the figures above remain the shipped default**. Setting it to
+65536 takes the 1 MiB body from +195,667 µs to +1,417 µs on the same host — at
+the price of those four detectors seeing none of an oversized body, head
+included. See `docs/dos-budget.md` §2.2.
 
 ### 4. Inside Lane 1, two detectors are 94% of the cost
 

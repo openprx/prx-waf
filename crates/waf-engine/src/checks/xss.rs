@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::RegexSet;
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
-use super::{Check, request_targets};
+use super::{Check, Lane1BodyBudget, request_targets};
 
 static XSS_DESCS: &[&str] = &[
     "<script> tag",
@@ -109,11 +109,23 @@ static XSS_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
 });
 
 /// XSS detection checker.
-pub struct XssCheck;
+pub struct XssCheck {
+    /// How much request body this detector will read. See [`Lane1BodyBudget`].
+    body_budget: Lane1BodyBudget,
+}
 
 impl XssCheck {
+    /// The detector with **no** body budget — the historical behaviour.
     pub const fn new() -> Self {
-        Self
+        Self {
+            body_budget: Lane1BodyBudget::UNLIMITED,
+        }
+    }
+
+    /// The same detector under an operator-configured Lane 1 body budget.
+    #[must_use]
+    pub const fn with_body_budget(body_budget: Lane1BodyBudget) -> Self {
+        Self { body_budget }
     }
 }
 
@@ -139,7 +151,7 @@ impl Check for XssCheck {
             });
         };
 
-        for (location, value) in request_targets(ctx) {
+        for (location, value) in request_targets(ctx, self.body_budget) {
             let matches = set.matches(&value);
             if matches.matched_any() {
                 let idx = matches.iter().next().unwrap_or(0);

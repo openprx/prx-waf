@@ -38,9 +38,10 @@ Two things follow that are worth internalising before the tables:
   legitimate one. That is a defensible product decision, but it means most of
   the limits below are **detection-bypass budgets, not availability budgets** —
   the number tells an attacker how much payload to put past the cut.
-* **Only one group of limits is configurable from `configs/default.toml`** (the
-  Lane 2 budget). A second small group is env-var only. Everything else needs a
-  recompile.
+* **Two groups of limits are configurable from `configs/default.toml`**: the
+  Lane 2 work budget (§2.1) and the Lane 1 body budget (§2.2). The second ships
+  **disabled**, so out of the box only the first one binds. A third small group
+  is env-var only. Everything else needs a recompile.
 
 ---
 
@@ -179,15 +180,15 @@ parse *before* `brush-parser` is called, because the lexer's stack overflow
 would `abort()` the process — uncatchable, and therefore a remote crash. It is
 a safety limit wearing a budget's clothes.
 
-**Decode loops.** `MAX_DECODE_PASSES = 5` (`checks/mod.rs:180`) on the Lane 1
+**Decode loops.** `MAX_DECODE_PASSES = 5` (`checks/mod.rs:189`) on the Lane 1
 path: after five passes the value is inspected **with a residual encoded layer
 still present**, an acknowledged bypass window
-(`checks/mod.rs:174-179`). Lane 2 uses the tighter, configurable
+(`checks/mod.rs:183-188`). Lane 2 uses the tighter, configurable
 `max_decode_rounds = 3`.
 
 ### 1.4 Header inspection coverage
 
-`SCANNED_HEADERS` (`crates/waf-engine/src/checks/mod.rs:197-205`) is a
+`SCANNED_HEADERS` (`crates/waf-engine/src/checks/mod.rs:206-214`) is a
 seven-name allowlist: `user-agent`, `referer`, `x-forwarded-for`, `x-real-ip`,
 `x-original-url`, `x-forwarded-host`, `forwarded`. Every other request header is
 never examined by the Lane 1 target collector. This is a permanent coverage
@@ -196,7 +197,9 @@ invisible in the metrics.
 
 ---
 
-## 2. The Lane 2 work budget — the only configurable set
+## 2. The configurable budgets
+
+### 2.1 The Lane 2 work budget
 
 `[content_security.budget]` in `configs/default.toml:464-475`, enforced in
 `crates/waf-engine/src/checks/content_security/budget.rs`.
@@ -220,10 +223,97 @@ Exceed behaviour is **degrade**: the unit of work is skipped and
 signals already found — the comment at `budget.rs:19-27` explains why: letting
 exhaustion clear the verdict would hand an attacker a one-request kill switch.
 
-`max_preprocess_output_bytes_total = 512 KiB` is the de-facto cap on regex work
-per request, and it is the closest thing this codebase has to a CPU budget on
-the detection path. It is worth treating as the primary knob if the WAF is
-CPU-bound.
+`max_preprocess_output_bytes_total = 512 KiB` is the de-facto cap on Lane 2's
+regex work per request. It is the primary Lane 2 knob if the WAF is CPU-bound —
+but on a large body it is not the term that dominates; §2.2 is.
+
+### 2.2 The Lane 1 body budget — present, and off by default
+
+`[content_security.lane1] max_body_bytes` in `configs/default.toml:536-574`
+(shipped **commented out**), compiled at
+`crates/waf-engine/src/checks/content_security/config.rs:134` and enforced by
+`Lane1BodyBudget::admits_body` (`crates/waf-engine/src/checks/mod.rs:321-330`),
+which `request_targets` (`crates/waf-engine/src/checks/mod.rs:418`) consults at
+`:462` before it builds the body-derived targets.
+
+| Key | Default | Applies to | Exceed behaviour |
+|---|---|---|---|
+| `max_body_bytes` | **`0` = unlimited** | the four frozen Lane 1 detectors (`SQLi` / XSS / RCE / traversal) | **skip** — the body contributes no target at all, counted and logged |
+
+**The default is a deliberate no-op.** `0` means unlimited, and a deployment
+that never sets the key inspects exactly the bytes it always did; the only added
+work on the request path is one integer comparison. Nothing below happens unless
+an operator opts in.
+
+**Why the knob exists.** Lane 1 is where the CPU goes. CPU µs/request over the
+same binary with detection off ([`tests/perf/RESULTS.md`](../tests/perf/RESULTS.md)):
+
+| layer | small GET | 1 KiB JSON | 64 KiB upload | 1 MiB body |
+|---|--:|--:|--:|--:|
+| Lane 1 | +83 | +616 | **+21,469** | **+102,228** |
+| CRS PL1 | +88 | +487 | +199 | +4,667 |
+| Lane 2 | +41 | +127 | +74 | +20 |
+
+Lane 2 barely moves because §2.1 bounds it; CRS gets *cheaper* at 64 KiB because
+`MAX_BODY_BYTES` skips its body processors past that point (§1.3). Lane 1 had
+neither, and §5.3 means that cost is the throughput of the entire process:
+**~9 rps of 1 MiB bodies per core, reachable by any unauthenticated client that
+can POST.**
+
+**Why one budget rather than one per detector.** All four detectors read the
+body through the single `request_targets` collector
+(`crates/waf-engine/src/checks/mod.rs:418`), and the measurements show they
+share no work — the per-detector deltas sum to the aggregate within 1–7%, with
+`sqli` +12,284 µs and `xss` +7,704 µs of Lane 1's 21,469 µs on a 64 KiB upload,
+and `rce` +431 / `traversal` +437 making the four of them **99.6%** of it.
+Capping the collector removes the cost from all four at once and keeps the
+coverage statement binary: either Lane 1 read this body or it did not.
+Per-detector control already exists separately, as the per-host
+`defense_config.sqli` / `.xss` toggles.
+
+**Skip, not truncate — and that is a real loss.** Past the budget, **zero** body
+bytes are examined by those four detectors. A payload anywhere in an oversized
+body — including its first byte — is invisible to Lane 1. Truncation would at
+least catch prefix payloads, and it is not offered, for two reasons worth
+stating rather than hiding:
+
+* it cannot bound the work. The gateway hands the body over as a sequence of
+  ≤68 KiB windows (§1.2), each in its own `RequestCtx`, so "scan the first N
+  bytes" applied per window still costs N × window-count on a large body —
+  the exact term the budget exists to delete. Bounding the *request* instead
+  needs cumulative cross-window state, which Lane 1's frozen
+  `Check::check(&RequestCtx)` signature cannot carry;
+* **skip** is already what this codebase does at the same boundary — the CRS
+  body processors (`body_processors.rs:130`, `:226`) — so there is one rule to
+  learn, not two.
+
+What still inspects an over-budget body: every CRS rule (its own 64 KiB
+structured cap, unlimited raw-body scan), Lane 2 under §2.1, and the
+`sensitive` detector. What still inspects the *request*: path, query string,
+cookies and the seven scanned headers (§1.4) — the budget gates the body
+targets only.
+
+**The decision is O(1) and made twice.** `admits_body` compares the declared
+`Content-Length` and this window's own length against the cap. Both terms are
+needed: the `Content-Length` term makes the whole request decide the same way
+for every window, so a 1 MiB body is skipped from its *first* window instead of
+after 64 KiB have already been paid for; the window term covers chunked requests,
+which declare no length (the gateway records `0`) and would otherwise walk past
+the budget one window at a time. **Residual gap, stated rather than papered
+over:** with a budget at or above the 68 KiB maximum window, a chunked body of
+unknown length satisfies both terms and is scanned in full. Budgets below the
+64 KiB window size are unaffected.
+
+**It is never silent.** Every skip increments a process counter
+(`lane1_body_skips()`) and, at most once per 30 s, emits a WARN naming the
+budget, the observed size, the host and the path — the same drop-and-count
+discipline as the queue sinks in §3, and with the same limitation: **log-only,
+not exported as a metric.** Grep for `Lane 1 body budget exceeded`. Read the
+counter as a rate signal, not a request count: it counts *detector invocations*,
+so one oversized request contributes up to four per body window (four detectors,
+each collecting its own targets). A non-zero budget also announces itself once
+at startup (`Lane 1 body budget ACTIVE`), so "is this on?" is answerable from
+the log rather than from the config file.
 
 ---
 
@@ -250,7 +340,8 @@ Notes an operator needs:
 * **All drop counters are log-only.** None of the four hot-path counters is
   exported as a metric. You can see saturation in the logs (a WARN every 30 s)
   and nowhere else, so you cannot alert on it. If audit completeness matters to
-  you, this is the gap to close first.
+  you, this is the gap to close first. The Lane 1 body-skip counter (§2.2)
+  follows the same pattern and has the same limitation.
 * **Cluster broadcast drops are silent and uncounted**
   (`crates/waf-cluster/src/node.rs:314-320`). Heartbeats and election messages
   are broadcast through the same 256-slot channel, so a congested peer link is
@@ -511,13 +602,22 @@ If you are deploying prx-waf, the short version:
    performance data too: the CRS layer gets *cheaper* on a 64 KiB multipart body
    (+199 µs) than on a 1 KiB JSON one (+487 µs), precisely because it stopped
    inspecting.
-7. **Lane 1 has no body-size budget, and it is where the time goes.** On a
-   64 KiB upload the native regex detectors cost 21 ms of CPU per request
-   against Lane 2's 74 µs — Lane 2 is cheap because
-   `[content_security.budget]` bounds its work and Lane 1 has no equivalent. If
-   you serve uploads and need throughput, the per-host `sqli` and `xss` toggles
-   are the two that matter (94% of Lane 1's cost), at the obvious detection
-   cost.
+7. **Decide the Lane 1 body budget deliberately — it ships off (§2.2).** Lane 1
+   is where the time goes: on a 64 KiB upload the native regex detectors cost
+   21 ms of CPU per request against Lane 2's 74 µs, and on a 1 MiB body 102 ms.
+   `[content_security.lane1] max_body_bytes` bounds it, and the shipped default
+   (`0` = unlimited) keeps the historical coverage *and* the historical DoS
+   surface. Neither answer is free:
+   * **leave it at 0** and body size, not request rate, is what exhausts you —
+     ~9 rps of 1 MiB bodies per core (§5.3), attacker-chosen;
+   * **set it** — just above the largest body your application legitimately
+     posts — and anything larger is not scanned by `sqli` / `xss` / `rce` /
+     `dir_traversal` at all. Not truncated: not scanned. CRS, Lane 2 and the
+     non-body surfaces still inspect it, and every skip is counted and WARNed.
+
+   The per-host `sqli` / `xss` toggles remain the blunter alternative (those two
+   are 94% of Lane 1's cost) — they remove the detector from *all* traffic,
+   where the budget removes it only from oversized bodies.
 8. **Watch the logs for queue-drop WARNs**, since there is no metric. Grep for
    `channel full` and `dropped`.
 9. **Expect memory to grow under attack.** Ten seconds of blocked traffic took

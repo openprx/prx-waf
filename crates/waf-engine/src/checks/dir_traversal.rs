@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::RegexSet;
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
-use super::{Check, request_targets};
+use super::{Check, Lane1BodyBudget, request_targets};
 
 static TRAVERSAL_DESCS: &[&str] = &[
     "directory traversal (../)",
@@ -82,11 +82,23 @@ static TRAVERSAL_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
 });
 
 /// Directory traversal / path injection detection checker.
-pub struct DirTraversalCheck;
+pub struct DirTraversalCheck {
+    /// How much request body this detector will read. See [`Lane1BodyBudget`].
+    body_budget: Lane1BodyBudget,
+}
 
 impl DirTraversalCheck {
+    /// The detector with **no** body budget — the historical behaviour.
     pub const fn new() -> Self {
-        Self
+        Self {
+            body_budget: Lane1BodyBudget::UNLIMITED,
+        }
+    }
+
+    /// The same detector under an operator-configured Lane 1 body budget.
+    #[must_use]
+    pub const fn with_body_budget(body_budget: Lane1BodyBudget) -> Self {
+        Self { body_budget }
     }
 }
 
@@ -114,7 +126,7 @@ impl Check for DirTraversalCheck {
 
         // Scan path / query / cookie / body plus curated headers, in raw and
         // (recursively) decoded forms — shared with the other content checkers.
-        for (location, value) in request_targets(ctx) {
+        for (location, value) in request_targets(ctx, self.body_budget) {
             if value.is_empty() {
                 continue;
             }

@@ -401,6 +401,8 @@ Three things an operator should know before deploying:
 * **Cost is driven by request-body size, not request rate.** A small GET costs
   ~216 µs of CPU; a 64 KiB upload costs ~21 ms. Almost all of that is the Lane 1
   regex detectors, and 94% of *that* is the `sqli` and `xss` detectors.
+  `[content_security.lane1] max_body_bytes` caps it — off by default, since
+  turning it on means those detectors stop reading oversized bodies entirely.
 * **Sustained attack traffic grows memory 4–7×** (110 MiB → 750 MiB in ten
   seconds), because every blocked request writes to the database.
 

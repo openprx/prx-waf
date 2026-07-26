@@ -130,11 +130,24 @@ impl ContentSecuritySubsystem {
     #[must_use]
     pub fn with_config(config: RuntimeContentSecurityConfig) -> Self {
         // Frozen order — must match the historical content_checkers vector.
+        //
+        // The Lane 1 body budget is threaded in here and nowhere else: this is
+        // the single construction site for the four detectors, so one config
+        // value governs all of them and they cannot drift apart. The shipped
+        // default is `UNLIMITED`, i.e. the historical target set.
+        let lane1_body_budget = config.lane1_body_budget;
+        if !lane1_body_budget.is_unlimited() {
+            tracing::info!(
+                max_body_bytes = lane1_body_budget.max_body_bytes(),
+                "Lane 1 body budget ACTIVE: request bodies larger than this are not inspected by the \
+                 sqli/xss/rce/traversal detectors (content_security.lane1.max_body_bytes)"
+            );
+        }
         let legacy_checkers: Vec<Box<dyn Check>> = vec![
-            Box::new(SqlInjectionCheck::new()),
-            Box::new(XssCheck::new()),
-            Box::new(RceCheck::new()),
-            Box::new(DirTraversalCheck::new()),
+            Box::new(SqlInjectionCheck::with_body_budget(lane1_body_budget)),
+            Box::new(XssCheck::with_body_budget(lane1_body_budget)),
+            Box::new(RceCheck::with_body_budget(lane1_body_budget)),
+            Box::new(DirTraversalCheck::with_body_budget(lane1_body_budget)),
         ];
         let now = Instant::now();
         let breaker = Mutex::new(CircuitBreaker::new(config.breaker, now));
@@ -1742,6 +1755,63 @@ mod tests {
             ..Budget::default()
         };
         rt
+    }
+
+    /// The Lane 1 body budget is a config value, and a config value is worth
+    /// nothing until it reaches the code. These three assertions are the wiring:
+    /// default → unlimited → detected; configured → skipped; and the *whole*
+    /// Lane 1 set moves together (traversal, not just `SQLi`, stops seeing it).
+    #[test]
+    fn lane1_body_budget_is_threaded_from_config_into_the_frozen_detectors() {
+        let mut sqli_body = "a".repeat(128 * 1024);
+        sqli_body.push_str("&q=1' UNION SELECT password FROM users--");
+        let mut trav_body = "a".repeat(128 * 1024);
+        trav_body.push_str("&file=../../../../etc/passwd");
+
+        let body_ctx = |payload: &str| {
+            let mut req = ctx();
+            req.body_preview = Bytes::from(payload.to_string());
+            req.content_length = req.body_preview.len() as u64;
+            req
+        };
+
+        // Default config: no budget. Both payloads are vetoed by Lane 1.
+        let unbudgeted = ContentSecuritySubsystem::new();
+        assert!(
+            unbudgeted.config().lane1_body_budget.is_unlimited(),
+            "the zero-config default must be unlimited"
+        );
+        for payload in [&sqli_body, &trav_body] {
+            assert!(
+                matches!(
+                    unbudgeted.evaluate(&body_ctx(payload)),
+                    ContentVerdict::LegacyVeto { .. }
+                ),
+                "with no budget the whole body must be inspected"
+            );
+        }
+
+        // Same subsystem with a 64 KiB Lane 1 budget compiled in: both payloads
+        // are now invisible to Lane 1 — the coverage this knob trades away.
+        let budgeted = ContentSecuritySubsystem::with_config(RuntimeContentSecurityConfig {
+            lane1_body_budget: crate::checks::Lane1BodyBudget::from_bytes(64 * 1024),
+            ..RuntimeContentSecurityConfig::default()
+        });
+        for payload in [&sqli_body, &trav_body] {
+            assert!(
+                matches!(budgeted.evaluate(&body_ctx(payload)), ContentVerdict::None),
+                "an over-budget body must reach none of the four Lane 1 detectors"
+            );
+        }
+
+        // …and a body inside the budget is unaffected.
+        assert!(
+            matches!(
+                budgeted.evaluate(&body_ctx("q=1' UNION SELECT password FROM users--")),
+                ContentVerdict::LegacyVeto { .. }
+            ),
+            "a small body must still be inspected under the same budget"
+        );
     }
 
     #[test]

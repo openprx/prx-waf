@@ -24,6 +24,8 @@ pub use content_security::{
     RuntimeContentSecurityConfig, SemanticAction, SemanticVerdict,
 };
 pub use dir_traversal::DirTraversalCheck;
+// `Lane1BodyBudget` is defined in this module (see below) and re-exported by
+// `waf_engine`'s prelude alongside the detectors it governs.
 pub use geo::{GeoCheck, GeoRule, GeoRuleMode};
 pub use owasp::{OWASPCheck, OverrideLoadReport, RuleDescriptor, RuleOverrideError, RuleOverrideSpec, RuleState};
 pub use rce::RceCheck;
@@ -31,6 +33,10 @@ pub use scanner::ScannerCheck;
 pub use sensitive::SensitiveCheck;
 pub use sql_injection::SqlInjectionCheck;
 pub use xss::XssCheck;
+
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use waf_common::{DetectionResult, RequestCtx, ResponseCtx};
 
@@ -221,6 +227,179 @@ fn header_decoded_label(name: &str) -> &'static str {
     }
 }
 
+// ─── Lane 1 body budget ───────────────────────────────────────────────────────
+
+/// How large a request body the four frozen Lane 1 detectors (`SQLi` → XSS →
+/// RCE → traversal) are willing to read.
+///
+/// # Why Lane 1 needs one
+///
+/// Lane 2 bounds its own work with `[content_security.budget]` and the CRS body
+/// processors decline anything over their hardcoded 64 KiB
+/// (`body_processors::MAX_BODY_BYTES`). Lane 1 had no equivalent, so its cost
+/// tracked body size all the way to the 10 MiB inspection ceiling: measured at
+/// **+21.5 ms of CPU on a 64 KiB upload and +102 ms on a 1 MiB body**, against
+/// Lane 2's +74 µs and +20 µs on the same requests (`tests/perf/RESULTS.md`).
+/// The proxy is single-threaded, so that is the throughput of the whole process.
+///
+/// # One budget, not one per detector
+///
+/// All four detectors derive their input from the single
+/// [`request_targets`] collector, and the measurements show they share no work —
+/// the per-detector deltas sum to the whole within 1–7%. Capping the collector
+/// therefore removes the cost from all four at once, and it keeps the coverage
+/// story describable: either Lane 1 read this body or it did not. Per-detector
+/// caps would produce a matrix of "sqli saw the body, xss did not" states that
+/// nothing downstream can reason about — and per-detector *control* already
+/// exists as the per-host `defense_config.sqli` / `.xss` toggles.
+///
+/// # Skip, not truncate
+///
+/// Over budget, the body contributes **no** targets at all; it is not scanned as
+/// a prefix. That is strictly worse for detection than truncation and is chosen
+/// anyway, for two reasons. First, truncation cannot be made to bound the work:
+/// the gateway feeds the body as a sequence of ≤68 KiB windows
+/// (`BODY_PREVIEW_LIMIT` + `BODY_WINDOW_OVERLAP`), each in its own `RequestCtx`,
+/// so "scan the first N bytes of each window" would still cost N × window-count
+/// on a large body — the exact term the budget exists to remove. Bounding the
+/// *request* instead of the window needs cumulative cross-window state, which
+/// the frozen `Check::check(&RequestCtx)` signature cannot carry. Second, skip
+/// is what this codebase already does at the same boundary
+/// (`body_processors.rs:130`, `:226`), so an operator learns one rule rather
+/// than two.
+///
+/// # Default
+///
+/// [`Self::UNLIMITED`]. A deployment that never sets the key inspects exactly
+/// the bytes it always did; the only added work is the integer comparison in
+/// [`Self::admits_body`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Lane1BodyBudget {
+    /// Largest body Lane 1 will read, in bytes. `0` = unlimited.
+    max_body_bytes: usize,
+}
+
+impl Lane1BodyBudget {
+    /// No cap — every byte the gateway hands over is inspected. The default, and
+    /// the behaviour of every prx-waf that shipped before this budget existed.
+    pub const UNLIMITED: Self = Self { max_body_bytes: 0 };
+
+    /// Build a budget from an operator-supplied byte count. `0` = unlimited.
+    #[must_use]
+    pub const fn from_bytes(max_body_bytes: usize) -> Self {
+        Self { max_body_bytes }
+    }
+
+    /// The configured cap in bytes; `0` when unlimited.
+    #[must_use]
+    pub const fn max_body_bytes(self) -> usize {
+        self.max_body_bytes
+    }
+
+    /// `true` when no cap is configured.
+    #[must_use]
+    pub const fn is_unlimited(self) -> bool {
+        self.max_body_bytes == 0
+    }
+
+    /// Whether this request's body may be read. **O(1)** — two integer
+    /// comparisons, no allocation, no scan.
+    ///
+    /// Two terms, because either one alone is evadable:
+    ///
+    /// * **the declared `Content-Length`** decides the whole request the same way
+    ///   for every window, so a 1 MiB body is skipped from its first window
+    ///   rather than after the first 64 KiB have already been paid for;
+    /// * **this window's own length**, because a chunked request declares no
+    ///   `Content-Length` (the gateway records `0`) and would otherwise walk past
+    ///   the budget one window at a time.
+    ///
+    /// The residual gap is stated rather than papered over: with a budget at or
+    /// above the 68 KiB maximum window, a **chunked** body of unknown length
+    /// satisfies both terms and is scanned in full. Budgets below the 64 KiB
+    /// window size are unaffected by this.
+    fn admits_body(self, ctx: &RequestCtx) -> bool {
+        if self.max_body_bytes == 0 {
+            return true;
+        }
+        if ctx.body_preview.len() > self.max_body_bytes {
+            return false;
+        }
+        usize::try_from(ctx.content_length).is_ok_and(|declared| declared <= self.max_body_bytes)
+    }
+}
+
+/// Sentinel for "no WARN has been emitted yet", so the first skip is reported
+/// immediately instead of waiting out an interval.
+const LANE1_SKIP_NEVER_WARNED: u64 = u64::MAX;
+
+/// How often the aggregate skip WARN is repeated. Matches the audit-log sink's
+/// drop-report cadence (`audit_log.rs:80`).
+const LANE1_SKIP_WARN_INTERVAL_SECS: u64 = 30;
+
+/// Body inspections Lane 1 declined because the budget said so.
+///
+/// Log-only, exactly like the queue-drop counters in `audit_log.rs` /
+/// `semantic_sink.rs` / `notify.rs`: an over-budget body must never be a *silent*
+/// coverage hole.
+///
+/// **Unit: detector invocations, not requests.** Each of the four Lane 1
+/// detectors collects its own targets, and the gateway inspects a large body
+/// window by window, so one oversized request contributes up to
+/// `4 × window_count`. Read it as a rate signal ("is this firing, and is it
+/// getting worse"), not as a request count.
+static LANE1_BODY_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Seconds since [`PROCESS_EPOCH`] at the last emitted WARN.
+static LANE1_BODY_SKIP_LAST_WARN: AtomicU64 = AtomicU64::new(LANE1_SKIP_NEVER_WARNED);
+
+/// Monotonic anchor for the WARN throttle. `Instant` cannot live in an atomic;
+/// seconds since this anchor can.
+static PROCESS_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// How many Lane 1 body inspections the budget has skipped since process start
+/// (telemetry / tests). Never reset. See [`LANE1_BODY_SKIPS`] for the unit —
+/// it counts detector invocations, not requests.
+#[must_use]
+pub fn lane1_body_skips() -> u64 {
+    LANE1_BODY_SKIPS.load(Ordering::Relaxed)
+}
+
+/// Count an over-budget body and, at most once every
+/// [`LANE1_SKIP_WARN_INTERVAL_SECS`], say so out loud.
+///
+/// `#[cold]`: only reachable when a budget is configured *and* exceeded, so the
+/// common path never touches any of this.
+#[cold]
+fn record_lane1_body_skip(ctx: &RequestCtx, budget: Lane1BodyBudget) {
+    let total = LANE1_BODY_SKIPS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+
+    let now = PROCESS_EPOCH.elapsed().as_secs();
+    let last = LANE1_BODY_SKIP_LAST_WARN.load(Ordering::Relaxed);
+    if last != LANE1_SKIP_NEVER_WARNED && now.saturating_sub(last) < LANE1_SKIP_WARN_INTERVAL_SECS {
+        return;
+    }
+    // Lost race: another thread is emitting this interval's line. One is enough.
+    if LANE1_BODY_SKIP_LAST_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    tracing::warn!(
+        skipped_inspections = total,
+        budget_bytes = budget.max_body_bytes(),
+        window_bytes = ctx.body_preview.len(),
+        content_length = ctx.content_length,
+        host = %ctx.host,
+        path = %ctx.path,
+        "Lane 1 body budget exceeded: the request body was NOT inspected by the sqli/xss/rce/traversal \
+         detectors (content_security.lane1.max_body_bytes). Path, query, cookies and headers were still \
+         inspected, as were CRS and Lane 2."
+    );
+}
+
 /// Collect all strings to inspect from the request context.
 ///
 /// Returns a list of `(location, value)` pairs so error messages can
@@ -232,7 +411,11 @@ fn header_decoded_label(name: &str) -> &'static str {
 /// double/triple-encoded evasion attempts are caught alongside the plain
 /// variants.  A curated set of request headers ([`SCANNED_HEADERS`]) is
 /// additionally scanned in raw + single-decoded form.
-pub(crate) fn request_targets(ctx: &RequestCtx) -> Vec<(&'static str, String)> {
+///
+/// `body_budget` gates **only** the three body-derived entries; every other
+/// surface is collected unconditionally. [`Lane1BodyBudget::UNLIMITED`] — the
+/// shipped default — reproduces the historical target set byte for byte.
+pub(crate) fn request_targets(ctx: &RequestCtx, body_budget: Lane1BodyBudget) -> Vec<(&'static str, String)> {
     let mut targets = Vec::new();
 
     // Raw, decoded, and recursively-decoded path
@@ -272,17 +455,23 @@ pub(crate) fn request_targets(ctx: &RequestCtx) -> Vec<(&'static str, String)> {
         }
     }
 
-    // Request body preview (best-effort UTF-8)
+    // Request body preview (best-effort UTF-8), subject to the Lane 1 body
+    // budget. The admission test comes first so an over-budget body costs one
+    // comparison instead of a lossy-UTF-8 copy plus up to five decode passes.
     if !ctx.body_preview.is_empty() {
-        let body_str = String::from_utf8_lossy(&ctx.body_preview).into_owned();
-        targets.push(("body", body_str.clone()));
-        let body_decoded = url_decode(&body_str);
-        let body_recursive = url_decode_recursive(&body_str);
-        if body_decoded != body_str {
-            targets.push(("body(decoded)", body_decoded.clone()));
-        }
-        if body_recursive != body_decoded {
-            targets.push(("body(decoded-recursive)", body_recursive));
+        if body_budget.admits_body(ctx) {
+            let body_str = String::from_utf8_lossy(&ctx.body_preview).into_owned();
+            targets.push(("body", body_str.clone()));
+            let body_decoded = url_decode(&body_str);
+            let body_recursive = url_decode_recursive(&body_str);
+            if body_decoded != body_str {
+                targets.push(("body(decoded)", body_decoded.clone()));
+            }
+            if body_recursive != body_decoded {
+                targets.push(("body(decoded-recursive)", body_recursive));
+            }
+        } else {
+            record_lane1_body_skip(ctx, body_budget);
         }
     }
 
@@ -331,6 +520,116 @@ mod tests {
         }
     }
 
+    /// A ctx carrying a body, with `content_length` set the way the gateway sets
+    /// it (the declared total, not this window's length) unless overridden.
+    fn ctx_with_body(body: Vec<u8>, declared_len: Option<u64>) -> RequestCtx {
+        let mut ctx = ctx_with_headers(HashMap::new());
+        ctx.path = "/upload".to_string();
+        ctx.query = "id=1".to_string();
+        ctx.content_length = declared_len.unwrap_or(body.len() as u64);
+        ctx.body_preview = Bytes::from(body);
+        ctx
+    }
+
+    /// 1 MiB of filler with the marker at the very end — the shape that proves
+    /// coverage is not quietly truncated somewhere.
+    fn one_mib_body_with_trailing_marker(marker: &str) -> Vec<u8> {
+        let mut body = vec![b'a'; 1024 * 1024];
+        body.extend_from_slice(marker.as_bytes());
+        body
+    }
+
+    #[test]
+    fn unlimited_is_the_default_budget() {
+        assert!(Lane1BodyBudget::default().is_unlimited());
+        assert!(Lane1BodyBudget::UNLIMITED.is_unlimited());
+        assert!(Lane1BodyBudget::from_bytes(0).is_unlimited());
+        assert!(!Lane1BodyBudget::from_bytes(1).is_unlimited());
+    }
+
+    /// The zero-behaviour-change guarantee: with the shipped default, a 1 MiB
+    /// body is read to its last byte.
+    #[test]
+    fn unlimited_budget_reads_a_one_mib_body_to_its_last_byte() {
+        let ctx = ctx_with_body(one_mib_body_with_trailing_marker("NEEDLE"), None);
+        let targets = request_targets(&ctx, Lane1BodyBudget::UNLIMITED);
+        assert!(
+            targets.iter().any(|(loc, v)| *loc == "body" && v.ends_with("NEEDLE")),
+            "unlimited must still see the tail of a 1 MiB body"
+        );
+    }
+
+    #[test]
+    fn budget_admits_a_body_at_or_under_the_cap() {
+        let ctx = ctx_with_body(b"user=admin&note=NEEDLE".to_vec(), None);
+        let targets = request_targets(&ctx, Lane1BodyBudget::from_bytes(64 * 1024));
+        assert!(
+            targets.iter().any(|(loc, v)| *loc == "body" && v.contains("NEEDLE")),
+            "a body inside the budget must still be inspected"
+        );
+    }
+
+    /// Over budget → the body contributes nothing, and everything else still
+    /// does. Skip, not truncate: no prefix of the body appears either.
+    #[test]
+    fn budget_skips_an_over_cap_body_but_keeps_every_other_surface() {
+        let ctx = ctx_with_body(one_mib_body_with_trailing_marker("NEEDLE"), None);
+        let targets = request_targets(&ctx, Lane1BodyBudget::from_bytes(64 * 1024));
+        assert!(
+            !targets.iter().any(|(loc, _)| loc.starts_with("body")),
+            "an over-budget body must contribute no target at all"
+        );
+        assert!(
+            targets.iter().any(|(loc, v)| *loc == "path" && v == "/upload"),
+            "path must still be inspected"
+        );
+        assert!(
+            targets.iter().any(|(loc, v)| *loc == "query" && v == "id=1"),
+            "query must still be inspected"
+        );
+    }
+
+    /// The declared `Content-Length` decides the whole request, so the *first*
+    /// window of a large body is skipped rather than paid for. Without this term
+    /// a 1 MiB body would still cost one full 64 KiB scan.
+    #[test]
+    fn declared_content_length_skips_the_first_window_too() {
+        // A small window (what the gateway hands over first) of a body the client
+        // declared as 1 MiB.
+        let ctx = ctx_with_body(vec![b'a'; 4096], Some(1024 * 1024));
+        let targets = request_targets(&ctx, Lane1BodyBudget::from_bytes(64 * 1024));
+        assert!(
+            !targets.iter().any(|(loc, _)| loc.starts_with("body")),
+            "a declared-oversized body must be skipped from its first window"
+        );
+    }
+
+    /// A chunked request declares no length (the gateway records `0`), so the
+    /// window's own size has to carry the decision.
+    #[test]
+    fn undeclared_length_falls_back_to_the_window_size() {
+        let ctx = ctx_with_body(vec![b'a'; 64 * 1024], Some(0));
+        assert!(
+            !request_targets(&ctx, Lane1BodyBudget::from_bytes(16 * 1024))
+                .iter()
+                .any(|(loc, _)| loc.starts_with("body")),
+            "a window larger than the budget must be skipped even with no Content-Length"
+        );
+    }
+
+    /// An over-budget body is a coverage hole; it must be counted, never silent.
+    #[test]
+    fn every_skip_is_counted() {
+        let before = lane1_body_skips();
+        let ctx = ctx_with_body(vec![b'a'; 32 * 1024], None);
+        let _ = request_targets(&ctx, Lane1BodyBudget::from_bytes(1024));
+        assert!(
+            lane1_body_skips() > before,
+            "the skip counter must advance (before={before}, after={})",
+            lane1_body_skips()
+        );
+    }
+
     #[test]
     fn request_targets_scans_curated_headers() {
         let mut headers = HashMap::new();
@@ -339,7 +638,7 @@ mod tests {
         // A header not on the allowlist must be ignored.
         headers.insert("x-custom".to_string(), "ignored".to_string());
         let ctx = ctx_with_headers(headers);
-        let targets = request_targets(&ctx);
+        let targets = request_targets(&ctx, Lane1BodyBudget::UNLIMITED);
         assert!(targets.iter().any(|(loc, v)| *loc == "user-agent" && v == "sqlmap/1.0"));
         assert!(
             targets
@@ -354,7 +653,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("referer".to_string(), "%3Cscript%3E".to_string());
         let ctx = ctx_with_headers(headers);
-        let targets = request_targets(&ctx);
+        let targets = request_targets(&ctx, Lane1BodyBudget::UNLIMITED);
         assert!(
             targets
                 .iter()

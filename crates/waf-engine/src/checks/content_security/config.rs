@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 use waf_common::content_security_config::ContentSecurityConfig;
 
+use crate::checks::Lane1BodyBudget;
+
 use super::budget::Budget;
 use super::canary::BreakerConfig;
 use super::scoring::RuntimeScoringConfig;
@@ -59,6 +61,14 @@ pub struct RuntimeContentSecurityConfig {
     pub rollout_bps: u32,
     pub rollout_salt: String,
     pub budget: Budget,
+    /// Lane 1's request-body admission cap. Compiled from
+    /// `[content_security.lane1]`; [`Lane1BodyBudget::UNLIMITED`] by default, so
+    /// a config that does not mention it leaves Lane 1 exactly as it was.
+    ///
+    /// It lives on this struct because [`super::ContentSecuritySubsystem`] owns
+    /// *both* lanes — it is the one place that constructs the four frozen Lane 1
+    /// detectors — so this is the config that already reaches them.
+    pub lane1_body_budget: Lane1BodyBudget,
     pub breaker: BreakerConfig,
     pub scoring: RuntimeScoringConfig,
 }
@@ -76,6 +86,7 @@ impl Default for RuntimeContentSecurityConfig {
             rollout_bps: 0,
             rollout_salt: String::new(),
             budget: Budget::default(),
+            lane1_body_budget: Lane1BodyBudget::UNLIMITED,
             breaker: BreakerConfig::default(),
             scoring: RuntimeScoringConfig::default(),
         }
@@ -120,6 +131,7 @@ impl RuntimeContentSecurityConfig {
             rollout_bps: cfg.rollout_bps,
             rollout_salt: cfg.rollout_salt.clone(),
             budget: Budget::from_config(&cfg.budget),
+            lane1_body_budget: Lane1BodyBudget::from_bytes(cfg.lane1.max_body_bytes),
             breaker: BreakerConfig::from_config(&cfg.breaker),
             scoring: RuntimeScoringConfig::compile(cfg)?,
         })

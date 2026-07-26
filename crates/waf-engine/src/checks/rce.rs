@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::RegexSet;
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
-use super::{Check, request_targets};
+use super::{Check, Lane1BodyBudget, request_targets};
 
 static RCE_DESCS: &[&str] = &[
     "shell command via pipe/semicolon (|; with command)",
@@ -198,11 +198,23 @@ static RCE_SET: LazyLock<Option<RegexSet>> = LazyLock::new(|| {
 });
 
 /// Remote Code Execution / Command Injection detection checker.
-pub struct RceCheck;
+pub struct RceCheck {
+    /// How much request body this detector will read. See [`Lane1BodyBudget`].
+    body_budget: Lane1BodyBudget,
+}
 
 impl RceCheck {
+    /// The detector with **no** body budget — the historical behaviour.
     pub const fn new() -> Self {
-        Self
+        Self {
+            body_budget: Lane1BodyBudget::UNLIMITED,
+        }
+    }
+
+    /// The same detector under an operator-configured Lane 1 body budget.
+    #[must_use]
+    pub const fn with_body_budget(body_budget: Lane1BodyBudget) -> Self {
+        Self { body_budget }
     }
 }
 
@@ -228,7 +240,7 @@ impl Check for RceCheck {
             });
         };
 
-        for (location, value) in request_targets(ctx) {
+        for (location, value) in request_targets(ctx, self.body_budget) {
             let matches = set.matches(&value);
             if matches.matched_any() {
                 let idx = matches.iter().next().unwrap_or(0);
