@@ -30,6 +30,13 @@ on:
       - 'crates/gateway/**'
       - 'crates/waf-common/**'
       - 'tests/ftw/**'
+      # The converter's output lands in rules/owasp-crs/, but a change that
+      # alters nothing there still deserves the run.
+      - 'rules/tools/**'
+      # Detection is only as stable as the crates that implement it: a bump to
+      # regex, aho-corasick or sqlparser changes what matches without touching
+      # a line of this repository's own source.
+      - 'Cargo.lock'
       - '.github/workflows/crs-regression.yml'
   pull_request:
     paths:
@@ -38,6 +45,13 @@ on:
       - 'crates/gateway/**'
       - 'crates/waf-common/**'
       - 'tests/ftw/**'
+      # The converter's output lands in rules/owasp-crs/, but a change that
+      # alters nothing there still deserves the run.
+      - 'rules/tools/**'
+      # Detection is only as stable as the crates that implement it: a bump to
+      # regex, aho-corasick or sqlparser changes what matches without touching
+      # a line of this repository's own source.
+      - 'Cargo.lock'
       - '.github/workflows/crs-regression.yml'
   workflow_dispatch:
     inputs:
