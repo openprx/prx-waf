@@ -79,6 +79,37 @@ async fn tagged(db: &Database, tag: &str) -> Vec<(i64, String)> {
         .collect()
 }
 
+/// A `tracing` writer that appends into a shared buffer, so a test can assert
+/// on the text an operator would actually see rather than on the mere absence
+/// of an error.
+#[derive(Clone, Default)]
+struct CapturedLogs(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 async fn purge(db: &Database, tag: &str) {
     sqlx::query("DELETE FROM crowdsec_decisions WHERE scenario = $1")
         .bind(tag)
@@ -332,4 +363,184 @@ async fn the_mirror_columns_match_the_writer_assumptions() {
     }
     assert!(widths.contains_key("duration_secs"), "duration_secs is missing");
     assert!(widths.contains_key("expires_at"), "expires_at is missing");
+}
+
+/// The five text columns the mirror depends on are all nullable in
+/// `migrations/0006_crowdsec.sql:22-26`. The writer never fills them with
+/// `NULL`, but the table is a *cache* that `cscli`, a restored dump or an
+/// operator can write to directly — and a decision this process cannot read is
+/// exactly the drift a schema assertion should catch, so pin the nullability
+/// the loader is written to survive.
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn the_mirrors_text_columns_are_nullable_in_the_schema() {
+    let db = connect().await;
+    let rows = sqlx::query(
+        "SELECT column_name, is_nullable
+           FROM information_schema.columns
+          WHERE table_name = 'crowdsec_decisions'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("introspect crowdsec_decisions");
+
+    let nullable: std::collections::HashMap<String, String> = rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.try_get::<String, _>("column_name").expect("column_name"),
+                r.try_get::<String, _>("is_nullable").expect("is_nullable"),
+            )
+        })
+        .collect();
+
+    for column in ["origin", "scope", "value", "type", "scenario"] {
+        assert_eq!(
+            nullable.get(column).map(String::as_str),
+            Some("YES"),
+            "crowdsec_decisions.{column} is no longer nullable — the loader's skip path is now unreachable \
+             and should be re-justified rather than silently kept"
+        );
+    }
+}
+
+/// One malformed mirror row must not cost the caller every other decision.
+///
+/// Before the fix, `load_active_crowdsec_decisions` decoded these five nullable
+/// columns into non-optional `String`s, so a single row with a `NULL` in any of
+/// them raised `UnexpectedNullError` and failed the entire `fetch_all` — which
+/// is the startup cache restore, i.e. the one thing standing between a restart
+/// with an unreachable LAPI and a fail-open bouncer. Hand-insert exactly such a
+/// row alongside two good ones and prove the good ones still come back.
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn a_null_column_skips_only_its_own_row() {
+    let db = connect().await;
+    let tag = format!("prxtest/nullrow-{}", uuid::Uuid::new_v4());
+    let good_a = unique_value();
+    let good_b = unique_value();
+
+    db.upsert_crowdsec_decisions(&[
+        row(unique_id(), &good_a, &tag, TimeDelta::try_hours(1).unwrap()),
+        row(unique_id(), &good_b, &tag, TimeDelta::try_hours(2).unwrap()),
+    ])
+    .await
+    .expect("seed the well-formed decisions");
+
+    // The malformed row: unexpired and therefore inside the load predicate, but
+    // with `origin` and `value` NULL. Written with raw SQL because the typed
+    // writer cannot express it — which is the point.
+    let bad_id = unique_id();
+    sqlx::query(
+        "INSERT INTO crowdsec_decisions (id, origin, scope, value, type, scenario, duration_secs, expires_at) \
+         VALUES ($1, NULL, 'Ip', NULL, 'ban', $2, 3600, NOW() + INTERVAL '1 hour')",
+    )
+    .bind(bad_id)
+    .bind(&tag)
+    .execute(db.pool())
+    .await
+    .expect("hand-insert the malformed row");
+
+    let logs = CapturedLogs::default();
+    let restored = {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            // Colour codes would sit between the field name and its value and
+            // make the assertions below meaningless.
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        db.load_active_crowdsec_decisions()
+            .await
+            .expect("a NULL column must not fail the whole load")
+    };
+    let mine: Vec<&CrowdSecDecisionRow> = restored.iter().filter(|r| r.scenario == tag).collect();
+
+    // A silent skip would be the worse bug: a decision quietly missing from the
+    // bouncer cache is invisible until the banned IP gets through.
+    let logged = logs.text();
+    assert!(
+        logged.contains("Skipped CrowdSec mirror rows"),
+        "the skip must be reported, not swallowed: {logged}"
+    );
+    assert!(
+        logged.contains("skipped=1"),
+        "the warning must carry an exact count: {logged}"
+    );
+    assert!(
+        logged.contains(&bad_id.to_string()),
+        "the warning must name the offending row so it can be found: {logged}"
+    );
+    assert!(
+        logged.contains("origin") && logged.contains("value"),
+        "the warning must name every NULL column, not just the first: {logged}"
+    );
+
+    let mut values: Vec<&str> = mine.iter().map(|r| r.value.as_str()).collect();
+    values.sort_unstable();
+    let mut expected = [good_a.as_str(), good_b.as_str()];
+    expected.sort_unstable();
+    assert_eq!(
+        values, expected,
+        "both well-formed decisions must survive a malformed sibling"
+    );
+    assert!(
+        !mine.iter().any(|r| r.id == bad_id),
+        "the malformed row must be skipped, not smuggled in with a placeholder value"
+    );
+
+    purge(&db, &tag).await;
+}
+
+/// Every one of the five columns must be able to sink its own row on its own —
+/// a fix that only handled, say, a NULL `origin` would leave four live faults.
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn each_nullable_column_is_survivable_alone() {
+    let db = connect().await;
+
+    for column in ["origin", "scope", "value", "type", "scenario"] {
+        let tag = format!("prxtest/null-{column}-{}", uuid::Uuid::new_v4());
+        let good = unique_value();
+        db.upsert_crowdsec_decisions(&[row(unique_id(), &good, &tag, TimeDelta::try_hours(1).unwrap())])
+            .await
+            .unwrap_or_else(|e| panic!("seed for {column}: {e}"));
+
+        // Write the bad row through the typed writer, then blank the one column
+        // — the writer cannot emit NULL, which is the whole reason this state is
+        // only reachable from outside. `column` is a literal from the array
+        // above, never external input, so the interpolation is safe.
+        let bad_id = unique_id();
+        db.upsert_crowdsec_decisions(&[row(bad_id, &unique_value(), &tag, TimeDelta::try_hours(1).unwrap())])
+            .await
+            .unwrap_or_else(|e| panic!("seed the soon-to-be-malformed row for {column}: {e}"));
+
+        let blank = format!("UPDATE crowdsec_decisions SET {column} = NULL WHERE id = $1");
+        sqlx::query(&blank)
+            .bind(bad_id)
+            .execute(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("NULL out {column}: {e}"));
+
+        let restored = db
+            .load_active_crowdsec_decisions()
+            .await
+            .unwrap_or_else(|e| panic!("a NULL {column} must not fail the whole load: {e}"));
+        assert!(
+            restored.iter().any(|r| r.value == good),
+            "the well-formed decision must survive a NULL {column}"
+        );
+        assert!(
+            !restored.iter().any(|r| r.id == bad_id),
+            "the row with a NULL {column} must be skipped"
+        );
+
+        sqlx::query("DELETE FROM crowdsec_decisions WHERE id = $1")
+            .bind(bad_id)
+            .execute(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("purge NULL {column}: {e}"));
+        purge(&db, &tag).await;
+    }
 }

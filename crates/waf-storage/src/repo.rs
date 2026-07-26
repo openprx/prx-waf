@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -2319,7 +2319,8 @@ impl Database {
     // in-memory cache removes on — so a revoked ban can never survive in the
     // mirror and be resurrected by the next restart.
 
-    /// Every decision in the mirror that has not expired yet.
+    /// Every decision in the mirror that has not expired yet, skipping rows too
+    /// incomplete to describe a decision.
     ///
     /// Filtered in SQL so a mirror holding days of expired rows (the retention
     /// window deliberately keeps them for a while) costs one index range scan
@@ -2327,15 +2328,46 @@ impl Database {
     /// (`expires_at IS NULL`, only reachable by hand-inserted rows — the writer
     /// below always supplies one) are skipped: an unknown lifetime cannot be
     /// proven still active, and restoring it would be the resurrection this
-    /// mirror exists to avoid.
+    /// mirror exists to avoid. That `IS NOT NULL` is also what lets
+    /// [`CrowdSecDecisionRow::expires_at`] stay a non-optional `DateTime`
+    /// against a nullable column, so the predicate must not be relaxed.
+    ///
+    /// The other five nullable text columns get the same protection in Rust
+    /// rather than in SQL, because a filtered-out row must be *reported*: see
+    /// [`RawCrowdSecDecision`] for why one malformed row may not cost the
+    /// caller every other decision.
     pub async fn load_active_crowdsec_decisions(&self) -> Result<Vec<CrowdSecDecisionRow>, StorageError> {
-        let rows = sqlx::query_as::<_, CrowdSecDecisionRow>(
+        let raw = sqlx::query_as::<_, RawCrowdSecDecision>(
             "SELECT id, origin, scope, value, type, scenario, duration_secs, expires_at \
                FROM crowdsec_decisions \
               WHERE expires_at IS NOT NULL AND expires_at > NOW()",
         )
         .fetch_all(&self.pool)
         .await?;
+
+        let mut rows = Vec::with_capacity(raw.len());
+        let mut skipped = 0usize;
+        let mut sample: Vec<String> = Vec::new();
+        for row in raw {
+            let id = row.id;
+            match row.into_decision() {
+                Ok(decision) => rows.push(decision),
+                Err(missing) => {
+                    skipped += 1;
+                    if sample.len() < MALFORMED_DECISION_SAMPLE {
+                        sample.push(format!("{id} (null: {})", missing.join("+")));
+                    }
+                }
+            }
+        }
+        if skipped > 0 {
+            warn!(
+                skipped,
+                restored = rows.len(),
+                sample = %sample.join(", "),
+                "Skipped CrowdSec mirror rows with NULL required columns; the rest of the mirror was restored"
+            );
+        }
         debug!("Loaded {} active CrowdSec decisions from the local mirror", rows.len());
         Ok(rows)
     }
@@ -2413,6 +2445,91 @@ impl Database {
 /// and each row lock hold — bounded, while still costing only a handful of
 /// round-trips for a realistic decision set.
 const CROWDSEC_DECISION_CHUNK: usize = 1_000;
+
+/// How many malformed decision ids the skip warning names before it stops.
+///
+/// A table that is wholly corrupt must produce a log line an operator can read,
+/// not one row of text per mirrored decision. The count is always exact; only
+/// the id list is capped.
+const MALFORMED_DECISION_SAMPLE: usize = 10;
+
+/// A `crowdsec_decisions` row as the *schema* permits it, not as the writer
+/// produces it.
+///
+/// `migrations/0006_crowdsec.sql:22-26` leaves `origin`, `scope`, `value`,
+/// `type` and `scenario` nullable. [`upsert_crowdsec_decision_chunk`] never
+/// writes `NULL` into any of them, so only a hand-inserted row, a restored
+/// dump, or third-party tooling writing to the same table can produce one — and
+/// this table is documented as a *cache*, which invites exactly that.
+///
+/// Decoding such a row straight into [`CrowdSecDecisionRow`]'s non-optional
+/// `String` fields raises `UnexpectedNullError`, and because the read is a
+/// `fetch_all` that error fails the **whole** load. The whole load is the
+/// bouncer's startup cache restore, whose entire purpose is to keep the process
+/// from failing open when LAPI is unreachable at boot. Letting one unusable row
+/// discard every usable one would disable that protection at precisely the
+/// moment it is needed, so the incomplete rows are dropped, counted and
+/// reported instead, and every well-formed decision is still restored.
+#[derive(sqlx::FromRow)]
+struct RawCrowdSecDecision {
+    id: i64,
+    origin: Option<String>,
+    scope: Option<String>,
+    value: Option<String>,
+    #[sqlx(rename = "type")]
+    type_: Option<String>,
+    scenario: Option<String>,
+    duration_secs: Option<i64>,
+    expires_at: DateTime<Utc>,
+}
+
+impl RawCrowdSecDecision {
+    /// The decision this row describes, or the names of the columns whose
+    /// `NULL` left it undescribable.
+    fn into_decision(self) -> Result<CrowdSecDecisionRow, Vec<&'static str>> {
+        let Self {
+            id,
+            origin,
+            scope,
+            value,
+            type_,
+            scenario,
+            duration_secs,
+            expires_at,
+        } = self;
+        match (origin, scope, value, type_, scenario) {
+            (Some(origin), Some(scope), Some(value), Some(type_), Some(scenario)) => Ok(CrowdSecDecisionRow {
+                id,
+                origin,
+                scope,
+                value,
+                type_,
+                scenario,
+                duration_secs,
+                expires_at,
+            }),
+            (origin, scope, value, type_, scenario) => {
+                let mut missing = Vec::new();
+                if origin.is_none() {
+                    missing.push("origin");
+                }
+                if scope.is_none() {
+                    missing.push("scope");
+                }
+                if value.is_none() {
+                    missing.push("value");
+                }
+                if type_.is_none() {
+                    missing.push("type");
+                }
+                if scenario.is_none() {
+                    missing.push("scenario");
+                }
+                Err(missing)
+            }
+        }
+    }
+}
 
 /// One bulk upsert of `chunk` into `crowdsec_decisions`.
 ///

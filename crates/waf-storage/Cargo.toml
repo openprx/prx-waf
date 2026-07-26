@@ -22,6 +22,9 @@ tokio = { workspace = true, features = ["test-util"] }
 # Test-only: shared call log for the retention scheduler tests. `parking_lot`
 # (never `std::sync::Mutex`) per the crate's mutex rule.
 parking_lot = { workspace = true }
+# Test-only: capture the `warn!` a skipped CrowdSec mirror row emits, so
+# "dropped silently" can never pass for "dropped and reported".
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

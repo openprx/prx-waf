@@ -3697,46 +3697,50 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
     use waf_common::{RequestCtx, WafAction};
-    use waf_storage::models::Host;
+    use waf_storage::models::{CreateHost, Host};
 
     fn database_url() -> String {
         std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgresql://prx_waf:prx_waf@127.0.0.1:15432/prx_waf".to_string())
     }
 
-    /// Persist a host row with a unique hostname so parallel/repeated test
-    /// runs never collide.
+    /// A seed row with a unique hostname so parallel/repeated test runs never
+    /// collide, and a `remote_ip` set on purpose.
     ///
-    /// This inserts directly rather than going through `Database::create_host`
-    /// because that helper has an unrelated, pre-existing sqlx binding defect
-    /// (out of scope for the `log_only_mode` wiring fixed here): it binds
-    /// `remote_ip: Option<String>` as an explicitly-typed TEXT parameter
-    /// against the `inet` column, which Postgres rejects whenever the value is
-    /// `None` (column "`remote_ip`" is of type inet but expression is of type
-    /// text). Every column this test doesn't care about (`remote_ip`
-    /// included) is left to its schema default via `INSERT ... RETURNING *`.
+    /// `remote_ip` is the `hosts` table's one `INET` column and sqlx is built
+    /// without an `INET` codec, so it is the field a seed helper is most likely
+    /// to break on. Populating it means these restart tests exercise the
+    /// `host(remote_ip)` projection rather than tiptoeing around it.
+    fn seed_req(prefix: &str, log_only_mode: bool, defense_config: Option<waf_common::DefenseConfig>) -> CreateHost {
+        CreateHost {
+            host: format!("{prefix}-{}.test", Uuid::new_v4()),
+            port: 80,
+            ssl: false,
+            guard_status: true,
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 8080,
+            remote_ip: Some("203.0.113.7".to_string()),
+            cert_file: None,
+            key_file: None,
+            remarks: None,
+            start_status: true,
+            log_only_mode,
+            defense_config,
+        }
+    }
+
+    /// Persist a host row through the same `create_host` the admin API uses.
+    ///
+    /// Going through the repo rather than hand-rolling an `INSERT ...
+    /// RETURNING *` is deliberate: `RETURNING *` drags in the raw `INET`
+    /// `remote_ip`, which the `Host` model decodes as `Option<String>` and sqlx
+    /// (built without the `ipnetwork` feature) cannot decode. `create_host`
+    /// projects through the shared `host(remote_ip)` column list, so the seed
+    /// path and the production path can never drift.
     async fn seed_host(db: &Database, log_only_mode: bool) -> Host {
-        let code = Uuid::new_v4().to_string().replace('-', "")[..16].to_string();
-        let host = format!("logonly-restart-{}.test", Uuid::new_v4());
-        sqlx::query_as::<_, Host>(
-            r"INSERT INTO hosts (
-                code, host, port, ssl, guard_status,
-                remote_host, remote_port, start_status, log_only_mode
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING *",
-        )
-        .bind(&code)
-        .bind(&host)
-        .bind(80_i32)
-        .bind(false)
-        .bind(true)
-        .bind("127.0.0.1")
-        .bind(8080_i32)
-        .bind(true)
-        .bind(log_only_mode)
-        .fetch_one(db.pool())
-        .await
-        .expect("seed host row")
+        db.create_host(seed_req("logonly-restart", log_only_mode, None))
+            .await
+            .expect("seed host row")
     }
 
     /// A malicious `SQLi` request bound to the reloaded runtime config. Benign
@@ -3837,35 +3841,16 @@ mod tests {
     // still blocks.
 
     /// Seed a host row carrying a `defense_json` with the given `sqli` toggle
-    /// (all other detectors left on). Inserts directly for the same reason
-    /// `seed_host` does (unrelated `remote_ip`/inet binding defect).
+    /// (all other detectors left on). Goes through `create_host` for the same
+    /// reason `seed_host` does.
     async fn seed_host_with_sqli(db: &Database, sqli: bool) -> Host {
-        let code = Uuid::new_v4().to_string().replace('-', "")[..16].to_string();
-        let host = format!("defense-restart-{}.test", Uuid::new_v4());
         let defense = waf_common::DefenseConfig {
             sqli,
             ..waf_common::DefenseConfig::default()
         };
-        sqlx::query_as::<_, Host>(
-            r"INSERT INTO hosts (
-                code, host, port, ssl, guard_status,
-                remote_host, remote_port, start_status, log_only_mode, defense_json
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING *",
-        )
-        .bind(&code)
-        .bind(&host)
-        .bind(80_i32)
-        .bind(false)
-        .bind(true)
-        .bind("127.0.0.1")
-        .bind(8080_i32)
-        .bind(true)
-        .bind(false)
-        .bind(sqlx::types::Json(defense))
-        .fetch_one(db.pool())
-        .await
-        .expect("seed host row")
+        db.create_host(seed_req("defense-restart", false, Some(defense)))
+            .await
+            .expect("seed host row")
     }
 
     /// Reload a `defense_json`-carrying host the way `init_async` does at
