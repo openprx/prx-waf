@@ -6,8 +6,8 @@
 /// offline (M-12). Legacy ciphertexts written with the previous single-round,
 /// unsalted SHA-256 KDF are still decryptable for backward-compatible migration.
 use aes_gcm::{
-    Aes256Gcm, Key, Nonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm, Key,
+    aead::{Aead, KeyInit, Nonce},
 };
 use anyhow::Context as _;
 use argon2::Argon2;
@@ -92,8 +92,10 @@ pub fn encrypt_field(key: &[u8; 32], plaintext: &str) -> anyhow::Result<String> 
     rand::rngs::OsRng.fill_bytes(&mut salt);
     let aes_key = argon2_derive(key, &salt)?;
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(aes_key));
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
     let ciphertext = cipher
         .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| anyhow::anyhow!("encryption error: {e}"))?;
@@ -128,10 +130,11 @@ pub fn decrypt_field(key: &[u8; 32], encoded: &str) -> anyhow::Result<String> {
             .get(FIELD_HEADER_LEN..)
             .context("ciphertext truncated: missing body")?;
         let aes_key = argon2_derive(key, salt)?;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(aes_key));
+        let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes)
+            .map_err(|_| anyhow::anyhow!("ciphertext malformed: bad nonce length"))?;
         let plaintext = cipher
-            .decrypt(nonce, ct)
+            .decrypt(&nonce, ct)
             .map_err(|e| anyhow::anyhow!("decryption error: {e}"))?;
         return Ok(String::from_utf8(plaintext)?);
     }
@@ -141,10 +144,11 @@ pub fn decrypt_field(key: &[u8; 32], encoded: &str) -> anyhow::Result<String> {
         return Err(anyhow::anyhow!("ciphertext too short"));
     }
     let (nonce_bytes, ct) = combined.split_at(NONCE_LEN);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*key));
+    let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes)
+        .map_err(|_| anyhow::anyhow!("ciphertext malformed: bad nonce length"))?;
     let plaintext = cipher
-        .decrypt(nonce, ct)
+        .decrypt(&nonce, ct)
         .map_err(|e| anyhow::anyhow!("decryption error: {e}"))?;
     Ok(String::from_utf8(plaintext)?)
 }
@@ -156,8 +160,10 @@ mod tests {
 
     /// Reproduce the pre-M-12 on-disk format (base64(nonce || ct), SHA-256 key).
     fn legacy_encrypt(key: &[u8; 32], plaintext: &str) -> String {
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*key));
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
         let ct = cipher.encrypt(&nonce, plaintext.as_bytes()).expect("legacy encrypt");
         let mut combined = nonce.to_vec();
         combined.extend_from_slice(&ct);

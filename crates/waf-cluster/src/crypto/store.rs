@@ -20,8 +20,8 @@ use std::fs;
 use std::path::Path;
 
 use aes_gcm::{
-    Aes256Gcm, Key, Nonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Aes256Gcm, Key,
+    aead::{Aead, KeyInit, Nonce},
 };
 use anyhow::{Context, Result};
 use argon2::Argon2;
@@ -113,8 +113,10 @@ pub fn encrypt_blob(plaintext: &[u8], passphrase: &str) -> Result<Vec<u8>> {
     rand::rngs::OsRng.fill_bytes(&mut salt);
     let aes_key = argon2_derive(passphrase, &salt)?;
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(aes_key));
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
         .map_err(|e| anyhow::anyhow!("blob encryption failed: {e}"))?;
@@ -145,10 +147,11 @@ pub fn decrypt_blob(data: &[u8], passphrase: &str) -> Result<Vec<u8>> {
             .get(BLOB_HEADER_LEN..)
             .context("encrypted blob truncated: missing body")?;
         let aes_key = argon2_derive(passphrase, salt)?;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(aes_key));
+        let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes)
+            .map_err(|_| anyhow::anyhow!("encrypted blob truncated: bad nonce length"))?;
         return cipher
-            .decrypt(nonce, ct)
+            .decrypt(&nonce, ct)
             .map_err(|_| anyhow::anyhow!("blob decryption failed — wrong passphrase?"));
     }
 
@@ -158,9 +161,10 @@ pub fn decrypt_blob(data: &[u8], passphrase: &str) -> Result<Vec<u8>> {
     }
     let (nonce_bytes, ciphertext) = data.split_at(NONCE_LEN);
     let cipher = legacy_cipher(passphrase);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes)
+        .map_err(|_| anyhow::anyhow!("encrypted blob too short (corrupt?)"))?;
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| anyhow::anyhow!("blob decryption failed — wrong passphrase?"))
 }
 
@@ -172,7 +176,7 @@ fn legacy_cipher(passphrase: &str) -> Aes256Gcm {
     hasher.update(b"prx-waf-cluster-ca-key-v1:");
     hasher.update(passphrase.as_bytes());
     let derived: [u8; 32] = hasher.finalize().into();
-    Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived))
+    Aes256Gcm::new(&Key::<Aes256Gcm>::from(derived))
 }
 
 #[cfg(test)]
@@ -185,7 +189,9 @@ mod tests {
     /// Reproduce the pre-M-12 on-disk format (nonce || ct, SHA-256 key).
     fn legacy_encrypt_blob(plaintext: &[u8], passphrase: &str) -> Vec<u8> {
         let cipher = legacy_cipher(passphrase);
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
         let ct = cipher.encrypt(&nonce, plaintext).expect("legacy encrypt");
         let mut out = nonce.to_vec();
         out.extend_from_slice(&ct);

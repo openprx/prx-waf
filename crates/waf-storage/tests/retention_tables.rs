@@ -210,7 +210,7 @@ async fn count_tagged(pool: &PgPool, table: RetentionTable, tag: &str) -> i64 {
         table.name(),
         tag_column(table)
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(bound)
         .fetch_one(pool)
         .await

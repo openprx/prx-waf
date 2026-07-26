@@ -186,14 +186,17 @@ impl Database {
     // ─── Hosts ───────────────────────────────────────────────────────────────
 
     pub async fn list_hosts(&self) -> Result<Vec<Host>, StorageError> {
+        // `HOST_COLUMNS` is a fixed column-list constant, not caller input.
         let sql = format!("SELECT {HOST_COLUMNS} FROM hosts ORDER BY created_at DESC");
-        let rows = sqlx::query_as::<_, Host>(&sql).fetch_all(&self.pool).await?;
+        let rows = sqlx::query_as::<_, Host>(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
     pub async fn get_host(&self, id: Uuid) -> Result<Option<Host>, StorageError> {
         let sql = format!("SELECT {HOST_COLUMNS} FROM hosts WHERE id = $1");
-        let row = sqlx::query_as::<_, Host>(&sql)
+        let row = sqlx::query_as::<_, Host>(sqlx::AssertSqlSafe(sql))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -202,7 +205,7 @@ impl Database {
 
     pub async fn get_host_by_code(&self, code: &str) -> Result<Option<Host>, StorageError> {
         let sql = format!("SELECT {HOST_COLUMNS} FROM hosts WHERE code = $1");
-        let row = sqlx::query_as::<_, Host>(&sql)
+        let row = sqlx::query_as::<_, Host>(sqlx::AssertSqlSafe(sql))
             .bind(code)
             .fetch_optional(&self.pool)
             .await?;
@@ -232,7 +235,7 @@ impl Database {
                 $16, $16
             ) RETURNING {HOST_COLUMNS}"
         );
-        let row = sqlx::query_as::<_, Host>(&sql)
+        let row = sqlx::query_as::<_, Host>(sqlx::AssertSqlSafe(sql))
             .bind(id)
             .bind(&code)
             .bind(&req.host)
@@ -281,7 +284,7 @@ impl Database {
             WHERE id = $1
             RETURNING {HOST_COLUMNS}"
         );
-        let row = sqlx::query_as::<_, Host>(&sql)
+        let row = sqlx::query_as::<_, Host>(sqlx::AssertSqlSafe(sql))
             .bind(id)
             .bind(req.host)
             .bind(req.port)
@@ -560,20 +563,22 @@ impl Database {
         );
 
         // Count query
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM attack_logs {filters}"))
-            .bind(&query.host_code)
-            .bind(client_ip)
-            .bind(&query.action)
-            .bind(&query.iso_code)
-            .bind(&query.country)
-            .fetch_one(&self.pool)
-            .await?;
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM attack_logs {filters}"
+        )))
+        .bind(&query.host_code)
+        .bind(client_ip)
+        .bind(&query.action)
+        .bind(&query.iso_code)
+        .bind(&query.country)
+        .fetch_one(&self.pool)
+        .await?;
 
-        let rows = sqlx::query_as::<_, AttackLog>(&format!(
+        let rows = sqlx::query_as::<_, AttackLog>(sqlx::AssertSqlSafe(format!(
             "SELECT {ATTACK_LOG_COLUMNS} FROM attack_logs {filters}
                ORDER BY created_at DESC
                LIMIT $6 OFFSET $7"
-        ))
+        )))
         .bind(&query.host_code)
         .bind(client_ip)
         .bind(&query.action)
@@ -1298,7 +1303,7 @@ impl Database {
         // The only interpolation is the conflict target, chosen from the two
         // string literals above by a boolean — no caller input reaches the SQL
         // text. Every value is bound.
-        let mut row = sqlx::query_as::<_, RuleOverride>(&sql)
+        let mut row = sqlx::query_as::<_, RuleOverride>(sqlx::AssertSqlSafe(sql))
             .bind(&req.rule_id)
             .bind(host_id)
             .bind(req.enabled)

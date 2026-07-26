@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 

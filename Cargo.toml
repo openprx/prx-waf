@@ -40,7 +40,7 @@ serde_json = "1"
 toml = "1.1"
 
 # Database - PostgreSQL (default-features = false to exclude mysql/sqlite which pull in rsa RUSTSEC-2023-0071)
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "chrono", "uuid", "json"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "chrono", "uuid", "json"] }
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -73,12 +73,12 @@ scraper = "0.27"
 # Phase 4 additions
 argon2 = { version = "0.5", features = ["std"] }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "smtp-transport", "builder"] }
 rust-embed = "8"
 mime_guess = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 rand = "0.8"
 totp-lite = "2"
@@ -105,7 +105,7 @@ url = "2"
 
 # Cluster additions
 lz4_flex = "0.11"
-hmac = "0.12"
+hmac = "0.13"
 time = { version = "0.3", default-features = false, features = ["std"] }
 parking_lot = "0.12"
 

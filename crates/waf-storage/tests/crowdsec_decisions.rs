@@ -517,7 +517,7 @@ async fn each_nullable_column_is_survivable_alone() {
             .unwrap_or_else(|e| panic!("seed the soon-to-be-malformed row for {column}: {e}"));
 
         let blank = format!("UPDATE crowdsec_decisions SET {column} = NULL WHERE id = $1");
-        sqlx::query(&blank)
+        sqlx::query(sqlx::AssertSqlSafe(blank))
             .bind(bad_id)
             .execute(db.pool())
             .await
