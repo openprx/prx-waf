@@ -62,6 +62,60 @@ rules:
       - protocol-attack
     crs_id: 920610
 
+  # CRS-920120 / CRS-920121 read `FILES` and `FILES_NAMES` — the `filename="…"`
+  # and `name="…"` of each `multipart/form-data` file part, parsed by
+  # crates/waf-engine/src/checks/multipart.rs. Both assert the same property
+  # from opposite directions: a file name may not carry a quote, an apostrophe,
+  # a semicolon, an `=` or a backslash, because those are what let an upload
+  # smuggle a second parameter past a naive `Content-Disposition` parser.
+  #
+  # 920120 is a NEGATED head and is therefore only emitted because these two
+  # variables survive inversion, which most do not. The argument is written out
+  # in full at NEGATION_FAITHFUL_VARS in rules/tools/modsec2yaml.py; in short,
+  # `!@rx` over a ModSecurity *collection* fires when any member fails the
+  # pattern, so extracting fewer members than upstream can only make the rule
+  # fire less — and the parser is built to emit nothing at all rather than a
+  # truncated value. An upload whose parts fall outside the inspection window
+  # contributes no members and cannot fire it.
+  #
+  # 920121 is the PL2 sibling: same surfaces, plain (non-negated) operator,
+  # so it is unconditionally safe and would have been emitted either way.
+  - id: CRS-920120
+    name: Attempted multipart/form-data bypass
+    category: protocol-attack
+    severity: critical
+    paranoia: 1
+    field: files+files_names
+    operator: regex
+    value: |-
+      (?i)^(?:&(?:(?:[acegilnorsuz]acut|[aeiou]grav|[aino]tild)e|[c-elnr-tz]caron|(?:[cgklnr-t]cedi|[aeiouy]um)l|[aceg-josuwy]circ|[au]ring|a(?:mp|pos)|nbsp|oslash);|[^\"';=\x5c])*$
+    transform:
+      - urlDecodeUni
+    negate: true
+    action: block
+    tags:
+      - owasp-crs
+      - protocol-attack
+      - attack-protocol
+    crs_id: 920120
+
+  - id: CRS-920121
+    name: Attempted multipart/form-data bypass
+    category: protocol-attack
+    severity: critical
+    paranoia: 2
+    field: files+files_names
+    operator: regex
+    value: '[''\";=\x5c]'
+    transform:
+      - urlDecodeUni
+    action: block
+    tags:
+      - owasp-crs
+      - protocol-attack
+      - attack-protocol
+    crs_id: 920121
+
   # Upstream is `REQUEST_HEADERS:Content-Type "!@rx ^[\w/.+*-]+(...)*$"`: the
   # negation means "this header is not a well-formed media type", so the rule
   # fires on what the pattern *rejects*. Two properties keep that from becoming

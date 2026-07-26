@@ -230,7 +230,7 @@ rules:
     category: rce
     severity: critical
     paranoia: 1
-    field: args+args_names
+    field: args+args_names+files_names
     operator: regex
     value: ^\(\s*\)\s+\{
     transform:
@@ -261,7 +261,7 @@ rules:
     category: rce
     severity: critical
     paranoia: 1
-    field: unmapped_files
+    field: files
     operator: pm_from_file
     value: restricted-upload.data
     transform:

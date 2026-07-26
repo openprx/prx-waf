@@ -104,6 +104,14 @@ ENGINE_FIELDS = {
     "args_names",
     "args_get_names",
     "args_post_names",
+    # `multipart/form-data` collections, one value per part. The engine parses
+    # the envelope (crates/waf-engine/src/checks/multipart.rs); these are NOT
+    # approximations of `body` and must never be widened into one — CRS-933110
+    # is `.*\.php\.*$`, which over a whole request blocks every POST to a `.php`
+    # URL and over a part's file name means what upstream means.
+    "files",
+    "files_names",
+    "multipart_part_headers",
     "content_length",
     "content_type",
     "header_content_type",
@@ -145,6 +153,9 @@ SURFACE_ORDER = [
     "args_get_names",
     "args_post_names",
     "body",
+    "files",
+    "files_names",
+    "multipart_part_headers",
     "cookies",
     "cookies_names",
     "headers",
@@ -173,6 +184,9 @@ FIELD_SURFACES = {
     "args_names":        ("args_get_names", "args_post_names"),
     "args_get_names":    ("args_get_names",),
     "args_post_names":   ("args_post_names",),
+    "files":                  ("files",),
+    "files_names":            ("files_names",),
+    "multipart_part_headers": ("multipart_part_headers",),
     "cookies":           ("cookies",),
     "cookies_names":     ("cookies_names",),
     "headers":           ("headers",),
@@ -334,6 +348,23 @@ def _single_var_map(v: str) -> str:
         return v.lower()
     if v == "QUERY_STRING":
         return "query"
+    # The `multipart/form-data` collections. EXACT names only, deliberately:
+    #
+    #   FILES_COMBINED_SIZE / FILES_SIZES / FILES_TMPNAMES / FILES_TMP_CONTENT
+    #   MULTIPART_PART_HEADERS:<part>   (the headers of one *named* part)
+    #   MULTIPART_FILENAME / MULTIPART_NAME / MULTIPART_STRICT_ERROR / ...
+    #
+    # all share a prefix with the three below and mean something else. A
+    # `startswith` here would map a file *size* onto a file *name* and hand
+    # CRS-920430's byte comparison a string — the same class of silent
+    # mis-mapping the `all` fallback used to produce. Everything not named here
+    # keeps falling through to the sentinel at the end of this function.
+    if v == "FILES":
+        return "files"
+    if v == "FILES_NAMES":
+        return "files_names"
+    if v == "MULTIPART_PART_HEADERS":
+        return "multipart_part_headers"
     # XML:/... selects nodes of the request body parsed as XML.
     if v.startswith("XML:"):
         return "body"
@@ -379,9 +410,13 @@ def _single_var_map(v: str) -> str:
     # names are stable across re-syncs and so this doubles as the "not
     # supported yet" inventory:
     #
-    #   MULTIPART_*        multipart part headers / charset — the engine sees
-    #                      the raw body, not parsed parts (CRS 922).
-    #   FILES, FILES_NAMES uploaded file names (CRS 933110/933220/944140/932180).
+    #   MULTIPART_*        everything except the bare MULTIPART_PART_HEADERS:
+    #                      the per-part selector `MULTIPART_PART_HEADERS:<name>`,
+    #                      MULTIPART_STRICT_ERROR, MULTIPART_UNMATCHED_BOUNDARY
+    #                      and friends are parser *verdicts*, not part text.
+    #   FILES_COMBINED_SIZE, FILES_SIZES, FILES_TMPNAMES
+    #                      sizes and on-disk temporaries; this WAF never spools
+    #                      an upload to disk and does not total part sizes.
     #   MATCHED_VAR(S)     the previous rule's match, chained rules only.
     #   REMOTE_ADDR        available to the engine, but not through Field.
     #   REQBODY_PROCESSOR, UNIQUE_ID, *_COMBINED_SIZE, REQUEST_BODY_LENGTH,
@@ -431,6 +466,36 @@ def _single_var_map(v: str) -> str:
 # `REQUEST_BODY`, `RESPONSE_BODY`, `REQUEST_HEADERS` as a collection — is
 # decoded, truncated to a preview window, or widened to names as well as
 # values, and none of those survive inversion.
+#
+# ── `FILES` / `FILES_NAMES` are in the list, and the reason is not the same ──
+#
+# The rule above is about *scalars*, where a reconstruction that differs from
+# upstream's flips the answer. A ModSecurity collection variable inverts
+# differently: `!@rx` over a collection fires when ANY member fails the
+# pattern, so the operator is inverted but the walk is not. That makes the two
+# error directions asymmetric:
+#
+#   * Extracting FEWER members than upstream can only make a negated rule fire
+#     LESS. This is the direction every gap here points in: a `filename*=`
+#     (RFC 5987) parameter, an unquoted value, a part cut off by the inspection
+#     window, a body past the inspected-byte ceiling — each yields no member at
+#     all rather than a short one (checks/multipart.rs, `parse_part` and
+#     `disposition_params` both refuse anything unterminated). An empty
+#     collection cannot satisfy a negated rule, which is exactly what stops a
+#     10 MB upload's later windows from firing CRS-920120 on every request.
+#   * Extracting a member whose CONTENT differs from upstream's would flip the
+#     answer, and that is a correctness question about the parser rather than an
+#     approximation: each member is a byte-for-byte slice of the request body
+#     (the text between the quotes of a `Content-Disposition` parameter), not
+#     decoded, not concatenated with anything, not widened to include the
+#     parameter name. `checks::multipart` tests that slice against the exact
+#     bytes CRS-920120's own regression corpus sends, backslashes and embedded
+#     semicolons included.
+#
+# CRS-920120 is the rule this buys (41 upstream regression tests). If it ever
+# has to be given back, deleting the two names below is the whole change: the
+# rule reverts to an `unmapped_negated_files_files_names` sentinel and is
+# refused at load time with a startup WARN, exactly as it was before.
 NEGATION_FAITHFUL_VARS = {
     "REQUEST_METHOD",
     "REQUEST_HEADERS:CONTENT-TYPE",
@@ -439,6 +504,8 @@ NEGATION_FAITHFUL_VARS = {
     "REQUEST_HEADERS:HOST",
     "REQUEST_HEADERS:RANGE",
     "RESPONSE_STATUS",
+    "FILES",
+    "FILES_NAMES",
 }
 
 

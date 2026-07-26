@@ -35,6 +35,7 @@ use tracing::{debug, error, info, warn};
 
 use waf_common::{DetectionResult, OwaspConfig, Phase, RequestCtx, ResponseCtx, is_form_urlencoded, split_form_args};
 
+use super::multipart::{self, Multipart};
 use super::{Check, ResponseCheck};
 use crate::audit_log::{AuditLogSink, RuleHit, ScorePhase, ScoreVerdict};
 
@@ -600,41 +601,54 @@ impl LoadSummary {
 /// whether the two words around an `=` are identical, and in a whole query
 /// string the `name=value` separator supplies that equality by itself, so
 /// `?tab=tab` reads as a `1=1` tautology.
+///
+/// # Collection members that are not `ARGS`
+///
+/// [`Self::FILES`], [`Self::FILES_NAMES`] and [`Self::MULTIPART_PART_HEADERS`]
+/// are collection-member surfaces too, but they come out of the
+/// `multipart/form-data` parser rather than out of a urlencoded split — see
+/// [`super::multipart`] for why those three cannot be approximated by `body`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Surfaces(u16);
+struct Surfaces(u32);
 
 impl Surfaces {
-    const PATH: u16 = 1 << 0;
+    const PATH: u32 = 1 << 0;
     /// `QUERY_STRING`: the whole query string, as one value.
-    const QUERY: u16 = 1 << 1;
+    const QUERY: u32 = 1 << 1;
     /// `REQUEST_BODY` / `XML:/*`: the whole request body, as one value.
-    const BODY: u16 = 1 << 2;
+    const BODY: u32 = 1 << 2;
     /// `REQUEST_COOKIES`: each cookie **value**.
-    const COOKIES: u16 = 1 << 3;
+    const COOKIES: u32 = 1 << 3;
     /// Every request header **value**.  Header *names* are only scanned by
     /// [`Field::Headers`], whose upstream (`REQUEST_HEADERS_NAMES`) asks for
     /// them explicitly.
-    const HEADER_VALUES: u16 = 1 << 4;
-    const USER_AGENT: u16 = 1 << 5;
-    const REFERER: u16 = 1 << 6;
+    const HEADER_VALUES: u32 = 1 << 4;
+    const USER_AGENT: u32 = 1 << 5;
+    const REFERER: u32 = 1 << 6;
     /// `REQUEST_URI_RAW` / `REQUEST_LINE`: the URI as received, before the
     /// parser percent-decodes it.
-    const PATH_RAW: u16 = 1 << 7;
+    const PATH_RAW: u32 = 1 << 7;
     /// `ARGS_GET`: each query-string parameter **value**, decoded.
-    const ARGS_GET: u16 = 1 << 8;
+    const ARGS_GET: u32 = 1 << 8;
     /// `ARGS_GET_NAMES`: each query-string parameter **name**, decoded.
-    const ARGS_GET_NAMES: u16 = 1 << 9;
+    const ARGS_GET_NAMES: u32 = 1 << 9;
     /// `ARGS_POST`: each urlencoded body parameter **value**, decoded.
-    const ARGS_POST: u16 = 1 << 10;
+    const ARGS_POST: u32 = 1 << 10;
     /// `ARGS_POST_NAMES`: each urlencoded body parameter **name**, decoded.
-    const ARGS_POST_NAMES: u16 = 1 << 11;
+    const ARGS_POST_NAMES: u32 = 1 << 11;
     /// `REQUEST_COOKIES_NAMES`: each cookie **name**.
-    const COOKIE_NAMES: u16 = 1 << 12;
+    const COOKIE_NAMES: u32 = 1 << 12;
+    /// `FILES`: the `filename="…"` of each `multipart/form-data` file part.
+    const FILES: u32 = 1 << 13;
+    /// `FILES_NAMES`: the form field name each file part was submitted under.
+    const FILES_NAMES: u32 = 1 << 14;
+    /// `MULTIPART_PART_HEADERS`: each header line of each part, verbatim.
+    const MULTIPART_PART_HEADERS: u32 = 1 << 15;
 
     /// Every `ARGS` value bit, i.e. what the bare `ARGS` variable covers.
-    const ARGS: u16 = Self::ARGS_GET | Self::ARGS_POST;
+    const ARGS: u32 = Self::ARGS_GET | Self::ARGS_POST;
     /// Every `ARGS` name bit, i.e. what `ARGS_NAMES` covers.
-    const ARGS_NAMES: u16 = Self::ARGS_GET_NAMES | Self::ARGS_POST_NAMES;
+    const ARGS_NAMES: u32 = Self::ARGS_GET_NAMES | Self::ARGS_POST_NAMES;
 
     /// Canonical order — also the order surface names appear in a field name.
     ///
@@ -642,7 +656,7 @@ impl Surfaces {
     /// ARGS_POST`); the aggregate spellings come first so the converter's
     /// canonicaliser prefers them and there is exactly one spelling per
     /// meaning.
-    const NAMED: [(&'static str, u16); 15] = [
+    const NAMED: [(&'static str, u32); 18] = [
         ("path", Self::PATH),
         ("path_raw", Self::PATH_RAW),
         ("query", Self::QUERY),
@@ -653,6 +667,9 @@ impl Surfaces {
         ("args_get_names", Self::ARGS_GET_NAMES),
         ("args_post_names", Self::ARGS_POST_NAMES),
         ("body", Self::BODY),
+        ("files", Self::FILES),
+        ("files_names", Self::FILES_NAMES),
+        ("multipart_part_headers", Self::MULTIPART_PART_HEADERS),
         ("cookies", Self::COOKIES),
         ("cookies_names", Self::COOKIE_NAMES),
         ("headers", Self::HEADER_VALUES),
@@ -661,9 +678,15 @@ impl Surfaces {
     ];
 
     /// What the bare field name `all` means: the whole request.
+    ///
+    /// The multipart surfaces are deliberately **not** in it. `all` is the
+    /// widest field the engine has and is only emitted when the upstream
+    /// variable list really is the whole request; a rule that wants file names
+    /// names `FILES`, and folding them into `all` would run every `all` rule
+    /// against every upload's file name for free.
     const ALL: Self = Self(Self::PATH | Self::QUERY | Self::BODY | Self::COOKIES | Self::HEADER_VALUES);
 
-    const fn has(self, bit: u16) -> bool {
+    const fn has(self, bit: u32) -> bool {
         self.0 & bit != 0
     }
 
@@ -673,7 +696,7 @@ impl Surfaces {
     /// typo — or a redundant `args+args_get` — is rejected at load time instead
     /// of quietly scanning less (or more) than the rule says.
     fn parse(name: &str) -> Option<Self> {
-        let mut bits = 0u16;
+        let mut bits = 0u32;
         for token in name.split('+') {
             let (_, mask) = Self::NAMED.iter().find(|(n, _)| *n == token)?;
             if bits & mask != 0 {
@@ -796,12 +819,25 @@ impl Field {
             "header_range" => Self::HeaderRange,
             "response_body" => Self::ResponseBody,
             "response_status" => Self::ResponseStatus,
-            // `ARGS` and friends: collections evaluated one member at a time.
-            // They have no dedicated `Field` variant because the surface bitset
-            // already distinguishes GET from POST and names from values, and a
-            // rule naming several of them at once must be one field.
-            "args" | "args_get" | "args_post" | "args_names" | "args_get_names" | "args_post_names"
-            | "cookies_names" => Self::Multi(Surfaces::parse(name)?),
+            // Collections evaluated one member at a time. They have no
+            // dedicated `Field` variant because the surface bitset already
+            // distinguishes GET from POST and names from values, and a rule
+            // naming several of them at once must be one field.
+            //
+            // The `ARGS` family comes from a urlencoded split; `files`,
+            // `files_names` and `multipart_part_headers` come from the
+            // `multipart/form-data` parser, one value per part (or per part
+            // header line).
+            "args"
+            | "args_get"
+            | "args_post"
+            | "args_names"
+            | "args_get_names"
+            | "args_post_names"
+            | "cookies_names"
+            | "files"
+            | "files_names"
+            | "multipart_part_headers" => Self::Multi(Surfaces::parse(name)?),
             // Composite surface list, e.g. `args+cookies`.  Requires a `+` so a
             // single-surface rule keeps using its dedicated field and there is
             // exactly one spelling per meaning.
@@ -906,6 +942,15 @@ impl Field {
                 if s.has(Surfaces::ARGS_POST_NAMES) {
                     out.extend(view.args_post().iter().map(|arg| Cow::Borrowed(arg.name.as_str())));
                 }
+                if s.has(Surfaces::FILES) {
+                    out.extend(view.multipart_files());
+                }
+                if s.has(Surfaces::FILES_NAMES) {
+                    out.extend(view.multipart_files_names());
+                }
+                if s.has(Surfaces::MULTIPART_PART_HEADERS) {
+                    out.extend(view.multipart_part_headers());
+                }
                 if s.has(Surfaces::COOKIES) {
                     out.extend(cookie_values(ctx).map(Cow::Borrowed));
                 }
@@ -951,6 +996,9 @@ impl Field {
                     || (s.has(Surfaces::ARGS_GET_NAMES) && view.args_get().iter().any(|a| f(&a.name)))
                     || (s.has(Surfaces::ARGS_POST) && view.args_post().iter().any(|a| f(&a.value)))
                     || (s.has(Surfaces::ARGS_POST_NAMES) && view.args_post().iter().any(|a| f(&a.name)))
+                    || (s.has(Surfaces::FILES) && view.multipart_files().any(|v| f(&v)))
+                    || (s.has(Surfaces::FILES_NAMES) && view.multipart_files_names().any(|v| f(&v)))
+                    || (s.has(Surfaces::MULTIPART_PART_HEADERS) && view.multipart_part_headers().any(|v| f(&v)))
                     || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(&mut f))
                     || (s.has(Surfaces::COOKIE_NAMES) && cookie_names(ctx).any(&mut f))
                     || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| f(v)))
@@ -1097,6 +1145,14 @@ struct RequestView<'a> {
     /// every other content type — see [`Self::body_surface_applies`] for how
     /// those bodies stay covered.
     args_post: OnceCell<Vec<Arg>>,
+    /// The parsed `multipart/form-data` envelope, backing `FILES` /
+    /// `FILES_NAMES` / `MULTIPART_PART_HEADERS`.
+    ///
+    /// `None` when the request is not multipart at all.  Parsed eagerly rather
+    /// than on demand because [`Self::body`] is derived from it: a multipart
+    /// envelope's `REQUEST_BODY` is its parts' payloads, so the parse happens
+    /// once per request either way.
+    multipart: Option<Multipart<'a>>,
     /// `(chain id, value address, value length)` → what that chain made of that
     /// value, for the current request.
     ///
@@ -1113,13 +1169,37 @@ struct RequestView<'a> {
 impl<'a> RequestView<'a> {
     fn new(ctx: &'a RequestCtx) -> Self {
         let content_type = ctx.headers.get("content-type").map(String::as_str);
-        let lossy = String::from_utf8_lossy(&ctx.body_preview);
-        let boundary = content_type.and_then(multipart_boundary);
-        let body = match (boundary, lossy) {
-            // A multipart envelope is not `ARGS`; see `multipart_payloads`.
-            (Some(boundary), envelope) => Cow::Owned(multipart_payloads(&envelope, boundary)),
-            (None, Cow::Borrowed(text)) => percent_decode(text, Plus::IsSpace),
-            (None, Cow::Owned(text)) => Cow::Owned(percent_decoded(&text, Plus::IsSpace).unwrap_or(text)),
+        let multipart = content_type
+            .and_then(multipart_boundary)
+            .map(|boundary| multipart::parse(&ctx.body_preview, boundary));
+        // A multipart envelope is not `ARGS`; see `Multipart::payload_surface`.
+        //
+        // The one case that must *not* take that path is an envelope nothing
+        // could be parsed out of — a `multipart/form-data` content type over a
+        // body that carries no such boundary. Reducing that to its (zero) part
+        // payloads would hide every byte of it from every `REQUEST_BODY` rule,
+        // which is a bypass and not a parse result, so it falls through to the
+        // ordinary whole-body path.
+        if let Some(envelope) = &multipart
+            && envelope.malformed()
+        {
+            // Not a rule hit and not an error: an envelope truncated by the
+            // inspection window is malformed by this definition too. It is
+            // recorded because "the parts a rule saw are not the parts the
+            // origin will see" is the one thing an operator chasing either a
+            // bypass or a false positive on an upload needs to know first.
+            debug!(
+                req_id = %ctx.req_id,
+                parts = envelope.part_count(),
+                "malformed multipart/form-data envelope"
+            );
+        }
+        let body = match &multipart {
+            Some(envelope) if !envelope.yielded_nothing() => Cow::Owned(envelope.payload_surface()),
+            _ => match String::from_utf8_lossy(&ctx.body_preview) {
+                Cow::Borrowed(text) => percent_decode(text, Plus::IsSpace),
+                Cow::Owned(text) => Cow::Owned(percent_decoded(&text, Plus::IsSpace).unwrap_or(text)),
+            },
         };
         Self {
             ctx,
@@ -1130,8 +1210,24 @@ impl<'a> RequestView<'a> {
             body_is_form: is_form_urlencoded(content_type),
             args_get: OnceCell::new(),
             args_post: OnceCell::new(),
+            multipart,
             memo: RefCell::new(TransformMemo::new()),
         }
+    }
+
+    /// `FILES`: the file name of every `multipart/form-data` file part.
+    fn multipart_files(&self) -> impl Iterator<Item = Cow<'a, str>> {
+        self.multipart.iter().flat_map(Multipart::files)
+    }
+
+    /// `FILES_NAMES`: the form field name of every file part.
+    fn multipart_files_names(&self) -> impl Iterator<Item = Cow<'a, str>> {
+        self.multipart.iter().flat_map(Multipart::files_names)
+    }
+
+    /// `MULTIPART_PART_HEADERS`: every part's header lines, one value per line.
+    fn multipart_part_headers(&self) -> impl Iterator<Item = Cow<'a, str>> {
+        self.multipart.iter().flat_map(Multipart::part_headers)
     }
 
     /// The same view, plus the response surfaces of `response`.
@@ -1219,45 +1315,6 @@ fn multipart_boundary(content_type: &str) -> Option<&str> {
         .and_then(|inner| inner.strip_suffix('"'))
         .unwrap_or(value);
     (!value.is_empty()).then_some(value)
-}
-
-/// What `ModSecurity` would put in `ARGS_POST` / `ARGS_NAMES` / `FILES_NAMES`
-/// for a `multipart/form-data` body: each part's payload, plus the quoted
-/// parameter values (`name="x"`, `filename="y"`) from its headers.
-///
-/// The MIME envelope itself — boundary lines and the `Content-Disposition:` /
-/// `Content-Type:` header *names* — never reaches an `ARGS` rule upstream, and
-/// handing it over anyway is a false-positive generator: CRS-921120 hunts
-/// `\r\n...content-type:` as a response-splitting payload, which every ordinary
-/// file upload contains verbatim.  (It stayed hidden only while the engine
-/// skipped the rule's `t:lowercase` and so never matched `Content-Type`.)
-fn multipart_payloads(body: &str, boundary: &str) -> String {
-    let delimiter = format!("--{boundary}");
-    let mut out = String::with_capacity(body.len());
-    let mut push = |text: &str| {
-        if text.is_empty() {
-            return;
-        }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(text);
-    };
-    for part in body.split(delimiter.as_str()).skip(1) {
-        let Some((headers, payload)) = part.split_once("\r\n\r\n").or_else(|| part.split_once("\n\n")) else {
-            // Preamble, epilogue, or the closing `--` delimiter.
-            continue;
-        };
-        // Quoted parameter values are the part's name and file name; upstream
-        // exposes those as collection members, so they stay in scope.
-        for (index, chunk) in headers.split('"').enumerate() {
-            if index % 2 == 1 {
-                push(chunk);
-            }
-        }
-        push(payload.strip_suffix("\r\n").unwrap_or(payload));
-    }
-    out
 }
 
 /// Whether `+` decodes to a space on the surface being decoded.
@@ -4591,20 +4648,26 @@ rules:
         let summary = checker.load_summary();
 
         assert!(summary.source_errors.is_empty(), "shipped rule set must parse cleanly");
-        assert_eq!(summary.attempted, 286, "declared CRS rules");
+        // 286 before the multipart parser: CRS-920120 and CRS-920121 are
+        // declared now that `FILES` / `FILES_NAMES` exist to carry them.
+        assert_eq!(summary.attempted, 288, "declared CRS rules");
         // 215 before per-parameter `ARGS`: CRS-942130 joins the set, because
         // its `TX:1 @streq %{TX.2}` capture equality is only a tautology test
         // when the head is evaluated one parameter at a time. 216 before the
         // response phase was wired: the 950–956 rules used to be rejected as
         // `UnsupportedField(response_body)` and now compile. 274 before `!@op`
         // heads were converted at all: CRS-920470 and CRS-954130 join the set.
-        assert_eq!(summary.compiled, 276, "enforceable CRS rules");
+        // 276 before the `multipart/form-data` parser: the two newly declared
+        // 920 rules compile, and so do the seven that were rejected for naming
+        // `FILES` / `FILES_NAMES` / `MULTIPART_PART_HEADERS` — 932180, 933110,
+        // 933111, 933220, 944140, 922120, 922130.
+        assert_eq!(summary.compiled, 285, "enforceable CRS rules");
         assert_eq!(checker.rule_count(), summary.compiled);
         assert_eq!(summary.attempted, summary.compiled + summary.rejected.len());
 
         // The split between the two pipelines, stated so a rule that quietly
         // changes sides is a test failure rather than a coverage surprise.
-        assert_eq!(checker.request_rule_count(), 217, "request-phase rules");
+        assert_eq!(checker.request_rule_count(), 226, "request-phase rules");
         assert_eq!(checker.response_rule_count(), 59, "response-phase rules");
         assert_eq!(
             checker.request_rule_count() + checker.response_rule_count(),
@@ -4626,17 +4689,18 @@ rules:
         // evaluated rather than rejected, so nothing is left in this bucket.
         assert_eq!(by_field("response_body"), 0, "RESPONSE_BODY is evaluated");
         assert_eq!(by_field("response_status"), 0, "RESPONSE_STATUS is evaluated");
-        // `FILES` / `FILES_NAMES` / `REQUEST_HEADERS:X-Filename`: uploaded file
-        // names.  CRS-933110 and CRS-944140 test them with `.*\.php$` style
-        // patterns, so running them over the whole request blocked every
-        // request to a `.php` or `.jsp` URL.
-        assert_eq!(by_field("unmapped_files"), 5, "CRS 932180/933110/933111/933220/944140");
-        // `MULTIPART_PART_HEADERS`: the headers of each multipart part.  The
-        // engine sees the raw body, not parsed parts.
+        // `FILES` / `FILES_NAMES` and `MULTIPART_PART_HEADERS` used to be the
+        // two largest sentinels here (5 rules and 2 rules). Both are now real
+        // surfaces fed by the `multipart/form-data` parser, so nothing is left
+        // in either bucket. `REQUEST_HEADERS:X-Filename` and friends are still
+        // unreachable, but every rule naming one also names `FILES`, so
+        // dropping the header narrows the rule rather than losing it.
+        assert_eq!(by_field("unmapped_files"), 0, "FILES is parsed");
+        assert_eq!(by_field("unmapped_files_names"), 0, "FILES_NAMES is parsed");
         assert_eq!(
             by_field("unmapped_multipart_part_headers"),
-            2,
-            "CRS-922120 / CRS-922130"
+            0,
+            "MULTIPART_PART_HEADERS is parsed"
         );
         // `&REQUEST_HEADERS:Range` is a *count*, not a value.
         assert_eq!(by_field("unmapped_count_request_headers_range"), 1, "CRS-921230");
@@ -4653,8 +4717,10 @@ rules:
         // upstream means, so it is enforced and the sentinel is gone.
         assert_eq!(by_field("unmapped_chained_args_self_equality"), 0, "CRS-942130");
         // 112 before per-parameter `ARGS` (CRS-942130 left the list), 111
-        // before the response phase was wired (the 950–956 rules left it).
-        assert_eq!(summary.rejected_field_count(), 9, "rules the engine cannot evaluate");
+        // before the response phase was wired (the 950–956 rules left it), 9
+        // before the `multipart/form-data` parser (the seven `FILES` /
+        // `MULTIPART_PART_HEADERS` rules left it).
+        assert_eq!(summary.rejected_field_count(), 2, "rules the engine cannot evaluate");
         assert!(
             summary
                 .rejected
@@ -4707,6 +4773,10 @@ rules:
                 "CRS-944120",
                 "CRS-933150",
                 "CRS-920200",
+                // Joins the set with the `multipart/form-data` parser: its head
+                // is `FILES @pmFromFile restricted-upload.data`, which had no
+                // field to read before.
+                "CRS-932180",
                 "CRS-932200",
                 "CRS-932205",
                 "CRS-932206",
@@ -6894,6 +6964,170 @@ rules:
         );
     }
 
+    /// A `POST` of `body` as `multipart/form-data`, evaluated at `paranoia`.
+    fn multipart_ctx(boundary: &str, body: &str, paranoia: u8) -> RequestCtx {
+        let mut ctx = make_ctx_with_body(body, paranoia);
+        ctx.headers.insert(
+            "content-type".to_owned(),
+            format!("multipart/form-data; boundary={boundary}"),
+        );
+        ctx
+    }
+
+    /// The `FILES` family reaches the rules that name it, and only those.
+    ///
+    /// Each of these fires on nothing but a part's file name, which is the
+    /// whole reason the surface exists: CRS-933110's pattern is
+    /// `.*\.ph(?:p\d*|tml|ar|ps|t|pt)\.*$`, and the only faithful reading of it
+    /// is "the uploaded file is called `x.php`". Run against any wider surface
+    /// it says "the request mentions a `.php` anywhere", which is every request
+    /// to a PHP site.
+    #[test]
+    fn the_files_surfaces_back_the_upload_name_rules() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        let upload = |disposition: &str, paranoia: u8| {
+            let body = format!("--b\r\nContent-Disposition: form-data; {disposition}\r\n\r\nx\r\n--b--\r\n");
+            multipart_ctx("b", &body, paranoia)
+        };
+
+        for (id, disposition, paranoia) in [
+            // `FILES`: the file name itself.
+            ("CRS-933110", "name=\"f\"; filename=\"shell.php\"", 1),
+            ("CRS-944140", "name=\"f\"; filename=\"shell.jsp\"", 1),
+            ("CRS-932180", "name=\"f\"; filename=\".htaccess\"", 1),
+            ("CRS-933220", "name=\"f\"; filename=\"sess_abcdefghij0123456789\"", 1),
+            // `FILES_NAMES`: the form field the file was submitted under.
+            ("CRS-920121", "name=\"fi;le\"; filename=\"ok.txt\"", 2),
+            ("CRS-920120", "name=\"fi;le\"; filename=\"ok.txt\"", 1),
+            ("CRS-920120", "name=\"f\"; filename=\"1.j\\s\\p\"", 1),
+        ] {
+            let ctx = upload(disposition, paranoia);
+            assert!(fires(&checker, id, &ctx), "{id} must fire for {disposition}");
+        }
+
+        // The same names in the URL, the query and an ordinary form body are
+        // *not* uploads and must not reach any of them.
+        let mut url = make_ctx("POST", "/uploads/shell.php", 0);
+        url.query = "file=sess_abcdefghij0123456789&next=/x/.htaccess".to_owned();
+        for id in ["CRS-933110", "CRS-932180", "CRS-933220", "CRS-944140", "CRS-920120"] {
+            assert!(!fires(&checker, id, &url), "{id} must not read the URL or query");
+        }
+    }
+
+    /// `MULTIPART_PART_HEADERS` is the part's header text, one value per line.
+    #[test]
+    fn multipart_part_headers_back_the_922_rules() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+
+        // CRS-922120: `Content-Transfer-Encoding` was deprecated by RFC 7578.
+        let deprecated = "--b\r\nContent-Disposition: form-data; name=\"f\"\r\n\
+                          Content-Transfer-Encoding: 8bit\r\n\r\nhi\r\n--b--\r\n";
+        assert!(fires(&checker, "CRS-922120", &multipart_ctx("b", deprecated, 1)));
+
+        // CRS-922130: a byte outside \x21-\x7E in a header name.
+        let control = "--b\r\n\x0eContent-Disposition: form-data; name=\"f\"; filename=\"1.php\"\r\n\
+                       Content-Disposition: form-data; name=\"post\"\r\n\r\nx\r\n--b--\r\n";
+        assert!(fires(&checker, "CRS-922130", &multipart_ctx("b", control, 1)));
+
+        // Neither fires on a part whose headers are ordinary — including the
+        // `Content-Type:` line every browser sends, which is what the old
+        // whole-envelope approximation used to trip over.
+        let ordinary = "--b\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.pdf\"\r\n\
+                        Content-Type: application/pdf\r\n\r\n%PDF-1.4\r\n--b--\r\n";
+        let ctx = multipart_ctx("b", ordinary, 1);
+        assert!(!fires(&checker, "CRS-922120", &ctx));
+        assert!(!fires(&checker, "CRS-922130", &ctx));
+    }
+
+    /// Ordinary uploads must not be blocked. This is the regression the whole
+    /// `FILES` change is judged by: CRS-920120 is a **negated** rule, so a file
+    /// name the parser reads differently from upstream does not fail to match,
+    /// it matches *everything*.
+    #[test]
+    fn benign_uploads_are_not_blocked() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        let bodies = [
+            // A plain single-file upload.
+            "--b\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"photo.jpg\"\r\n\
+             Content-Type: image/jpeg\r\n\r\n\u{ffff}JFIF binary bytes\r\n--b--\r\n",
+            // A non-ASCII file name, which `[^\"';=\x5c]` admits and a broken
+            // decode would not.
+            "--b\r\nContent-Disposition: form-data; name=\"文件\"; filename=\"年度报告 2026.pdf\"\r\n\
+             Content-Type: application/pdf\r\n\r\n%PDF-1.7 ...\r\n--b--\r\n",
+            // Several files plus ordinary text fields, as a real form posts.
+            //
+            // The field names are `doc1` / `doc2` and not PHP's `docs[]`
+            // spelling on purpose: `docs[]` trips CRS-932240 at PL2 through the
+            // *body* surface, because `payload_surface` joins each part's
+            // values with a newline and the rule's `[\[-\]]+[\s\x0b]*` bridges
+            // it. That predates this parser (the previous reconstruction joined
+            // the same way) and is not a `FILES` behaviour — CRS-932240 reads
+            // `args+body+cookies+cookies_names`. Left out of this test so a real
+            // regression here cannot hide behind a known unrelated one.
+            "--b\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nQuarterly report\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"doc1\"; filename=\"q1.pdf\"\r\n\
+             Content-Type: application/pdf\r\n\r\n%PDF-1.7 a\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"doc2\"; filename=\"q2 (final).xlsx\"\r\n\
+             Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\nPK\u{3}\u{4}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"submit\"\r\n\r\nSave\r\n--b--\r\n",
+            // The empty file input a browser sends for an untouched field.
+            "--b\r\nContent-Disposition: form-data; name=\"attachment\"; filename=\"\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n\r\n--b--\r\n",
+            // LF-only line endings, which some clients still emit.
+            "--b\nContent-Disposition: form-data; name=\"f\"; filename=\"notes.txt\"\n\nhello\n--b--\n",
+        ];
+        for paranoia in [1u8, 2, 4] {
+            for body in bodies {
+                let ctx = multipart_ctx("b", body, paranoia);
+                assert!(
+                    checker.check(&ctx).is_none(),
+                    "PL{paranoia}: benign upload blocked: {:?}",
+                    checker.check(&ctx)
+                );
+            }
+        }
+    }
+
+    /// A `multipart/form-data` content type over a body that carries no such
+    /// boundary must not hide that body from the `REQUEST_BODY` rules.
+    ///
+    /// Reducing an envelope to its (zero) part payloads is what a parser does;
+    /// handing the rules an empty string for a body full of bytes is a bypass,
+    /// and one an attacker reaches by setting a header.
+    #[test]
+    fn a_multipart_header_over_a_non_multipart_body_does_not_hide_it() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        let ctx = multipart_ctx("nothing-matches-this", "<?php system($_GET['c']); ?>", 1);
+        let view = RequestView::new(&ctx);
+        assert_eq!(
+            view.body.as_ref(),
+            "<?php system($_GET['c']); ?>",
+            "an unparseable envelope falls back to the whole body"
+        );
+        assert!(
+            checker.check(&ctx).is_some(),
+            "a web shell must not become invisible by declaring a boundary"
+        );
+    }
+
+    /// `FILES` is a surface a rule has to ask for by name — it is not part of
+    /// `all`, and no rule acquires it by accident.
+    #[test]
+    fn the_multipart_surfaces_are_not_in_the_all_field() {
+        for bit in [Surfaces::FILES, Surfaces::FILES_NAMES, Surfaces::MULTIPART_PART_HEADERS] {
+            assert!(!Surfaces::ALL.has(bit), "`all` must not cover a multipart surface");
+        }
+        // And every spelling the converter can emit resolves to exactly one.
+        for (name, bit) in [
+            ("files", Surfaces::FILES),
+            ("files_names", Surfaces::FILES_NAMES),
+            ("multipart_part_headers", Surfaces::MULTIPART_PART_HEADERS),
+        ] {
+            let parsed = Surfaces::parse(name).expect("BUG: surface name is in Surfaces::NAMED");
+            assert_eq!(parsed, Surfaces(bit), "{name}");
+        }
+    }
+
     /// The word-at-a-time encoded-ness guard must agree with a plain byte scan
     /// for every input — it decides whether a value is decoded at all, so a
     /// false negative is a silent bypass.
@@ -7588,13 +7822,15 @@ rules:
             checker.request_rule_count(),
             "the enforced request set is only critical and warning rules: {counts:?}"
         );
-        // 207 critical / 10 warning. The scoring model changes the verdict of a
+        // 216 critical / 10 warning. The scoring model changes the verdict of a
         // lone match for the 10 only — 95% of the enforced set still blocks on a
         // single hit — so this is a false-positive control, not a relaxation of
         // detection. Pinned so a rule-file change that shifts the balance has to
-        // be argued for in the diff.
+        // be argued for in the diff. 207 before the `multipart/form-data`
+        // parser: all nine rules it turned on are `severity: CRITICAL`
+        // upstream, which is why the ratio barely moves.
         assert_eq!(warning, 10, "the rules that stop blocking alone: {counts:?}");
-        assert_eq!(critical, 207, "the rules that still block alone: {counts:?}");
+        assert_eq!(critical, 216, "the rules that still block alone: {counts:?}");
 
         // The response set has its own shape and its own threshold, so it is
         // counted separately. 43 critical + 16 error, all of which reach the

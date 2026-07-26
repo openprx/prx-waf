@@ -85,7 +85,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 1
-    field: unmapped_files
+    field: files
     operator: regex
     value: .*\.(?:jsp|jspx)\.*$
     transform:

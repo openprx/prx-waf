@@ -27,7 +27,7 @@ rules:
     category: php-injection
     severity: critical
     paranoia: 1
-    field: unmapped_files
+    field: files
     operator: regex
     value: .*\.ph(?:p\d*|tml|ar|ps|t|pt)\.*$
     transform:
@@ -195,7 +195,7 @@ rules:
     category: php-injection
     severity: critical
     paranoia: 1
-    field: unmapped_files
+    field: files+files_names
     operator: regex
     value: (?:^|[/\x5c])sess_[,\-0-9a-z]{20,256}$
     transform:
@@ -283,7 +283,7 @@ rules:
     category: php-injection
     severity: critical
     paranoia: 3
-    field: unmapped_files
+    field: files
     operator: regex
     value: .*\.ph(?:p\d*|tml|ar|ps|t|pt)\..*$
     transform:

@@ -4,6 +4,7 @@ pub mod cc;
 pub mod content_security;
 pub mod dir_traversal;
 pub mod geo;
+pub(crate) mod multipart;
 pub mod owasp;
 pub mod rce;
 pub mod scanner;

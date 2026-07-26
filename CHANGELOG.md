@@ -9,6 +9,48 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **A real multipart/form-data part parser, exposing `FILES`, `FILES_NAMES`
+  and `MULTIPART_PART_HEADERS`.** Nine CRS rules that had been refused at load
+  time now compile and enforce: 920120, 920121, 922120, 922130, 932180,
+  933110, 933111, 933220, 944140. The two `[unsupported-field]` startup
+  warnings for `unmapped_files` (5 rules) and
+  `unmapped_multipart_part_headers` (2 rules) are gone. Enforced rules:
+  **276 → 285** (226 request-phase, 59 response-phase).
+
+  go-ftw v1.3.0 against CRS v4.25.0, log mode, 4674 tests, zero exclusions:
+  **2744 → 2779 / 3701 → 3742 / 4176 → 4222** at PL1 / PL2 / PL4
+  (89.35% → **90.33%**). Over-blocks unchanged at all three levels (26/32/34),
+  verified as a per-test-id set difference rather than a count.
+
+  The gain is +46, not the +100 the previous round predicted. That estimate
+  counted each rule's whole ftw case list; in fact 57 of those cases exercise
+  the `REQUEST_HEADERS:X-Filename` branch of the same rules — an upload
+  filename passed as a custom header by Nginx/IIS upload modules — which needs
+  a general `REQUEST_HEADERS:<name>` accessor, not a multipart parser. Of the
+  cases that do go through a multipart upload, 38 of 38 now pass. 922110 (17
+  cases) and 922100 (2) remain out of reach: both read `TX:` collections
+  populated by another rule's `setvar`, which this engine has no store for.
+
+  The parser is a new attack surface and is bounded accordingly:
+  `MAX_BOUNDARY_LEN` 70 (RFC 2046 §5.1.1), `MAX_PARTS` 256 (each part is
+  scanned like an ARGS member, so it matches `MAX_FORM_ARGS`),
+  `MAX_PART_HEADER_BYTES` 8 KiB and `MAX_PART_HEADER_LINES` 32. Parts borrow
+  from the body window rather than copying — which makes this cheaper than
+  what it replaces, since `RequestView::new` used to run
+  `String::from_utf8_lossy` over every body including binary uploads.
+  "Not multipart" and "malformed multipart" are kept distinct, because
+  detecting the malformed case is what rules like 920120 exist for.
+
+### Fixed
+
+- **A declared multipart boundary that the body never uses no longer hides the
+  body from every body rule.** `multipart_payloads` returned an empty string
+  for that combination, so setting a bogus `boundary=` on any request made its
+  entire body invisible to inspection. A parse that yields no part now falls
+  back to the whole body.
+
 ### Security
 
 - **Three advisory exemptions retired instead of renewed.** A

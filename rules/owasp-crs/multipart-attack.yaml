@@ -14,7 +14,7 @@ rules:
     category: multipart-attack
     severity: critical
     paranoia: 1
-    field: unmapped_multipart_part_headers
+    field: multipart_part_headers
     operator: regex
     value: content-transfer-encoding:(.*)
     transform:
@@ -29,7 +29,7 @@ rules:
     category: multipart-attack
     severity: critical
     paranoia: 1
-    field: unmapped_multipart_part_headers
+    field: multipart_part_headers
     operator: regex
     value: '[^\x21-\x7E][\x21-\x39\x3B-\x7E]*:'
     transform:
