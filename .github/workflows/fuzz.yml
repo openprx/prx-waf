@@ -155,6 +155,50 @@ jobs:
           fi
           echo "seconds=$seconds" >> "$GITHUB_OUTPUT"
 
+      # Carry the corpus a soak grows forward into the *next* soak instead of
+      # starting from the committed seeds every week. Only wired up for
+      # schedule/workflow_dispatch (the long runs, 600-1800s): a 60s
+      # push/pull_request regression is meant to be the fixed, seeded check
+      # the README describes, and giving it a growing, non-reproducible
+      # corpus would make it neither fast nor deterministic.
+      #
+      # Key design:
+      #   * One cache per target (`fuzz-corpus-<target>-...`) — the seven
+      #     corpora are unrelated inputs and must never merge.
+      #   * The save key embeds `github.run_id`, which is unique every run, so
+      #     `actions/cache` never reports an exact hit and therefore always
+      #     saves the post-run (post-cmin) corpus at the end of the job. Restore
+      #     falls through to `restore-keys`, a prefix match with no run id,
+      #     which resolves to the most recently saved entry for this target.
+      #     This is the standard "ever-growing cache" shape: it does NOT key
+      #     on any hash of source or rule content, so a code change never
+      #     invalidates accumulated corpus (the entire point — corpus value is
+      #     about input shapes, not the commit that happened to be checked out
+      #     when they were found).
+      #   * No explicit expiry/rotation beyond that: `cargo fuzz cmin` below
+      #     bounds the size that gets saved each run, and GitHub's own 10GB/repo
+      #     LRU eviction plus 7-day-unused eviction reclaims the orphaned
+      #     entry from the previous run (it can never be restored again once a
+      #     newer one exists, so it is dead weight the moment this save lands).
+      #   * Branch scoping is GitHub's, not ours, and it works in our favour:
+      #     a cache save is scoped to the branch it ran on, while restore may
+      #     read the current branch, its PR base branch, or the repo default
+      #     branch. `schedule` only ever fires on the default branch, so in
+      #     practice only `main`'s own runs write this cache. A manually
+      #     dispatched soak on a feature branch *can* still read main's
+      #     accumulated corpus (good — full coverage from the first second)
+      #     but its own save lands in a cache scoped to that branch, so it can
+      #     never leak into (or evict) main's entry. Nothing here can pollute
+      #     main from a branch.
+      - name: Restore fuzz corpus
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
       # Corpus arguments: libFuzzer writes new units only into the FIRST
       # directory, so `corpus/` is the throwaway working set and `seeds/` is
       # mounted read-only alongside it. That keeps the committed seeds curated.
@@ -205,7 +249,28 @@ jobs:
             -rss_limit_mb=4096 \
             -print_final_stats=1
 
-      # Only runs when the step above failed, i.e. libFuzzer wrote a reproducer.
+      # Bound what the cache above saves: a soak's corpus grows without limit
+      # (tens of thousands of units), and the cache has a 10GB/repo cap shared
+      # with every other workflow's cache, so an ever-growing corpus must be
+      # minimized before it is persisted or it eventually either evicts other
+      # caches or makes every future save slower. `cmin` re-runs the corpus
+      # through the target and keeps only the files that contribute distinct
+      # coverage, in place, in the same `corpus/<target>` directory the cache
+      # step (and a local repro session) expects.
+      #
+      # `always()` because a crash on this target still leaves a corpus worth
+      # minimizing and carrying forward, and the plain job condition alone
+      # would otherwise skip this step whenever the Fuzz step above failed.
+      - name: Minimize corpus (cmin)
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && always()
+        working-directory: fuzz
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.FUZZ_NIGHTLY }}
+          TARGET: ${{ matrix.target }}
+          PRX_WAF_FUZZ_RULES_DIR: ${{ github.workspace }}/rules/owasp-crs
+        run: cargo fuzz cmin "${TARGET}" "corpus/${TARGET}"
+
+      # Only runs when the Fuzz step failed, i.e. libFuzzer wrote a reproducer.
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@v4
@@ -216,9 +281,13 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-      # The corpus the soak grew is worth keeping: it is the starting point for
-      # the next soak and for a local repro session. Not committed — it is tens
-      # of thousands of files, and `seeds/` is the curated set instead.
+      # The corpus the soak grew (already minimized above) is worth a
+      # human-inspectable copy alongside the cache: an artifact can be
+      # browsed/downloaded from the run summary without `gh cache`, and it
+      # survives even if the cache entry above is later evicted. The cache
+      # step, not this artifact, is what actually carries the corpus into the
+      # *next* run — nothing reads this artifact back in. Not committed — it
+      # is tens of thousands of files, and `seeds/` is the curated set instead.
       - name: Upload grown corpus
         if: github.event_name == 'schedule' && always()
         uses: actions/upload-artifact@v4

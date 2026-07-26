@@ -1,0 +1,28 @@
+# libFuzzer dictionary for waf_common::url_validator::validate_scheme_only.
+# `Url::parse` must accept the input before the scheme allow-list ever runs,
+# so tokens are the URL grammar (RFC 3986) plus the schemes/host forms that
+# operator-supplied feed/webhook/LAPI URLs are known to smuggle past a naive
+# scheme check (userinfo, alternate IP encodings, IPv6 literals).
+scheme_http="http://"
+scheme_https="https://"
+scheme_ftp="ftp://"
+scheme_file="file://"
+scheme_javascript="javascript:"
+scheme_data="data:"
+scheme_gopher="gopher://"
+sep_scheme="://"
+userinfo="user:pass@"
+at_sign="@"
+ipv6_literal="[::1]"
+ipv6_mapped="[::ffff:127.0.0.1]"
+ip_octal="0177.0.0.1"
+ip_hex="0x7f000001"
+ip_decimal="2130706433"
+port=":8080"
+path_traversal="/../"
+query="?a=1&b=2"
+fragment="#frag"
+backslash="\\"
+pct_dot="%2e"
+pct_null="%00"
+idna_prefix="xn--"

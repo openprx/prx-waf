@@ -1,0 +1,21 @@
+# libFuzzer dictionary for gateway::smuggling::detect. Input framing is
+# newline-separated "name: value" header lines (see fuzz_targets/smuggling_headers.rs),
+# so tokens are the two framing header names and the Transfer-Encoding
+# codings is_canonical_chunked distinguishes from an obfuscated one.
+hdr_cl="Content-Length: "
+hdr_te="Transfer-Encoding: "
+tok_chunked="chunked"
+tok_chunked_upper="Chunked"
+tok_identity="identity"
+tok_gzip="gzip"
+cl_list="5, 6"
+te_obfuscated="xchunked"
+te_smuggled_ws=" chunked"
+te_double="chunked, chunked"
+te_mixed="gzip, chunked"
+sep_colon=":"
+sep_comma=","
+ws_space=" "
+ws_tab="\x09"
+crlf="\x0d\x0a"
+newline="\x0a"

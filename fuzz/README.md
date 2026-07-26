@@ -141,6 +141,15 @@ Crash reproducers upload as build artifacts; they are deliberately **not**
 committed, because a committed reproducer for an unfixed parser bug is a
 published exploit.
 
+The soak's corpus persists across runs through a per-target `actions/cache`
+entry (schedule and `workflow_dispatch` only — a 60 s regression run stays
+seeded and deterministic). Each run minimizes its corpus with `cargo fuzz
+cmin` before saving, so the cache stays bounded instead of growing forever
+against the shared 10 GB/repo cache cap. A copy of the (already minimized)
+corpus is also uploaded as a build artifact on the weekly cron for manual
+inspection; the cache, not that artifact, is what actually feeds the next
+run.
+
 ## Results so far
 
 First full run, 2026-07-25, on `main` at `30311ba` (16-core x86_64, ASan,
