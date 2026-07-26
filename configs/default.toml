@@ -143,6 +143,53 @@ cors_origins = []
 # # seeds = ["10.0.0.1:16851", "10.0.0.2:16851"]
 # seeds = []
 #
+# # Join token presented by a worker during the join handshake. Generate with
+# # `prx-waf cluster token generate --ttl 24h` and copy it into every worker's
+# # config (or PRXWAF_CLUSTER_JOIN_TOKEN). The main validates it against the
+# # cluster CA key and burns its nonce on first use — an empty or reused token
+# # is rejected.
+# join_token = ""
+#
+# ⚠ PRODUCTION REQUIREMENT — set this to the full, fixed list of node ids
+# before going to production. Left empty (the default), election quorum is
+# computed from the *live* peer view instead of a fixed size: as peers get
+# evicted (dead-peer cleanup after missed heartbeats — normal behavior during
+# a network partition), the quorum denominator shrinks right along with them.
+# Taken to its conclusion, a single node that gets partitioned away from the
+# rest of the cluster will, once it has evicted its now-unreachable peers, see
+# itself as a "1-node cluster" and self-promote to Main WITHOUT an election —
+# indistinguishable, from its own point of view, from a genuine single-node
+# deployment. If the other side of the partition still holds a working
+# majority, you now have two Mains simultaneously accepting writes: split-brain.
+# Declaring `members` fixes the denominator to this list's length, so a
+# partitioned minority can never manufacture a majority no matter how many of
+# its peers it evicts. The list must be identical, byte-for-byte, on every
+# node in the cluster, and updated on every existing node (not just the new
+# one) whenever you add or remove a member.
+# members = ["node-a", "node-b", "node-c"]
+#
+# ⚠ KEEP FALSE — the cluster CA private key is the root of trust for the
+# whole mesh: mTLS peer identity, join tokens, and election vote grants are
+# all "does this chain to the CA and match the claimed node_id." Only the
+# main node holds this key by default (ca_key is empty on workers, and they
+# never read a CA key file). Flipping this to true makes the main encrypt its
+# CA private key (AES-256-GCM, keyed off cluster.crypto.ca_passphrase below)
+# and ship it to EVERY worker that joins, in memory, "for failover." That
+# turns a single compromised worker into a full CA compromise — mint certs
+# for any node_id, forge votes, become the accepted Main for the whole
+# cluster — instead of just that one node's blast radius.
+# #
+# # As of this version the trade is one-sided: the blob a worker receives is
+# # only ever stored (NodeState.ca_key_encrypted), and nothing ever decrypts it
+# # back into a usable CA key on promotion. You pay the full security cost above
+# # and get none of the automatic CA failover it exists for. Leave it false
+# # until that path is wired up. Even then, enable it only if every node that
+# # could receive the key sits in the same trust tier you'd put the CA key
+# # itself in, and ca_passphrase is a long random secret managed like the CA key
+# # (not a memorable string in a committed file). See
+# # docs/cluster-security-defaults.md before enabling.
+# replicate_ca_key = false
+#
 # [cluster.crypto]
 # ca_cert   = "/app/certs/cluster-ca.pem"
 # node_cert = "/app/certs/node.pem"
@@ -152,6 +199,12 @@ cors_origins = []
 # ca_validity_days    = 3650   # 10 years
 # node_validity_days  = 365    # 1 year
 # renewal_before_days = 7      # auto-renew 7 days before expiry
+# # Passphrase used to encrypt the CA private key when cluster.replicate_ca_key
+# # = true above. Empty disables replication regardless of replicate_ca_key.
+# # Minimum 16 characters are enforced, but treat this as CA-key-grade
+# # material, not a password: generate it with a CSPRNG and store it in a
+# # secrets manager, identical on every node that might decrypt it.
+# ca_passphrase = ""
 #
 # [cluster.sync]
 # rules_interval_secs        = 10    # periodic rule version check
