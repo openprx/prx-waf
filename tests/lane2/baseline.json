@@ -1,0 +1,166 @@
+{
+ "_comment": [
+  "Recorded result of the Lane 2 semantic-engine FP/FN corpus against prx-waf.",
+  "",
+  "This file is the gate. tests/lane2/run.sh with BASELINE=<this file> exits",
+  "non-zero when FEWER attacks are detected, or MORE benign requests are",
+  "flagged, than the numbers below. It is a ratchet, not a target: the",
+  "detection rate is expected to be nowhere near 100% and the point is that it",
+  "cannot silently get worse.",
+  "",
+  "TOLERANCE IS ZERO, deliberately, and that is a claim about determinism, not",
+  "optimism. The corpus is static, the config is sliced out of a committed",
+  "configs/default.toml, the detectors are pure functions of their input, and",
+  "the two time-dependent components in the engine (the restart shadow latch",
+  "and the anomaly-rate breaker) are neutralised by run.sh in enforce mode. Two",
+  "runs on the same tree produced identical numbers. If this file ever starts",
+  "flapping, the right response is to find what stopped being deterministic —",
+  "not to add a tolerance.",
+  "",
+  "THE CORPUS SIZE IS PART OF THE GATE. classify.py fails the run if the corpus",
+  "shrank, because deleting the rows that fail is the cheapest way to make",
+  "every number here look better.",
+  "",
+  "── How to read the two modes ────────────────────────────────────────────",
+  "",
+  "shadow  — the shipped posture, verbatim: enforcement_mode = log_only,",
+  "          rollout_bps = 0. Verdicts come from the semantic_observations the",
+  "          lane persists. This is detection quality.",
+  "",
+  "enforce — enforcement_mode = enforce, rollout_bps = 10000, i.e. the far end",
+  "          of the rollout dial. Verdicts come from HTTP status codes. This is",
+  "          what actually happens to traffic, and the two numbers are very far",
+  "          apart: 73.53% of the attack corpus is DETECTED, 43.53% would be",
+  "          BLOCKED. The gap is the two-detector corroboration requirement",
+  "          (block_threshold = 80 with two 0.5 weights needs both detectors to",
+  "          agree) plus the A2 blind guard. It is not a defect; it is the",
+  "          shipped design, and this is the first time it has been measured.",
+  "",
+  "── The number that gates rollout_bps ────────────────────────────────────",
+  "",
+  "Two benign requests out of 220 are blocked in enforce mode — 0.91%. Both are",
+  "the same shape: a tool whose declared input language IS the attack grammar.",
+  "content-099 is an LDAP admin page saving (&(objectClass=person)(uid=jsmith));",
+  "content-100 is a document-transform tool saving an XPath expression. Both",
+  "score 88 against a block_threshold of 80, from a single detector at weight",
+  "1.0, so there is no corroboration step to save them.",
+  "",
+  "Those two families — ldap_injection and xpath_injection — are also two of the",
+  "three highest blockers on the attack side (80.0% and 86.7%). The measurement",
+  "says the single-detector T2 families are simultaneously the most ready to",
+  "enforce and the only source of blocking false positives, and it names the two",
+  "rules responsible: ldap.filter_break_known_attr and xpath.func_axis.",
+  "",
+  "── What the low families mean (read before 'fixing' them) ───────────────",
+  "",
+  "nosql_injection 40.0% and ssti 33.3% are not detector defects. Both ship",
+  "with their high-noise rules DEFAULT-OFF pending holdout calibration (see the",
+  "[content_security.attacks.*] comments in configs/default.toml): NoSQL runs",
+  "only $where/$function/$accumulator, so every $ne/$gt/$or/$regex bypass in",
+  "the corpus is out of scope by configuration, and SSTI holds back the bare",
+  "{{ }} / ${ } / #{ } delimiters, so a plain {{7*7}} probe is invisible on",
+  "purpose. Turning those rules on would move these two rows and would also be",
+  "the single most likely way to move the FP column — which is exactly the",
+  "trade this harness exists to price."
+ ],
+ "recorded_at": "2026-07-26",
+ "recorded_from": "PLACEHOLDER-SHA — the commit that adds tests/lane2/. Measured on that tree with configs/default.toml unmodified; replace this string with the real sha when the change lands.",
+ "corpus": {
+  "attack": 170,
+  "benign": 220,
+  "files": {
+   "attack-core.jsonl": 80,
+   "attack-t2.jsonl": 90,
+   "benign-app.jsonl": 110,
+   "benign-content.jsonl": 110
+  }
+ },
+ "modes": {
+  "shadow": {
+   "_comment": "Shipped log_only posture; verdicts from semantic_observations joined by client_ip.",
+   "attack": {
+    "n": 170,
+    "detected": 125,
+    "detection_rate": 73.53,
+    "buckets": {
+     "detected": 121,
+     "misattributed": 4,
+     "sub-threshold": 1,
+     "wrong-family": 4,
+     "blind": 40,
+     "harness": 0
+    },
+    "by_family": {
+     "sql_injection": {"n": 20, "detected": 15},
+     "rce": {"n": 20, "detected": 14},
+     "traversal": {"n": 20, "detected": 18},
+     "xss": {"n": 20, "detected": 18},
+     "xxe": {"n": 15, "detected": 12},
+     "nosql_injection": {"n": 15, "detected": 6},
+     "ssti": {"n": 15, "detected": 5},
+     "ldap_injection": {"n": 15, "detected": 12},
+     "xpath_injection": {"n": 15, "detected": 13},
+     "deserialization": {"n": 15, "detected": 12}
+    }
+   },
+   "benign": {
+    "n": 220,
+    "false_positives": 10,
+    "fp_rate": 4.55,
+    "fp_block": 2,
+    "fp_block_rate": 0.91,
+    "buckets": {
+     "clean": 207,
+     "sub-threshold": 3,
+     "fp-log": 8,
+     "fp-block": 2,
+     "harness": 0
+    },
+    "named": {
+     "fp-block": ["content-099", "content-100"],
+     "fp-log": [
+      "content-005",
+      "content-010",
+      "content-011",
+      "content-029",
+      "content-031",
+      "content-033",
+      "content-044",
+      "content-059"
+     ]
+    }
+   }
+  },
+  "enforce": {
+   "_comment": "enforcement_mode = enforce, rollout_bps = 10000; verdicts from HTTP status codes.",
+   "attack": {
+    "n": 170,
+    "detected": 74,
+    "detection_rate": 43.53,
+    "buckets": {"blocked": 74, "not-blocked": 96, "harness": 0},
+    "by_family": {
+     "sql_injection": {"n": 20, "detected": 7},
+     "rce": {"n": 20, "detected": 2},
+     "traversal": {"n": 20, "detected": 2},
+     "xss": {"n": 20, "detected": 3},
+     "xxe": {"n": 15, "detected": 12},
+     "nosql_injection": {"n": 15, "detected": 6},
+     "ssti": {"n": 15, "detected": 5},
+     "ldap_injection": {"n": 15, "detected": 12},
+     "xpath_injection": {"n": 15, "detected": 13},
+     "deserialization": {"n": 15, "detected": 12}
+    }
+   },
+   "benign": {
+    "n": 220,
+    "false_positives": 2,
+    "fp_rate": 0.91,
+    "fp_block": 2,
+    "fp_block_rate": 0.91,
+    "buckets": {"passed": 217, "fp-block": 2, "harness": 1},
+    "named": {"fp-block": ["content-099", "content-100"]},
+    "_harness_note": "app-090, an OPTIONS CORS preflight, returns 502 through the gateway although the origin answers it 200 on its own. Reproduced in BOTH modes, so it is not a Lane 2 verdict; recorded here rather than hidden because a request that never reached a verdict must not be counted as having passed."
+   }
+  }
+ }
+}

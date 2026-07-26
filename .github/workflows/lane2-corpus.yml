@@ -1,0 +1,141 @@
+# Lane 2 semantic-engine FP/FN corpus.
+#
+# Purpose is regression detection with a ratchet, not a green tick. The gate is
+# tests/lane2/baseline.json: a run fails when FEWER attacks are detected or MORE
+# benign requests are flagged than the recorded baseline. The baseline lives in a
+# file, so moving it is a reviewable diff in the PR that earned it.
+#
+# ── Why this is a gate and tests/perf/ is not ────────────────────────────────
+# tests/perf/ deliberately does not gate, because a latency number on a shared
+# runner is noise and a noisy gate becomes a `continue-on-error` ornament. This
+# measurement has no such property: the corpus is static, the config is derived
+# from a committed file, the detectors are pure functions of their input, and the
+# only two time-dependent components in the engine (the restart shadow latch and
+# the anomaly-rate breaker) are neutralised deterministically by run.sh. Same
+# inputs, same verdict, on any machine. That is the same argument that makes
+# crs-regression a gate, so this follows crs-regression.
+#
+# ── Why both modes run ───────────────────────────────────────────────────────
+#   shadow   The shipped `log_only` posture. Verdicts from the semantic
+#            observations, with per-detector and per-rule attribution. This is
+#            detection quality, and it is the only mode that can say WHICH rule
+#            caused a false positive.
+#   enforce  `rollout_bps = 10000`. Verdicts from HTTP status codes. This is the
+#            only mode that can catch a regression in the *blocking* decision —
+#            a scoring change that starts 403-ing benign traffic leaves every
+#            shadow-mode observation untouched, because in shadow nothing blocks.
+name: lane2-corpus
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/waf-engine/src/checks/content_security/**'
+      - 'crates/waf-engine/src/engine.rs'
+      - 'crates/waf-engine/src/semantic_sink.rs'
+      - 'crates/waf-common/src/content_security_config.rs'
+      - 'configs/default.toml'
+      - 'tests/lane2/**'
+      # Detection is only as stable as the parsers behind it: a bump to
+      # sqlparser, brush-parser, html5ever or regex changes what matches without
+      # touching a line of this repository's own source.
+      - 'Cargo.lock'
+      - '.github/workflows/lane2-corpus.yml'
+  pull_request:
+    paths:
+      - 'crates/waf-engine/src/checks/content_security/**'
+      - 'crates/waf-engine/src/engine.rs'
+      - 'crates/waf-engine/src/semantic_sink.rs'
+      - 'crates/waf-common/src/content_security_config.rs'
+      - 'configs/default.toml'
+      - 'tests/lane2/**'
+      - 'Cargo.lock'
+      - '.github/workflows/lane2-corpus.yml'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Verdict mode (shadow | enforce)'
+        required: false
+        default: 'shadow'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lane2-corpus-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  corpus:
+    name: Lane 2 corpus (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [shadow, enforce]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: prx_waf
+          POSTGRES_PASSWORD: prx_waf
+          POSTGRES_DB: prx_waf
+        ports:
+          - 15477:5432
+        options: >-
+          --health-cmd "pg_isready -U prx_waf"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lane2-corpus
+
+      # SKIP_POSTGRES=1 makes run.sh read results through a host psql instead of
+      # `podman exec`, so the client has to be present.
+      - name: Install postgresql-client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+
+      - name: Build prx-waf
+        run: cargo build --release -p prx-waf
+
+      - name: Run Lane 2 corpus
+        env:
+          MODE: ${{ matrix.mode }}
+          WORK: ${{ runner.temp }}/lane2-work-${{ matrix.mode }}
+          PRXWAF_BIN: ${{ github.workspace }}/target/release/prx-waf
+          BASELINE: ${{ github.workspace }}/tests/lane2/baseline.json
+          # Postgres comes from `services:` above, already listening on 15477,
+          # so run.sh must not start (or remove) a container of its own.
+          SKIP_POSTGRES: '1'
+          PG_PORT: '15477'
+          RUST_LOG: warn
+        run: bash tests/lane2/run.sh
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lane2-corpus-${{ matrix.mode }}
+          path: ${{ runner.temp }}/lane2-work-${{ matrix.mode }}/reports/
+          retention-days: 14
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo '## Lane 2 corpus — ${{ matrix.mode }} mode'
+            echo '```'
+            head -40 "${{ runner.temp }}/lane2-work-${{ matrix.mode }}/reports/report-${{ matrix.mode }}.txt" \
+              2>/dev/null || echo '(no report produced)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
