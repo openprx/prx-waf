@@ -464,32 +464,96 @@ Only the notification limiter enforces its cap at insert
 
 ## 5. Timeouts and concurrency
 
-### 5.1 The proxy has no upstream timeout
+### 5.1 Upstream timeouts — configurable, off by default
 
-`crates/gateway/src/proxy.rs:411` and `:424` construct `HttpPeer::new(...)` and
-**never touch `peer.options`**. Pingora's `PeerOptions::default()` sets
+Pingora arms no upstream timer of its own. `PeerOptions::new()` leaves
 `connection_timeout`, `total_connection_timeout`, `read_timeout`,
-`write_timeout` and `idle_timeout` all to `None`
-(`pingora-core-0.8.1/src/upstreams/peer.rs:474-478`), and `None` means *no
-timeout*.
+`write_timeout` and `idle_timeout` all `None`
+(`pingora-core-0.8.1/src/upstreams/peer.rs:471-478`), and `None` means *no
+timeout*. The proxy used to accept those defaults silently.
 
-There is no config key for upstream timeouts anywhere in
-`configs/default.toml` or `crates/waf-common/src/config.rs`.
+There is now a config key per stage —
+**`[proxy.upstream_timeouts]`**, `crates/waf-common/src/config.rs:767-838` —
+applied to both peers built in `upstream_peer`
+(`crates/gateway/src/proxy.rs:426` load-balanced, `:440` single backend) by
+`UpstreamTimeouts::apply` (`crates/gateway/src/upstream_timeout.rs:81-97`).
 
-Consequence: **a slow or black-holed upstream pins proxy connections
-indefinitely, and there is no application-level bound an operator can set.**
-This is the single largest availability gap in the list. It compounds with
-§5.3.
+| Key | Bounds | `PeerOptions` field |
+|---|---|---|
+| `connect_ms` | one TCP connect attempt | `connection_timeout` |
+| `total_connect_ms` | TCP + TLS handshake, all attempts | `total_connection_timeout` |
+| `read_ms` | **inactivity** between upstream reads | `read_timeout` |
+| `write_ms` | inactivity between upstream writes | `write_timeout` |
+| `idle_ms` | keep-alive residency in the connection pool | `idle_timeout` |
+| `stream_exempt` | skip `read_ms`/`write_ms` for `Upgrade` / SSE requests | — (this proxy's own) |
 
-The HTTP/3 path is the same shape:
+**Every one defaults to `0` = unlimited, which is the historical behaviour and
+is preserved exactly.** With nothing configured `apply` returns before writing
+anything (`upstream_timeout.rs:82-84`), so the peer carries Pingora's own
+`None`s and the request path costs one boolean test. Nothing is logged either;
+a non-zero setting announces itself at startup (`crates/prx-waf/src/main.rs:1935-1940`)
+so an operator can confirm from the log which stages are armed.
+
+**So the gap is closed only for operators who close it.** Left at the defaults,
+a slow or black-holed upstream still pins proxy connections indefinitely, and
+that still compounds with the single worker thread of §5.3.
+
+Measured end-to-end (debug build, real proxy + Postgres, a scripted upstream
+that stalls on demand; each figure includes ~0.5 s of fixed WAF processing in
+this build):
+
+| upstream behaviour | defaults (no keys set) | `connect_ms=1000, read_ms=2000` |
+|---|---|---|
+| responds after 10 s | **200 in 10.51 s** | **502 in 2.57 s** (`ReadTimedout`) |
+| responds after 0.5 s | 200 in 0.51 s | 200 in 0.51 s |
+| black-holed IP (`10.255.255.1`) | never returned; client abandoned at **25.0 s** | **502 in 1.56 s** (`ConnectTimedout`) |
+| SSE, 8 s between events | 200, both events, 16.0 s | **cut at 2.02 s, zero events delivered** |
+
+Each expiry writes one `WARN` at target `waf.upstream_timeout`
+(`crates/gateway/src/proxy.rs:948-965`) naming the stage, the peer and the
+configured values, alongside Pingora's own `Fail to proxy` `ERROR`. The client
+gets a 502; nothing hangs and nothing panics.
+
+**`read_ms` is an inactivity timer, and it is the one that breaks things.** It
+is re-armed on every read, so it never trips on a slow-but-steady response and
+always trips on a stalled one — including a stream that is idle *by design*.
+Pingora applies the peer's read/write timeouts to upgraded connections too:
+`proxy_h1.rs:39-40` copies them onto the upstream session before the upgrade is
+known, and they then govern the post-101 WebSocket frames as well. The SSE row
+above is that fact, measured: `read_ms = 2000` against an 8-second event gap
+killed the stream at 2.02 s with zero events delivered.
+
+`stream_exempt = true` is the escape hatch: a request carrying `Upgrade` or
+`Accept: text/event-stream` skips `read_ms`/`write_ms` (only those two —
+connection setup and pool residency stay bounded). Measured with it on, same
+2 s read timeout: the 8-second-gap SSE feed completed both events in 16.6 s,
+and an `Upgrade: websocket` request survived an 8-second idle stream, while an
+ordinary request to the 10-second upstream was still cut at 2.03 s.
+
+**It ships off because the predicate is client-controlled.** Both signals are
+request headers. Measured: with `stream_exempt = true`, the same 10-second
+upstream that returns `502 in 2.03 s` for `Accept: text/html` returns
+**`200 in 10.01 s` for `Accept: text/event-stream`** — one header, and the
+caller has exempted itself from the bound. Prefer sizing `read_ms` above your
+stream's heartbeat interval; reach for `stream_exempt` only when you cannot,
+and understand that it reopens this section's DoS surface to anyone who asks
+for it by name.
+
+Scope is **global**, not per-host. The precise answer is per-host — a 2-second
+`read_ms` for an API backend and none for an SSE backend — but host records live
+in the database and the admin UI, so that is a schema and interface change;
+the global knob is what exists today.
+
+The HTTP/3 path is **unchanged and still unbounded**:
 `reqwest::Client::builder()` at `crates/gateway/src/http3.rs:176-178` sets
-neither `.timeout()` nor `.connect_timeout()`, and reqwest's default is no
-timeout.
+neither `.timeout()` nor `.connect_timeout()`, reqwest's default is no timeout,
+and `[proxy.upstream_timeouts]` does not reach it.
 
 ### 5.2 Timeouts that do exist
 
 | What | Value | On expiry | Tunable |
 |---|---|---|---|
+| Upstream connect / total-connect / read / write / idle | **none** (0 = unlimited) | 502 + `WARN waf.upstream_timeout` | `proxy.upstream_timeouts.*` (§5.1) |
 | CrowdSec AppSec (**on the request path**) | 500 ms | `Unavailable` → `appsec_failure_action`, default **allow** (fail-open) | `crowdsec.appsec_timeout_ms` |
 | CrowdSec LAPI client (background) | 10 s | poll retried at the same cadence | no |
 | CrowdSec mirror restore at startup | 10 s | start with empty cache (fail-open), logged | no |
@@ -552,8 +616,15 @@ Database pool: `storage.max_connections = 20`
 These are gaps, listed so nobody has to discover them during an incident. They
 are recorded here as findings; none has been changed by this document.
 
-1. **No upstream connect/read/write timeout** (§5.1). No config key exists.
-   The most consequential entry on this list.
+1. ~~**No upstream connect/read/write timeout.** No config key exists.~~
+   **Now configurable, still off by default** (§5.1). `[proxy.upstream_timeouts]`
+   bounds connect / total-connect / read / write / idle, each `0` = unlimited and
+   all five `0` as shipped — so an install that does not set them keeps the
+   unbounded behaviour verbatim, and this stays the most consequential entry on
+   the list for everyone who leaves it alone. Turning `read_ms` on cuts idle
+   streams (SSE, WebSocket) unless `stream_exempt` is also on, which is itself
+   opt-out-able by any client that sends the right header. Read §5.1 before
+   setting a value.
 2. **HTTP/3 upstream client has no timeout at all** (§5.1).
 3. **Proxy is single-threaded and not configurable** (§5.3). Throughput does not
    scale with cores.
@@ -612,10 +683,16 @@ are recorded here as findings; none has been changed by this document.
 
 If you are deploying prx-waf, the short version:
 
-1. **Put a timeout in front of the upstream problem.** Until §6.1 is closed,
-   the upstream must have its own liveness discipline — a load balancer with
-   connect/read timeouts in front of the origin, or an origin that closes slow
-   connections itself. prx-waf will wait forever otherwise.
+1. **Put a timeout on the upstream — prx-waf ships with none.**
+   `[proxy.upstream_timeouts]` now exists but every stage defaults to `0` =
+   unlimited, so out of the box the proxy still waits forever (§5.1). Either set
+   `connect_ms` / `total_connect_ms` (cheap, nothing legitimate takes seconds to
+   connect) and a `read_ms` sized **above** your slowest legitimate response and
+   above any SSE/WebSocket heartbeat interval — or give the upstream its own
+   liveness discipline, a load balancer with connect/read timeouts in front of
+   the origin or an origin that closes slow connections itself. `read_ms` cuts
+   idle streams; `stream_exempt = true` spares them but hands the exemption to
+   any client that sends `Accept: text/event-stream`.
 2. **Size for one core of proxy throughput per process.** On a Ryzen 9 5900HX
    that is ~3,900 rps for a small GET, ~770 rps for a 1 KiB JSON POST and
    **47 rps for a 64 KiB upload**, in the shipping default configuration

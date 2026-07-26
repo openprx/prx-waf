@@ -23,6 +23,7 @@ use crate::response::{
 };
 use crate::router::HostRouter;
 use crate::ssl::ChallengeStore;
+use crate::upstream_timeout::{UpstreamTimeouts, is_streaming_request};
 
 /// Pingora-based reverse proxy with WAF integration
 pub struct WafProxy {
@@ -63,6 +64,13 @@ pub struct WafProxy {
     /// The CRS `RESPONSE-95x` rules attach here once `checks::owasp` learns to
     /// evaluate `RESPONSE_BODY` / `RESPONSE_STATUS`.
     pub response_checks: Arc<ResponseCheckSet>,
+    /// Per-stage timeouts stamped onto every upstream peer.
+    ///
+    /// **Unlimited by default**, which is what Pingora's own `PeerOptions`
+    /// carry: with nothing configured, [`UpstreamTimeouts::apply`] returns
+    /// without writing to the peer and no timer is armed. See
+    /// [`crate::upstream_timeout`] and `[proxy.upstream_timeouts]`.
+    pub upstream_timeouts: UpstreamTimeouts,
 }
 
 impl WafProxy {
@@ -77,6 +85,7 @@ impl WafProxy {
             cache: None,
             smuggling_detection: true,
             response_checks: Arc::new(ResponseCheckSet::new()),
+            upstream_timeouts: UpstreamTimeouts::default(),
         }
     }
 
@@ -376,7 +385,12 @@ impl ProxyHttp for WafProxy {
     /// phase order).  By the time we get here `ctx.host_config` is guaranteed to
     /// be populated for any request that was allowed through, so we simply
     /// rebuild the peer from it.
-    async fn upstream_peer(&self, _session: &mut Session, ctx: &mut GatewayCtx) -> pingora_core::Result<Box<HttpPeer>> {
+    async fn upstream_peer(&self, session: &mut Session, ctx: &mut GatewayCtx) -> pingora_core::Result<Box<HttpPeer>> {
+        // Streaming intent has to be read off the request: the peer is built
+        // before any response byte exists. Only consulted when a read/write
+        // bound is actually configured *and* the exemption is on.
+        let streaming = self.upstream_timeouts.stream_exempt && is_streaming_request(session.req_header());
+
         let host_config = ctx.host_config.as_ref().ok_or_else(|| {
             pingora_core::Error::explain(
                 pingora_core::ErrorType::ConnectProxyFailure,
@@ -408,7 +422,8 @@ impl ProxyHttp for WafProxy {
                 ctx.selected_backend = Some(backend);
 
                 info!("Proxying {} → {} (load-balanced)", host_config.host, upstream_addr);
-                let peer = HttpPeer::new(&upstream_addr, use_tls, sni);
+                let mut peer = HttpPeer::new(&upstream_addr, use_tls, sni);
+                self.upstream_timeouts.apply(&mut peer, streaming);
                 return Ok(Box::new(peer));
             }
             // Empty / fully-drained pool → fall through to the single backend.
@@ -421,7 +436,8 @@ impl ProxyHttp for WafProxy {
         // Single-backend path (unchanged, backward compatible).
         let upstream_addr = format!("{}:{}", host_config.remote_host, host_config.remote_port);
         info!("Proxying {} → {}", host_config.host, upstream_addr);
-        let peer = HttpPeer::new(&upstream_addr, use_tls, host_config.remote_host.clone());
+        let mut peer = HttpPeer::new(&upstream_addr, use_tls, host_config.remote_host.clone());
+        self.upstream_timeouts.apply(&mut peer, streaming);
         Ok(Box::new(peer))
     }
 
@@ -916,12 +932,36 @@ impl ProxyHttp for WafProxy {
         Ok(None)
     }
 
-    async fn logging(&self, _session: &mut Session, _error: Option<&pingora_core::Error>, ctx: &mut GatewayCtx) {
+    async fn logging(&self, _session: &mut Session, error: Option<&pingora_core::Error>, ctx: &mut GatewayCtx) {
         // Release the load-balanced backend's active-connection slot (paired
         // with the acquire in `upstream_peer`) so Least-Connections accounting
         // stays balanced even on errors / early termination.
         if let Some(backend) = ctx.selected_backend.take() {
             backend.release_connection();
+        }
+
+        // An upstream timeout is a configured cut, not a mystery 502: say so at
+        // WARN, naming the stage and the peer, so `[proxy.upstream_timeouts]`
+        // can be tuned from the log instead of from guesswork. These error
+        // types have no other source in this proxy — nothing else arms a timer
+        // on the upstream connection.
+        if let Some(err) = error {
+            let stage = match err.etype() {
+                pingora_core::ErrorType::ConnectTimedout => Some("connect"),
+                pingora_core::ErrorType::ReadTimedout => Some("read"),
+                pingora_core::ErrorType::WriteTimedout => Some("write"),
+                _ => None,
+            };
+            if let Some(stage) = stage {
+                warn!(
+                    target: "waf.upstream_timeout",
+                    "Upstream {stage} timeout ({}) → upstream={} host={} path={}",
+                    self.upstream_timeouts.summary(),
+                    ctx.upstream_addr.as_deref().unwrap_or("unknown"),
+                    ctx.request_ctx.as_ref().map_or("unknown", |c| c.host.as_str()),
+                    ctx.request_ctx.as_ref().map_or("unknown", |c| c.path.as_str()),
+                );
+            }
         }
 
         if let Some(req_ctx) = &ctx.request_ctx {

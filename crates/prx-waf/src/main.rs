@@ -1926,6 +1926,19 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     proxy.cache = response_cache;
     proxy.trust_proxy_headers = config.proxy.trust_proxy_headers;
     proxy.smuggling_detection = config.proxy.smuggling_detection;
+
+    // Upstream timeouts are unlimited unless configured, so the log stays quiet
+    // on a default install and is unambiguous on a configured one: an operator
+    // who set a bound can confirm from the log that it is armed and at what
+    // value, without reading the config off the box.
+    proxy.upstream_timeouts = gateway::UpstreamTimeouts::from_config(&config.proxy.upstream_timeouts);
+    if !proxy.upstream_timeouts.is_unlimited() {
+        info!(
+            "Upstream timeouts armed: {} — connections exceeding a stage are cut",
+            proxy.upstream_timeouts.summary()
+        );
+    }
+
     proxy.trusted_proxies = config
         .proxy
         .trusted_proxies

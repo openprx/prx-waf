@@ -2,6 +2,60 @@
 listen_addr = "0.0.0.0:80"
 listen_addr_tls = "0.0.0.0:443"
 
+# ── Upstream timeouts — ALL OFF BY DEFAULT (0 = no timeout) ───────────────────
+# Pingora arms no upstream timer on its own: HttpPeer::new() leaves every stage
+# of PeerOptions at None (pingora-core-0.8.1/src/upstreams/peer.rs:471-478) and
+# None means wait forever. The proxy data path is also single-threaded
+# (Server::new(None) → threads: 1, no config key changes it), so an upstream
+# that accepts a connection and then goes silent holds a worker slot until the
+# client gives up. That is the exposure these keys close.
+#
+# Leaving them at 0 keeps exactly the behaviour every previous release had —
+# nothing is written to the peer at all, one boolean test per request. Setting
+# any of them is a genuine trade, in both directions:
+#
+#   OFF (default): no request is ever cut short by the WAF. A slow or
+#                  black-holed upstream is bounded only by the client, and by
+#                  whatever timeout sits in front of the origin.
+#   ON:            a connection that exceeds a stage is severed. Pingora fails
+#                  the request (ConnectTimedout / ReadTimedout / WriteTimedout),
+#                  the client sees a 502, and the gateway logs one WARN line at
+#                  target `waf.upstream_timeout` naming the stage and peer. Any
+#                  legitimately slow request over the bound dies with the
+#                  attacks — file uploads, report generation, long polls.
+#
+# read_ms is the one that surprises people. It is an INACTIVITY timer, re-armed
+# on every read, not a total response deadline: a steady trickle never trips it
+# and a stalled stream trips it after read_ms of silence. That also makes it
+# lethal to Server-Sent Events and WebSocket, where minutes of silence are
+# normal. Size read_ms above your stream's heartbeat interval, or use
+# stream_exempt below and read its caveat first.
+#
+# [proxy.upstream_timeouts]
+# connect_ms       = 3000     # one TCP connect attempt
+# total_connect_ms = 5000     # TCP + TLS handshake, all address attempts
+# read_ms          = 30000    # silence allowed between upstream reads
+# write_ms         = 30000    # silence allowed between upstream writes
+# idle_ms          = 60000    # pooled keep-alive residency; never affects an
+#                             # in-flight request
+# stream_exempt    = false    # see below
+
+# stream_exempt = true drops read_ms/write_ms (only those two) for requests that
+# carry an `Upgrade` header or `Accept: text/event-stream`, so WebSocket and SSE
+# survive a read_ms that is shorter than their idle periods. Pingora draws no
+# such distinction itself — proxy_h1.rs:39-40 copies the peer's read/write
+# timeouts onto the upstream session before the upgrade is even known, and they
+# then govern the post-101 frames too — so this is the proxy's own exemption,
+# decided from the request headers when the peer is built.
+#
+# It ships OFF because both signals are client-supplied. With it on, anyone who
+# adds `Accept: text/event-stream` to a request has exempted themselves from
+# read_ms and has the unbounded behaviour back. Turn it on only when you really
+# serve long-idle streams through this proxy and accept that hole. Per-host
+# timeouts would be the precise answer — one value for an API backend, another
+# for an SSE backend — but the host table lives in the database and the admin UI,
+# so that is a later change; today the setting is global.
+
 [api]
 listen_addr = "0.0.0.0:9527"
 

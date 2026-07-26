@@ -8,6 +8,7 @@ pub mod router;
 pub mod smuggling;
 pub mod ssl;
 pub mod tunnel;
+pub mod upstream_timeout;
 
 pub use cache::{CacheStatsSnapshot, ResponseCache};
 pub use http3::alt_svc_header;
@@ -19,3 +20,4 @@ pub use response::{
 pub use router::HostRouter;
 pub use ssl::{ChallengeStore, SslManager};
 pub use tunnel::{TunnelConfig, TunnelConnection, TunnelRegistry, TunnelStatus, generate_token, hash_token};
+pub use upstream_timeout::UpstreamTimeouts;

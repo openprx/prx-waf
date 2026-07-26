@@ -743,6 +743,11 @@ pub struct ProxyConfig {
     /// altered. Defaults to `true`.
     #[serde(default = "default_true")]
     pub smuggling_detection: bool,
+    /// Per-stage timeouts applied to the connection the proxy opens to the
+    /// upstream. **Every stage is unlimited by default** — see
+    /// [`UpstreamTimeoutConfig`].
+    #[serde(default)]
+    pub upstream_timeouts: UpstreamTimeoutConfig,
 }
 
 impl Default for ProxyConfig {
@@ -754,8 +759,82 @@ impl Default for ProxyConfig {
             trust_proxy_headers: false,
             trusted_proxies: Vec::new(),
             smuggling_detection: true,
+            upstream_timeouts: UpstreamTimeoutConfig::default(),
         }
     }
+}
+
+/// Timeouts for the proxy → upstream connection, one key per Pingora
+/// `PeerOptions` stage.
+///
+/// **All five default to `0` = no timeout**, which is what the proxy has always
+/// done: `HttpPeer::new()` leaves `PeerOptions::connection_timeout`,
+/// `total_connection_timeout`, `read_timeout`, `write_timeout` and
+/// `idle_timeout` at `None`, and `None` means *wait forever*
+/// (`pingora-core-0.8.1/src/upstreams/peer.rs:471-478`). An install that sets
+/// none of these keys is byte-for-byte the old behaviour: no timer is armed and
+/// the peer options are never written.
+///
+/// Turning any of them on is a real trade. It bounds how long a slow or
+/// black-holed upstream can pin the proxy's single worker thread, and it
+/// severs any connection that exceeds the bound — including long-lived
+/// streaming responses that are behaving exactly as designed. `read_ms` is the
+/// dangerous one: it is an **inactivity** timer re-armed per read, so a
+/// Server-Sent Events feed that is silent for longer than `read_ms` between
+/// events is killed mid-stream. See `stream_exempt` and `docs/dos-budget.md`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpstreamTimeoutConfig {
+    /// Milliseconds allowed for one TCP connect attempt to the upstream.
+    /// `0` = unlimited (default). Maps to `PeerOptions::connection_timeout`.
+    pub connect_ms: u64,
+    /// Milliseconds allowed for the whole connection setup — TCP connect plus
+    /// the TLS handshake, across all address-family attempts. `0` = unlimited
+    /// (default). Maps to `PeerOptions::total_connection_timeout`. Should be no
+    /// smaller than `connect_ms`; the two are independent deadlines and
+    /// whichever fires first wins.
+    pub total_connect_ms: u64,
+    /// Milliseconds the proxy will wait for *any single read* from the
+    /// upstream — the response header, then each body chunk. `0` = unlimited
+    /// (default). Maps to `PeerOptions::read_timeout`.
+    ///
+    /// This is not a total response deadline: the timer restarts on every byte
+    /// received, so a steady trickle never trips it and a stalled stream trips
+    /// it after `read_ms` of silence. On expiry Pingora fails the request with
+    /// `ReadTimedout`.
+    pub read_ms: u64,
+    /// Milliseconds the proxy will wait for any single write to the upstream
+    /// (request header, then each request-body chunk). `0` = unlimited
+    /// (default). Maps to `PeerOptions::write_timeout`.
+    pub write_ms: u64,
+    /// Milliseconds an idle keep-alive connection may sit in the upstream
+    /// connection pool before it is closed. `0` = unlimited (default), i.e.
+    /// pooled connections are held until the upstream itself hangs up. Maps to
+    /// `PeerOptions::idle_timeout`. This is a pool-residency bound, not a
+    /// request-path timeout: no in-flight request is ever affected by it.
+    pub idle_ms: u64,
+    /// Exempt streaming requests from `read_ms` / `write_ms`. Default `false`.
+    ///
+    /// A request counts as streaming when it carries an `Upgrade` header
+    /// (WebSocket and friends) or asks for `Accept: text/event-stream` (SSE).
+    /// Pingora itself draws no such distinction — `proxy_h1.rs:39-40` copies
+    /// the peer's read/write timeouts onto the upstream session before the
+    /// upgrade is even known, and they then govern every body read including
+    /// the post-101 WebSocket frames — so this exemption is the proxy's own,
+    /// applied when the peer is built.
+    ///
+    /// **Default off, deliberately.** Both signals are request headers, so
+    /// they are attacker-chosen: with the exemption on, anyone who adds
+    /// `Accept: text/event-stream` to a request opts *themselves* out of
+    /// `read_ms` and gets the unbounded behaviour back. Turn it on only when
+    /// you genuinely serve long-idle streams through this proxy and accept
+    /// that hole; the alternative that keeps the bound honest is to set
+    /// `read_ms` above your stream's heartbeat interval.
+    ///
+    /// `connect_ms`, `total_connect_ms` and `idle_ms` are never exempted —
+    /// connection setup is not a streaming activity, and an upgraded
+    /// connection is never returned to the idle pool.
+    pub stream_exempt: bool,
 }
 
 /// Management API configuration
