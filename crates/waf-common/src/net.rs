@@ -1,4 +1,11 @@
-//! Client-address normalization.
+//! Client-address normalization and rate-limit bucketing.
+//!
+//! Two related questions live here, both of the form *"what is the canonical
+//! way to name this client?"*: [`canonicalize_client_ip`] answers it for
+//! **identity** (is this the address the operator wrote in their blocklist?)
+//! and [`RateLimitKey`] answers it for **accounting** (whose quota does this
+//! request spend?). They are deliberately different answers — see
+//! [`RateLimitKey`] for why an address is the wrong unit of account over IPv6.
 //!
 //! # The problem this solves
 //!
@@ -32,15 +39,19 @@
 //! | HTTP/3 data plane | `gateway::http3::handle_h3_request` (peer address) |
 //! | Management API | `waf_api::security::request_client_ip` |
 //!
-//! Downstream consumers — `IpRuleSet`, the `CrowdSec` cache, the CC limiter,
-//! `GeoIP`, the admin allowlist — deliberately do **not** normalize. Folding at
-//! each consumer instead of at the boundary is what produced this bug in the
-//! first place: the decision was made once for the admin allowlist and
-//! silently inherited everywhere else. If you add a new consumer of
-//! `RequestCtx::client_ip`, it is already canonical; if you add a new
-//! *producer* of a client address, normalize it here and add it to the table
-//! above.
+//! Downstream consumers — `IpRuleSet`, the `CrowdSec` cache, `GeoIP`, the admin
+//! allowlist — deliberately do **not** normalize. Folding at each consumer
+//! instead of at the boundary is what produced this bug in the first place: the
+//! decision was made once for the admin allowlist and silently inherited
+//! everywhere else. If you add a new consumer of `RequestCtx::client_ip`, it is
+//! already canonical; if you add a new *producer* of a client address,
+//! normalize it here and add it to the table above.
+//!
+//! [`RateLimitKey::from_client_ip`] is the single exception, and it states its
+//! own reason: masking an unfolded address is not merely a missed match, it
+//! collapses the whole IPv4 space into one bucket.
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Fold an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) down to plain IPv4.
@@ -67,6 +78,126 @@ pub const fn canonicalize_client_ip(ip: IpAddr) -> IpAddr {
             None => IpAddr::V6(v6),
         },
         IpAddr::V4(_) => ip,
+    }
+}
+
+/// Prefix length at which IPv6 client addresses are aggregated into a single
+/// rate-limit bucket.
+///
+/// # Why 64, and why it is a constant rather than a knob
+///
+/// RFC 4291 §2.5.4 fixes the interface identifier of every non-`000` unicast
+/// address at the low 64 bits, so `/64` is not a tuning choice — it is the
+/// smallest unit an IPv6 network is ever subdivided into. A single host is
+/// routinely handed a whole `/64` (SLAAC, RFC 4941 temporary addresses, a
+/// container host, a VPS), which is 2⁶⁴ addresses it can rotate through for
+/// free. Any prefix longer than 64 therefore accounts a *fraction of one
+/// client*, which is the same as not accounting at all.
+///
+/// Exposing this as a configuration value was considered and rejected. Its
+/// only safe value is this one: raising it silently restores the unbounded
+/// bucket space it exists to close, and lowering it to `/56` or `/48` merges
+/// entire unrelated customers of an ISP into one quota — a self-inflicted
+/// denial of service with no feedback signal. Aggregating at the *site* level
+/// (`/56`, `/48`) is a coherent feature, but it is customer-level accounting,
+/// not a prefix-length tweak, and it would need its own limits and its own
+/// operator-visible semantics.
+pub const IPV6_RATE_LIMIT_PREFIX: u8 = 64;
+
+/// The unit of account for per-IP rate limiting: an IPv4 address, or an IPv6
+/// [`IPV6_RATE_LIMIT_PREFIX`] network.
+///
+/// # Why aggregation is required
+///
+/// Every per-IP limiter is a map from *some notion of a client* to a token
+/// bucket. Over IPv4 the address is a serviceable stand-in for the client. Over
+/// IPv6 it is not: the standard residential and VPS allocation is a routed
+/// `/64`, so one client owns 2⁶⁴ distinct addresses and can present a fresh one
+/// per request. Keyed on the full address, a limiter facing such a client:
+///
+/// * never accumulates violations, so a ban threshold is unreachable — the
+///   bucket is created, decremented once, and abandoned;
+/// * grows one map entry per request until the map hits its cap, at which point
+///   eviction starts discarding the **oldest** entries. Those are the entries
+///   belonging to steady, legitimate clients. The limiter does not merely fail
+///   to stop the flood, it converts the flood into an eraser for everyone
+///   else's state.
+///
+/// Folding to `/64` makes the flood cost one entry and one bucket, which is
+/// what the limiter was designed around.
+///
+/// # The accepted cost
+///
+/// Distinct hosts inside one `/64` — the devices on a home LAN, the machines on
+/// one enterprise segment — share a quota. This is deliberate and matches what
+/// large edge networks (Cloudflare, Fastly) do, on the reasoning that a `/64` is
+/// one subscriber and a limiter that cannot be evaded for free is worth more
+/// than per-device precision. Operators serving many independent hosts from one
+/// `/64` should raise `cc_rps` / `cc_burst` accordingly.
+///
+/// # Why a newtype and not a plain `IpAddr`
+///
+/// A masked address is not an address. `2001:db8:1:2::` is a perfectly legal,
+/// assignable host address, so a bare `IpAddr` carrying a `/64` network is
+/// indistinguishable at the type level from a real client address — and the one
+/// mistake that matters here is exactly that confusion: a bucketing key leaking
+/// into an attack log, a block decision, or an API response would name a host
+/// that never sent the request. The newtype makes that a compile error instead
+/// of a review question, and its [`Display`](fmt::Display) writes the prefix
+/// length (`203.0.113.9/32`, `2001:db8:1:2::/64`) so that a key which *is*
+/// deliberately logged cannot be misread as a client address either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RateLimitKey {
+    /// IPv4 verbatim, or an IPv6 address with the low
+    /// `128 - IPV6_RATE_LIMIT_PREFIX` bits cleared.
+    network: IpAddr,
+}
+
+impl RateLimitKey {
+    /// Derive the bucketing key for a client address.
+    ///
+    /// IPv4 is used verbatim (`/32`), preserving the pre-existing behaviour of
+    /// every limiter exactly. IPv6 is masked to [`IPV6_RATE_LIMIT_PREFIX`].
+    ///
+    /// # Why this canonicalizes even though the ingress boundary already did
+    ///
+    /// The module invariant says a consumer of a client address should not fold
+    /// again, and for an *identity* comparison that is right. Bucketing is the
+    /// one place where it is not, because the failure is not symmetric: masking
+    /// an unfolded `::ffff:a.b.c.d` clears the entire embedded IPv4 address, so
+    /// **every** IPv4 client on a `[::]` listener collapses into the single
+    /// `::/64` bucket and shares one quota. A missed fold elsewhere costs one
+    /// wrong decision; here it would be a self-inflicted global rate limit. The
+    /// fold is idempotent, so paying for it twice costs a branch.
+    #[must_use]
+    pub const fn from_client_ip(ip: IpAddr) -> Self {
+        let network = match canonicalize_client_ip(ip) {
+            IpAddr::V4(v4) => IpAddr::V4(v4),
+            IpAddr::V6(v6) => {
+                // Host-bit mask: the low (128 - prefix) bits, cleared.
+                let host_bits = u128::MAX >> IPV6_RATE_LIMIT_PREFIX;
+                IpAddr::V6(Ipv6Addr::from_bits(v6.to_bits() & !host_bits))
+            }
+        };
+        Self { network }
+    }
+
+    /// Prefix length this key accounts at: 32 for IPv4, [`IPV6_RATE_LIMIT_PREFIX`]
+    /// for IPv6.
+    #[must_use]
+    pub const fn prefix_len(&self) -> u8 {
+        match self.network {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => IPV6_RATE_LIMIT_PREFIX,
+        }
+    }
+}
+
+impl fmt::Display for RateLimitKey {
+    /// Renders as a CIDR (`203.0.113.9/32`, `2001:db8:1:2::/64`) so a logged key
+    /// is never mistaken for the address of an individual client.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix_len())
     }
 }
 
@@ -168,6 +299,86 @@ mod tests {
         assert!(canonicalize_client_ip(ip("::1.2.3.4")).is_ipv6());
         // `to_canonical` would have turned loopback into 0.0.0.1.
         assert_eq!(canonicalize_client_ip(ip("::1")), ip("::1"));
+    }
+
+    fn key(s: &str) -> RateLimitKey {
+        RateLimitKey::from_client_ip(ip(s))
+    }
+
+    /// IPv4 keeps /32 accounting: every distinct address is its own bucket,
+    /// exactly as before aggregation existed.
+    #[test]
+    fn ipv4_is_accounted_per_address() {
+        assert_eq!(key("203.0.113.9"), key("203.0.113.9"));
+        assert_ne!(key("203.0.113.9"), key("203.0.113.10"));
+        assert_ne!(key("10.0.0.1"), key("10.0.1.1"));
+        // Not even the neighbouring /31 shares a bucket.
+        assert_ne!(key("10.0.0.0"), key("10.0.0.1"));
+        assert_eq!(key("203.0.113.9").prefix_len(), 32);
+        assert_eq!(key("203.0.113.9").to_string(), "203.0.113.9/32");
+    }
+
+    /// Every address inside one /64 is one bucket — the whole point.
+    #[test]
+    fn ipv6_aggregates_within_a_64() {
+        let expected = key("2001:db8:1:2::");
+        for s in [
+            "2001:db8:1:2::",
+            "2001:db8:1:2::1",
+            "2001:db8:1:2:ffff:ffff:ffff:ffff",
+            "2001:db8:1:2:dead:beef:cafe:1",
+        ] {
+            assert_eq!(key(s), expected, "{s} must land in the 2001:db8:1:2::/64 bucket");
+        }
+        assert_eq!(expected.prefix_len(), IPV6_RATE_LIMIT_PREFIX);
+        assert_eq!(expected.to_string(), "2001:db8:1:2::/64");
+    }
+
+    /// ...and no further. Aggregating past /64 would merge unrelated sites.
+    #[test]
+    fn ipv6_keeps_distinct_64s_apart() {
+        let a = key("2001:db8:1:2::1");
+        for s in [
+            "2001:db8:1:3::1",   // adjacent /64
+            "2001:db8:1:2:0::1", // same, sanity anchor below
+            "2001:db8:2:2::1",   // different /48
+            "2001:db9:1:2::1",   // different /32
+            "2a00:1450:4001:80f::1",
+        ] {
+            let k = key(s);
+            if s == "2001:db8:1:2:0::1" {
+                assert_eq!(k, a, "same /64 written differently");
+            } else {
+                assert_ne!(k, a, "{s} is a different /64 and must not share a bucket");
+            }
+        }
+    }
+
+    /// The failure this constructor's extra fold exists to prevent: without it,
+    /// masking `::ffff:a.b.c.d` to /64 yields `::` for **every** IPv4 client, so
+    /// an operator switching to a `[::]` listener would rate-limit their entire
+    /// IPv4 audience as one bucket.
+    #[test]
+    fn mapped_v4_does_not_collapse_into_one_bucket() {
+        assert_eq!(key("::ffff:203.0.113.9"), key("203.0.113.9"));
+        assert_ne!(key("::ffff:203.0.113.9"), key("::ffff:203.0.113.10"));
+        assert_ne!(key("::ffff:203.0.113.9"), key("::"));
+        assert_eq!(key("::ffff:203.0.113.9").to_string(), "203.0.113.9/32");
+        // Idempotent: folding twice is folding once.
+        let once = RateLimitKey::from_client_ip(canonicalize_client_ip(ip("::ffff:10.0.0.1")));
+        assert_eq!(once, key("::ffff:10.0.0.1"));
+    }
+
+    /// v4 and v6 buckets never alias each other, in either direction.
+    #[test]
+    fn families_do_not_alias() {
+        assert_ne!(key("0.0.0.0"), key("::"));
+        assert_ne!(key("127.0.0.1"), key("::1"));
+        // The deprecated IPv4-compatible form stays IPv6 (see
+        // `deprecated_v4_compatible_form_is_not_folded`) and therefore masks to
+        // ::/64 like any other address in that block.
+        assert_eq!(key("::1.2.3.4"), key("::1"));
+        assert_eq!(key("::1.2.3.4").to_string(), "::/64");
     }
 
     #[test]

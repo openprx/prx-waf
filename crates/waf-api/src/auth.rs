@@ -119,9 +119,16 @@ pub async fn login(
     axum::extract::ConnectInfo(peer_addr): axum::extract::ConnectInfo<SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    // Enforce login-specific rate limit (stricter than general API)
+    // Enforce login-specific rate limit (stricter than general API).
+    //
+    // The address goes through the crate's normalization boundary rather than
+    // straight off the socket: on a `[::]` listener `peer_addr.ip()` yields the
+    // IPv4-mapped spelling, which is a different budget from the plain one, and
+    // an IPv6 client's budget is per-`/64` rather than per-address. Both are
+    // handled below the call — see `security::canonical_peer_ip` and
+    // `waf_common::net::RateLimitKey`.
     if let Some(ref limiter) = state.login_rate_limiter {
-        let ip = peer_addr.ip();
+        let ip = crate::security::canonical_peer_ip(peer_addr);
         if !limiter.check(ip) {
             return Err(ApiError::TooManyRequests(
                 "Too many login attempts, please try again later".into(),

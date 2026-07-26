@@ -657,6 +657,35 @@ impl WafEngine {
             .primary_result
             .as_ref()
             .and_then(|r| crate::checks::AttackKind::from_phase(r.phase));
+        // Deliberately the full address, NOT `waf_common::net::RateLimitKey`.
+        //
+        // The per-IP limiters aggregate IPv6 to a /64 because they are accounting
+        // for a *resource* — a bucket a rotating client would otherwise mint an
+        // unbounded supply of, evicting everyone else's state on the way. This is
+        // not accounting; it is a sampling key for a rollout, and coarsening it
+        // hurts:
+        //
+        // * `rollout_bps` exists to bound the blast radius of turning semantic
+        //   enforcement on. The realised enforce-share concentrates on the
+        //   configured fraction only in proportion to the number of independent
+        //   keys observed. Bucketing by /64 collapses however many addresses a
+        //   prefix presents into one coin flip, so a single busy /64 turns a "1 %"
+        //   rollout into 0 % or 100 % of that prefix's traffic. That is exactly the
+        //   outcome the knob is there to prevent, and the error is asymmetric: an
+        //   over-aggregated limiter costs a legitimate client some quota, while an
+        //   over-aggregated canary blocks a whole subnet's traffic during the phase
+        //   where the operator has explicitly declared they do not yet trust the
+        //   detector.
+        // * There is no evasion to close. Landing outside the canary yields `Log`,
+        //   which is where 100 % of traffic sits in the shipped posture
+        //   (`rollout_bps = 0`) and where everything outside the experiment sits
+        //   otherwise. Lane 1, OWASP CRS, CC and the blocklists all run regardless,
+        //   so rotating out of a canary bucket gains an attacker nothing.
+        // * Per-client stability is already delivered. The contrast this key draws
+        //   is against `req_id`, which changes every request; a client's address is
+        //   stable for the life of a connection and, for RFC 4941 temporary
+        //   addresses, for about a day — the same churn an IPv4 DHCP lease has
+        //   always given this bucketing.
         let request_key = ctx.client_ip.to_string();
         let effective = self.content_security.resolve_enforced_action(
             verdict.recommendation,

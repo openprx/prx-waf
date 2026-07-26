@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
+use waf_common::net::RateLimitKey;
 
 use axum::{
     Json,
@@ -70,12 +71,22 @@ struct Bucket {
     last_refill: Instant,
 }
 
-/// Simple in-process per-IP rate limiter (token bucket algorithm).
+/// Simple in-process per-client rate limiter (token bucket algorithm).
 ///
 /// Includes periodic cleanup of stale entries to prevent unbounded memory
 /// growth when facing large numbers of unique source IPs.
+///
+/// # Unit of account
+///
+/// Buckets are keyed by [`RateLimitKey`], not by the raw address: an IPv4
+/// address stands for itself, an IPv6 address stands for its `/64`. The
+/// derivation happens inside [`check`](Self::check) rather than at the call
+/// sites so that no caller can forget it — this limiter backs both the general
+/// management-API throttle and the login brute-force throttle, and the latter
+/// is the one place where a per-address key would have made the limit purely
+/// decorative over IPv6.
 pub struct ApiRateLimiter {
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    buckets: Mutex<HashMap<RateLimitKey, Bucket>>,
     rps: f64,
     burst: f64,
 }
@@ -102,14 +113,18 @@ impl ApiRateLimiter {
     }
 
     /// Returns `true` if the request is allowed, `false` if rate-limited.
+    ///
+    /// `ip` is a client address; the bucket it spends from is
+    /// [`RateLimitKey::from_client_ip`] of that address.
     #[allow(clippy::significant_drop_tightening)] // lock must span all bucket operations
     pub fn check(&self, ip: IpAddr) -> bool {
         if self.rps == 0.0 {
             return true;
         }
+        let key = RateLimitKey::from_client_ip(ip);
         let now = Instant::now();
         let mut map = self.buckets.lock();
-        let bucket = map.entry(ip).or_insert(Bucket {
+        let bucket = map.entry(key).or_insert(Bucket {
             tokens: self.burst,
             last_refill: now,
         });
@@ -133,16 +148,16 @@ impl ApiRateLimiter {
         let mut map = self.buckets.lock();
 
         // Remove stale entries
-        map.retain(|_ip, bucket| now.duration_since(bucket.last_refill) < API_RATE_TTL);
+        map.retain(|_key, bucket| now.duration_since(bucket.last_refill) < API_RATE_TTL);
 
         // If still over limit, evict oldest entries
         if map.len() > API_RATE_MAX_ENTRIES {
-            let mut entries: Vec<(IpAddr, Instant)> = map.iter().map(|(ip, b)| (*ip, b.last_refill)).collect();
-            entries.sort_by_key(|&(_ip, t)| t);
+            let mut entries: Vec<(RateLimitKey, Instant)> = map.iter().map(|(k, b)| (*k, b.last_refill)).collect();
+            entries.sort_by_key(|&(_key, t)| t);
 
             let to_remove = map.len().saturating_sub(API_RATE_MAX_ENTRIES);
-            for (ip, _) in entries.into_iter().take(to_remove) {
-                map.remove(&ip);
+            for (key, _) in entries.into_iter().take(to_remove) {
+                map.remove(&key);
             }
         }
     }
@@ -150,26 +165,37 @@ impl ApiRateLimiter {
 
 // ─── Client address extraction ────────────────────────────────────────────────
 
-/// Canonical client address of a management-API request.
+/// Canonical client address of a management-API connection.
 ///
 /// # Normalization boundary
 ///
 /// This is **the** point where a client address enters the management API, and
 /// therefore the only place in this crate that folds IPv4-mapped IPv6
 /// (`::ffff:a.b.c.d` — what a `[::]` listener reports for an IPv4 client) down
-/// to plain IPv4. Both middlewares below go through it; neither
-/// [`is_admin_ip_allowed`] nor [`ApiRateLimiter::check`] folds again. See
+/// to plain IPv4. [`is_admin_ip_allowed`] does not fold again; see
 /// [`waf_common::net`] for the invariant and for what this fixes.
+///
+/// Handlers that take an `axum::extract::ConnectInfo<SocketAddr>` extractor
+/// rather than a whole `Request` — [`crate::auth::login`] is the only one —
+/// call this directly. Reaching for `peer_addr.ip()` instead is what left the
+/// login throttle outside the boundary: on a `[::]` listener the same IPv4
+/// client spelled two ways occupied two separate brute-force budgets.
+#[must_use]
+pub const fn canonical_peer_ip(peer: std::net::SocketAddr) -> IpAddr {
+    waf_common::net::canonicalize_client_ip(peer.ip())
+}
+
+/// Canonical client address of a management-API request.
 ///
 /// Falls back to `0.0.0.0` when axum did not attach `ConnectInfo`, which only
 /// happens for synthetically constructed requests — a real connection always
 /// has a peer.
 fn request_client_ip(req: &Request<Body>) -> IpAddr {
-    let raw = req
-        .extensions()
+    req.extensions()
         .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
-        .map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |ci| ci.0.ip());
-    waf_common::net::canonicalize_client_ip(raw)
+        .map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |ci| {
+            canonical_peer_ip(ci.0)
+        })
 }
 
 // ─── IP allowlist check ───────────────────────────────────────────────────────
@@ -365,6 +391,69 @@ mod tests {
 
         // ip2 is unaffected
         assert!(limiter.check(ip2));
+    }
+
+    /// An IPv6 client rotating inside its own routed /64 spends one budget.
+    /// Keyed on the full address this loop would never be limited at all.
+    #[tokio::test]
+    async fn rate_limiter_ipv6_shares_one_budget_per_64() {
+        let limiter = ApiRateLimiter::new(1); // burst = 10
+        for i in 0..10_u16 {
+            let ip: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, i));
+            assert!(limiter.check(ip), "address #{i} is inside the shared burst");
+        }
+        let fresh: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0xdead, 0xbeef, 0xcafe, 1));
+        assert!(
+            !limiter.check(fresh),
+            "an 11th never-seen address in the same /64 must find the budget spent"
+        );
+    }
+
+    /// Aggregation stops at /64: the neighbouring prefix keeps its own budget.
+    #[tokio::test]
+    async fn rate_limiter_distinct_ipv6_64s_independent() {
+        let limiter = ApiRateLimiter::new(1); // burst = 10
+        let inside: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 1));
+        for _ in 0..11 {
+            let _ = limiter.check(inside);
+        }
+        assert!(!limiter.check(inside));
+
+        for (label, other) in [
+            ("adjacent /64", Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 0, 0, 0, 1)),
+            ("different /48", Ipv6Addr::new(0x2001, 0xdb8, 2, 2, 0, 0, 0, 1)),
+            ("different /32", Ipv6Addr::new(0x2001, 0xdb9, 1, 2, 0, 0, 0, 1)),
+        ] {
+            assert!(
+                limiter.check(IpAddr::V6(other)),
+                "{label} must not inherit the exhausted budget"
+            );
+        }
+    }
+
+    /// An IPv4 client reaching a `[::]` listener spends the same budget it would
+    /// have spent on an `0.0.0.0` listener — it does not get a second one, and it
+    /// is emphatically not merged with every other IPv4 client into `::/64`.
+    #[tokio::test]
+    async fn rate_limiter_mapped_ipv4_shares_the_plain_budget() {
+        let limiter = ApiRateLimiter::new(1); // burst = 10
+        let plain: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let mapped: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xcb00, 0x7109));
+
+        for _ in 0..10 {
+            assert!(limiter.check(plain));
+        }
+        assert!(
+            !limiter.check(mapped),
+            "the mapped spelling must not be a fresh brute-force budget"
+        );
+
+        // A different IPv4 client, also arriving mapped, is still its own client.
+        let other_mapped: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xcb00, 0x710a));
+        assert!(
+            limiter.check(other_mapped),
+            "mapped IPv4 addresses must not collapse into a single ::/64 bucket"
+        );
     }
 
     /// rps=0 means unlimited — every call returns true regardless of volume.

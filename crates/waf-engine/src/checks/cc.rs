@@ -2,9 +2,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use waf_common::net::RateLimitKey;
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
 use super::Check;
+
+/// One bucket per protected host and per client, where "client" is
+/// [`RateLimitKey`] — an IPv4 address or an IPv6 `/64`.
+///
+/// The pair is stored as a tuple rather than a formatted string on purpose. The
+/// previous key was `format!("{host_code}:{client_ip}")`, and a colon is the one
+/// character an IPv6 address is full of, so `("a", "b::1")` and `("a:b", ":1")`
+/// hashed to the same bucket. A tuple has no separator to be ambiguous about.
+type BucketKey = (String, RateLimitKey);
 
 /// Maximum number of entries in the rate-limiter map.
 /// Beyond this limit, stale entries are forcefully evicted.
@@ -30,14 +40,19 @@ struct BucketState {
 
 /// CC / rate-limit protection using the token bucket algorithm.
 ///
-/// State is stored per `(host_code, client_ip)` key in a `DashMap` so it is
-/// safe to call from multiple threads simultaneously.
+/// State is stored per [`BucketKey`] in a `DashMap` so it is safe to call from
+/// multiple threads simultaneously.
 ///
 /// A background cleanup task evicts entries that have been idle for longer
 /// than [`ENTRY_TTL`] and enforces [`MAX_ENTRIES`] to prevent unbounded
-/// memory growth from IP-rotating attackers.
+/// memory growth from IP-rotating attackers. That cap is the reason the key
+/// aggregates IPv6 to a `/64`: a client rotating inside its own routed prefix
+/// would otherwise mint a fresh entry per request, reach [`MAX_ENTRIES`], and
+/// push the [`cleanup`](Self::cleanup) oldest-first sweep into evicting the
+/// steady legitimate clients instead — never accumulating a `violation_count`
+/// of its own, so `CC-BAN` could not fire either.
 pub struct CcCheck {
-    buckets: Arc<DashMap<String, BucketState>>,
+    buckets: Arc<DashMap<BucketKey, BucketState>>,
 }
 
 impl CcCheck {
@@ -62,7 +77,7 @@ impl CcCheck {
     }
 
     /// Remove expired entries and enforce the maximum entry count.
-    fn cleanup(buckets: &DashMap<String, BucketState>) {
+    fn cleanup(buckets: &DashMap<BucketKey, BucketState>) {
         let now = Instant::now();
 
         // Remove entries whose last_check is older than ENTRY_TTL
@@ -78,7 +93,7 @@ impl CcCheck {
         // If still over the limit after TTL eviction, remove oldest entries
         if buckets.len() > MAX_ENTRIES {
             // Collect keys with their last_check time, sorted oldest first
-            let mut entries: Vec<(String, Instant)> = buckets
+            let mut entries: Vec<(BucketKey, Instant)> = buckets
                 .iter()
                 .map(|e| (e.key().clone(), e.value().last_check))
                 .collect();
@@ -111,8 +126,13 @@ impl Check for CcCheck {
         let ban_threshold = dc.cc_ban_threshold;
         let ban_duration_secs = dc.cc_ban_duration_secs;
 
-        // Key: one bucket per (host_code, client_ip)
-        let key = format!("{}:{}", ctx.host_config.code, ctx.client_ip);
+        // One bucket per (host, client). IPv4 is the address; IPv6 is the /64
+        // the address sits in, because that is the smallest unit a client
+        // cannot mint more of for free. See `waf_common::net::RateLimitKey`.
+        let key: BucketKey = (
+            ctx.host_config.code.clone(),
+            RateLimitKey::from_client_ip(ctx.client_ip),
+        );
 
         // Obtain or create the bucket entry.  DashMap's entry API holds the
         // shard lock for the duration of the operation, giving us atomic RMW.
@@ -194,9 +214,13 @@ mod tests {
     use waf_common::{DefenseConfig, HostConfig};
 
     fn make_ctx_with_rps(rps: f64, burst: u32) -> RequestCtx {
+        make_ctx(rps, burst, "10.0.0.1")
+    }
+
+    fn make_ctx(rps: f64, burst: u32, client_ip: &str) -> RequestCtx {
         RequestCtx {
             req_id: "test".to_string(),
-            client_ip: "10.0.0.1".parse::<IpAddr>().unwrap(),
+            client_ip: client_ip.parse::<IpAddr>().unwrap(),
             client_port: 0,
             method: "GET".to_string(),
             host: "example.com".to_string(),
@@ -249,6 +273,143 @@ mod tests {
         assert!(
             checker.check(&ctx).is_some(),
             "Should be rate limited after burst exhausted"
+        );
+    }
+
+    /// IPv4 accounting is untouched by /64 aggregation: two neighbouring
+    /// addresses still hold independent budgets.
+    #[test]
+    fn ipv4_addresses_keep_independent_budgets() {
+        let checker = CcCheck::new();
+        let a = make_ctx(0.01, 3, "203.0.113.9");
+        let b = make_ctx(0.01, 3, "203.0.113.10");
+
+        for _ in 0..3 {
+            assert!(checker.check(&a).is_none());
+        }
+        assert!(checker.check(&a).is_some(), "203.0.113.9 must exhaust its own burst");
+        assert!(
+            checker.check(&b).is_none(),
+            "203.0.113.10 must be unaffected — IPv4 is still accounted per address"
+        );
+        assert_eq!(checker.buckets.len(), 2);
+    }
+
+    /// The bug this aggregation exists to fix: a client rotating addresses
+    /// inside its own routed /64 must spend one shared budget, not a fresh one
+    /// per request.
+    #[test]
+    fn ipv6_rotation_within_a_64_shares_one_budget() {
+        let checker = CcCheck::new();
+        let burst = 3;
+
+        // Three requests from three *different* addresses drain the shared burst.
+        for i in 0..burst {
+            let ctx = make_ctx(0.01, burst, &format!("2001:db8:1:2::{i:x}"));
+            assert!(checker.check(&ctx).is_none(), "request {i} is inside the burst");
+        }
+
+        let next = make_ctx(0.01, burst, "2001:db8:1:2:dead:beef:cafe:1");
+        let hit = checker
+            .check(&next)
+            .expect("a fourth, freshly-minted address must be limited");
+        assert_eq!(hit.rule_id.as_deref(), Some("CC-001"));
+        assert_eq!(checker.buckets.len(), 1, "2^64 addresses, one bucket");
+    }
+
+    /// Aggregation stops at /64 — an adjacent prefix is a different client.
+    #[test]
+    fn ipv6_distinct_64s_stay_independent() {
+        let checker = CcCheck::new();
+        let a = make_ctx(0.01, 3, "2001:db8:1:2::1");
+        let b = make_ctx(0.01, 3, "2001:db8:1:3::1");
+
+        for _ in 0..3 {
+            assert!(checker.check(&a).is_none());
+        }
+        assert!(checker.check(&a).is_some());
+        assert!(
+            checker.check(&b).is_none(),
+            "2001:db8:1:3::/64 is a different network and must not inherit the limit"
+        );
+        assert_eq!(checker.buckets.len(), 2);
+    }
+
+    /// `CC-BAN` was unreachable over IPv6: each rotated address created a fresh
+    /// bucket whose `violation_count` restarted at zero.
+    #[test]
+    fn ipv6_rotation_reaches_the_ban_threshold() {
+        let base = make_ctx(0.01, 1, "2001:db8:1:2::0");
+        let mut host = (*base.host_config).clone();
+        // The fixture's threshold is 100; lower it so the test exercises the
+        // threshold rather than the loop bound.
+        host.defense_config.cc_ban_threshold = 5;
+        let host = Arc::new(host);
+
+        let checker = CcCheck::new();
+        let mut banned = None;
+        for i in 0..64_u32 {
+            let mut ctx = make_ctx(0.01, 1, &format!("2001:db8:1:2::{i:x}"));
+            ctx.host_config = Arc::clone(&host);
+            if let Some(r) = checker.check(&ctx)
+                && r.rule_id.as_deref() == Some("CC-BAN")
+            {
+                banned = Some(i);
+                break;
+            }
+        }
+        // Burst of 1 is spent by request #0; violations 1..=5 follow, and the
+        // 5th trips the threshold.
+        assert_eq!(
+            banned,
+            Some(5),
+            "CC-BAN must fire on the 5th violation from a /64 rotating its host bits"
+        );
+    }
+
+    /// The eviction failure mode: with a per-address key a rotation flood grows
+    /// the map one entry per request until [`MAX_ENTRIES`] forces the
+    /// oldest-first sweep, which discards *legitimate* clients' state. With a
+    /// /64 key the flood occupies a single entry, so the sweep never has cause
+    /// to run and the steady client survives with its bucket intact.
+    #[test]
+    fn ipv6_rotation_flood_cannot_evict_a_steady_client() {
+        let checker = CcCheck::new();
+
+        // A steady, well-behaved IPv4 client establishes its bucket first.
+        let steady = make_ctx(1000.0, 10, "203.0.113.9");
+        assert!(checker.check(&steady).is_none());
+
+        // 20 000 requests, each from an address never seen before, all from one
+        // routed /64.
+        for i in 0..20_000_u32 {
+            let ctx = make_ctx(0.01, 1, &format!("2001:db8:1:2::{i:x}"));
+            let _ = checker.check(&ctx);
+        }
+
+        assert_eq!(
+            checker.buckets.len(),
+            2,
+            "20 000 rotated addresses must occupy one entry, beside the steady client's"
+        );
+        assert!(
+            checker.buckets.len() < MAX_ENTRIES,
+            "the oldest-first eviction sweep must have no reason to run"
+        );
+
+        // Run the sweep anyway: the steady client must still be there.
+        CcCheck::cleanup(&checker.buckets);
+        let steady_key = (
+            "test-host".to_string(),
+            RateLimitKey::from_client_ip("203.0.113.9".parse().unwrap()),
+        );
+        assert!(
+            checker.buckets.contains_key(&steady_key),
+            "the steady client's state must survive the flood"
+        );
+        assert!(
+            checker.check(&steady).is_none(),
+            "and it must still be served without being rate-limited"
         );
     }
 }

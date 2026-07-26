@@ -133,12 +133,14 @@ client socket:
 - **Cluster-synced rules.** IP rules replicated from a peer arrive as strings
   and are subject to the same load-time WARN as local ones, but a peer running
   an older build will keep re-publishing mapped entries until it is upgraded.
-- **`waf_api::auth`'s login-throttle bucket** keys on the raw axum peer
+Two items listed here when this document was first written have since been
+fixed, and are recorded so the history reads straight:
+
+- **`waf_api::auth`'s login-throttle bucket** keyed on the raw axum peer
   address rather than the canonical one, so on a `[::]` listener an IPv4 client
-  and its mapped spelling would occupy separate buckets. Contained: it is a
-  counter, not an adjudication, and both spellings cannot arrive on the same
-  connection.
-- **Rate-limit granularity is unchanged.** Every per-IP limiter still keys on
-  the full address, which for IPv6 means /128 — a client with a routed /64
-  still controls 2⁶⁴ distinct buckets. That is a separate defect and is not
-  addressed here.
+  and its mapped spelling occupied separate buckets. It now goes through
+  `waf_api::security::canonical_peer_ip`, inside the boundary.
+- **Rate-limit granularity.** Every per-IP limiter keyed on the full address,
+  which for IPv6 meant /128 — a client with a routed /64 controlled 2⁶⁴
+  distinct buckets. IPv6 is now accounted per /64; IPv4 is unchanged. See
+  [IPv6 Rate-Limit Aggregation](./ipv6-rate-limit-aggregation.md).
