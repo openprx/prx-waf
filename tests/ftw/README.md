@@ -17,9 +17,10 @@ runs the suite; prints a classified report; and tears everything down again.
 
 ## Where we stand
 
-CRS v4.25.0, go-ftw v1.3.0, 4674 tests, CRS check only. Recorded from `e535a32`
-(the `multipart/form-data` part parser) on 2026-07-26; the same numbers are the
-CI gate in `baseline.json`.
+CRS v4.25.0, go-ftw v1.3.0, 4674 tests, CRS check only. Recorded on 2026-07-26
+from the generic `REQUEST_HEADERS:<name>` accessor; the same numbers are the CI
+gate in `baseline.json`, which is the authority — this table used to drift from
+it and is now transcribed from it.
 **A pass rate is meaningless without its mode and its paranoia level — always
 quote all three.**
 
@@ -30,12 +31,12 @@ the posture ModSecurity v2 + CRS and Coraza are measured in.
 
 | | PL1 | PL2 | PL4 |
 |---|---|---|---|
-| passed | 2779 | 3742 | 4222 |
-| **pass rate** | **59.46%** | **80.06%** | **90.33%** |
-| not-implemented | 211 | 211 | 211 |
-| paranoia-scope | 1513 | 494 | 0 |
-| over-block | 26 | 32 | 34 |
-| missed-detection | 144 | 194 | 206 |
+| passed | 2850 | 3814 | 4301 |
+| **pass rate** | **60.98%** | **81.60%** | **92.02%** |
+| not-implemented | 196 | 196 | 196 |
+| paranoia-scope | 1516 | 497 | 0 |
+| over-block | 25 | 31 | 33 |
+| missed-detection | 86 | 135 | 143 |
 | harness | 1 | 1 | 1 |
 
 ### cloud mode — the blocking decision
@@ -44,23 +45,26 @@ WAF enforcing, verdicts from HTTP status codes.
 
 | | PL1 | PL2 | PL4 |
 |---|---|---|---|
-| passed | 3216 | 3753 | 3997 |
-| **pass rate** | **68.81%** | **80.30%** | **85.52%** |
-| not-implemented | 208 | 195 | 182 |
-| paranoia-scope | 973 | 286 | 0 |
-| over-block | 95 | 251 | 314 |
-| missed-detection | 181 | 188 | 180 |
+| passed | 3182 | 3717 | 4063 |
+| **pass rate** | **68.08%** | **79.53%** | **86.93%** |
+| not-implemented | 196 | 192 | 180 |
+| paranoia-scope | 1076 | 384 | 0 |
+| over-block | 89 | 238 | 301 |
+| missed-detection | 130 | 142 | 129 |
 | harness | 1 | 1 | 1 |
 
-Previous recording, for the delta: log `2744 / 3701 / 4176` and cloud
-`3185 / 3750 / 3994` at `3018ac1`, measured the same way on the same host. The
-multipart parser is **+35 / +41 / +46** in log mode with **zero** new failures at
-any level, and **+31 / +3 / +3** in cloud mode. Cloud gains less at PL2/PL4
-because 22 of its wins are cancelled by 22 new `over-block` entries that log mode
-does not see — 19 of them are CRS-920121 correctly firing at PL2 on the HTML
-entity field names in 920120's *negative* tests (`&auml;` contains a `;`, and the
-PL2 sibling has no entity exemption, exactly as upstream), which is the
-`collateral` artefact described below, not a false positive.
+Previous recording, for the delta: log `2782 / 3746 / 4229` and cloud
+`3122 / 3657 / 3999` at `a3b7647`, re-measured the same way on the same host and
+identical to the figures `baseline.json` stored. The by-name header accessor is
+**+68 / +68 / +72** in log mode with **zero** tests going from pass to fail at
+any level, and **+60 / +60 / +64** in cloud mode. Cloud gains four fewer at every
+level for one reason, named in `baseline.json`: 920310-2/-5/-6 and 920311-2 send
+an *empty* `Accept:` header, CRS-920600 now rejects it (the RFC media-type
+grammar it asserts has no empty alternative, and upstream scores the same 5
+points), and cloud mode cannot tell that 403 apart from the rule under test —
+the `collateral` artefact described below, not a false positive. Log mode passes
+all four before and after, because what the corpus asserts is that 920310 and
+920311 must not fire, and they do not.
 
 PL4 is the level CRS runs its own regression suite at
 (`BLOCKING_PARANOIA: 4` in coreruleset `tests/docker-compose.yml`), so it is
@@ -69,33 +73,33 @@ the same question upstream asks it. PL1 is the shipping default.
 
 For reference: ModSecurity v2 + CRS is 100% (it is the reference
 implementation), Coraza is 100%, ModSecurity v3 is 96–98%. Those are log-mode
-numbers, so **`90.33%` at PL4 is the figure that belongs next to them**; the
+numbers, so **`92.02%` at PL4 is the figure that belongs next to them**; the
 cloud column is a different question with a different answer.
 
 ### Why the two columns disagree in both directions
 
-At PL1 cloud looks *better* (68.81% vs 59.46%) and at PL4 it looks *worse*
-(85.52% vs 90.33%). Neither is noise — a status code is a lossy projection of
+At PL1 cloud looks *better* (68.08% vs 60.98%) and at PL4 it looks *worse*
+(86.93% vs 92.02%). Neither is noise — a status code is a lossy projection of
 the corpus's assertions, and it loses information in both directions. Comparing
-the two failure **sets** at PL4 (344 tests fail in both modes):
+the two failure **sets** at PL4 (284 tests fail in both modes):
 
 | | count | what it is |
 |---|---|---|
-| fails only in cloud | 333 | 280 `over-block`, 41 `missed-detection`, 12 `not-implemented` |
-| fails only in log | 108 | 67 `missed-detection`, 41 `not-implemented` |
+| fails only in cloud | 327 | 268 `over-block`, 47 `missed-detection`, 12 `not-implemented` |
+| fails only in log | 89 | 61 `missed-detection`, 28 `not-implemented` |
 
 * **Cloud invents failures.** A negative test asserts "rule 941100 did not
   fire". Cloud can only ask "did anything block?", so any *other* rule blocking
-  fails it. Those are the 280. Log mode deletes that entire class: `collateral`
+  fails it. Those are the 268. Log mode deletes that entire class: `collateral`
   is structurally impossible when the assertion names an id, because a rule the
-  test does not name cannot fail it. All 34 of log mode's PL4 `over-block`
+  test does not name cannot fail it. All 33 of log mode's PL4 `over-block`
   entries are `same-rule` — real false positives of the rule under test.
 * **Cloud hands out free passes.** A positive test asserts "rule 933151 fired".
   Cloud can only ask "did anything block?", so when an unrelated rule blocks the
   request the test passes without the rule under test ever matching. Those are
-  the 108 — and they are not marginal: 41 of them are for rules that do not
+  the 89 — and they are not marginal: 28 of them are for rules that do not
   exist in `rules/owasp-crs/` at all. The same effect explains PL1, where
-  cloud's `paranoia-scope` is 973 against log mode's 1513: 540 tests for rules
+  cloud's `paranoia-scope` is 1076 against log mode's 1516: 440 tests for rules
   that were never even evaluated at PL1 still "passed" in cloud because
   something else blocked.
 
@@ -272,9 +276,11 @@ request", which is true in DetectionOnly too.
 
 ## Sizing a capability before you build it
 
-Twice now a capability has been sized by counting the regression tests that name
-the rules it would turn on, and twice the estimate has come out roughly double.
-The correction is cheap and mechanical, so it belongs here.
+Twice a capability was sized by counting the regression tests that name the rules
+it would turn on, and twice the estimate came out roughly double. The correction
+is cheap and mechanical, so it belongs here — and the third time it was applied
+up front, the estimate was exact (see "The method, applied" at the end of this
+section).
 
 **A rule's test count is an upper bound, not an estimate.** Before committing to a
 number, split the corpus for each rule by *how the test delivers the payload* and
@@ -299,9 +305,9 @@ test that the parser earned by adding `FILES` to that rule's surface list. The
 57-test shortfall is not a defect in the parser: those tests send the file name
 in `REQUEST_HEADERS:X-Filename` / `X_Filename` / `X.Filename` / `X-File-Name`,
 because CRS writes both delivery mechanisms into one `SecRule`. Reaching them
-needs a **generic `REQUEST_HEADERS:<name>` accessor** (`Field::parse` currently
-knows six headers by name), which is a different capability that happens to share
-a rule id.
+needed a **generic `REQUEST_HEADERS:<name>` accessor** — a different capability
+that happens to share a rule id. It landed next, and all 57 converted; see "The
+method, applied" below.
 
 Two more 922 rules are out of reach for a third reason — they need a variable
 store, not a parser:
@@ -318,6 +324,60 @@ So the three questions to ask of any "N tests" estimate are: *which transport do
 each test use*, *is the variable the rule reads actually the one this change
 produces*, and *does the rule need `setvar`*. The first alone accounted for the
 whole gap here.
+
+### The method, applied: the by-name header accessor
+
+The next capability was sized with the three questions above **before** it was
+built, and the estimate held to the test: **+68 / +68 / +72** predicted at
+PL1 / PL2 / PL4 in log mode, **+68 / +68 / +72** measured. It is written out
+here because a method is only worth keeping if it is checked against an outcome
+it could have failed.
+
+Start from the two counts the section above warns about. The `not-implemented`
+bucket said **15** (the rules a by-name field would let the converter emit); the
+"total tests of every rule that names a `REQUEST_HEADERS:<x>` the engine cannot
+read" said **1443**. Both are useless: 15 counts rules and not tests, and 1443
+counts every test of every rule that merely *mentions* such a header.
+
+Question 1 — *which construct, and which transport*:
+
+| construct | rules | positive tests | delivered |
+|---|---|---|---|
+| `REQUEST_HEADERS:<name>` — read | 11 | 110, of which **72** carry the header | **72 / 72** |
+| `&REQUEST_HEADERS:<name>` — count | 5 | 23 | **0** (different capability) |
+| `!REQUEST_HEADERS:<name>` — exclude | 18 | — | **0** (an exclusion, not a read) |
+
+The 1443 collapses to 110 as soon as `!REQUEST_HEADERS:Cookie` is recognised for
+what it is: an *exclusion* in the 944 and 941 rules, which contributes no field
+and never needed one. That single misreading accounted for more than half of the
+original overcount.
+
+Question 2 — *is the variable the one this change produces*: the 23 tests behind
+`&REQUEST_HEADERS:<name>` need a header **count**, which is a separate field
+(`count_header_<name>`) with its own, deliberately narrower, policy gate
+(`COUNT_MAPPED_HEADERS` in `rules/tools/modsec2yaml.py`). CRS-920660 alone is 17
+of them. They were excluded from the estimate and are still failing.
+
+Question 3 — *does the rule need `setvar`*: none of the eleven do.
+
+Of the 110 positive tests, 38 do not carry the header at all (they exercise the
+rule's other branch or its absent-header case) and were excluded; the remaining
+72 split by paranoia level as 68 at PL1/PL2 and 72 at PL4, which is the estimate
+and the result. The rules and their yields:
+
+| rule | PL | positive tests | carrying the named header | delivered |
+|---|---|---|---|---|
+| 933110 | 1 | 30 | 27 | **27** |
+| 933220 | 1 | 13 | 11 | **11** |
+| 932180 | 1 | 11 | 9 | **9** |
+| 944140 | 1 | 11 | 9 | **9** |
+| 920210 | 1 | 5 | 5 | **5** |
+| 920600 | 1 | 4 | 4 | **4** |
+| 920310 | 1 | 2 | 2 | **2** |
+| 920520 | 1 | 1 | 1 | **1** |
+| 920275 | 4 | 2 | 2 | **2** |
+| 920521 | 3 | 1 | 1 | **1** |
+| 933111 | 3 | 6 | 1 | **1** |
 
 ## Exclusions
 

@@ -85,7 +85,7 @@ rules:
     category: java-injection
     severity: critical
     paranoia: 1
-    field: files
+    field: files+header:x-file-name+header:x-filename+header:x.filename+header:x_filename
     operator: regex
     value: .*\.(?:jsp|jspx)\.*$
     transform:

@@ -110,7 +110,12 @@ load time rather than compared as a literal.
 
 `count_header_<name>` is a header **presence** test (`&REQUEST_HEADERS:<name>`),
 valid only with `equals` against `'0'` or `'1'` — repeated headers are folded
-into one entry, so no other count is reachable.
+into one entry, so no other count is reachable. Its inventory is smaller than
+the readable one on purpose: the engine can read any header by name
+(`header:<name>`), but turning a `&VAR` test into an enforced rule changes what
+the rule set blocks, so a header is added to `COUNT_MAPPED_HEADERS` in
+`rules/tools/modsec2yaml.py` only together with false-positive probes for the
+rules it activates.
 
 Evaluation short-circuits: the head is tested first with the ordinary
 allocation-free path, and the chain runs only if it matched.

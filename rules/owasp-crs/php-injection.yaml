@@ -27,7 +27,7 @@ rules:
     category: php-injection
     severity: critical
     paranoia: 1
-    field: files
+    field: files+header:x-file-name+header:x-filename+header:x.filename+header:x_filename
     operator: regex
     value: .*\.ph(?:p\d*|tml|ar|ps|t|pt)\.*$
     transform:
@@ -195,7 +195,7 @@ rules:
     category: php-injection
     severity: critical
     paranoia: 1
-    field: files+files_names
+    field: files+files_names+header:x-file-name+header:x-filename+header:x.filename+header:x_filename
     operator: regex
     value: (?:^|[/\x5c])sess_[,\-0-9a-z]{20,256}$
     transform:
@@ -283,7 +283,7 @@ rules:
     category: php-injection
     severity: critical
     paranoia: 3
-    field: files
+    field: files+header:x-file-name+header:x-filename+header:x.filename+header:x_filename
     operator: regex
     value: .*\.ph(?:p\d*|tml|ar|ps|t|pt)\..*$
     transform:

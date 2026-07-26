@@ -261,7 +261,7 @@ rules:
     category: rce
     severity: critical
     paranoia: 1
-    field: files
+    field: files+header:x-file-name+header:x-filename+header:x_filename
     operator: pm_from_file
     value: restricted-upload.data
     transform:

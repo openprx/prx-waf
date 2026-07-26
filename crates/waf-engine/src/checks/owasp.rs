@@ -723,12 +723,60 @@ impl Surfaces {
     }
 }
 
+/// The request headers a rule names one at a time (`REQUEST_HEADERS:<name>`),
+/// together with whatever other surfaces the same rule lists.
+///
+/// # Why this is not a `Surfaces` bit
+///
+/// [`Surfaces`] is a bitset over a closed inventory of *places*; a header name
+/// is an open set of *keys* into one place, so it cannot be a bit. Upstream
+/// writes both kinds into one variable list — CRS-933110 is
+/// `FILES|REQUEST_HEADERS:X-Filename|REQUEST_HEADERS:X_Filename|…` — which is
+/// why the two live in one field rather than in two.
+///
+/// # Why the names are stored verbatim
+///
+/// `X-Filename`, `X_Filename` and `X.Filename` are three different headers and
+/// CRS names all three. Any spelling normalisation beyond ASCII case folding
+/// (which HTTP itself mandates) would collapse them onto each other and make
+/// the accessor read a header the rule did not ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamedHeaders {
+    /// The other surfaces the rule names, or `Surfaces(0)` when it names none.
+    surfaces: Surfaces,
+    /// Lower-cased header names, sorted and deduplicated by
+    /// [`Field::parse`] so that two spellings of one variable list compare
+    /// equal and a lookup is bounded by the rule's own name count.
+    names: Box<[Box<str>]>,
+}
+
+/// Prefix that marks a field-name token as naming one request header.
+///
+/// `:` cannot occur in an HTTP field name (RFC 9110 §5.6.2 `token`) and no
+/// surface name contains one, so the prefix can never be confused with either.
+const HEADER_TOKEN: &str = "header:";
+
+/// `true` for a byte an HTTP field name may contain.
+///
+/// RFC 9110 §5.6.2 `token`, minus `+`: the composite-field grammar uses `+` as
+/// its separator, so a header whose name contained one could not be spelled.
+/// No such header exists in practice, and rejecting it here means the
+/// converter emits a sentinel and the gap is named in the startup WARN,
+/// instead of the name being silently split into two.
+const fn is_header_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        )
+}
+
 /// A request location a CRS rule can be evaluated against.
 ///
 /// Every variant is backed by a real accessor, so a rule that compiles is
 /// guaranteed to be evaluable.  Unknown names are rejected at load time
 /// ([`RejectReason::UnsupportedField`]) rather than silently never matching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Field {
     /// Several request surfaces at once; `all` is the full set.
     Multi(Surfaces),
@@ -770,6 +818,19 @@ enum Field {
     HeaderReferer,
     HeaderHost,
     HeaderRange,
+    /// `REQUEST_HEADERS:<name>` for one or more headers named in the rule,
+    /// plus any other surfaces the same rule lists.
+    ///
+    /// Spelled `header:<name>` in a field name, and joined with `+` like every
+    /// other surface: CRS-933110 is `files+header:x-file-name+header:x-filename
+    /// +header:x.filename+header:x_filename`.
+    ///
+    /// Reads exactly the headers named and nothing else. A header the request
+    /// does not carry yields **no value at all** rather than an empty one,
+    /// which is what upstream does (the collection simply has no member) and
+    /// is what keeps a negated rule such as CRS-920600 off every request that
+    /// omits the header.
+    Named(NamedHeaders),
     /// `&REQUEST_HEADERS:<name>` — how many times the header occurs.
     ///
     /// The engine folds repeated headers into a map, so the only values this
@@ -796,9 +857,14 @@ enum Field {
 
 /// Headers `count_header_<name>` may name.
 ///
-/// Restricted to the headers [`Field`] can already read, so the countable set
-/// and the readable set stay the same inventory.  Underscores in the field
-/// name stand for hyphens.
+/// Not the readable inventory: since [`Field::Named`] landed the engine can
+/// *read* any header, and this list is the smaller set it can be asked to
+/// *count*. It stays a closed list because a count spells its header name with
+/// underscores standing for hyphens, which cannot distinguish `X-Filename`
+/// from `X_Filename`; a rule that needs that distinction reads the header
+/// instead. Widening it is also a policy change, not just a capability one —
+/// see `COUNT_MAPPED_HEADERS` in `rules/tools/modsec2yaml.py`, which is the
+/// gate that decides which `&REQUEST_HEADERS:<name>` rules are emitted at all.
 const COUNTABLE_HEADERS: [&str; 6] = [
     "content-type",
     "content-length",
@@ -814,6 +880,12 @@ impl Field {
             let wanted = header.replace('_', "-");
             let known = COUNTABLE_HEADERS.iter().find(|h| **h == wanted)?;
             return Some(Self::HeaderCount(known));
+        }
+        // `header:<name>` tokens name individual request headers and may be
+        // mixed with ordinary surfaces in the same `+` list.  Handled before
+        // the table below because a header name is data, not a keyword.
+        if name.split('+').any(|token| token.starts_with(HEADER_TOKEN)) {
+            return Self::parse_named(name);
         }
         Some(match name {
             "all" => Self::Multi(Surfaces::ALL),
@@ -866,10 +938,61 @@ impl Field {
         })
     }
 
+    /// Parse a `+` list that contains at least one `header:<name>` token.
+    ///
+    /// Returns `None` — so the rule is rejected at load time and named in the
+    /// startup WARN — for an empty or non-`token` header name, for a name
+    /// repeated within the list, and for any non-header token `Surfaces` does
+    /// not know. Nothing here falls back to a wider field: a field name that
+    /// cannot be read exactly is not read at all.
+    fn parse_named(name: &str) -> Option<Self> {
+        let mut names: Vec<Box<str>> = Vec::new();
+        let mut surface_bits = 0u32;
+        for token in name.split('+') {
+            let Some(header) = token.strip_prefix(HEADER_TOKEN) else {
+                // An ordinary surface sharing the list, e.g. the `files` in
+                // CRS-933110.  Parsed one token at a time so an overlap
+                // between two of them is still refused.
+                let surfaces = Surfaces::parse(token)?;
+                if surface_bits & surfaces.0 != 0 {
+                    return None;
+                }
+                surface_bits |= surfaces.0;
+                continue;
+            };
+            if header.is_empty() || !header.bytes().all(is_header_name_byte) {
+                return None;
+            }
+            names.push(header.to_ascii_lowercase().into_boxed_str());
+        }
+        // Sorting makes the field order-insensitive the way a surface bitset
+        // already is, so `files+header:a` and `header:a+files` are one field;
+        // the duplicate check rides on the sort.
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        if names.is_empty() || names.len() != before {
+            return None;
+        }
+        Some(Self::Named(NamedHeaders {
+            surfaces: Surfaces(surface_bits),
+            names: names.into_boxed_slice(),
+        }))
+    }
+
     /// `false` for fields that expand to several values; scalar comparisons
     /// (`equals` / `not_in` / `gt` / `lt`) are not meaningful on those.
-    const fn is_scalar(self) -> bool {
-        !matches!(self, Self::Multi(_) | Self::Headers | Self::Cookies)
+    ///
+    /// One named header on its own *is* a single value — that is what makes
+    /// CRS-920520 (`REQUEST_HEADERS:Accept-Encoding "@gt 100"` under
+    /// `t:length`) expressible — but a list of them, or one mixed with other
+    /// surfaces, is not.
+    fn is_scalar(&self) -> bool {
+        match self {
+            Self::Multi(_) | Self::Headers | Self::Cookies => false,
+            Self::Named(named) => named.surfaces.0 == 0 && named.names.len() == 1,
+            _ => true,
+        }
     }
 
     /// `true` for the fields that can only be read once the origin has answered.
@@ -879,16 +1002,19 @@ impl Field {
     /// [`Check`]. Splitting on the field rather than on a declared `phase:` key
     /// keeps the two in agreement by construction — a rule cannot end up in the
     /// request pipeline reading a surface that does not exist there.
-    const fn is_response(self) -> bool {
+    const fn is_response(&self) -> bool {
         matches!(self, Self::ResponseBody | Self::ResponseStatus)
     }
 
     /// The single value of a scalar field, or `None` for multi-valued fields
     /// and for scalar fields absent from the request.
-    fn scalar<'v>(self, view: &'v RequestView<'_>) -> Option<Cow<'v, str>> {
+    fn scalar<'v>(&self, view: &'v RequestView<'_>) -> Option<Cow<'v, str>> {
         let ctx = view.ctx;
         let header = |name: &str| ctx.headers.get(name).map(|v| Cow::Borrowed(v.as_str()));
         match self {
+            // A lone named header is the one `Named` shape that is scalar; the
+            // rest are answered by `collect_values` / `any_value`.
+            Self::Named(named) if self.is_scalar() => named.names.first().and_then(|n| header(n)),
             Self::Method => Some(Cow::Borrowed(ctx.method.as_str())),
             Self::Path => Some(Cow::Borrowed(view.path.as_ref())),
             Self::PathRaw => Some(Cow::Borrowed(ctx.path.as_str())),
@@ -908,7 +1034,7 @@ impl Field {
                 let count = ctx.query.split('&').filter(|s| !s.is_empty()).count();
                 Some(Cow::Owned(count.to_string()))
             }
-            Self::HeaderCount(name) => Some(Cow::Borrowed(if ctx.headers.contains_key(name) { "1" } else { "0" })),
+            Self::HeaderCount(name) => Some(Cow::Borrowed(if ctx.headers.contains_key(*name) { "1" } else { "0" })),
             // `None` when the view has no response attached, which is every
             // request-phase evaluation. That is the safety property that makes
             // the split cheap: even if a response rule reached the request
@@ -916,7 +1042,7 @@ impl Field {
             // matching some unrelated request surface.
             Self::ResponseBody => view.response.as_ref().map(|r| Cow::Borrowed(r.body.as_ref())),
             Self::ResponseStatus => view.response.as_ref().map(|r| Cow::Borrowed(r.status.as_str())),
-            Self::Multi(_) | Self::Headers | Self::Cookies => None,
+            Self::Multi(_) | Self::Headers | Self::Cookies | Self::Named(_) => None,
         }
     }
 
@@ -928,70 +1054,18 @@ impl Field {
     /// `matched_value` (`ModSecurity` `MATCHED_VARS`) condition can be applied
     /// to them, so the whole expansion is collected — but only after the head
     /// condition has already matched, so this never runs on ordinary traffic.
-    fn collect_values<'v>(self, view: &'v RequestView<'_>) -> Vec<Cow<'v, str>> {
+    fn collect_values<'v>(&self, view: &'v RequestView<'_>) -> Vec<Cow<'v, str>> {
         let ctx = view.ctx;
         match self {
-            Self::Multi(s) => {
-                let mut out: Vec<Cow<'v, str>> = Vec::new();
-                let header = |name: &str, out: &mut Vec<Cow<'v, str>>| {
-                    if let Some(value) = ctx.headers.get(name) {
-                        out.push(Cow::Borrowed(value.as_str()));
-                    }
-                };
-                if s.has(Surfaces::PATH) {
-                    out.push(Cow::Borrowed(view.path.as_ref()));
-                }
-                if s.has(Surfaces::PATH_RAW) {
-                    out.push(Cow::Borrowed(ctx.path.as_str()));
-                }
-                if s.has(Surfaces::QUERY) {
-                    out.push(Cow::Borrowed(view.query.as_ref()));
-                }
-                if view.body_surface_applies(s) {
-                    out.push(Cow::Borrowed(view.body.as_ref()));
-                }
-                if s.has(Surfaces::XML_TEXT) && !view.xml().text.is_empty() {
-                    out.push(Cow::Borrowed(view.xml().text.as_str()));
-                }
-                if s.has(Surfaces::XML_ATTRS) {
-                    out.extend(view.xml().attrs.iter().map(|v| Cow::Borrowed(v.as_str())));
-                }
-                if s.has(Surfaces::ARGS_GET) {
-                    out.extend(view.args_get().iter().map(|arg| Cow::Borrowed(arg.value.as_str())));
-                }
-                if s.has(Surfaces::ARGS_GET_NAMES) {
-                    out.extend(view.args_get().iter().map(|arg| Cow::Borrowed(arg.name.as_str())));
-                }
-                if s.has(Surfaces::ARGS_POST) {
-                    out.extend(view.args_post().iter().map(|arg| Cow::Borrowed(arg.value.as_str())));
-                }
-                if s.has(Surfaces::ARGS_POST_NAMES) {
-                    out.extend(view.args_post().iter().map(|arg| Cow::Borrowed(arg.name.as_str())));
-                }
-                if s.has(Surfaces::FILES) {
-                    out.extend(view.multipart_files());
-                }
-                if s.has(Surfaces::FILES_NAMES) {
-                    out.extend(view.multipart_files_names());
-                }
-                if s.has(Surfaces::MULTIPART_PART_HEADERS) {
-                    out.extend(view.multipart_part_headers());
-                }
-                if s.has(Surfaces::COOKIES) {
-                    out.extend(cookie_values(ctx).map(Cow::Borrowed));
-                }
-                if s.has(Surfaces::COOKIE_NAMES) {
-                    out.extend(cookie_names(ctx).map(Cow::Borrowed));
-                }
-                if s.has(Surfaces::HEADER_VALUES) {
-                    out.extend(ctx.headers.values().map(|v| Cow::Borrowed(v.as_str())));
-                }
-                if s.has(Surfaces::USER_AGENT) {
-                    header("user-agent", &mut out);
-                }
-                if s.has(Surfaces::REFERER) {
-                    header("referer", &mut out);
-                }
+            Self::Multi(s) => Self::collect_surfaces(*s, view),
+            Self::Named(named) => {
+                let mut out = Self::collect_surfaces(named.surfaces, view);
+                out.extend(
+                    named
+                        .names
+                        .iter()
+                        .filter_map(|name| ctx.headers.get(&**name).map(|v| Cow::Borrowed(v.as_str()))),
+                );
                 out
             }
             Self::Headers => ctx
@@ -1004,39 +1078,124 @@ impl Field {
         }
     }
 
+    /// Materialise every value the surfaces in `s` expand to.
+    ///
+    /// Split out of [`Self::collect_values`] so [`Self::Named`] can reuse it
+    /// verbatim: a rule that names both a surface and a header must read the
+    /// surface exactly as a rule that names it alone does.
+    fn collect_surfaces<'v>(s: Surfaces, view: &'v RequestView<'_>) -> Vec<Cow<'v, str>> {
+        let ctx = view.ctx;
+        let mut out: Vec<Cow<'v, str>> = Vec::new();
+        let header = |name: &str, out: &mut Vec<Cow<'v, str>>| {
+            if let Some(value) = ctx.headers.get(name) {
+                out.push(Cow::Borrowed(value.as_str()));
+            }
+        };
+        if s.has(Surfaces::PATH) {
+            out.push(Cow::Borrowed(view.path.as_ref()));
+        }
+        if s.has(Surfaces::PATH_RAW) {
+            out.push(Cow::Borrowed(ctx.path.as_str()));
+        }
+        if s.has(Surfaces::QUERY) {
+            out.push(Cow::Borrowed(view.query.as_ref()));
+        }
+        if view.body_surface_applies(s) {
+            out.push(Cow::Borrowed(view.body.as_ref()));
+        }
+        if s.has(Surfaces::XML_TEXT) && !view.xml().text.is_empty() {
+            out.push(Cow::Borrowed(view.xml().text.as_str()));
+        }
+        if s.has(Surfaces::XML_ATTRS) {
+            out.extend(view.xml().attrs.iter().map(|v| Cow::Borrowed(v.as_str())));
+        }
+        if s.has(Surfaces::ARGS_GET) {
+            out.extend(view.args_get().iter().map(|arg| Cow::Borrowed(arg.value.as_str())));
+        }
+        if s.has(Surfaces::ARGS_GET_NAMES) {
+            out.extend(view.args_get().iter().map(|arg| Cow::Borrowed(arg.name.as_str())));
+        }
+        if s.has(Surfaces::ARGS_POST) {
+            out.extend(view.args_post().iter().map(|arg| Cow::Borrowed(arg.value.as_str())));
+        }
+        if s.has(Surfaces::ARGS_POST_NAMES) {
+            out.extend(view.args_post().iter().map(|arg| Cow::Borrowed(arg.name.as_str())));
+        }
+        if s.has(Surfaces::FILES) {
+            out.extend(view.multipart_files());
+        }
+        if s.has(Surfaces::FILES_NAMES) {
+            out.extend(view.multipart_files_names());
+        }
+        if s.has(Surfaces::MULTIPART_PART_HEADERS) {
+            out.extend(view.multipart_part_headers());
+        }
+        if s.has(Surfaces::COOKIES) {
+            out.extend(cookie_values(ctx).map(Cow::Borrowed));
+        }
+        if s.has(Surfaces::COOKIE_NAMES) {
+            out.extend(cookie_names(ctx).map(Cow::Borrowed));
+        }
+        if s.has(Surfaces::HEADER_VALUES) {
+            out.extend(ctx.headers.values().map(|v| Cow::Borrowed(v.as_str())));
+        }
+        if s.has(Surfaces::USER_AGENT) {
+            header("user-agent", &mut out);
+        }
+        if s.has(Surfaces::REFERER) {
+            header("referer", &mut out);
+        }
+        out
+    }
+
     /// Apply `f` to every value this field expands to, short-circuiting on the
     /// first `true`.
     ///
     /// Values arrive as the request parser produced them; the caller applies
     /// the rule's own `t:` chain on top.
-    fn any_value(self, view: &RequestView<'_>, mut f: impl FnMut(&str) -> bool) -> bool {
+    fn any_value(&self, view: &RequestView<'_>, mut f: impl FnMut(&str) -> bool) -> bool {
         let ctx = view.ctx;
         match self {
-            Self::Multi(s) => {
-                let header = |name: &str, f: &mut dyn FnMut(&str) -> bool| ctx.headers.get(name).is_some_and(|v| f(v));
-                (s.has(Surfaces::PATH) && f(&view.path))
-                    || (s.has(Surfaces::PATH_RAW) && f(&ctx.path))
-                    || (s.has(Surfaces::QUERY) && f(&view.query))
-                    || (view.body_surface_applies(s) && f(&view.body))
-                    || (s.has(Surfaces::XML_TEXT) && !view.xml().text.is_empty() && f(&view.xml().text))
-                    || (s.has(Surfaces::XML_ATTRS) && view.xml().attrs.iter().any(|v| f(v)))
-                    || (s.has(Surfaces::ARGS_GET) && view.args_get().iter().any(|a| f(&a.value)))
-                    || (s.has(Surfaces::ARGS_GET_NAMES) && view.args_get().iter().any(|a| f(&a.name)))
-                    || (s.has(Surfaces::ARGS_POST) && view.args_post().iter().any(|a| f(&a.value)))
-                    || (s.has(Surfaces::ARGS_POST_NAMES) && view.args_post().iter().any(|a| f(&a.name)))
-                    || (s.has(Surfaces::FILES) && view.multipart_files().any(|v| f(&v)))
-                    || (s.has(Surfaces::FILES_NAMES) && view.multipart_files_names().any(|v| f(&v)))
-                    || (s.has(Surfaces::MULTIPART_PART_HEADERS) && view.multipart_part_headers().any(|v| f(&v)))
-                    || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(&mut f))
-                    || (s.has(Surfaces::COOKIE_NAMES) && cookie_names(ctx).any(&mut f))
-                    || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| f(v)))
-                    || (s.has(Surfaces::USER_AGENT) && header("user-agent", &mut f))
-                    || (s.has(Surfaces::REFERER) && header("referer", &mut f))
+            Self::Multi(s) => Self::any_surface(*s, view, &mut f),
+            // Named headers are tried after the surfaces so a rule that lists
+            // both keeps reading them in the order upstream writes them, and
+            // the header map is only probed when no surface answered.
+            Self::Named(named) => {
+                Self::any_surface(named.surfaces, view, &mut f)
+                    || named
+                        .names
+                        .iter()
+                        .any(|name| ctx.headers.get(&**name).is_some_and(|v| f(v)))
             }
             Self::Headers => ctx.headers.iter().any(|(name, value)| f(name) || f(value)),
             Self::Cookies => cookie_values(ctx).any(&mut f),
             _ => self.scalar(view).as_deref().is_some_and(f),
         }
+    }
+
+    /// [`Self::any_value`] restricted to the surface bitset — the shared half
+    /// of [`Self::Multi`] and [`Self::Named`].
+    fn any_surface(s: Surfaces, view: &RequestView<'_>, f: &mut impl FnMut(&str) -> bool) -> bool {
+        let ctx = view.ctx;
+        let header = |name: &str, f: &mut dyn FnMut(&str) -> bool| ctx.headers.get(name).is_some_and(|v| f(v));
+        (s.has(Surfaces::PATH) && f(&view.path))
+            || (s.has(Surfaces::PATH_RAW) && f(&ctx.path))
+            || (s.has(Surfaces::QUERY) && f(&view.query))
+            || (view.body_surface_applies(s) && f(&view.body))
+            || (s.has(Surfaces::XML_TEXT) && !view.xml().text.is_empty() && f(&view.xml().text))
+            || (s.has(Surfaces::XML_ATTRS) && view.xml().attrs.iter().any(|v| f(v)))
+            || (s.has(Surfaces::ARGS_GET) && view.args_get().iter().any(|a| f(&a.value)))
+            || (s.has(Surfaces::ARGS_GET_NAMES) && view.args_get().iter().any(|a| f(&a.name)))
+            || (s.has(Surfaces::ARGS_POST) && view.args_post().iter().any(|a| f(&a.value)))
+            || (s.has(Surfaces::ARGS_POST_NAMES) && view.args_post().iter().any(|a| f(&a.name)))
+            || (s.has(Surfaces::FILES) && view.multipart_files().any(|v| f(&v)))
+            || (s.has(Surfaces::FILES_NAMES) && view.multipart_files_names().any(|v| f(&v)))
+            || (s.has(Surfaces::MULTIPART_PART_HEADERS) && view.multipart_part_headers().any(|v| f(&v)))
+            || (s.has(Surfaces::COOKIES) && cookie_values(ctx).any(&mut *f))
+            || (s.has(Surfaces::COOKIE_NAMES) && cookie_names(ctx).any(&mut *f))
+            || (s.has(Surfaces::HEADER_VALUES) && ctx.headers.values().any(|v| f(v)))
+            || (s.has(Surfaces::USER_AGENT) && header("user-agent", &mut *f))
+            || (s.has(Surfaces::REFERER) && header("referer", &mut *f))
     }
 }
 
@@ -2479,7 +2638,7 @@ impl CompiledMatcher {
 }
 
 /// Where a condition reads its values from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CondField {
     /// A request surface.
     Request(Field),
@@ -2526,7 +2685,7 @@ impl Condition {
     /// nothing, and an ordinary request is answered by the first surface that
     /// fails without recording anything about the match.
     fn matches_any(&self, view: &RequestView<'_>) -> bool {
-        let CondField::Request(field) = self.field else {
+        let CondField::Request(field) = &self.field else {
             // A bare `matched_value` / `tx:N` head has nothing to read; the
             // loader rejects it, so this is unreachable in a loaded rule set.
             return false;
@@ -2549,7 +2708,7 @@ impl Condition {
     /// a time so each hit can drive the chain on its own — see
     /// [`CompiledRule::matches`].
     fn hits<'v>(&self, view: &'v RequestView<'_>) -> Vec<Cow<'v, str>> {
-        let CondField::Request(field) = self.field else {
+        let CondField::Request(field) = &self.field else {
             return Vec::new();
         };
         let empty = ChainState::default();
@@ -2591,12 +2750,12 @@ impl Condition {
     /// what `ModSecurity` puts in `MATCHED_VARS` and `TX:N`: a later link must
     /// see what its predecessor actually matched.
     fn advance<'v>(&self, view: &'v RequestView<'_>, state: &mut ChainState<'v>) -> bool {
-        let subjects: Vec<Cow<'v, str>> = match self.field {
+        let subjects: Vec<Cow<'v, str>> = match &self.field {
             CondField::Request(field) => field.collect_values(view),
             CondField::MatchedValue => std::mem::take(&mut state.matched),
             CondField::Capture(n) => state
                 .captures
-                .get(usize::from(n))
+                .get(usize::from(*n))
                 .cloned()
                 .map(Cow::Owned)
                 .into_iter()
@@ -3096,7 +3255,7 @@ impl CompiledRule {
     /// the head, because a rule whose head is `RESPONSE_STATUS`-free but which
     /// chains a `RESPONSE_BODY` link is still a `phase:4` rule.
     fn reads_response(&self) -> bool {
-        let reads = |condition: &Condition| match condition.field {
+        let reads = |condition: &Condition| match &condition.field {
             CondField::Request(field) => field.is_response(),
             CondField::MatchedValue | CondField::Capture(_) => false,
         };
@@ -3343,7 +3502,7 @@ impl Loader {
         // the schema cannot express the CRS collection-member selector, so
         // `equals` on `cookies` would silently mean "any cookie".  Chain
         // pseudo-fields are exempt — they are single values by construction.
-        if let CondField::Request(request_field) = field
+        if let CondField::Request(request_field) = &field
             && matches!(operator, "equals" | "not_in" | "gt" | "lt")
             && !request_field.is_scalar()
         {
@@ -3412,7 +3571,7 @@ impl Loader {
         // into one entry), so a comparison against anything else — or with any
         // other operator — could never be reached and is refused instead of
         // shipping a rule that never fires.
-        if let CondField::Request(Field::HeaderCount(_)) = field {
+        if let CondField::Request(Field::HeaderCount(_)) = &field {
             let reachable = match &matcher {
                 CompiledMatcher::Equals(operand) => matches!(operand.literal(), Some("0" | "1")),
                 _ => false,
@@ -5036,6 +5195,188 @@ rules:
         assert_eq!(summary.rejected_operator_ids(), vec!["BAD-OP"]);
     }
 
+    // ── `header:<name>` — the generic REQUEST_HEADERS accessor ───────────────
+
+    /// The name is carried verbatim, so the three spellings CRS lists for the
+    /// AJAX upload header stay three different fields.
+    #[test]
+    fn named_header_field_keeps_hyphen_dot_and_underscore_apart() {
+        for name in ["x-filename", "x_filename", "x.filename"] {
+            let checker = OWASPCheck::from_yaml(&single_rule_yaml(&format!("header:{name}"), "contains", "evil"));
+            assert_eq!(checker.rule_count(), 1, "header:{name} must compile");
+            assert!(
+                checker.check(&make_ctx_with_header(name, "evil.php")).is_some(),
+                "header:{name} must read {name}"
+            );
+            for other in ["x-filename", "x_filename", "x.filename"] {
+                if other == name {
+                    continue;
+                }
+                assert!(
+                    checker.check(&make_ctx_with_header(other, "evil.php")).is_none(),
+                    "header:{name} must not read {other}"
+                );
+            }
+        }
+    }
+
+    /// Precision: naming one header must not turn into scanning the others.
+    #[test]
+    fn named_header_field_reads_only_the_header_it_names() {
+        let checker = OWASPCheck::from_yaml(&single_rule_yaml("header:x-filename", "contains", "evil"));
+        for decoy in [
+            "user-agent",
+            "referer",
+            "x-forwarded-for",
+            "authorization",
+            "cookie",
+            "accept",
+        ] {
+            assert!(
+                checker.check(&make_ctx_with_header(decoy, "evil.php")).is_none(),
+                "a rule naming x-filename must not read {decoy}"
+            );
+        }
+    }
+
+    /// HTTP field names are case-insensitive; nothing else about them is.
+    #[test]
+    fn named_header_field_is_case_insensitive_on_the_name() {
+        assert_eq!(Field::parse("header:X-Filename"), Field::parse("header:x-filename"));
+        let checker = OWASPCheck::from_yaml(&single_rule_yaml("header:X-FileName", "contains", "evil"));
+        assert!(checker.check(&make_ctx_with_header("x-filename", "evil.php")).is_some());
+    }
+
+    /// A composite is a set, not a sequence: two spellings of one CRS variable
+    /// list must be one field, and a repeat must be refused the way a repeated
+    /// surface already is.
+    #[test]
+    fn named_header_composites_are_order_insensitive_and_reject_repeats() {
+        assert_eq!(
+            Field::parse("files+header:x-filename+header:x_filename"),
+            Field::parse("header:x_filename+files+header:x-filename")
+        );
+        assert_eq!(Field::parse("header:accept+header:accept"), None);
+        assert_eq!(Field::parse("header:accept+headers+headers"), None);
+    }
+
+    /// A name that is not an RFC 9110 token has no spelling, so the rule is
+    /// rejected at load time rather than reading some other header.
+    #[test]
+    fn malformed_named_header_is_rejected_not_approximated() {
+        for bad in [
+            "header:",
+            "header:x filename",
+            "header:x/filename",
+            "header:x:filename",
+            "header:x@filename",
+            "header:\"x\"",
+        ] {
+            assert_eq!(Field::parse(bad), None, "{bad} must stay unevaluable");
+            let checker = OWASPCheck::from_yaml(&single_rule_yaml(bad, "contains", "evil"));
+            assert_eq!(checker.rule_count(), 0, "{bad} must not compile");
+        }
+    }
+
+    /// Upstream does not evaluate a variable the request does not carry, and a
+    /// negated rule that ignored that would fire on every request that omits
+    /// the header — the CRS-920600 failure mode.
+    #[test]
+    fn absent_named_header_yields_no_value_even_negated() {
+        let yaml = single_rule_yaml("header:accept", "regex", "'^text/'")
+            .replace("    action: block", "    negate: true\n    action: block");
+        let checker = OWASPCheck::from_yaml(&yaml);
+        assert_eq!(checker.rule_count(), 1);
+        assert!(
+            checker.check(&make_ctx("GET", "/", 0)).is_none(),
+            "no Accept header means no value to test, so a negated rule cannot hold"
+        );
+        assert!(
+            checker.check(&make_ctx_with_header("accept", "text/html")).is_none(),
+            "a value the pattern accepts must not fire a negated rule"
+        );
+        assert!(
+            checker.check(&make_ctx_with_header("accept", "!!!")).is_some(),
+            "a value the pattern rejects must fire a negated rule"
+        );
+    }
+
+    /// CRS-933110's shape: one field over a multipart surface *and* the header
+    /// branch of the same rule. Both halves have to work, independently.
+    #[test]
+    fn named_header_composite_reads_surface_and_header() {
+        let checker = OWASPCheck::from_yaml(&single_rule_yaml("files+header:x-filename", "regex", r"'.*\.php$'"));
+        assert_eq!(checker.rule_count(), 1);
+        assert!(
+            checker
+                .check(&make_ctx_with_header("x-filename", "shell.php"))
+                .is_some()
+        );
+        let mut upload = make_ctx("POST", "/upload", 0);
+        let body = "--b\r\nContent-Disposition: form-data; name=\"f\"; filename=\"shell.php\"\r\n\r\nx\r\n--b--\r\n";
+        upload
+            .headers
+            .insert("content-type".into(), "multipart/form-data; boundary=b".into());
+        upload.body_preview = Bytes::copy_from_slice(body.as_bytes());
+        upload.content_length = body.len() as u64;
+        assert!(checker.check(&upload).is_some(), "the FILES half must still work");
+    }
+
+    /// A lone named header is one value, so a numeric comparison is meaningful
+    /// on it (CRS-920520 under `t:length`); a list of them is not.
+    #[test]
+    fn named_header_is_scalar_only_when_it_names_one_header() {
+        let one = single_rule_yaml("header:accept-encoding", "gt", "100").replace(
+            "    action: block",
+            "    transform: [lowercase, length]\n    action: block",
+        );
+        assert_eq!(OWASPCheck::from_yaml(&one).rule_count(), 1);
+        let long = "gzip, ".repeat(30);
+        let checker = OWASPCheck::from_yaml(&one);
+        assert!(checker.check(&make_ctx_with_header("accept-encoding", &long)).is_some());
+        assert!(
+            checker
+                .check(&make_ctx_with_header("accept-encoding", "gzip, deflate, br"))
+                .is_none()
+        );
+
+        let two = single_rule_yaml("header:accept-encoding+header:accept", "gt", "100");
+        assert_eq!(
+            OWASPCheck::from_yaml(&two).rule_count(),
+            0,
+            "`gt` over two headers has no single value to compare"
+        );
+        let mixed = single_rule_yaml("files+header:accept", "gt", "100");
+        assert_eq!(OWASPCheck::from_yaml(&mixed).rule_count(), 0);
+    }
+
+    /// Repeated headers arrive already folded (`gateway::fold_request_headers`),
+    /// so the accessor sees the one RFC-shaped value the origin would rebuild
+    /// and needs no folding of its own.
+    #[test]
+    fn named_header_reads_the_folded_value() {
+        let checker = OWASPCheck::from_yaml(&single_rule_yaml("header:connection", "regex", r"'close, close'"));
+        assert!(
+            checker
+                .check(&make_ctx_with_header("connection", "close, close"))
+                .is_some()
+        );
+    }
+
+    /// The countable inventory is deliberately narrower than the readable one;
+    /// making headers readable must not have widened it.
+    #[test]
+    fn generic_read_did_not_widen_the_countable_set() {
+        assert!(Field::parse("count_header_referer").is_some());
+        for name in [
+            "count_header_accept",
+            "count_header_request_range",
+            "count_header_x_filename",
+        ] {
+            assert_eq!(Field::parse(name), None, "{name} must stay uncountable");
+        }
+    }
+
     // ── A.2: load failures must not degrade silently ─────────────────────────
 
     #[test]
@@ -5322,8 +5663,11 @@ rules:
 
         assert!(summary.source_errors.is_empty(), "shipped rule set must parse cleanly");
         // 286 before the multipart parser: CRS-920120 and CRS-920121 are
-        // declared now that `FILES` / `FILES_NAMES` exist to carry them.
-        assert_eq!(summary.attempted, 288, "declared CRS rules");
+        // declared now that `FILES` / `FILES_NAMES` exist to carry them. 288
+        // before `header:<name>`: six 920 rules that read one request header by
+        // name are declared now that there is a field for them — 920210,
+        // 920275, 920310, 920520, 920521, 920600.
+        assert_eq!(summary.attempted, 294, "declared CRS rules");
         // 215 before per-parameter `ARGS`: CRS-942130 joins the set, because
         // its `TX:1 @streq %{TX.2}` capture equality is only a tautology test
         // when the head is evaluated one parameter at a time. 216 before the
@@ -5333,14 +5677,15 @@ rules:
         // 276 before the `multipart/form-data` parser: the two newly declared
         // 920 rules compile, and so do the seven that were rejected for naming
         // `FILES` / `FILES_NAMES` / `MULTIPART_PART_HEADERS` — 932180, 933110,
-        // 933111, 933220, 944140, 922120, 922130.
-        assert_eq!(summary.compiled, 285, "enforceable CRS rules");
+        // 933111, 933220, 944140, 922120, 922130. 285 before `header:<name>`:
+        // all six newly declared 920 rules compile.
+        assert_eq!(summary.compiled, 291, "enforceable CRS rules");
         assert_eq!(checker.rule_count(), summary.compiled);
         assert_eq!(summary.attempted, summary.compiled + summary.rejected.len());
 
         // The split between the two pipelines, stated so a rule that quietly
         // changes sides is a test failure rather than a coverage surprise.
-        assert_eq!(checker.request_rule_count(), 226, "request-phase rules");
+        assert_eq!(checker.request_rule_count(), 232, "request-phase rules");
         assert_eq!(checker.response_rule_count(), 59, "response-phase rules");
         assert_eq!(
             checker.request_rule_count() + checker.response_rule_count(),
@@ -5365,9 +5710,9 @@ rules:
         // `FILES` / `FILES_NAMES` and `MULTIPART_PART_HEADERS` used to be the
         // two largest sentinels here (5 rules and 2 rules). Both are now real
         // surfaces fed by the `multipart/form-data` parser, so nothing is left
-        // in either bucket. `REQUEST_HEADERS:X-Filename` and friends are still
-        // unreachable, but every rule naming one also names `FILES`, so
-        // dropping the header narrows the rule rather than losing it.
+        // in either bucket. `REQUEST_HEADERS:X-Filename` and friends used to be
+        // dropped from those same rules — narrowing them rather than losing
+        // them — and are now read by name through `Field::Named`.
         assert_eq!(by_field("unmapped_files"), 0, "FILES is parsed");
         assert_eq!(by_field("unmapped_files_names"), 0, "FILES_NAMES is parsed");
         assert_eq!(
@@ -5446,6 +5791,11 @@ rules:
                 "CRS-944120",
                 "CRS-933150",
                 "CRS-920200",
+                // Joins the set with the by-name header accessor: its head is
+                // `REQUEST_HEADERS:Accept "@rx ^$"`, and both links (`!^OPTIONS$`
+                // on the method, `!@pm` on the User-Agent) were already
+                // expressible.
+                "CRS-920310",
                 // Joins the set with the `multipart/form-data` parser: its head
                 // is `FILES @pmFromFile restricted-upload.data`, which had no
                 // field to read before.
@@ -6139,7 +6489,7 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
     fn rule_directory_load_status_is_pinned() {
         // (directory, declared, compiled)
         let expected = [
-            ("owasp-crs", 288, 285),
+            ("owasp-crs", 294, 291),
             ("advanced", 77, 75),
             ("owasp-api", 64, 61),
             ("modsecurity", 46, 40),
@@ -9175,21 +9525,28 @@ rules:
         }
         let critical = counts.get("critical").copied().unwrap_or_default();
         let warning = counts.get("warning").copied().unwrap_or_default();
+        let notice = counts.get("notice").copied().unwrap_or_default();
 
         assert_eq!(
-            critical + warning,
+            critical + warning + notice,
             checker.request_rule_count(),
-            "the enforced request set is only critical and warning rules: {counts:?}"
+            "the enforced request set is only critical, warning and notice rules: {counts:?}"
         );
-        // 216 critical / 10 warning. The scoring model changes the verdict of a
-        // lone match for the 10 only — 95% of the enforced set still blocks on a
-        // single hit — so this is a false-positive control, not a relaxation of
-        // detection. Pinned so a rule-file change that shifts the balance has to
-        // be argued for in the diff. 207 before the `multipart/form-data`
-        // parser: all nine rules it turned on are `severity: CRITICAL`
-        // upstream, which is why the ratio barely moves.
-        assert_eq!(warning, 10, "the rules that stop blocking alone: {counts:?}");
-        assert_eq!(critical, 216, "the rules that still block alone: {counts:?}");
+        // 220 critical / 11 warning / 1 notice. The scoring model changes the
+        // verdict of a lone match for the 12 low-severity rules only — 95% of
+        // the enforced set still blocks on a single hit — so this is a
+        // false-positive control, not a relaxation of detection. Pinned so a
+        // rule-file change that shifts the balance has to be argued for in the
+        // diff. 207 critical before the `multipart/form-data` parser: all nine
+        // rules it turned on are `severity: CRITICAL` upstream, which is why
+        // the ratio barely moves. 216 / 10 / 0 before `header:<name>`: of the
+        // six 920 rules it turned on, four are CRITICAL (920275, 920520,
+        // 920521, 920600), one WARNING (920210) and one is the first NOTICE in
+        // the set (920310, an empty Accept header — upstream scores it 2, below
+        // the inbound threshold, so it cannot block on its own by design).
+        assert_eq!(warning, 11, "the rules that stop blocking alone: {counts:?}");
+        assert_eq!(notice, 1, "CRS-920310, the only notice-severity rule: {counts:?}");
+        assert_eq!(critical, 220, "the rules that still block alone: {counts:?}");
 
         // The response set has its own shape and its own threshold, so it is
         // counted separately. 43 critical + 16 error, all of which reach the

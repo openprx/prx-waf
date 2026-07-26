@@ -200,3 +200,159 @@ rules:
       - owasp-crs
       - protocol-attack
     crs_id: 920460
+
+  # `REQUEST_HEADERS:Connection` — the first rule the by-name header accessor
+  # buys outright (it used to map to `header_connection`, a field
+  # `Field::parse` did not know, so the rule was refused at load time).
+  #
+  # The pattern needs two conflicting connection tokens in one value, which is
+  # a request-smuggling signature rather than something a client produces:
+  # browsers send `keep-alive`, proxies send `close` or `Upgrade`, and none of
+  # those match. Repeated `Connection` lines fold into one comma-separated
+  # value before the rule sees them, which is the helpful direction here —
+  # `close` twice is exactly the desync the rule looks for.
+  - id: CRS-920210
+    name: Multiple/Conflicting Connection Header Data Found
+    category: protocol-attack
+    severity: warning
+    paranoia: 1
+    field: header:connection
+    operator: regex
+    value: \b(?:keep-alive|close),\s?(?:keep-alive|close)\b
+    action: block
+    tags:
+      - owasp-crs
+      - protocol-attack
+    crs_id: 920210
+
+  # `REQUEST_HEADERS:Accept "@rx ^$"` — a *present but empty* Accept header.
+  #
+  # An absent Accept yields no value at all, so the rule cannot fire on the
+  # many clients that simply omit it (that case is upstream's 920300, which
+  # needs a header count and is still refused here). Both chain links must
+  # hold as well, and the last one exempts the broken CFNetwork clients
+  # upstream lists. Severity is NOTICE — 2 points, below the inbound
+  # threshold, so it cannot block on its own.
+  - id: CRS-920310
+    name: Request Has an Empty Accept Header
+    category: protocol-attack
+    severity: notice
+    paranoia: 1
+    field: header:accept
+    operator: regex
+    value: ^$
+    chain:
+      - field: method
+        operator: regex
+        value: ^OPTIONS$
+        negate: true
+      - field: user_agent
+        operator: contains_any
+        value: AppleWebKit Android Business Enterprise Entreprise
+        negate: true
+    action: block
+    tags:
+      - owasp-crs
+      - protocol-attack
+    crs_id: 920310
+
+  # `REQUEST_HEADERS:Accept-Encoding` under `t:length`. One named header is a
+  # single value, which is what makes a numeric comparison meaningful on it
+  # (`Field::is_scalar`). 100 bytes is about four times the longest thing a
+  # browser sends — `gzip, deflate, br, zstd` is 23.
+  - id: CRS-920520
+    name: Accept-Encoding header exceeded sensible length
+    category: protocol-attack
+    severity: critical
+    paranoia: 1
+    field: header:accept-encoding
+    operator: gt
+    value: 100
+    transform:
+      - lowercase
+      - length
+    action: block
+    tags:
+      - owasp-crs
+      - protocol-attack
+    crs_id: 920520
+
+  # `REQUEST_HEADERS:Accept !@rx <RFC media-type grammar>` — fires on what the
+  # pattern *rejects*, which makes it the highest-risk rule in this group:
+  # PL1, CRITICAL, blocking on its own. Two properties bound it, both
+  # structural rather than lucky:
+  #
+  #   * the engine hands the rule the raw folded header, byte for byte, so
+  #     inverting the operator does not widen the surface (see
+  #     NEGATION_FAITHFUL_VARS in rules/tools/modsec2yaml.py);
+  #   * a request with no Accept header yields no value, and a condition with
+  #     nothing to test cannot hold — which is also what ModSecurity does with
+  #     an absent variable.
+  #
+  # Probed against the Accept headers Chrome, Firefox, Safari, curl, fetch and
+  # the JSON/CSS/SSE clients send: every one satisfies the grammar and none
+  # fires. What it does reject is a charset parameter outside iso-8859-1/15,
+  # utf-8 and windows-1252, which is upstream's deliberate allow-list.
+  - id: CRS-920600
+    name: 'Illegal Accept header: charset parameter'
+    category: protocol-attack
+    severity: critical
+    paranoia: 1
+    field: header:accept
+    operator: regex
+    value: ^(?:(?:\*|[^!\"\(\),/:-\?\[-\]\{\}]+)/(?:\*|[^!\"\(\),/:-\?\[-\]\{\}]+)|\*)(?:[\s\x0b]*;[\s\x0b]*(?:charset[\s\x0b]*=[\s\x0b]*\"?(?:iso-8859-15?|utf-8|windows-1252)\b\"?|(?:[^\s\x0b-\"\(\),/:-\?\[-\]c\{\}]|c(?:[^!\"\(\),/:-\?\[-\]h\{\}]|h(?:[^!\"\(\),/:-\?\[-\]a\{\}]|a(?:[^!\"\(\),/:-\?\[-\]r\{\}]|r(?:[^!\"\(\),/:-\?\[-\]s\{\}]|s(?:[^!\"\(\),/:-\?\[-\]e\{\}]|e[^!\"\(\),/:-\?\[-\]t\{\}]))))))[^!\"\(\),/:-\?\[-\]\{\}]*[\s\x0b]*=[\s\x0b]*[^!\(\),/:-\?\[-\]\{\}]+);?)*(?:[\s\x0b]*,[\s\x0b]*(?:(?:\*|[^!\"\(\),/:-\?\[-\]\{\}]+)/(?:\*|[^!\"\(\),/:-\?\[-\]\{\}]+)|\*)(?:[\s\x0b]*;[\s\x0b]*(?:charset[\s\x0b]*=[\s\x0b]*\"?(?:iso-8859-15?|utf-8|windows-1252)\b\"?|(?:[^\s\x0b-\"\(\),/:-\?\[-\]c\{\}]|c(?:[^!\"\(\),/:-\?\[-\]h\{\}]|h(?:[^!\"\(\),/:-\?\[-\]a\{\}]|a(?:[^!\"\(\),/:-\?\[-\]r\{\}]|r(?:[^!\"\(\),/:-\?\[-\]s\{\}]|s(?:[^!\"\(\),/:-\?\[-\]e\{\}]|e[^!\"\(\),/:-\?\[-\]t\{\}]))))))[^!\"\(\),/:-\?\[-\]\{\}]*[\s\x0b]*=[\s\x0b]*[^!\(\),/:-\?\[-\]\{\}]+);?)*)*$
+    transform:
+      - lowercase
+    negate: true
+    action: block
+    tags:
+      - owasp-crs
+      - protocol-attack
+    crs_id: 920600
+
+  # `REQUEST_HEADERS:Accept-Encoding !@rx <known codings>` at PL3. Unanchored
+  # alternation, so any real coding anywhere in the value satisfies it:
+  # `gzip, deflate, br, zstd`, `identity`, `*` and an empty value all pass.
+  - id: CRS-920521
+    name: Illegal Accept-Encoding header
+    category: protocol-attack
+    severity: critical
+    paranoia: 3
+    field: header:accept-encoding
+    operator: regex
+    value: br|compress|deflate|(?:pack200-)?gzip|identity|\*|^$|aes128gcm|exi|zstd|x-(?:compress|gzip)
+    transform:
+      - lowercase
+    negate: true
+    action: block
+    tags:
+      - owasp-crs
+      - protocol-attack
+    crs_id: 920521
+
+  # `REQUEST_HEADERS:Sec-Fetch-User|REQUEST_HEADERS:Sec-CH-UA-Mobile` at PL4 —
+  # two named headers in one field, evaluated one at a time exactly as
+  # upstream evaluates the two collection members.
+  #
+  # The anchored `^(?:\?[01])?$` is the entire grammar those two headers have,
+  # so a conforming client always satisfies it. The one way this can diverge
+  # from upstream is a *repeated* header: two `Sec-Fetch-User: ?1` lines are
+  # two passing members upstream and one folded `?1, ?1` here, which fails.
+  # No client sends either header twice, and the divergence points at
+  # detecting a duplicate rather than at missing one.
+  - id: CRS-920275
+    name: Invalid character in request headers (outside of very strict set)
+    category: protocol-attack
+    severity: critical
+    paranoia: 4
+    field: header:sec-ch-ua-mobile+header:sec-fetch-user
+    operator: regex
+    value: ^(?:\?[01])?$
+    transform:
+      - urlDecodeUni
+    negate: true
+    action: block
+    tags:
+      - owasp-crs
+      - protocol-attack
+    crs_id: 920275

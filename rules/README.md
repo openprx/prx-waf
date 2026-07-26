@@ -280,14 +280,43 @@ rules:
 | `header_referer`   | Referer header only                                |
 | `header_host`      | Host request header only (not the matched vhost)   |
 | `header_range`     | Range header only                                  |
+| `header:<name>`    | One request header, named (`REQUEST_HEADERS:<name>`) |
 | `all`              | Path, query, body, cookies and every header value  |
+
+#### `header:<name>` — one named request header
+
+`header:x-filename` reads exactly the `X-Filename` header and nothing else. The
+name is matched case-insensitively, as HTTP requires, and in **no other** way:
+`header:x-filename`, `header:x_filename` and `header:x.filename` are three
+different fields, because `X-Filename`, `X_Filename` and `X.Filename` are three
+different headers — CRS-933110 names all three, since the AJAX uploaders that
+send a file name out of band disagree about the spelling.
+
+A header the request does not carry produces **no value at all**, not an empty
+one. That is what `ModSecurity` does with an absent variable, and it is what
+keeps a negated rule (`negate: true`) off every request that omits the header
+rather than firing on all of them.
+
+Repeated header lines are already folded into one RFC-shaped value by the
+gateway before any rule runs (`fold_request_headers`: `; ` for `Cookie`, `, `
+for everything else, bounded by `MAX_HEADER_VALUES_PER_NAME` /
+`MAX_FOLDED_HEADER_BYTES`), so the accessor sees the same string the origin
+would reconstruct.
+
+A name that is not an RFC 9110 `token` — or that contains a `+`, which the
+composite grammar uses as its separator — is rejected at load time. Reading the
+*count* of a header is a different field (`count_header_<name>`) with a
+deliberately narrower inventory.
 
 #### Composite fields
 
 A rule that must read several places at once names them joined with `+`, in
 this order: `path`, `query`, `body`, `cookies`, `headers`, `user_agent`,
-`referer` — for example `query+body+cookies`. `all` is exactly
-`path+query+body+cookies+headers`.
+`referer`, then any `header:<name>` in alphabetical order — for example
+`query+body+cookies` or `files+header:x-filename+header:x_filename`. `all` is
+exactly `path+query+body+cookies+headers`; a field that names a header
+individually never collapses to `all`, since singling a header out is the
+opposite of asking for the whole request.
 
 Reach for the narrowest list that covers the rule. `all` walks **every request
 header value**, and a pattern that is safe on arguments is often not safe

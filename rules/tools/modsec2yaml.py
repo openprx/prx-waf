@@ -208,13 +208,78 @@ FIELD_SURFACES = {
 # single label.
 FIELD_SURFACE = {field: surfaces[0] for field, surfaces in FIELD_SURFACES.items()}
 
+# ── Individually named request headers ────────────────────────────────────────
+#
+# `REQUEST_HEADERS:X-Filename` is not a surface: `Surfaces` in owasp.rs is a
+# bitset over a closed list of places, and a header name is an open set of keys
+# into one of them.  The engine spells such a field `header:<name>` and lets it
+# share a `+` list with ordinary surfaces, because upstream writes both kinds
+# into one variable list (CRS-933110 is
+# `FILES|REQUEST_HEADERS:X-Filename|REQUEST_HEADERS:X_Filename|…`).
+#
+# The name is carried through **verbatim**, lower-cased and nothing else.  The
+# old `header_<name>` spelling mapped `-` to `_`, which silently made
+# `X-Filename` and `X_Filename` the same field — two different headers that
+# CRS names separately in the same rule, precisely because both exist in the
+# wild.
+HEADER_TOKEN = "header:"
+
+# RFC 9110 §5.6.2 `token`, minus `+` (the composite separator).  A header name
+# outside this set cannot be spelled as a field, so it becomes a sentinel and
+# is named in the startup WARN rather than approximated.
+HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*.^_`|~-]+$")
+
+# Headers that already have an engine field of their own.  Those spellings stay
+# in use so this change moves no existing rule, and so there is exactly one
+# spelling per meaning in the emitted YAML.
+DEDICATED_HEADER_FIELDS = {
+    "user-agent": "user_agent",
+    "content-type": "content_type",
+    "content-length": "content_length",
+    "referer": "header_referer",
+    "host": "header_host",
+    "range": "header_range",
+}
+
+# The subset of the above that really is the raw header, byte for byte.
+# `content_length` is not: it is the gateway's declared-body-size `u64`, which
+# reads `0` for a request that carries no `Content-Length` at all.  The
+# difference only matters under negation — see `_negation_is_faithful`.
+RAW_HEADER_FIELDS = frozenset(
+    field for header, field in DEDICATED_HEADER_FIELDS.items() if header != "content-length"
+)
+
+
+def _named_header_field(name: str) -> str | None:
+    """`header:<name>` for a header the engine can read by name, else `None`."""
+    name = name.strip().lower()
+    return HEADER_TOKEN + name if HEADER_NAME_RE.match(name) else None
+
+
+def _is_named_header(field: str) -> bool:
+    return field.startswith(HEADER_TOKEN)
+
+
+def _is_engine_field(field: str) -> bool:
+    """`True` when the engine has an accessor for this field name."""
+    return field in ENGINE_FIELDS or _is_named_header(field)
+
 
 def _surface_field(surfaces) -> str:
-    """Canonical field name for a set of surfaces."""
+    """Canonical field name for a set of surfaces.
+
+    `surfaces` may contain `header:<name>` pseudo-surfaces alongside the real
+    ones; they are emitted last, sorted, so one variable list has exactly one
+    spelling.  Their presence also suppresses the `all` collapse: `all` means
+    "the whole request" and a rule that singles out a header is saying the
+    opposite.
+    """
     remaining = set(surfaces)
+    headers = sorted(s for s in remaining if _is_named_header(s))
+    remaining -= set(headers)
     if not remaining:
-        return "all"
-    if remaining == {"path", "query", "body", "cookies", "headers"}:
+        return "+".join(headers) if headers else "all"
+    if not headers and remaining == {"path", "query", "body", "cookies", "headers"}:
         return "all"
 
     # Collapse `args_get`+`args_post` into `args` (and the names pair likewise)
@@ -228,10 +293,10 @@ def _surface_field(surfaces) -> str:
         named[atom] = SURFACE_ORDER.index(atom)
 
     ordered = [name for name, _ in sorted(named.items(), key=lambda item: item[1])]
-    if len(ordered) == 1:
+    if len(ordered) == 1 and not headers:
         single = {"headers": "headers", "user_agent": "user_agent", "referer": "header_referer"}
         return single.get(ordered[0], ordered[0])
-    return "+".join(ordered)
+    return "+".join(ordered + headers)
 
 
 def _sentinel(var: str) -> str:
@@ -271,10 +336,10 @@ def map_variables(var_str: str) -> str:
     if any(f == "tx" for f in fields):
         return "tx"
 
-    supported = [f for f in fields if f in ENGINE_FIELDS]
+    supported = [f for f in fields if _is_engine_field(f)]
     if not supported:
         # Nothing in this rule is reachable.  Name the first gap.
-        return next(f for f in fields if f not in ENGINE_FIELDS)
+        return next(f for f in fields if not _is_engine_field(f))
 
     # Variables the engine cannot reach are simply not scanned.  Dropping them
     # narrows the rule, which is safe; widening to cover them is not.
@@ -283,7 +348,12 @@ def map_variables(var_str: str) -> str:
 
     surfaces = set()
     for field in fields:
-        if field not in ENGINE_FIELDS:
+        if not _is_engine_field(field):
+            continue
+        # A named header is its own pseudo-surface: it carries the header name,
+        # which no bitset entry can.
+        if _is_named_header(field):
+            surfaces.add(field)
             continue
         surfaces.update(FIELD_SURFACES.get(field, ()))
     if not surfaces:
@@ -380,20 +450,27 @@ def _single_var_map(v: str) -> str:
         return "body"
     if v == "REQUEST_METHOD":
         return "method"
-    if v == "REQUEST_HEADERS:USER-AGENT":
-        return "user_agent"
-    # Headers the engine exposes under a name of its own rather than as
-    # `header_<name>`.
-    if v == "REQUEST_HEADERS:CONTENT-LENGTH":
-        return "content_length"
-    if v == "REQUEST_HEADERS:CONTENT-TYPE":
-        return "content_type"
     if v.startswith("REQUEST_HEADERS:"):
-        # Specific header.  `header_<name>` is only evaluable for the handful
-        # of headers `Field::parse` knows; the rest are rejected by name, which
-        # is exactly the signal a maintainer needs.
-        header = v[len("REQUEST_HEADERS:"):].lower().replace("-", "_")
-        return f"header_{header}"
+        # One named header.
+        #
+        # Six of them predate the generic accessor and keep their own field
+        # name so this mapping moves no existing rule; `content_length` is in
+        # that list even though it is *not* the raw header (it is the gateway's
+        # declared-body-size `u64`), because every emitted rule that reads it
+        # was written and measured against that field.
+        #
+        # Everything else becomes `header:<name>`, carrying the name verbatim.
+        # A name that is not an RFC 9110 `token` — a `REQUEST_HEADERS:/regex/`
+        # selector, say — has no spelling, so it falls through to the sentinel
+        # at the end of this function and is named in the startup WARN.
+        header = v[len("REQUEST_HEADERS:"):].lower()
+        dedicated = DEDICATED_HEADER_FIELDS.get(header)
+        if dedicated:
+            return dedicated
+        named = _named_header_field(header)
+        if named:
+            return named
+        return _sentinel(v)
     if v in ("REQUEST_HEADERS", "REQUEST_HEADERS_NAMES"):
         return "headers"
     if v.startswith("REQUEST_COOKIES_NAMES"):
@@ -505,13 +582,32 @@ def _single_var_map(v: str) -> str:
 # has to be given back, deleting the two names below is the whole change: the
 # rule reverts to an `unmapped_negated_files_files_names` sentinel and is
 # refused at load time with a startup WARN, exactly as it was before.
+#
+# ── Any named header, and the one way that can still diverge ────────────────
+#
+# The list below no longer has to enumerate headers: `REQUEST_HEADERS:<name>`
+# is faithful for *every* name, because the engine hands the rule the folded
+# header value undecoded, which is the same byte string ModSecurity puts in the
+# collection member.  `_negation_is_faithful` therefore accepts any named
+# header whose field is `header:<name>` or one of the five dedicated spellings
+# that read the raw header.
+#
+# `REQUEST_HEADERS:Content-Length` remains excluded, for the reason given
+# above: its field is the gateway's `u64`, not the header.
+#
+# The one residual divergence is **repeated** headers.  ModSecurity gives the
+# rule one member per line; the engine folds the lines into one RFC-shaped
+# value (`gateway::context::fold_request_headers`).  Under a negated operator
+# that is a widening: two `Sec-Fetch-User: ?1` lines are two members upstream,
+# each satisfying CRS-920275's `^(?:\?[01])?$`, while the engine tests
+# `?1, ?1`, which does not.  It is bounded — it needs a repeated header, and
+# the headers CRS negates (`Accept`, `Accept-Encoding`, `Sec-Fetch-User`,
+# `Sec-CH-UA-Mobile`) are single-valued in every client that sends them — and
+# it points at *detecting* a duplicated header rather than at missing one, so
+# it is accepted rather than papered over with a per-header allow-list that
+# would go stale on the next CRS re-sync.
 NEGATION_FAITHFUL_VARS = {
     "REQUEST_METHOD",
-    "REQUEST_HEADERS:CONTENT-TYPE",
-    "REQUEST_HEADERS:USER-AGENT",
-    "REQUEST_HEADERS:REFERER",
-    "REQUEST_HEADERS:HOST",
-    "REQUEST_HEADERS:RANGE",
     "RESPONSE_STATUS",
     "FILES",
     "FILES_NAMES",
@@ -522,7 +618,17 @@ def _negation_is_faithful(var_str: str) -> bool:
     """`True` when inverting the operator over `var_str` cannot widen the rule."""
     parts = [p.strip() for p in var_str.strip().strip('"').split("|") if p.strip()]
     positives = [p.upper() for p in parts if not p.startswith("!")]
-    return bool(positives) and all(p in NEGATION_FAITHFUL_VARS for p in positives)
+    if not positives:
+        return False
+    return all(p in NEGATION_FAITHFUL_VARS or _reads_raw_header(p) for p in positives)
+
+
+def _reads_raw_header(var: str) -> bool:
+    """`True` when `var` is a named header the engine reads byte for byte."""
+    if not var.startswith("REQUEST_HEADERS:"):
+        return False
+    field = _single_var_map(var)
+    return _is_named_header(field) or field in RAW_HEADER_FIELDS
 
 
 # ── Operator mapping ──────────────────────────────────────────────────────────
@@ -838,6 +944,23 @@ SECRULE_CHILD_RE = re.compile(
 )
 
 
+# Operators whose operand the engine reads as an integer (`int_value` in
+# owasp.rs), not as a string.  Emitting `value: '100'` for one of them is a
+# load-time rejection — which is how CRS-920520 was lost the moment its field
+# became readable, having never been reachable before.
+NUMERIC_OPERATORS = {"gt", "lt", "ge", "le"}
+
+
+def _typed_value(operator: str, value):
+    """The operand as the engine's schema expects it for `operator`."""
+    if operator in NUMERIC_OPERATORS and isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return value
+    return value
+
+
 class ChainUnsupported(Exception):
     """A chain condition this converter cannot express faithfully.
 
@@ -913,7 +1036,7 @@ def _map_chain_variables(var_str: str) -> str:
     field = map_variables(var_str)
     if field == "tx":
         raise ChainUnsupported("tx_variable")
-    if field not in ENGINE_FIELDS and "+" not in field:
+    if not _is_engine_field(field) and "+" not in field:
         raise ChainUnsupported("variable")
     return field
 
@@ -994,7 +1117,11 @@ def _per_member_only(field: str) -> str | None:
         return None
     atoms = set()
     for token in field.split("+"):
-        mapped = FIELD_SURFACES.get(token)
+        # A named header is one value, not a collection of members, so it is a
+        # known atom that simply never survives the `PER_MEMBER_SURFACES`
+        # filter below — unlike an unknown token, which means the caller must
+        # refuse rather than narrow.
+        mapped = (token,) if _is_named_header(token) else FIELD_SURFACES.get(token)
         if mapped is None:
             return None
         atoms.update(mapped)
@@ -1068,7 +1195,7 @@ def build_chain(head_field: str, head_operator: str, head_value: str, head_opts:
         if "%{" in value and bound_source is not None:
             used_providers.add(bound_source)
 
-        condition = {"field": field, "operator": operator, "value": value}
+        condition = {"field": field, "operator": operator, "value": _typed_value(operator, value)}
         # A chain child carries its own `t:` list; `ModSecurity` does not
         # propagate the chain starter's transformations to the links, and CRS
         # relies on that (CRS-920200's starter is untransformed while its link
@@ -1216,7 +1343,7 @@ def extract_rule(variables: str, operator_str: str, opts: dict,
         "paranoia": paranoia,
         "field":    field,
         "operator": operator,
-        "value":    value,
+        "value":    _typed_value(operator, value),
         # Ordered `t:` chain, `t:none` already applied.  Absent when the rule
         # declares no transformation, which in `ModSecurity` means the value is
         # matched exactly as the parser produced it.
