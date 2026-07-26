@@ -159,12 +159,59 @@
     "  log PL4 — i.e. wherever 933111 is actually in scope, it still detects them,",
     "  now through `FILES` as upstream does.",
     "",
-    "Nothing else changed in any bucket at any level in either mode."
+    "Nothing else changed in any bucket at any level in either mode.",
+    "",
+    "`XML:/*` STOPPED MEANING `body` — the change this recording measures. The",
+    "converter mapped every `XML:` variable onto the whole-`body` surface, so 154",
+    "of the 167 rules that carried `body` got there through `XML:/*` and nothing",
+    "else. Upstream those rules see a body ONLY when ModSecurity selected the XML",
+    "body processor for its Content-Type (modsecurity.conf rule 200000); here they",
+    "were reading every JSON, plain-text and arbitrary-content-type body in full.",
+    "`XML:/*` and `XML://@*` now have surfaces of their own, and the JSON and",
+    "multipart body processors fill `ARGS_POST` the way upstream's do — which is",
+    "where upstream's coverage of those bodies actually comes from. The thirteen",
+    "rules that name `REQUEST_BODY` upstream keep the `body` surface unchanged.",
+    "",
+    "log mode  2779 / 3742 / 4222  ->  2782 / 3746 / 4229   (+3 / +4 / +7)",
+    "cloud     3213 / 3756 / 4000  ->  3122 / 3657 / 3999   (-91 / -99 / -1)",
+    "",
+    "LOG MODE GAINED AND LOST NOTHING. Set-diffed over test ids against a full",
+    "re-measurement of the pre-change binary on this host, which reproduced every",
+    "figure and every bucket in this file exactly: ZERO tests went from pass to",
+    "fail at PL1, PL2 or PL4. The gains are 931100-3, 932140-158 (an over-block",
+    "that stopped firing), 944150-16 at every level, plus 944151-16 (PL2+),",
+    "932190-5/-6 and 944152-16 at PL4.",
+    "",
+    "CLOUD LOST 91 / 99 / 1 AND NOT ONE OF THEM IS A DETECTION. Cross-checked",
+    "test by test against log mode: of the 105 / 114 / 19 tests that went pass ->",
+    "fail, 104 / 109 / 14 were ALREADY FAILING IN LOG MODE both before and after",
+    "— the rule under test never fired either way, so their cloud pass was a 403",
+    "from some unrelated rule, exactly the artefact the header above warns about.",
+    "194 of them are 944300 (a PL3 rule) and 944210 (PL2) scored at PL1/PL2 where",
+    "they cannot fire, and the rest are rules this engine does not convert at all",
+    "(920420, 920640, 920400). The remaining 1 / 5 / 5 still PASS in log mode",
+    "before and after: they are the response-phase 954100/954101/955260/956110",
+    "tests, which cloud cannot see because response inspection defaults to",
+    "observe, plus 922110-30 at PL4.",
+    "",
+    "922110-30 is the one genuinely new over-block, and it is upstream's too: a",
+    "multipart part named `jsondata` carrying `{\"test\": \"data\"}` is an ARGS",
+    "member under upstream's MULTIPART processor and now under this one, and the",
+    "PL3/PL4 special-character counters 942431/942432/942460 count its braces and",
+    "quotes. The test only asserts that 922110 does not fire, which it does not —",
+    "log mode passes it before and after.",
+    "",
+    "Over-blocks fell in both modes and at every level: log 26/32/34 -> 25/31/33,",
+    "cloud 95/248/311 -> 86/235/298. On a live enforcing WAF the effect is larger",
+    "than the corpus shows, because the corpus has few benign structured bodies:",
+    "nine benign probes (JSON, nested JSON, plain text, XML, urlencoded, two",
+    "multipart shapes, query) scored 1 / 6 / 6 blocked at PL1 / PL2 / PL4 before",
+    "and 0 / 3 / 4 after, with all ten attack probes still blocked at every level."
   ],
   "crs_version": "v4.25.0",
   "go_ftw_version": "v1.3.0",
   "recorded_at": "2026-07-26",
-  "recorded_from": "ed275d7's engine changes applied to 4ca40bf (file part content withheld from the parameter surface); the pre-change side is 4ca40bf itself, fully re-measured on the same host and identical to the figures this file previously stored. Not literally the ed275d7 tree: the two binaries were built before 4dc3b8b (jsonwebtoken 11, wasmtime 47) landed, so they carry 4ca40bf's dependency set. Neither crate participates in rule evaluation, so the figures hold — but this file exists to be reproducible, and reproducing it means checking out 4ca40bf and applying ed275d7's diff to crates/waf-engine, not checking out ed275d7.",
+  "recorded_from": "835f61e's engine and rule changes applied to 62c75bd (request bodies routed through upstream's body-processor table); the pre-change side is 62c75bd itself, fully re-measured on the same host and identical - passed AND every bucket - to the figures this file previously stored. Not literally the 835f61e tree: it also carries 400a442's admin-surface work, which touches no crate the request path uses. Reproduce by checking out 62c75bd and applying 835f61e's diff to crates/waf-engine and rules/.",
   "tolerance": 5,
   "modes": {
     "log": {
@@ -172,40 +219,40 @@
       "results": {
         "PL1": {
           "run": 4674,
-          "passed": 2779,
-          "failed": 1895,
-          "pass_rate": 59.46,
+          "passed": 2782,
+          "failed": 1892,
+          "pass_rate": 59.52,
           "buckets": {
             "not-implemented": 211,
             "paranoia-scope": 1513,
-            "over-block": 26,
-            "missed-detection": 144,
+            "over-block": 25,
+            "missed-detection": 142,
             "harness": 1
           }
         },
         "PL2": {
           "run": 4674,
-          "passed": 3742,
-          "failed": 932,
-          "pass_rate": 80.06,
+          "passed": 3746,
+          "failed": 928,
+          "pass_rate": 80.15,
           "buckets": {
             "not-implemented": 211,
             "paranoia-scope": 494,
-            "over-block": 32,
-            "missed-detection": 194,
+            "over-block": 31,
+            "missed-detection": 191,
             "harness": 1
           }
         },
         "PL4": {
           "run": 4674,
-          "passed": 4222,
-          "failed": 452,
-          "pass_rate": 90.33,
+          "passed": 4229,
+          "failed": 445,
+          "pass_rate": 90.48,
           "buckets": {
             "not-implemented": 211,
             "paranoia-scope": 0,
-            "over-block": 34,
-            "missed-detection": 206,
+            "over-block": 33,
+            "missed-detection": 200,
             "harness": 1
           }
         }
@@ -216,40 +263,40 @@
       "results": {
         "PL1": {
           "run": 4674,
-          "passed": 3213,
-          "failed": 1461,
-          "pass_rate": 68.74,
+          "passed": 3122,
+          "failed": 1552,
+          "pass_rate": 66.8,
           "buckets": {
-            "not-implemented": 208,
-            "paranoia-scope": 976,
-            "over-block": 95,
+            "not-implemented": 211,
+            "paranoia-scope": 1073,
+            "over-block": 86,
             "missed-detection": 181,
             "harness": 1
           }
         },
         "PL2": {
           "run": 4674,
-          "passed": 3756,
-          "failed": 918,
-          "pass_rate": 80.36,
+          "passed": 3657,
+          "failed": 1017,
+          "pass_rate": 78.24,
           "buckets": {
-            "not-implemented": 195,
-            "paranoia-scope": 286,
-            "over-block": 248,
-            "missed-detection": 188,
+            "not-implemented": 207,
+            "paranoia-scope": 381,
+            "over-block": 235,
+            "missed-detection": 193,
             "harness": 1
           }
         },
         "PL4": {
           "run": 4674,
-          "passed": 4000,
-          "failed": 674,
-          "pass_rate": 85.58,
+          "passed": 3999,
+          "failed": 675,
+          "pass_rate": 85.56,
           "buckets": {
-            "not-implemented": 182,
+            "not-implemented": 195,
             "paranoia-scope": 0,
-            "over-block": 311,
-            "missed-detection": 180,
+            "over-block": 298,
+            "missed-detection": 181,
             "harness": 1
           }
         }
