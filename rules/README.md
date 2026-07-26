@@ -382,7 +382,7 @@ compile errors, and the rule is dropped with `InvalidRegex` at startup.
 |---------------------------|-----------------------------------------------------------------------------------|
 | `block` / `score`         | Add this rule's severity to the anomaly score, keep evaluating (upstream `block`) |
 | `deny` / `drop` / `reject`| Block immediately, whatever the score is                                          |
-| `log` / `pass` / `alert`  | Record the match, contribute nothing — **see [`action: log` is silent](#action-log-is-silent)** |
+| `log` / `pass` / `alert`  | Evaluate the rule, write every match to the audit log, contribute **no** score — see [Observing a rule without enforcing it](#observing-a-rule-without-enforcing-it) |
 
 `block` does **not** mean "deny". It means what `SecDefaultAction` says
 upstream, which for CRS is "add to the score and continue". Whether it ends in
@@ -451,11 +451,14 @@ rules:
 
 ### Tips for Good Rules
 
-- **`action: log` is not an observation mode today** — it writes one `debug!`
-  line, contributes no score and produces no audit-log row. See
-  [`action: log` is silent](#action-log-is-silent). Until that changes, "log
-  first" has to mean replaying traffic against the rule offline, not shipping
-  it as `log` and watching.
+- **`action: log` is a real observation mode.** The rule is evaluated exactly
+  as a `block` rule is, every match is written to the rule-hit audit log with
+  `score 0`, and nothing is added to the anomaly score — so the rule can be
+  watched in production without it blocking anything or helping another rule
+  reach the threshold. See
+  [Observing a rule without enforcing it](#observing-a-rule-without-enforcing-it).
+  The audit log has to be switched on (`[audit_log] enabled = true`) for the
+  matches to land anywhere durable.
 - **Prefer `severity` over `action` to soften a rule.** A `warning` (3) rule
   needs a second hit to reach the inbound threshold of 5, which is the
   gradient CRS is built on; `critical` (5) is an unconditional block dressed
@@ -640,7 +643,9 @@ balancer):
 
 A `0 / 52` is not a clean bill of health: 104 of the 275 rules are
 `action: log`, which contributes no score and therefore cannot appear as a
-block (see [`action: log` is silent](#action-log-is-silent) below).
+block at all. Those 104 are now *visible* in the audit log — see
+[Observing a rule without enforcing it](#observing-a-rule-without-enforcing-it)
+— but this measurement predates that and counts blocks only.
 
 ### Confirmed against a running WAF
 
@@ -700,21 +705,53 @@ These bit the audited rules repeatedly. Each is verified against the engine, not
   It is not "a strong signal that contributes to a score"; it is a 403 on the
   first match.
 
-### `action: log` is silent
+### Observing a rule without enforcing it
 
-`RuleAction::Log` writes one `debug!` line and returns
-(`crates/waf-engine/src/checks/owasp.rs:3593-3598`). It contributes no score,
-and — because the audit log is built from the scoring contributions
-(`record_audit`, `owasp.rs:3621`) — it produces **no audit-log record and no
-`security_events` row**. At the default log level it produces nothing at all.
+A rule that matches contributes to the anomaly score, and the request is blocked
+when the total reaches the threshold. There are two ways to keep a rule running
+without letting it do that, and they are not the same thing.
 
-So the advice under [Tips for Good Rules](#tips-for-good-rules) — "start with
-`action: log`, monitor before blocking" — does not currently work for
-YAML rules. Nothing takes that branch today: all 288 shipped `owasp-crs/`
-rules are `action: block`. Anyone enabling one of the audited directories in
-"observe mode" would be observing silence, which is why 104 `action: log`
-rules across those directories have never produced a single false-positive
-report. Pinned by `log_action_contributes_no_score_and_no_audit_record`.
+**`action: log` in the rule file.** `RuleAction::Log` evaluates the rule
+normally, writes one `[ref "<rule id>"] … [score "0"]` line to the rule-hit
+audit log for every match, and adds nothing to the score
+(`crates/waf-engine/src/checks/owasp.rs`, the `Log` arm of `evaluate_rules`).
+It cannot block on its own and it cannot help another rule reach the threshold.
+Pinned by `log_action_is_recorded_in_the_audit_log_and_never_scores`.
+
+This used to be genuinely silent: the `Log` arm produced a `debug!` and no
+contribution, `record_audit` builds its rows from the contributions, and so a
+matching `log` rule left no audit-log row, no `security_events` row, and at the
+default log level nothing at all. "Start with `action: log`, monitor before
+blocking" was an instruction to watch silence. It is not any more, but the
+audit log is off by default — set `[audit_log] enabled = true` (and a `path`)
+or the matches have nowhere to go.
+
+**An operator override, no file edit.** The same downgrade is available at
+runtime for any loaded CRS rule, through `rule_overrides`:
+
+```bash
+# stop CRS-942100 scoring, keep recording every match
+prx-waf rules disable CRS-942100 --log-only --note "measuring FPs on /search"
+
+# ... or for one host only
+prx-waf rules disable CRS-942100 --log-only --host shop-prod
+
+# put it back
+prx-waf rules enable CRS-942100 --clear
+```
+
+or `POST /api/rules/overrides` with `{"rule_id": "CRS-942100",
+"action_override": "log"}`, which takes effect on the running proxy
+immediately — the CLI writes to the database and needs a
+`POST /api/rules/reload` (or a restart) before a running process picks it up.
+`prx-waf rules list` shows the effective state of every enforced rule.
+
+**Disabling is not observing.** `prx-waf rules disable CRS-942100` without
+`--log-only`, or `{"enabled": false}`, means the rule is *not evaluated*: it
+cannot match, cannot score, and produces no log line of any kind. That is a
+detection this WAF stops performing, and it is the right tool only when the
+rule is wrong for this deployment — not when you want to find out whether it
+is. Reach for `--log-only` first.
 
 ---
 
@@ -762,8 +799,10 @@ Contributions are welcome. Please follow these guidelines:
    python tools/validate.py rules/
    ```
 
-4. **Do not introduce false positives** — test new rules against real traffic
-   logs with `action: log` before switching to `action: block`.
+4. **Do not introduce false positives** — run the rule with `action: log`
+   against real traffic first and read the audit log, then switch it to
+   `action: block`. See
+   [Observing a rule without enforcing it](#observing-a-rule-without-enforcing-it).
 
 5. **Document your rule** — use inline YAML comments (`#`) to explain
    the threat, the pattern rationale, and any known limitations.
@@ -783,5 +822,9 @@ If a rule incorrectly blocks legitimate traffic:
 1. Identify the rule ID from the WAF log.
 2. Open an issue with the rule ID, the blocked request (sanitized), and the
    application context.
-3. Consider raising the rule's `paranoia` level as an interim mitigation
-   while a fix is prepared.
+3. As an interim mitigation, downgrade the rule to record-only rather than
+   removing it: `prx-waf rules disable <RULE-ID> --log-only`, or
+   `POST /api/rules/overrides` with `{"action_override": "log"}`. Scope it to
+   the affected host with `--host <code>` if only one application is hitting
+   it. Raising the rule's `paranoia` level in the file works too, but it is a
+   change to the shipped rule set rather than to this deployment.

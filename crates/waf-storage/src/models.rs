@@ -210,6 +210,65 @@ pub struct UpdateBotPattern {
     pub enabled: Option<bool>,
 }
 
+/// Operator override for one loaded OWASP CRS rule (`rule_overrides`).
+///
+/// Subtractive, unlike [`BotPattern`]: a row here cannot add a rule, only
+/// switch one of the compiled CRS rules off or downgrade it to record-only. The
+/// scope is the `hosts` row named by [`Self::host_id`], or every host when it is
+/// null.
+///
+/// [`Self::host_code`] is joined in rather than stored: the request path
+/// identifies a host by its code (`HostConfig::code`), the 0007 schema keys this
+/// table by the `hosts` UUID, and the engine needs the code. Doing the join here
+/// keeps that translation in one place.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct RuleOverride {
+    pub id: i32,
+    /// Engine rule id (`CRS-942100`) or the bare upstream number (`942100`).
+    pub rule_id: String,
+    /// `hosts.id`, or `None` for an override that applies to every host.
+    pub host_id: Option<Uuid>,
+    /// `hosts.code` for [`Self::host_id`]. Not a column — see the type docs.
+    pub host_code: Option<String>,
+    /// `Some(false)` switches the rule off. `None` inherits.
+    pub enabled: Option<bool>,
+    /// `log` (evaluate and record, contribute no score) or `block` (restore the
+    /// declared action). `None` inherits.
+    pub action_override: Option<String>,
+    /// Why the operator made this change. Free text, shown in the admin UI.
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Create/replace a rule override.
+///
+/// Upsert semantics on `(rule_id, host_id)`: an operator changing their mind
+/// about a rule is editing one decision, not accumulating rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRuleOverride {
+    pub rule_id: String,
+    /// `hosts.code` to scope this to, or `None` for every host.
+    pub host_code: Option<String>,
+    pub enabled: Option<bool>,
+    pub action_override: Option<String>,
+    pub note: Option<String>,
+}
+
+/// Replace the decision an existing override carries.
+///
+/// A **replacement**, not a patch: an absent field is stored as null, because
+/// null is a meaningful value here (`enabled = null` means "inherit") and a
+/// COALESCE-style patch would make it unreachable. The scope (`rule_id`,
+/// `host_id`) is not editable — retargeting an override is deleting one and
+/// creating another.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateRuleOverride {
+    pub enabled: Option<bool>,
+    pub action_override: Option<String>,
+    pub note: Option<String>,
+}
+
 /// Hotlink configuration entry
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct HotlinkConfig {

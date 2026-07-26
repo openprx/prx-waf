@@ -17,9 +17,10 @@ use waf_common::config::{ApiConfig, AppConfig, ConfigError, SecurityConfig, appl
 use waf_engine::checks::ResponseCheckSet;
 use waf_engine::{
     BUILTIN_BAD_BOTS, BUILTIN_GOOD_BOTS, BotAction, BotCheck, CrowdSecClient, CrowdSecConfig, EnforcementMode,
-    ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource, MAX_USER_PATTERNS, RuleManager,
-    RuntimeContentSecurityConfig, UserBotPattern, WafEngine, WafEngineConfig, XdbUpdater, cache_policy_from_str,
-    init_community, init_crowdsec, spawn_auto_updater, spawn_ip_feed_sync, validate_user_pattern,
+    ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource, MAX_USER_PATTERNS, OWASPCheck, RuleManager,
+    RuleOverrideSpec, RuleState, RuntimeContentSecurityConfig, UserBotPattern, WafEngine, WafEngineConfig, XdbUpdater,
+    cache_policy_from_str, init_community, init_crowdsec, spawn_auto_updater, spawn_ip_feed_sync,
+    validate_user_pattern,
 };
 use waf_storage::Database;
 
@@ -157,29 +158,60 @@ enum CrowdSecCommands {
 /// Rule management sub-commands
 #[derive(Subcommand, Debug)]
 enum RulesCommands {
-    /// List all loaded rules
+    /// List the OWASP CRS rules this build enforces, with their effective state
     List {
-        /// Filter by category (sqli, xss, rce, bot, scanner, …)
+        /// Filter by category (sqli, xss, rce, lfi, rfi, …)
         #[arg(long)]
         category: Option<String>,
-        /// Filter by source (owasp, builtin-bot, builtin-scanner, custom, …)
+        /// Filter by source file (substring of the path, e.g. "sqli")
         #[arg(long)]
         source: Option<String>,
+        /// Filter by effective state: active | disabled | `log_only` | overridden
+        #[arg(long)]
+        state: Option<String>,
+        /// Show the state in force for this host code instead of the global one
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Show detailed information about a rule
     Info {
-        /// Rule id
+        /// Rule id, as `CRS-942100` or the bare upstream number `942100`
         rule_id: String,
+        /// Show the state in force for this host code instead of the global one
+        #[arg(long)]
+        host: Option<String>,
     },
-    /// Enable a rule
+    /// Re-enable a rule that an override switched off or downgraded
     Enable {
-        /// Rule id
+        /// Rule id, as `CRS-942100` or the bare upstream number `942100`
         rule_id: String,
+        /// Scope to one host code instead of every host
+        #[arg(long)]
+        host: Option<String>,
+        /// Why (stored with the override)
+        #[arg(long)]
+        note: Option<String>,
+        /// Delete the override outright instead of storing an explicit "on"
+        #[arg(long)]
+        clear: bool,
     },
-    /// Disable a rule
+    /// Stop a rule from blocking — either entirely, or by downgrading it to
+    /// record-only
     Disable {
-        /// Rule id
+        /// Rule id, as `CRS-942100` or the bare upstream number `942100`
         rule_id: String,
+        /// Scope to one host code instead of every host
+        #[arg(long)]
+        host: Option<String>,
+        /// Why (stored with the override)
+        #[arg(long)]
+        note: Option<String>,
+        /// Keep evaluating the rule and keep writing every match to the audit
+        /// log, but stop it contributing to the anomaly score. This is the
+        /// safe way to measure a rule's false positives; a full disable is a
+        /// detection the WAF stops performing.
+        #[arg(long)]
+        log_only: bool,
     },
     /// Hot-reload all rules from disk
     Reload,
@@ -484,82 +516,140 @@ async fn run_geoip_cmd(cmd: GeoIpCommands, config: &AppConfig) -> anyhow::Result
 #[allow(clippy::significant_drop_tightening)]
 async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result<()> {
     match cmd {
-        RulesCommands::List { category, source } => {
-            let mut manager = RuleManager::new(&config.rules);
-            manager.load_all()?;
-
-            let reg = manager.registry.read();
-            let rules: Vec<_> = match (&category, &source) {
-                (Some(cat), _) => reg.filter_by_category(cat),
-                (_, Some(src)) => reg.filter_by_source(src),
-                _ => reg.list(),
-            };
+        RulesCommands::List {
+            category,
+            source,
+            state,
+            host,
+        } => {
+            let (checker, db_note) = live_rule_registry(config).await;
+            let mut rules = checker.registry(host.as_deref());
+            if let Some(cat) = &category {
+                rules.retain(|r| r.category.eq_ignore_ascii_case(cat));
+            }
+            if let Some(src) = &source {
+                rules.retain(|r| r.source.contains(src.as_str()));
+            }
+            if let Some(want) = &state {
+                let want = want.trim().to_ascii_lowercase();
+                rules.retain(|r| match want.as_str() {
+                    "overridden" => r.state != RuleState::Active,
+                    other => r.state.as_str() == other,
+                });
+            }
 
             println!(
-                "{:<20} {:<35} {:<12} {:<16} {:<8} Action",
-                "ID", "Name", "Category", "Source", "Status"
+                "{:<16} {:<44} {:<10} {:<9} {:<3} {:<9} {:<9} State",
+                "ID", "Name", "Category", "Severity", "PL", "Phase", "Declared"
             );
-            println!("{}", "-".repeat(100));
+            println!("{}", "-".repeat(120));
             for rule in &rules {
                 println!(
-                    "{:<20} {:<35} {:<12} {:<16} {:<8} {}",
-                    truncate(&rule.id, 19),
-                    truncate(&rule.name, 34),
-                    truncate(&rule.category, 11),
-                    truncate(&rule.source, 15),
-                    if rule.enabled { "enabled" } else { "disabled" },
-                    rule.action,
+                    "{:<16} {:<44} {:<10} {:<9} {:<3} {:<9} {:<9} {}",
+                    truncate(&rule.id, 15),
+                    truncate(&rule.name, 43),
+                    truncate(&rule.category, 9),
+                    rule.severity,
+                    rule.paranoia,
+                    rule.phase,
+                    rule.declared_action,
+                    rule.state.as_str(),
                 );
             }
-            println!("\nTotal: {} rules", rules.len());
-        }
-
-        RulesCommands::Info { rule_id } => {
-            let mut manager = RuleManager::new(&config.rules);
-            manager.load_all()?;
-
-            let reg = manager.registry.read();
-            match reg.get(&rule_id) {
-                Some(rule) => {
-                    println!("ID:          {}", rule.id);
-                    println!("Name:        {}", rule.name);
-                    println!("Category:    {}", rule.category);
-                    println!("Source:      {}", rule.source);
-                    println!("Status:      {}", if rule.enabled { "enabled" } else { "disabled" });
-                    println!("Action:      {}", rule.action);
-                    if let Some(sev) = &rule.severity {
-                        println!("Severity:    {sev}");
+            let disabled = rules.iter().filter(|r| r.state == RuleState::Disabled).count();
+            let log_only = rules.iter().filter(|r| r.state == RuleState::LogOnly).count();
+            println!(
+                "\n{} rule(s) listed — {} active, {} disabled, {} log-only. Scope: {}.",
+                rules.len(),
+                rules.len().saturating_sub(disabled).saturating_sub(log_only),
+                disabled,
+                log_only,
+                host.as_deref()
+                    .map_or_else(|| "global".to_owned(), |h| format!("host {h}")),
+            );
+            let summary = checker.load_summary();
+            if summary.is_degraded() {
+                println!(
+                    "WARNING: {} of {} declared rule(s) are NOT enforced ({} unreadable source(s)){}.",
+                    summary.rejected.len(),
+                    summary.attempted,
+                    summary.source_errors.len(),
+                    if summary.used_embedded_fallback {
+                        "; the minimal embedded rule set was substituted"
+                    } else {
+                        ""
                     }
-                    if let Some(desc) = &rule.description {
-                        println!("Description: {desc}");
-                    }
-                    if let Some(pattern) = &rule.pattern {
-                        println!("Pattern:     {pattern}");
-                    }
-                    if !rule.tags.is_empty() {
-                        println!("Tags:        {}", rule.tags.join(", "));
-                    }
-                }
-                None => println!("Rule not found: {rule_id}"),
+                );
+            }
+            if let Some(note) = db_note {
+                println!("{note}");
             }
         }
 
-        // `enable` / `disable` flip a bit on a registry this process built a
-        // moment ago and drops on exit — nothing is persisted and no running
-        // proxy ever sees it. The id is still resolved first, so a typo is
-        // reported as a typo rather than as the missing feature.
-        RulesCommands::Enable { rule_id } => {
-            let mut manager = RuleManager::new(&config.rules);
-            manager.load_all()?;
-            manager.enable_rule(&rule_id)?;
-            anyhow::bail!("{}", rule_toggle_unimplemented("enable", &rule_id));
+        RulesCommands::Info { rule_id, host } => {
+            let (checker, db_note) = live_rule_registry(config).await;
+            let wanted = rule_id.trim();
+            let rules = checker.registry(host.as_deref());
+            let found = rules
+                .iter()
+                .find(|r| r.id == wanted || r.crs_id.is_some_and(|id| id.to_string() == wanted));
+            if let Some(rule) = found {
+                println!("ID:          {}", rule.id);
+                if let Some(crs_id) = rule.crs_id {
+                    println!("CRS id:      {crs_id}");
+                }
+                println!("Name:        {}", rule.name);
+                println!("Category:    {}", rule.category);
+                println!("Source:      {}", rule.source);
+                println!("Severity:    {} (+{} to the anomaly score)", rule.severity, rule.score);
+                println!("Paranoia:    {}", rule.paranoia);
+                println!("Phase:       {}", rule.phase);
+                println!("Declared:    {}", rule.declared_action);
+                println!(
+                    "State:       {} ({})",
+                    rule.state.as_str(),
+                    host.as_deref()
+                        .map_or_else(|| "global".to_owned(), |h| format!("host {h}")),
+                );
+            } else {
+                println!("Rule not found in the loaded set: {rule_id}");
+                println!("`prx-waf rules list` shows every rule this build enforces.");
+            }
+            if let Some(note) = db_note {
+                println!("{note}");
+            }
         }
 
-        RulesCommands::Disable { rule_id } => {
-            let mut manager = RuleManager::new(&config.rules);
-            manager.load_all()?;
-            manager.disable_rule(&rule_id)?;
-            anyhow::bail!("{}", rule_toggle_unimplemented("disable", &rule_id));
+        RulesCommands::Enable {
+            rule_id,
+            host,
+            note,
+            clear,
+        } => {
+            write_rule_override(
+                config,
+                &rule_id,
+                host.as_deref(),
+                note,
+                RuleOverrideWrite::Enable { clear },
+            )
+            .await?;
+        }
+
+        RulesCommands::Disable {
+            rule_id,
+            host,
+            note,
+            log_only,
+        } => {
+            write_rule_override(
+                config,
+                &rule_id,
+                host.as_deref(),
+                note,
+                RuleOverrideWrite::Disable { log_only },
+            )
+            .await?;
         }
 
         RulesCommands::Reload => {
@@ -734,17 +824,174 @@ fn run_sources_cmd(cmd: SourcesCommands, config: &AppConfig) -> anyhow::Result<(
     Ok(())
 }
 
-/// Message for `rules enable` / `rules disable`, which have no persistent store.
-fn rule_toggle_unimplemented(verb: &str, rule_id: &str) -> String {
-    format!(
-        "`rules {verb}` is not implemented — rule '{rule_id}' was NOT {verb}d.\n\
-         The registry this command edits is built in-process and discarded on exit; there is no \
-         per-rule enable/disable store, so no running proxy could observe the change.\n\
-         To stop a CRS rule from firing, remove or edit its declaration in `rules/owasp-crs/` and \
-         restart. Database-backed rules (custom Rhai rules, IP/URL lists) can be deleted through \
-         the admin API and take effect immediately.\n\n\
-         {RULE_SOURCES_ARE_CLI_ONLY}"
-    )
+/// What every mutating `rules` sub-command has to say.
+///
+/// The CLI writes to the database directly; a `prx-waf run` process already
+/// serving traffic is holding its own override snapshot and will not notice.
+/// Saying "disabled" without saying this is how an operator ends up believing a
+/// rule is off when it is still blocking.
+const RULE_OVERRIDE_RELOAD_NOTE: &str = "A running proxy keeps its current override snapshot until it reloads. Apply it with \
+     `POST /api/rules/reload` (or `POST /api/reload`), or restart the process. Changes made \
+     through the Admin UI / `POST /api/rules/overrides` take effect immediately and need none of \
+     this.";
+
+/// Build the rule set the daemon would build, so `rules list` / `rules info`
+/// answer "what is this WAF enforcing" and not "what is in some file".
+///
+/// [`OWASPCheck::new`] reads `rules/owasp-crs/` relative to the working
+/// directory — the same hardcoded path the serving process uses — so running
+/// the CLI from the deployment root gives the deployment's rule set. The
+/// overrides are then layered on from the database.
+///
+/// The second return value is a warning to print when the database could not be
+/// consulted: the listing is still useful (it is the whole declared rule set),
+/// but the *state* column would then be the declared one rather than the
+/// effective one, and an operator has to be told which they are looking at.
+async fn live_rule_registry(config: &AppConfig) -> (OWASPCheck, Option<String>) {
+    let checker = OWASPCheck::new().with_config(&config.owasp);
+    let db = match waf_storage::Database::connect(&config.storage.database_url, config.storage.max_connections).await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                checker,
+                Some(format!(
+                    "NOTE: the database could not be reached ({e}), so operator overrides were not \
+                     read. Every state above is the rule's DECLARED state, which is not necessarily \
+                     what the running proxy is doing."
+                )),
+            );
+        }
+    };
+    let rows = match db.list_rule_overrides().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (
+                checker,
+                Some(format!(
+                    "NOTE: rule_overrides could not be read ({e}); the states above are the declared \
+                     ones."
+                )),
+            );
+        }
+    };
+    let specs: Vec<RuleOverrideSpec> = rows
+        .into_iter()
+        .filter(|row| row.host_id.is_none() || row.host_code.is_some())
+        .filter_map(|row| {
+            RuleState::from_row(row.enabled, row.action_override.as_deref())
+                .ok()
+                .map(|state| RuleOverrideSpec {
+                    rule_id: row.rule_id,
+                    host_code: row.host_code,
+                    state,
+                })
+        })
+        .collect();
+    checker.load_overrides(&specs);
+    (checker, None)
+}
+
+/// Which way `rules enable` / `rules disable` moves one rule.
+enum RuleOverrideWrite {
+    /// `--clear` deletes the override outright; otherwise an explicit "on" is
+    /// stored, which is what cancels a *global* disable for one host.
+    Enable { clear: bool },
+    /// `--log-only` keeps the rule running and recorded; without it the rule is
+    /// not evaluated at all.
+    Disable { log_only: bool },
+}
+
+/// Write one `rule_overrides` row, having first checked the rule exists.
+///
+/// The id is resolved against the rule set this build actually loads before
+/// anything is written, so a typo is a non-zero exit rather than a row that
+/// silently never applies — the same check `POST /api/rules/overrides` runs.
+async fn write_rule_override(
+    config: &AppConfig,
+    rule_id: &str,
+    host: Option<&str>,
+    note: Option<String>,
+    write: RuleOverrideWrite,
+) -> anyhow::Result<()> {
+    let rule_id = rule_id.trim();
+    let checker = OWASPCheck::new();
+    if !checker.knows_rule(rule_id) {
+        anyhow::bail!(
+            "unknown rule id {rule_id:?} — nothing was written. It is not in the rule set this \
+             build loads from `rules/owasp-crs/` (run this command from the deployment root). \
+             `prx-waf rules list` shows every enforced rule; ids are accepted as \"CRS-942100\" or \
+             as the bare upstream number \"942100\"."
+        );
+    }
+
+    let db = waf_storage::Database::connect(&config.storage.database_url, config.storage.max_connections).await?;
+    if let Some(code) = host
+        && db.get_host_by_code(code).await?.is_none()
+    {
+        anyhow::bail!(
+            "unknown host code {code:?} — nothing was written. An override can only be scoped to a \
+             host in the database; hosts declared in the config file get a fresh code on every \
+             start and can only be governed by a global override (omit --host)."
+        );
+    }
+
+    let scope = host.map_or_else(|| "every host".to_owned(), |code| format!("host {code}"));
+    let (enabled, action_override, outcome) = match write {
+        RuleOverrideWrite::Enable { clear: true } => {
+            let rows = db.list_rule_overrides().await?;
+            let Some(row) = rows
+                .iter()
+                .find(|r| r.rule_id == rule_id && r.host_code.as_deref() == host)
+            else {
+                println!("No override for {rule_id} in scope '{scope}' — the rule already runs as declared.");
+                return Ok(());
+            };
+            db.delete_rule_override(row.id).await?;
+            println!("Override for {rule_id} removed from scope '{scope}': the rule runs as declared again.");
+            println!("{RULE_OVERRIDE_RELOAD_NOTE}");
+            return Ok(());
+        }
+        RuleOverrideWrite::Enable { clear: false } => (
+            Some(true),
+            None,
+            format!("{rule_id} is now explicitly ACTIVE for {scope}."),
+        ),
+        RuleOverrideWrite::Disable { log_only: true } => (
+            None,
+            Some("log".to_owned()),
+            format!(
+                "{rule_id} is now LOG-ONLY for {scope}: it keeps running and every match is written \
+                 to the audit log, but it contributes nothing to the anomaly score, so it can no \
+                 longer block on its own or help another rule reach the threshold."
+            ),
+        ),
+        RuleOverrideWrite::Disable { log_only: false } => (
+            Some(false),
+            None,
+            format!(
+                "{rule_id} is now DISABLED for {scope}: it is no longer evaluated, so the attacks \
+                 it detects pass this WAF unrecorded.\n\
+                 If the goal is to measure this rule's false positives rather than to remove it, \
+                 use `--log-only` instead."
+            ),
+        ),
+    };
+
+    let row = db
+        .upsert_rule_override(&waf_storage::models::CreateRuleOverride {
+            rule_id: rule_id.to_owned(),
+            host_code: host.map(str::to_owned),
+            enabled,
+            action_override,
+            note,
+        })
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("host {scope} disappeared while writing the override"))?;
+
+    println!("{outcome}");
+    println!("Stored as override #{}.", row.id);
+    println!("{RULE_OVERRIDE_RELOAD_NOTE}");
+    Ok(())
 }
 
 /// The one fact every `sources` / `rules` failure message has to carry.

@@ -41,6 +41,10 @@ use crate::notifications::{
 };
 use crate::observations::{list_observations, observation_stats};
 use crate::plugins::{WASM_UPLOAD_MAX, delete_plugin, disable_plugin, enable_plugin, list_plugins, upload_plugin};
+use crate::rules::{
+    create_rule_override, delete_rule_override, list_rule_overrides, reload_rules_overrides, rules_registry,
+    update_rule_override,
+};
 use crate::security::{admin_ip_check_middleware, list_audit_log, rate_limit_middleware, security_headers_middleware};
 use crate::state::AppState;
 use crate::static_files::static_handler;
@@ -161,6 +165,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/bot-patterns/{id}",
             put(update_bot_pattern).delete(delete_bot_pattern),
+        )
+        // OWASP CRS rule registry and the per-rule override layer. Admin-only
+        // for reads as well: the registry is an inventory of what this WAF
+        // inspects, and the override list is a map of the rules an operator has
+        // switched off. See `rules.rs`.
+        .route("/api/rules/registry", get(rules_registry))
+        .route("/api/rules/reload", post(reload_rules_overrides))
+        .route(
+            "/api/rules/overrides",
+            get(list_rule_overrides).post(create_rule_override),
+        )
+        .route(
+            "/api/rules/overrides/{id}",
+            put(update_rule_override).delete(delete_rule_override),
         )
         // Sensitive patterns
         .route("/api/sensitive-patterns", post(create_sensitive_pattern))

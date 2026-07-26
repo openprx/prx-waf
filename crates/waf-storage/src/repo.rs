@@ -7,13 +7,14 @@ use crate::error::StorageError;
 use crate::models::{
     AdminUser, AllowIp, AllowUrl, AttackLog, AttackLogQuery, AuditLogEntry, AuditLogQuery, BlockIp, BlockUrl,
     BotPattern, Certificate, CreateAdminUser, CreateBotPattern, CreateCertificate, CreateCrowdSecEvent,
-    CreateCustomRule, CreateHost, CreateIpRule, CreateLbBackend, CreateNotificationConfig, CreateSecurityEvent,
-    CreateSemanticObservation, CreateSensitivePattern, CreateTunnel, CreateUrlRule, CreateWasmPlugin,
-    CrowdSecConfigRow, CrowdSecDecisionRow, CrowdSecEventQuery, CrowdSecEventRow, CustomRule, GeoDistEntry, GeoStats,
-    Host, HotlinkConfig, LabeledCount, LbBackend, NotificationConfig, NotificationLog, RefreshToken, SecurityEvent,
-    SecurityEventQuery, SemanticObservation, SemanticObservationFilter, SemanticObservationQuery, SensitivePattern,
-    StatsOverview, TimeSeriesPoint, TopEntry, TunnelRow, UpdateBotPattern, UpdateCertificatePem, UpdateHost,
-    UpdateNotificationConfig, UpsertCrowdSecConfig, UpsertHotlinkConfig, WasmPluginRow,
+    CreateCustomRule, CreateHost, CreateIpRule, CreateLbBackend, CreateNotificationConfig, CreateRuleOverride,
+    CreateSecurityEvent, CreateSemanticObservation, CreateSensitivePattern, CreateTunnel, CreateUrlRule,
+    CreateWasmPlugin, CrowdSecConfigRow, CrowdSecDecisionRow, CrowdSecEventQuery, CrowdSecEventRow, CustomRule,
+    GeoDistEntry, GeoStats, Host, HotlinkConfig, LabeledCount, LbBackend, NotificationConfig, NotificationLog,
+    RefreshToken, RuleOverride, SecurityEvent, SecurityEventQuery, SemanticObservation, SemanticObservationFilter,
+    SemanticObservationQuery, SensitivePattern, StatsOverview, TimeSeriesPoint, TopEntry, TunnelRow, UpdateBotPattern,
+    UpdateCertificatePem, UpdateHost, UpdateNotificationConfig, UpdateRuleOverride, UpsertCrowdSecConfig,
+    UpsertHotlinkConfig, WasmPluginRow,
 };
 use crate::retention::{DEFAULT_DELETE_BATCH_SIZE, RetentionTable, prune_in_batches};
 use waf_common::notify::{NotificationEvent, NotificationEventKind};
@@ -1156,6 +1157,115 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(r.rows_affected())
+    }
+
+    // ─── Rule overrides ───────────────────────────────────────────────────────
+
+    /// Every operator override, with the host code joined in.
+    ///
+    /// One query for the whole table: it is bounded by the size of the rule set
+    /// an operator has chosen to tune (single digits in practice), and the
+    /// engine needs all of it to rebuild its snapshot anyway.
+    pub async fn list_rule_overrides(&self) -> Result<Vec<RuleOverride>, StorageError> {
+        let rows = sqlx::query_as::<_, RuleOverride>(
+            r"SELECT o.id, o.rule_id, o.host_id, h.code AS host_code, o.enabled,
+                     o.action_override, o.note, o.created_at, o.updated_at
+                FROM rule_overrides o
+                LEFT JOIN hosts h ON h.id = o.host_id
+               ORDER BY o.rule_id, h.code NULLS FIRST",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Create or replace the override for one `(rule, scope)` pair.
+    ///
+    /// `Ok(None)` means `req.host_code` names no host — reported rather than
+    /// silently written as a *global* override, which is what a plain
+    /// `(SELECT id FROM hosts WHERE code = …)` sub-select would have done with a
+    /// typo'd host and is the worst possible failure mode for this table.
+    ///
+    /// The upsert targets both uniqueness rules the schema carries: the
+    /// `(rule_id, host_id)` constraint for host-scoped rows and the
+    /// `idx_rule_overrides_global` partial index for the global ones (0016).
+    pub async fn upsert_rule_override(&self, req: &CreateRuleOverride) -> Result<Option<RuleOverride>, StorageError> {
+        let host_id = match req.host_code.as_deref() {
+            None => None,
+            Some(code) => match self.get_host_by_code(code).await? {
+                Some(host) => Some(host.id),
+                None => return Ok(None),
+            },
+        };
+
+        // Two different uniqueness rules cover the two scopes, and `ON CONFLICT`
+        // infers an index by matching the target *exactly*: the 0007 table
+        // constraint for host-scoped rows, the 0016 partial index — predicate
+        // included — for the global ones.
+        let conflict = if host_id.is_some() {
+            "(rule_id, host_id)"
+        } else {
+            "(rule_id) WHERE host_id IS NULL"
+        };
+        let sql = format!(
+            r"INSERT INTO rule_overrides (rule_id, host_id, enabled, action_override, note)
+                   VALUES ($1, $2, $3, $4, $5)
+              ON CONFLICT {conflict} DO UPDATE
+                     SET enabled         = EXCLUDED.enabled,
+                         action_override = EXCLUDED.action_override,
+                         note            = EXCLUDED.note,
+                         updated_at      = NOW()
+               RETURNING id, rule_id, host_id, NULL::VARCHAR AS host_code, enabled,
+                         action_override, note, created_at, updated_at"
+        );
+        // The only interpolation is the conflict target, chosen from the two
+        // string literals above by a boolean — no caller input reaches the SQL
+        // text. Every value is bound.
+        let mut row = sqlx::query_as::<_, RuleOverride>(&sql)
+            .bind(&req.rule_id)
+            .bind(host_id)
+            .bind(req.enabled)
+            .bind(&req.action_override)
+            .bind(&req.note)
+            .fetch_one(&self.pool)
+            .await?;
+        row.host_code.clone_from(&req.host_code);
+        Ok(Some(row))
+    }
+
+    /// Replace the decision an existing override carries. `Ok(None)` when no
+    /// row has that id.
+    pub async fn update_rule_override(
+        &self,
+        id: i32,
+        req: &UpdateRuleOverride,
+    ) -> Result<Option<RuleOverride>, StorageError> {
+        let row = sqlx::query_as::<_, RuleOverride>(
+            r"UPDATE rule_overrides o
+                 SET enabled         = $2,
+                     action_override = $3,
+                     note            = $4,
+                     updated_at      = NOW()
+               WHERE o.id = $1
+               RETURNING o.id, o.rule_id, o.host_id,
+                         (SELECT code FROM hosts h WHERE h.id = o.host_id) AS host_code,
+                         o.enabled, o.action_override, o.note, o.created_at, o.updated_at",
+        )
+        .bind(id)
+        .bind(req.enabled)
+        .bind(&req.action_override)
+        .bind(&req.note)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn delete_rule_override(&self, id: i32) -> Result<bool, StorageError> {
+        let r = sqlx::query("DELETE FROM rule_overrides WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
     }
 
     // ─── Hotlink Configs ──────────────────────────────────────────────────────

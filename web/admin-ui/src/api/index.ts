@@ -177,6 +177,107 @@ export const botPatternsApi = {
   test: (userAgent: string) => api.get('/api/bot-patterns/test', { params: { user_agent: userAgent } }),
 }
 
+// ─── OWASP CRS Rule Registry & Overrides ──────────────────────────────────────
+// The registry is read straight from the live `waf_engine::OWASPCheck` — what is
+// listed here is exactly what the request path walks, for the queried scope.
+// Overrides are strictly subtractive (disable, or downgrade to log-only); there
+// is no way to add a rule or escalate one to an unconditional deny here.
+export interface RejectedRule {
+  rule_id: string
+  source: string
+  reason: string
+}
+export interface SourceLoadError {
+  source: string
+  error: string
+}
+export interface RegistrySummary {
+  declared: number
+  enforced: number
+  request_rules: number
+  response_rules: number
+  rejected: number
+  rejected_rules: RejectedRule[]
+  source_errors: SourceLoadError[]
+  severity_defaulted: string[]
+  action_defaulted: string[]
+  used_embedded_fallback: boolean
+  degraded: boolean
+  /** Overrides in this scope that switch a rule off entirely — a hole, not a tuning knob. */
+  disabled: number
+  log_only: number
+}
+export interface RuleDescriptor {
+  id: string
+  crs_id: number
+  name: string
+  category: string
+  source: string
+  severity: string
+  score: number
+  paranoia: number
+  phase: 'request' | 'response'
+  declared_action: string
+  /** What the request path does with a match in this scope, after overrides. */
+  effective_action: 'score' | 'deny' | 'log' | 'disabled'
+  state: 'active' | 'disabled' | 'log_only'
+  enabled: boolean
+  overridden: boolean
+}
+export interface RulesRegistry {
+  scope: { host_code: string | null }
+  summary: RegistrySummary
+  rules: RuleDescriptor[]
+}
+export interface RuleOverride {
+  id: number
+  rule_id: string
+  host_code: string | null
+  enabled: boolean | null
+  action_override: string | null
+  note: string | null
+  /** `false` = this override names a rule this build does not load; it is inert. */
+  known_rule: boolean
+  state: 'active' | 'disabled' | 'log_only' | 'invalid'
+  created_at: string
+  updated_at: string
+}
+export interface CreateRuleOverrideReq {
+  rule_id: string
+  host_code?: string | null
+  enabled?: boolean | null
+  action_override?: string | null
+  note?: string | null
+}
+export interface UpdateRuleOverrideReq {
+  enabled?: boolean | null
+  action_override?: string | null
+  note?: string | null
+}
+export interface RuleOverrideResult {
+  success: boolean
+  data: RuleOverride
+  applied: boolean
+  warning: string | null
+}
+export interface ReloadRulesReport {
+  applied: number
+  disabled: number
+  log_only: number
+  hosts: number
+  unknown_rule_ids: string[]
+  enforced_rules: number
+}
+export const rulesApi = {
+  /** `host` omitted = the global layer; a host code narrows to what applies there. */
+  registry: (host?: string) => api.get('/api/rules/registry', { params: { host } }),
+  overrides: () => api.get('/api/rules/overrides'),
+  createOverride: (data: CreateRuleOverrideReq) => api.post('/api/rules/overrides', data),
+  updateOverride: (id: number, data: UpdateRuleOverrideReq) => api.put(`/api/rules/overrides/${id}`, data),
+  deleteOverride: (id: number) => api.delete(`/api/rules/overrides/${id}`),
+  reload: () => api.post('/api/rules/reload'),
+}
+
 // ─── Certificates ─────────────────────────────────────────────────────────────
 export const certsApi = {
   list: (hostCode?: string) => api.get('/api/certificates', { params: { host_code: hostCode } }),

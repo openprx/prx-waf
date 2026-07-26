@@ -25,7 +25,7 @@ pub use content_security::{
 };
 pub use dir_traversal::DirTraversalCheck;
 pub use geo::{GeoCheck, GeoRule, GeoRuleMode};
-pub use owasp::OWASPCheck;
+pub use owasp::{OWASPCheck, OverrideLoadReport, RuleDescriptor, RuleOverrideError, RuleOverrideSpec, RuleState};
 pub use rce::RceCheck;
 pub use scanner::ScannerCheck;
 pub use sensitive::SensitiveCheck;

@@ -33,12 +33,14 @@ const routes: RouteRecordRaw[] = [
   // Phase 7 rule management: `/bot-management` is routed again now that
   // `/api/bot-patterns` exists and `checks/bot.rs` reads a hot-reloadable store.
   { path: '/bot-management', component: () => import('../views/BotManagement.vue') },
-  // `/rules-management` and `/rule-sources` stay unrouted: they call
-  // `/api/rules/registry` and `/api/rule-sources`, which do not exist, and the
-  // subsystem they present (`waf_engine::RuleManager`) is still never loaded by
-  // the daemon. The views remain in `src/views/` — this removes the entry, not
-  // the work. An old bookmark lands on the catch-all below instead of a blank
-  // page.
+  // Phase 7 stage 2: `/rules-management` is routed again now that
+  // `/api/rules/registry` and `/api/rules/overrides` exist and read/write the
+  // live `waf_engine::OWASPCheck` registry and its override layer.
+  { path: '/rules-management', component: () => import('../views/RulesManagement.vue') },
+  // `/rule-sources` stays unrouted: it calls `/api/rule-sources`, which does not
+  // exist — there is no external-source subsystem behind it. The view remains
+  // in `src/views/` — this removes the entry, not the work. An old bookmark
+  // lands on the catch-all below instead of a blank page.
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
 ]
 

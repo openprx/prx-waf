@@ -13,6 +13,7 @@ pub mod notifications;
 pub mod notify_runtime;
 pub mod observations;
 pub mod plugins;
+pub mod rules;
 pub mod security;
 pub mod server;
 pub mod state;

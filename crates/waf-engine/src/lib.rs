@@ -17,8 +17,9 @@ pub use checks::{
     AntiHotlinkCheck, BUILTIN_BAD_BOTS, BUILTIN_GOOD_BOTS, BotAction, BotCheck, BotMatch, BotPatternError,
     BotPatternLoadReport, BuiltinBotRule, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict,
     EnforcementMode, GeoCheck, GeoRule, GeoRuleMode, InspectionScope, MAX_USER_PATTERN_LEN, MAX_USER_PATTERNS,
-    OWASPCheck, RuntimeContentSecurityConfig, SemanticAction, SemanticVerdict, SensitiveCheck, UserBotPattern,
-    user_rule_id, validate_user_pattern,
+    OWASPCheck, OverrideLoadReport, RuleDescriptor, RuleOverrideError, RuleOverrideSpec, RuleState,
+    RuntimeContentSecurityConfig, SemanticAction, SemanticVerdict, SensitiveCheck, UserBotPattern, user_rule_id,
+    validate_user_pattern,
 };
 pub use community::{
     CommunityChecker, CommunityClient, CommunityComponents, CommunityConfig, CommunityReporter, RequestInfo,

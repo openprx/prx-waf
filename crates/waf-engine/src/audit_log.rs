@@ -344,6 +344,20 @@ impl AuditLogSink {
 }
 
 impl AuditLogWorker {
+    /// Everything queued so far, concatenated, without touching the filesystem.
+    ///
+    /// Test-only, and crate-visible so the checks that *feed* this log can
+    /// assert on what came out of them without each of them re-implementing a
+    /// drain. Not compiled into the shipped binary.
+    #[cfg(test)]
+    pub(crate) fn drain_to_string(&mut self) -> String {
+        let mut out = String::new();
+        while let Ok(block) = self.rx.try_recv() {
+            out.push_str(&block);
+        }
+        out
+    }
+
     /// Drain the channel in bounded batches, appending to the log file and
     /// rotating it when it outgrows the configured size.
     ///

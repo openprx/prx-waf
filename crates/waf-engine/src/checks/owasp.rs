@@ -29,6 +29,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use arc_swap::ArcSwapOption;
 use regex::Regex;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
@@ -140,7 +141,9 @@ struct YamlRule {
     /// obliged to have an upstream counterpart.
     #[serde(default)]
     crs_id: Option<u32>,
-    #[allow(dead_code)]
+    /// Attack class this rule belongs to (`sqli`, `xss`, `rce`, …), as written
+    /// by the converter. Carried through to [`RuleDescriptor::category`] so the
+    /// admin API can group the registry the way the rule files are organised.
     #[serde(default)]
     category: String,
     /// `ModSecurity` `severity:`, which decides how much this rule adds to the
@@ -2713,6 +2716,254 @@ impl RuleAction {
             _ => None,
         }
     }
+
+    /// Canonical spelling for the admin API, the CLI and diagnostics.
+    ///
+    /// `score` rather than `block` on purpose: `block` is upstream's word for
+    /// "do what `SecDefaultAction` says", and rendering it in an operator-facing
+    /// list is what makes people read a scoring rule as an unconditional deny.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Score => "score",
+            Self::Deny => "deny",
+            Self::Log => "log",
+        }
+    }
+}
+
+// ── Operator rule overrides ───────────────────────────────────────────────────
+
+/// What an operator has done to one loaded CRS rule.
+///
+/// This is the *effective* state the request path reads, already resolved from
+/// the `rule_overrides` row. Deliberately three states and not a bool: "off" and
+/// "on but recorded only" are different postures, and collapsing them is how a
+/// tuning exercise turns into a hole nobody can see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuleState {
+    /// No override, or one that restores the rule's declared behaviour.
+    #[default]
+    Active,
+    /// The rule is not evaluated at all. It cannot match, cannot score and
+    /// cannot appear in any log — this is a hole in the rule set by definition.
+    Disabled,
+    /// The rule is still evaluated and every match is written to the audit log,
+    /// but it contributes **nothing** to the anomaly score, so it can no longer
+    /// block on its own or help another rule reach the threshold.
+    LogOnly,
+}
+
+impl RuleState {
+    /// Canonical spelling for the API, the CLI and log lines.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Disabled => "disabled",
+            Self::LogOnly => "log_only",
+        }
+    }
+
+    /// Resolve a `rule_overrides` row into the state the request path applies.
+    ///
+    /// Shared by the write path (so the API can refuse a row that means nothing
+    /// *before* it is stored) and the load path (so a row written straight into
+    /// the database is read the same way). The two cannot drift.
+    ///
+    /// Precedence is `enabled = false` first: a row that both switches a rule
+    /// off and asks for an action is contradictory, and the safe reading of a
+    /// contradiction is the one that does not leave a rule scoring when the
+    /// operator believed it was off. [`Self::from_row`] reports that case so the
+    /// API can reject it outright rather than pick for the operator.
+    pub fn from_row(enabled: Option<bool>, action_override: Option<&str>) -> Result<Self, RuleOverrideError> {
+        let action = match action_override.map(str::trim).filter(|a| !a.is_empty()) {
+            None => None,
+            Some(a) => Some(match a.to_ascii_lowercase().as_str() {
+                "log" | "pass" => Self::LogOnly,
+                // The declared action, whatever it is, is restored. This is what
+                // lets a per-host row cancel a global downgrade.
+                "block" | "score" => Self::Active,
+                _ => return Err(RuleOverrideError::UnsupportedAction(a.to_owned())),
+            }),
+        };
+        match (enabled, action) {
+            (Some(false), None) => Ok(Self::Disabled),
+            (Some(false), Some(_)) => Err(RuleOverrideError::Contradictory),
+            (_, Some(state)) => Ok(state),
+            (Some(true), None) => Ok(Self::Active),
+            (None, None) => Err(RuleOverrideError::Empty),
+        }
+    }
+}
+
+/// Why a `rule_overrides` row cannot be turned into a [`RuleState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleOverrideError {
+    /// `action_override` names something the request path cannot carry out.
+    UnsupportedAction(String),
+    /// The row switches the rule off *and* asks for an action.
+    Contradictory,
+    /// Both `enabled` and `action_override` are null — the row changes nothing.
+    Empty,
+}
+
+impl fmt::Display for RuleOverrideError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedAction(a) => write!(
+                f,
+                "unsupported action_override {a:?}: only \"log\" (evaluate and record, contribute no \
+                 score) and \"block\" (restore the rule's declared action) are implemented"
+            ),
+            Self::Contradictory => write!(
+                f,
+                "enabled = false together with an action_override is contradictory: a rule that is \
+                 not evaluated cannot carry out an action"
+            ),
+            Self::Empty => write!(
+                f,
+                "the override sets neither enabled nor action_override, so it would change nothing"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RuleOverrideError {}
+
+/// One `rule_overrides` row, as handed to [`OWASPCheck::load_overrides`].
+#[derive(Debug, Clone)]
+pub struct RuleOverrideSpec {
+    /// The rule this applies to, as `CRS-942100` or bare `942100`.
+    pub rule_id: String,
+    /// `HostConfig::code` this override is scoped to, or `None` for every host.
+    pub host_code: Option<String>,
+    /// The effective state, already resolved by [`RuleState::from_row`].
+    pub state: RuleState,
+}
+
+/// Effective state of every loaded rule, for one scope.
+///
+/// Two dense slices indexed by the rule's position in [`OWASPCheck::rules`] /
+/// [`OWASPCheck::response_rules`]. Not a map: the request path needs the state
+/// of *every* rule it walks, so a direct index is one bounds check where a hash
+/// lookup would be a hash plus a probe, 288 times per request.
+struct RuleStates {
+    request: Box<[RuleState]>,
+    response: Box<[RuleState]>,
+}
+
+impl RuleStates {
+    fn active(request: usize, response: usize) -> Self {
+        Self {
+            request: vec![RuleState::Active; request].into_boxed_slice(),
+            response: vec![RuleState::Active; response].into_boxed_slice(),
+        }
+    }
+
+    fn set(&mut self, index: RuleIndex, state: RuleState) {
+        let slice = if index.response {
+            &mut self.response
+        } else {
+            &mut self.request
+        };
+        if let Some(slot) = slice.get_mut(index.position) {
+            *slot = state;
+        }
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        let all = self.request.iter().chain(self.response.iter());
+        all.fold((0, 0), |(disabled, log_only), state| match state {
+            RuleState::Disabled => (disabled.saturating_add(1), log_only),
+            RuleState::LogOnly => (disabled, log_only.saturating_add(1)),
+            RuleState::Active => (disabled, log_only),
+        })
+    }
+}
+
+impl Clone for RuleStates {
+    fn clone(&self) -> Self {
+        Self {
+            request: self.request.clone(),
+            response: self.response.clone(),
+        }
+    }
+}
+
+/// The published override snapshot the request path reads.
+struct OverrideSnapshot {
+    /// Applies to every host that has no rows of its own.
+    global: RuleStates,
+    /// `HostConfig::code` → that host's states, with the global layer already
+    /// folded in at load time. Empty in the common case, and then never probed.
+    per_host: HashMap<String, RuleStates>,
+}
+
+impl OverrideSnapshot {
+    /// The states governing `host_code`. One hash lookup, and not even that when
+    /// no host-scoped override exists.
+    fn for_host(&self, host_code: &str) -> &RuleStates {
+        if self.per_host.is_empty() {
+            return &self.global;
+        }
+        self.per_host.get(host_code).unwrap_or(&self.global)
+    }
+}
+
+/// Where one rule lives inside [`OWASPCheck`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuleIndex {
+    /// `true` for [`OWASPCheck::response_rules`], `false` for the request half.
+    response: bool,
+    position: usize,
+}
+
+/// Outcome of an [`OWASPCheck::load_overrides`] call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OverrideLoadReport {
+    /// Overrides now on the request path.
+    pub applied: usize,
+    /// Rule ids that are not in the loaded set. Their rows are inert; the
+    /// operator is told so rather than left believing a typo took effect.
+    pub unknown_rule_ids: Vec<String>,
+    /// Rules switched off in at least one scope.
+    pub disabled: usize,
+    /// Rules downgraded to record-only in at least one scope.
+    pub log_only: usize,
+    /// Hosts carrying at least one host-scoped override.
+    pub hosts: usize,
+}
+
+/// One loaded CRS rule, as the admin API and the CLI need to show it.
+///
+/// Built on demand from the compiled rule and its load-time metadata, so the
+/// list an operator reads is by construction the list the request path runs —
+/// there is no second registry to fall out of step.
+#[derive(Debug, Clone)]
+pub struct RuleDescriptor {
+    /// Engine rule id (`CRS-942100`).
+    pub id: String,
+    /// Upstream numeric `SecRule` id, when the source declares one.
+    pub crs_id: Option<u32>,
+    /// Rule name / `msg`.
+    pub name: String,
+    /// Attack class from the rule file (`sqli`, `xss`, …).
+    pub category: String,
+    /// File the rule was loaded from.
+    pub source: String,
+    /// CRS severity label (`critical` / `error` / `warning` / `notice`).
+    pub severity: &'static str,
+    /// Anomaly score a match adds at the configured weights, before any
+    /// override. `0` for a rule whose declared action is `log`.
+    pub score: u32,
+    /// Minimum `owasp_paranoia` at which this rule is evaluated.
+    pub paranoia: u8,
+    /// `request` or `response`.
+    pub phase: &'static str,
+    /// What the rule file declares (`score` / `deny` / `log`).
+    pub declared_action: &'static str,
+    /// The operator override in force for the queried scope.
+    pub state: RuleState,
 }
 
 /// The severity-to-score map and the blocking threshold, resolved once at load
@@ -2782,7 +3033,13 @@ impl Default for AnomalyScoring {
     }
 }
 
-/// One rule's contribution to a request's anomaly score.
+/// One rule that matched a request.
+///
+/// Named for the common case, but it also carries the matches that contribute
+/// *nothing*: a rule whose declared action is `log`, and a rule an operator
+/// downgraded to [`RuleState::LogOnly`]. Those are recorded — that is the whole
+/// point of a log-only rule — and excluded from every arithmetic and every
+/// operator-facing "N rule(s) contributed" count by [`Self::scored`].
 struct Contribution<'r> {
     id: &'r str,
     /// Upstream numeric CRS id, when the rule declares one. See
@@ -2791,6 +3048,26 @@ struct Contribution<'r> {
     name: &'r str,
     severity: Severity,
     score: u32,
+    /// `false` for a record-only match: it is written to the audit log and
+    /// nowhere else.
+    scored: bool,
+}
+
+/// Outcome of walking one phase's rule list.
+enum Evaluation<'r> {
+    /// Every in-scope rule was evaluated; `score` is the total the threshold is
+    /// compared against.
+    Scored {
+        score: u32,
+        contributions: Vec<Contribution<'r>>,
+    },
+    /// A rule with `action: deny` matched, which settles the verdict on its own.
+    /// The walk stopped there, so `contributions` is what had been recorded up
+    /// to and including it.
+    Denied {
+        rule: &'r CompiledRule,
+        contributions: Vec<Contribution<'r>>,
+    },
 }
 
 struct CompiledRule {
@@ -2865,8 +3142,20 @@ impl CompiledRule {
 /// same way for every rule referencing it and a success is compiled once.
 type WordlistResult = Result<Arc<AhoCorasick>, String>;
 
+/// Load-time metadata that the request path never reads.
+///
+/// Held in a vector parallel to the compiled rules rather than inside
+/// [`CompiledRule`], so the struct the hot loop walks does not grow two more
+/// pointers per rule for the sake of an admin listing.
+struct RuleMeta {
+    category: Box<str>,
+    /// The file the rule came from. `Arc` because one file contributes tens of
+    /// rules and the string is only ever read.
+    source: Arc<str>,
+}
+
 struct Loader {
-    rules: Vec<CompiledRule>,
+    rules: Vec<(CompiledRule, RuleMeta)>,
     summary: LoadSummary,
     /// Directory holding `pm_from_file` wordlists; `None` when the rules did
     /// not come from a directory (in that case `pm_from_file` is rejected
@@ -2913,11 +3202,19 @@ impl Loader {
             }
         };
 
+        let origin: Arc<str> = Arc::from(source);
         for rule in ruleset.rules {
             self.summary.attempted = self.summary.attempted.saturating_add(1);
             let rule_id = rule.id.clone();
+            let category = Box::from(rule.category.as_str());
             match self.compile(rule) {
-                Ok(compiled) => self.rules.push(compiled),
+                Ok(compiled) => self.rules.push((
+                    compiled,
+                    RuleMeta {
+                        category,
+                        source: Arc::clone(&origin),
+                    },
+                )),
                 Err(reason) => self.summary.rejected.push(RejectedRule {
                     rule_id,
                     source: source.to_owned(),
@@ -3182,22 +3479,76 @@ impl Loader {
     fn finish(self, origin: &str) -> OWASPCheck {
         self.summary.report(origin);
         let mut rules = Vec::with_capacity(self.rules.len());
+        let mut meta = Vec::with_capacity(self.rules.len());
         let mut response_rules = Vec::new();
-        for rule in self.rules {
+        let mut response_meta = Vec::new();
+        for (rule, rule_meta) in self.rules {
             if rule.reads_response() {
                 response_rules.push(rule);
+                response_meta.push(rule_meta);
             } else {
                 rules.push(rule);
+                meta.push(rule_meta);
             }
         }
+        let by_id = build_rule_index(&rules, &response_rules);
         OWASPCheck {
             rules,
             response_rules,
+            meta,
+            response_meta,
+            by_id,
+            overrides: ArcSwapOption::empty(),
             summary: self.summary,
             scoring: AnomalyScoring::default(),
             audit: None,
         }
     }
+}
+
+/// Map every accepted spelling of a rule id onto its position.
+///
+/// Both the engine id (`CRS-942100`) and the bare upstream number (`942100`)
+/// resolve, because an operator reading a CRS advisory has the number and an
+/// operator reading our own logs has the prefixed form; requiring the right one
+/// would make `rules disable 942100` a silent no-op.
+///
+/// A duplicate id is refused rather than overwritten: with two rules answering
+/// to one name an override would apply to whichever the loader happened to see
+/// first, which is the sort of ambiguity that is only ever discovered during an
+/// incident.
+fn build_rule_index(rules: &[CompiledRule], response_rules: &[CompiledRule]) -> HashMap<Box<str>, RuleIndex> {
+    let mut by_id: HashMap<Box<str>, Option<RuleIndex>> = HashMap::new();
+    for (response, list) in [(false, rules), (true, response_rules)] {
+        for (position, rule) in list.iter().enumerate() {
+            let index = RuleIndex { response, position };
+            let mut keys = vec![Box::<str>::from(rule.id.as_str())];
+            if let Some(crs_id) = rule.crs_id {
+                keys.push(Box::from(crs_id.to_string().as_str()));
+            }
+            for key in keys {
+                match by_id.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(Some(index));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if slot.get() != &Some(index) {
+                            warn!(
+                                "duplicate OWASP rule id {:?} in the loaded rule set — per-rule \
+                                 overrides naming it are ambiguous and will be refused",
+                                slot.key()
+                            );
+                            slot.insert(None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    by_id
+        .into_iter()
+        .filter_map(|(key, index)| index.map(|index| (key, index)))
+        .collect()
 }
 
 fn str_value<'a>(value: &'a YamlValue, operator: &str) -> Result<&'a str, RejectReason> {
@@ -3280,6 +3631,19 @@ pub struct OWASPCheck {
     /// `RESPONSE_BODY` or `RESPONSE_STATUS`. Held apart from [`Self::rules`] so
     /// neither pipeline walks the other's rules; see [`Loader::finish`].
     response_rules: Vec<CompiledRule>,
+    /// Load-time metadata for [`Self::rules`], same order, same length.
+    meta: Vec<RuleMeta>,
+    /// Load-time metadata for [`Self::response_rules`], same order, same length.
+    response_meta: Vec<RuleMeta>,
+    /// Rule id (both spellings) → position, built once at load time. Used by the
+    /// override loader and the admin API; never touched on the request path.
+    by_id: HashMap<Box<str>, RuleIndex>,
+    /// Operator overrides, published atomically by [`Self::load_overrides`].
+    ///
+    /// `None` — no override anywhere, which is the shipped state — costs the
+    /// request path one wait-free atomic load and nothing else. See the module
+    /// header of `checks/bot.rs` for why this is an `ArcSwap` and not a lock.
+    overrides: ArcSwapOption<OverrideSnapshot>,
     summary: LoadSummary,
     /// Severity weights and the blocking threshold. Defaults to the upstream
     /// CRS v4.25.0 numbers; [`Self::with_config`] replaces them from the TOML.
@@ -3441,6 +3805,164 @@ impl OWASPCheck {
         &self.summary
     }
 
+    // ── Operator overrides ────────────────────────────────────────────────────
+
+    /// Replace the operator override layer, atomically.
+    ///
+    /// In-flight requests finish against the previous snapshot and the next one
+    /// picks up the new states; no request ever observes a half-built table and
+    /// no request ever waits for this call. Nothing is recompiled — an override
+    /// only changes how an already-compiled rule is *treated*, which is the
+    /// whole reason per-rule enable/disable is affordable here and is not in
+    /// `checks/bot.rs`, where the signatures live in one merged `RegexSet`.
+    ///
+    /// Ids that name no loaded rule are reported in the returned
+    /// [`OverrideLoadReport`] rather than dropped, because a typo that silently
+    /// does nothing is exactly how an operator ends up believing a rule is off.
+    pub fn load_overrides(&self, specs: &[RuleOverrideSpec]) -> OverrideLoadReport {
+        if specs.is_empty() {
+            let had = self.overrides.swap(None).is_some();
+            if had {
+                info!("OWASP CRS rule overrides cleared: every loaded rule is back to its declared action");
+            }
+            return OverrideLoadReport::default();
+        }
+
+        let mut report = OverrideLoadReport::default();
+        let mut global = RuleStates::active(self.rules.len(), self.response_rules.len());
+        // Host rows are applied on top of the global layer, so a host-scoped
+        // `enabled = true` can cancel a global disable. That layering is
+        // resolved here, once, rather than on every request.
+        let mut host_specs: HashMap<&str, Vec<(RuleIndex, RuleState)>> = HashMap::new();
+
+        for spec in specs {
+            let Some(index) = self.by_id.get(spec.rule_id.trim()).copied() else {
+                report.unknown_rule_ids.push(spec.rule_id.clone());
+                continue;
+            };
+            report.applied = report.applied.saturating_add(1);
+            match spec.host_code.as_deref() {
+                None => global.set(index, spec.state),
+                Some(host) => host_specs.entry(host).or_default().push((index, spec.state)),
+            }
+        }
+
+        let per_host: HashMap<String, RuleStates> = host_specs
+            .into_iter()
+            .map(|(host, entries)| {
+                let mut states = global.clone();
+                for (index, state) in entries {
+                    states.set(index, state);
+                }
+                (host.to_owned(), states)
+            })
+            .collect();
+
+        report.hosts = per_host.len();
+        let (disabled, log_only) =
+            per_host
+                .values()
+                .chain(std::iter::once(&global))
+                .fold((0usize, 0usize), |(d, l), states| {
+                    let (sd, sl) = states.counts();
+                    (d.max(sd), l.max(sl))
+                });
+        report.disabled = disabled;
+        report.log_only = log_only;
+
+        if report.disabled > 0 {
+            warn!(
+                "OWASP CRS rule overrides applied: {} rule(s) are now DISABLED and are not evaluated \
+                 at all — each one is a detection the WAF no longer performs. {} rule(s) are \
+                 log-only (recorded, no anomaly score). {} host-scoped scope(s).",
+                report.disabled, report.log_only, report.hosts
+            );
+        } else {
+            info!(
+                "OWASP CRS rule overrides applied: {} override(s), {} log-only, {} host-scoped scope(s)",
+                report.applied, report.log_only, report.hosts
+            );
+        }
+        if !report.unknown_rule_ids.is_empty() {
+            warn!(
+                "{} rule override(s) name ids that are not in the loaded rule set and do nothing: {}",
+                report.unknown_rule_ids.len(),
+                report.unknown_rule_ids.join(", ")
+            );
+        }
+
+        self.overrides
+            .store(Some(Arc::new(OverrideSnapshot { global, per_host })));
+        report
+    }
+
+    /// `true` when `rule_id` (either spelling) names a rule in the loaded set.
+    ///
+    /// The admin API and the CLI call this before writing a row, so an override
+    /// for a rule that does not exist is a `400` the operator can act on rather
+    /// than a row that quietly never applies.
+    #[must_use]
+    pub fn knows_rule(&self, rule_id: &str) -> bool {
+        self.by_id.contains_key(rule_id.trim())
+    }
+
+    /// Every enforced rule with the state in force for `host_code`, in load
+    /// order (request phase first, then response phase).
+    ///
+    /// `None` asks for the global layer — the states a host with no rows of its
+    /// own is governed by.
+    #[must_use]
+    pub fn registry(&self, host_code: Option<&str>) -> Vec<RuleDescriptor> {
+        let guard = self.overrides.load();
+        let states = guard
+            .as_ref()
+            .map(|snapshot| host_code.map_or(&snapshot.global, |code| snapshot.for_host(code)))
+            .map(|states| (states.request.as_ref(), states.response.as_ref()));
+
+        let halves = [
+            ("request", &self.rules, &self.meta, states.map(|(req, _)| req)),
+            (
+                "response",
+                &self.response_rules,
+                &self.response_meta,
+                states.map(|(_, resp)| resp),
+            ),
+        ];
+        let mut out = Vec::with_capacity(self.rule_count());
+        for (phase, rules, meta, phase_states) in halves {
+            for (position, rule) in rules.iter().enumerate() {
+                let state = phase_states.and_then(|s| s.get(position)).copied().unwrap_or_default();
+                out.push(RuleDescriptor {
+                    id: rule.id.clone(),
+                    crs_id: rule.crs_id,
+                    name: rule.name.clone(),
+                    category: meta.get(position).map_or_else(String::new, |m| m.category.to_string()),
+                    source: meta.get(position).map_or_else(String::new, |m| m.source.to_string()),
+                    severity: rule.severity.label(),
+                    score: match rule.action {
+                        RuleAction::Score => self.scoring.score_for(rule.severity),
+                        RuleAction::Deny | RuleAction::Log => 0,
+                    },
+                    paranoia: rule.paranoia,
+                    phase,
+                    declared_action: rule.action.label(),
+                    state,
+                });
+            }
+        }
+        out
+    }
+
+    /// How many rules are disabled and how many are log-only in the global
+    /// layer, for health reporting and the startup banner.
+    #[must_use]
+    pub fn override_counts(&self) -> (usize, usize) {
+        self.overrides
+            .load()
+            .as_ref()
+            .map_or((0, 0), |snapshot| snapshot.global.counts())
+    }
+
     /// Install the operator-configured anomaly-scoring model and announce it.
     ///
     /// Kept separate from the constructors because they are infallible and run
@@ -3547,7 +4069,7 @@ impl OWASPCheck {
     }
 
     /// Evaluate every in-scope rule and return the score plus the rules that
-    /// produced it, or `Err` with the rule that denied outright.
+    /// produced it, or the rule that denied outright.
     ///
     /// # Why this does not stop at the threshold
     ///
@@ -3565,36 +4087,69 @@ impl OWASPCheck {
     ///
     /// A `deny` rule *does* short-circuit, because there the verdict is settled
     /// and no further rule can add to it.
-    fn evaluate<'r>(
-        &'r self,
-        view: &RequestView<'_>,
-        paranoia: u8,
-    ) -> Result<(u32, Vec<Contribution<'r>>), &'r CompiledRule> {
-        self.evaluate_rules(&self.rules, view, paranoia)
+    fn evaluate<'r>(&'r self, view: &RequestView<'_>, paranoia: u8, states: Option<&[RuleState]>) -> Evaluation<'r> {
+        self.evaluate_rules(&self.rules, view, paranoia, states)
     }
 
     /// [`Self::evaluate`] over an explicit rule list, so the request and
     /// response pipelines share one scoring loop and cannot drift apart.
+    ///
+    /// `states`, when present, is the operator override table for this phase,
+    /// indexed by the rule's position in `rules`. `None` — no override anywhere —
+    /// is the shipped state and reduces the whole layer to one null check per
+    /// rule against a value already in a register.
     fn evaluate_rules<'r>(
         &self,
         rules: &'r [CompiledRule],
         view: &RequestView<'_>,
         paranoia: u8,
-    ) -> Result<(u32, Vec<Contribution<'r>>), &'r CompiledRule> {
+        states: Option<&[RuleState]>,
+    ) -> Evaluation<'r> {
         let mut score: u32 = 0;
         let mut contributions = Vec::new();
 
-        for rule in rules {
-            if rule.paranoia > paranoia || !rule.matches(view) {
+        for (position, rule) in rules.iter().enumerate() {
+            let state = states.and_then(|s| s.get(position)).copied().unwrap_or_default();
+            // Checked before `matches`: a disabled rule must cost a comparison,
+            // not a regex.
+            if state == RuleState::Disabled || rule.paranoia > paranoia || !rule.matches(view) {
                 continue;
             }
-            match rule.action {
-                RuleAction::Deny => return Err(rule),
+            // An override to log-only outranks the declared action, `deny`
+            // included: "record this, do not act on it" is the whole request.
+            let action = if state == RuleState::LogOnly {
+                RuleAction::Log
+            } else {
+                rule.action
+            };
+            match action {
+                RuleAction::Deny => {
+                    // Everything recorded so far travels with the verdict: a
+                    // log-only rule that matched before the deny is still
+                    // something the operator asked to see.
+                    contributions.push(Contribution {
+                        id: &rule.id,
+                        crs_id: rule.crs_id,
+                        name: &rule.name,
+                        severity: rule.severity,
+                        score: 0,
+                        scored: true,
+                    });
+                    return Evaluation::Denied { rule, contributions };
+                }
                 RuleAction::Log => {
                     debug!(
                         "OWASP rule {} matched with action=log: recorded, contributes no score ({})",
                         rule.id, rule.name
                     );
+                    contributions.push(Contribution {
+                        id: &rule.id,
+                        crs_id: rule.crs_id,
+                        name: &rule.name,
+                        severity: rule.severity,
+                        score: 0,
+                        scored: false,
+                    });
                 }
                 RuleAction::Score => {
                     let points = self.scoring.score_for(rule.severity);
@@ -3605,12 +4160,66 @@ impl OWASPCheck {
                         name: &rule.name,
                         severity: rule.severity,
                         score: points,
+                        scored: true,
                     });
                 }
             }
         }
 
-        Ok((score, contributions))
+        Evaluation::Scored { score, contributions }
+    }
+
+    /// Pre-scoring behaviour: the first rule that matches decides, and nothing
+    /// accumulates.
+    ///
+    /// Shared by both phases' `anomaly_scoring = false` escape hatch. Records
+    /// the audit block itself — including the record-only matches walked past on
+    /// the way — so the caller only has to render a verdict.
+    fn first_match<'r>(
+        &self,
+        rules: &'r [CompiledRule],
+        view: &RequestView<'_>,
+        paranoia: u8,
+        states: Option<&[RuleState]>,
+        ctx: &RequestCtx,
+        phase: ScorePhase,
+    ) -> Option<&'r CompiledRule> {
+        let mut contributions: Vec<Contribution<'r>> = Vec::new();
+        let mut hit = None;
+        for (position, rule) in rules.iter().enumerate() {
+            let state = states.and_then(|s| s.get(position)).copied().unwrap_or_default();
+            if state == RuleState::Disabled || rule.paranoia > paranoia || !rule.matches(view) {
+                continue;
+            }
+            // Record-only means record-only in this mode too: without the
+            // `scored` flag a `log` rule would decide the request, which is the
+            // opposite of what it asks for.
+            let record_only = state == RuleState::LogOnly || rule.action == RuleAction::Log;
+            contributions.push(Contribution {
+                id: &rule.id,
+                crs_id: rule.crs_id,
+                name: &rule.name,
+                severity: rule.severity,
+                score: 0,
+                scored: !record_only,
+            });
+            if !record_only {
+                hit = Some(rule);
+                break;
+            }
+        }
+        self.record_audit(
+            ctx,
+            &contributions,
+            ScoreVerdict {
+                score: 0,
+                threshold: 0,
+                paranoia,
+                reached_threshold: hit.is_some(),
+                phase,
+            },
+        );
+        hit
     }
 
     /// Hand one request's rule hits to the audit log, if one is attached.
@@ -3618,6 +4227,11 @@ impl OWASPCheck {
     /// Both halves of the verdict go through here — the rules that fired and
     /// whether the total reached the threshold — because the sub-threshold case
     /// is precisely the one no other log records today.
+    ///
+    /// Record-only matches (`action: log`, or a rule an operator downgraded)
+    /// are written here too, with `score 0`. That is the only place they appear:
+    /// they contribute to no verdict, so without this line an operator watching
+    /// a rule "in log mode" would be watching nothing at all.
     fn record_audit(&self, ctx: &RequestCtx, contributions: &[Contribution<'_>], verdict: ScoreVerdict) {
         let Some(sink) = self.audit.as_ref() else {
             return;
@@ -3636,21 +4250,46 @@ impl OWASPCheck {
     }
 }
 
+/// The matches that actually moved the score.
+///
+/// Record-only matches are deliberately excluded from every operator-facing
+/// count and from the leader choice: a rule that contributed nothing did not
+/// block the request and must not be named as the reason it was blocked.
+fn scored<'a, 'r>(contributions: &'a [Contribution<'r>]) -> impl Iterator<Item = &'a Contribution<'r>> {
+    contributions.iter().filter(|c| c.scored)
+}
+
+/// How many rules contributed to the score.
+fn scored_count(contributions: &[Contribution<'_>]) -> usize {
+    scored(contributions).count()
+}
+
 /// Render the contributing rules for the block `detail`, capped at
 /// [`MAX_NAMED_CONTRIBUTORS`] with the elision spelled out.
 fn render_contributions(contributions: &[Contribution<'_>]) -> String {
-    let mut rendered = contributions
-        .iter()
+    let total = scored_count(contributions);
+    let mut rendered = scored(contributions)
         .take(MAX_NAMED_CONTRIBUTORS)
         .map(|c| format!("{} {} +{} ({})", c.id, c.severity.label(), c.score, c.name))
         .collect::<Vec<_>>()
         .join("; ");
-    if let Some(hidden) = contributions.len().checked_sub(MAX_NAMED_CONTRIBUTORS)
+    if let Some(hidden) = total.checked_sub(MAX_NAMED_CONTRIBUTORS)
         && hidden > 0
     {
         let _ = write!(rendered, "; and {hidden} more");
     }
     rendered
+}
+
+/// The heaviest scoring contributor, ties going to the earliest in load order.
+///
+/// `max_by_key` would hand back the *last* maximum and silently renumber the
+/// verdict of every request where two rules of equal severity match.
+fn leading_contributor<'a, 'r>(contributions: &'a [Contribution<'r>]) -> Option<&'a Contribution<'r>> {
+    scored(contributions).fold(None, |best, candidate| match best {
+        Some(best) if best.score >= candidate.score => Some(best),
+        _ => Some(candidate),
+    })
 }
 
 impl Default for OWASPCheck {
@@ -3709,29 +4348,16 @@ impl OWASPCheck {
         // that reads the query reads the same decoded query.
         let view = RequestView::new(ctx);
 
+        // One wait-free load. `None` — no operator override anywhere, the
+        // shipped state — leaves the loops below byte-for-byte what they were.
+        let overrides = self.overrides.load();
+        let states = overrides
+            .as_ref()
+            .map(|snapshot| snapshot.for_host(&ctx.host_config.code).request.as_ref());
+
         if !self.scoring.enabled {
             // Escape hatch: pre-scoring behaviour, first match wins.
-            let rule = self
-                .rules
-                .iter()
-                .find(|rule| rule.paranoia <= paranoia && rule.matches(&view))?;
-            self.record_audit(
-                ctx,
-                &[Contribution {
-                    id: &rule.id,
-                    crs_id: rule.crs_id,
-                    name: &rule.name,
-                    severity: rule.severity,
-                    score: 0,
-                }],
-                ScoreVerdict {
-                    score: 0,
-                    threshold: 0,
-                    paranoia,
-                    reached_threshold: true,
-                    phase: ScorePhase::Inbound,
-                },
-            );
+            let rule = self.first_match(&self.rules, &view, paranoia, states, ctx, ScorePhase::Inbound)?;
             return Some(DetectionResult {
                 rule_id: Some(rule.id.clone()),
                 rule_name: rule.name.clone(),
@@ -3740,17 +4366,11 @@ impl OWASPCheck {
             });
         }
 
-        let (score, contributions) = match self.evaluate(&view, paranoia) {
-            Err(rule) => {
+        let (score, contributions) = match self.evaluate(&view, paranoia, states) {
+            Evaluation::Denied { rule, contributions } => {
                 self.record_audit(
                     ctx,
-                    &[Contribution {
-                        id: &rule.id,
-                        crs_id: rule.crs_id,
-                        name: &rule.name,
-                        severity: rule.severity,
-                        score: 0,
-                    }],
+                    &contributions,
                     ScoreVerdict {
                         score: 0,
                         threshold: self.scoring.inbound_threshold,
@@ -3770,7 +4390,7 @@ impl OWASPCheck {
                     ),
                 });
             }
-            Ok(evaluated) => evaluated,
+            Evaluation::Scored { score, contributions } => (score, contributions),
         };
 
         let threshold = self.scoring.inbound_threshold;
@@ -3789,11 +4409,11 @@ impl OWASPCheck {
             // The negative case needs to be as legible as the positive one: an
             // operator chasing a miss has to be able to see that rules *did*
             // fire and how far short they fell.
-            if !contributions.is_empty() {
+            let contributed = scored_count(&contributions);
+            if contributed > 0 {
                 debug!(
                     "OWASP CRS inbound anomaly score {score} is below the threshold {threshold} at \
-                     paranoia {paranoia}: allowed. {} rule(s) contributed: {}",
-                    contributions.len(),
+                     paranoia {paranoia}: allowed. {contributed} rule(s) contributed: {}",
                     render_contributions(&contributions)
                 );
             }
@@ -3803,18 +4423,7 @@ impl OWASPCheck {
         // Name the heaviest contributor: it is the most useful single answer to
         // "what got me blocked", it is what the block page renders, and it keeps
         // a per-rule verdict meaningful. The full account lives in `detail`.
-        //
-        // Ties go to the rule that comes first in load order, which is the same
-        // precedence the pre-scoring first-match-wins check had. `max_by_key`
-        // would hand back the *last* maximum and silently renumber the verdict
-        // of every request where two rules of equal severity match.
-        let leader = contributions
-            .iter()
-            .fold(None::<&Contribution<'_>>, |best, candidate| match best {
-                Some(best) if best.score >= candidate.score => Some(best),
-                _ => Some(candidate),
-            })
-            .map(|c| (c.id.to_owned(), c.name.to_owned()));
+        let leader = leading_contributor(&contributions).map(|c| (c.id.to_owned(), c.name.to_owned()));
         let (rule_id, rule_name) =
             leader.unwrap_or_else(|| ("CRS-949110".to_owned(), "Inbound Anomaly Score Exceeded".to_owned()));
 
@@ -3825,7 +4434,7 @@ impl OWASPCheck {
             detail: format!(
                 "OWASP CRS inbound anomaly score {score} reached the threshold {threshold} at \
                  paranoia {paranoia} (CRS-949110); {} rule(s) contributed: {}",
-                contributions.len(),
+                scored_count(&contributions),
                 render_contributions(&contributions)
             ),
         })
@@ -3880,29 +4489,23 @@ impl ResponseCheck for OWASPCheck {
         let paranoia = request.host_config.defense_config.owasp_paranoia;
         let view = RequestView::for_response(ctx);
 
+        // Response rules carry their own override slice; the scope is still the
+        // request's host, because that is the only host a response has.
+        let overrides = self.overrides.load();
+        let states = overrides
+            .as_ref()
+            .map(|snapshot| snapshot.for_host(&request.host_config.code).response.as_ref());
+
         if !self.scoring.enabled {
             // Escape hatch, matching the request phase: first match wins.
-            let rule = self
-                .response_rules
-                .iter()
-                .find(|rule| rule.paranoia <= paranoia && rule.matches(&view))?;
-            self.record_audit(
+            let rule = self.first_match(
+                &self.response_rules,
+                &view,
+                paranoia,
+                states,
                 request,
-                &[Contribution {
-                    id: &rule.id,
-                    crs_id: rule.crs_id,
-                    name: &rule.name,
-                    severity: rule.severity,
-                    score: 0,
-                }],
-                ScoreVerdict {
-                    score: 0,
-                    threshold: 0,
-                    paranoia,
-                    reached_threshold: true,
-                    phase: ScorePhase::Outbound,
-                },
-            );
+                ScorePhase::Outbound,
+            )?;
             return Some(DetectionResult {
                 rule_id: Some(rule.id.clone()),
                 rule_name: rule.name.clone(),
@@ -3911,17 +4514,11 @@ impl ResponseCheck for OWASPCheck {
             });
         }
 
-        let (score, contributions) = match self.evaluate_rules(&self.response_rules, &view, paranoia) {
-            Err(rule) => {
+        let (score, contributions) = match self.evaluate_rules(&self.response_rules, &view, paranoia, states) {
+            Evaluation::Denied { rule, contributions } => {
                 self.record_audit(
                     request,
-                    &[Contribution {
-                        id: &rule.id,
-                        crs_id: rule.crs_id,
-                        name: &rule.name,
-                        severity: rule.severity,
-                        score: 0,
-                    }],
+                    &contributions,
                     ScoreVerdict {
                         score: 0,
                         threshold: self.scoring.outbound_threshold,
@@ -3941,7 +4538,7 @@ impl ResponseCheck for OWASPCheck {
                     ),
                 });
             }
-            Ok(evaluated) => evaluated,
+            Evaluation::Scored { score, contributions } => (score, contributions),
         };
 
         let threshold = self.scoring.outbound_threshold;
@@ -3957,11 +4554,11 @@ impl ResponseCheck for OWASPCheck {
             },
         );
         if score < threshold {
-            if !contributions.is_empty() {
+            let contributed = scored_count(&contributions);
+            if contributed > 0 {
                 debug!(
                     "OWASP CRS outbound anomaly score {score} is below the threshold {threshold} at \
-                     paranoia {paranoia}: response delivered. {} rule(s) contributed: {}",
-                    contributions.len(),
+                     paranoia {paranoia}: response delivered. {contributed} rule(s) contributed: {}",
                     render_contributions(&contributions)
                 );
             }
@@ -3970,13 +4567,7 @@ impl ResponseCheck for OWASPCheck {
 
         // Same leader rule as the request phase, and the same tie-break: first
         // in load order, so a verdict does not renumber itself between releases.
-        let leader = contributions
-            .iter()
-            .fold(None::<&Contribution<'_>>, |best, candidate| match best {
-                Some(best) if best.score >= candidate.score => Some(best),
-                _ => Some(candidate),
-            })
-            .map(|c| (c.id.to_owned(), c.name.to_owned()));
+        let leader = leading_contributor(&contributions).map(|c| (c.id.to_owned(), c.name.to_owned()));
         let (rule_id, rule_name) =
             leader.unwrap_or_else(|| ("CRS-959100".to_owned(), "Outbound Anomaly Score Exceeded".to_owned()));
 
@@ -3993,7 +4584,7 @@ impl ResponseCheck for OWASPCheck {
                 } else {
                     ""
                 },
-                contributions.len(),
+                scored_count(&contributions),
                 render_contributions(&contributions)
             ),
         })
@@ -4932,6 +5523,302 @@ rules:
         ctx
     }
 
+    /// A one-rule set that matches every request, with the action left open so
+    /// a test can compile the same rule as `log` and as `block`.
+    const PROBE_RULE: &str = r#"
+version: "1.0"
+rules:
+  - id: PROBE-001
+    name: Matches every request path
+    category: probe
+    severity: critical
+    paranoia: 1
+    field: path
+    operator: contains
+    value: "/"
+    action: ACTION
+"#;
+
+    /// A check with a live audit log attached, plus the drain side, so a test
+    /// can read exactly what the check recorded.
+    fn audited(yaml: &str) -> (OWASPCheck, crate::audit_log::AuditLogWorker) {
+        let sink = Arc::new(AuditLogSink::new(&waf_common::AuditLogConfig {
+            enabled: true,
+            ..waf_common::AuditLogConfig::default()
+        }));
+        let worker = sink.take_worker().expect("worker taken once");
+        let check = OWASPCheck::from_yaml(yaml)
+            .with_config(&OwaspConfig::default())
+            .with_audit_log(Some(sink));
+        (check, worker)
+    }
+
+    /// One override row, already resolved.
+    fn override_spec(rule_id: &str, host_code: Option<&str>, state: RuleState) -> RuleOverrideSpec {
+        RuleOverrideSpec {
+            rule_id: rule_id.to_owned(),
+            host_code: host_code.map(str::to_owned),
+            state,
+        }
+    }
+
+    /// `probe`, but for a named host, so per-host override scoping can be tested.
+    fn probe_for_host(host_code: &str) -> RequestCtx {
+        let mut ctx = probe("GET", "/anything", "", &[], "", 1);
+        let mut cfg = HostConfig::clone(&ctx.host_config);
+        cfg.code = host_code.to_owned();
+        ctx.host_config = Arc::new(cfg);
+        ctx
+    }
+
+    // ── Operator overrides ────────────────────────────────────────────────────
+
+    #[test]
+    fn disabling_a_rule_stops_it_blocking_and_restoring_it_brings_it_back() {
+        let checker =
+            OWASPCheck::from_yaml(&PROBE_RULE.replace("ACTION", "block")).with_config(&OwaspConfig::default());
+        let ctx = probe("GET", "/anything", "", &[], "", 1);
+        assert!(checker.check(&ctx).is_some(), "the rule blocks before any override");
+
+        let report = checker.load_overrides(&[override_spec("PROBE-001", None, RuleState::Disabled)]);
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.disabled, 1);
+        assert!(report.unknown_rule_ids.is_empty());
+        assert!(
+            checker.check(&ctx).is_none(),
+            "a disabled rule must not be evaluated, let alone block"
+        );
+
+        // Removing the row restores the declared behaviour with no reload of
+        // the rule set itself.
+        checker.load_overrides(&[]);
+        assert!(checker.check(&ctx).is_some(), "clearing the override restores the rule");
+        assert_eq!(checker.override_counts(), (0, 0));
+    }
+
+    #[test]
+    fn a_log_only_override_records_the_match_and_stops_it_scoring() {
+        let (checker, mut worker) = audited(&PROBE_RULE.replace("ACTION", "block"));
+        let ctx = probe("GET", "/anything", "", &[], "", 1);
+        assert!(checker.check(&ctx).is_some());
+        let blocked = worker.drain_to_string();
+        assert!(blocked.contains("[id \"949110\"]"), "baseline is a block: {blocked}");
+
+        checker.load_overrides(&[override_spec("PROBE-001", None, RuleState::LogOnly)]);
+        assert_eq!(checker.override_counts(), (0, 1));
+        assert!(
+            checker.check(&ctx).is_none(),
+            "a log-only rule contributes no score, so the threshold is never reached"
+        );
+        let recorded = worker.drain_to_string();
+        assert!(
+            recorded.contains("[ref \"PROBE-001\"]") && recorded.contains("[score \"0\"]"),
+            "the downgraded rule must still be recorded — otherwise 'observe first' observes \
+             nothing: {recorded}"
+        );
+        assert!(
+            !recorded.contains("[id \"949110\"]"),
+            "nothing was blocked, so no blocking-evaluation line: {recorded}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_rule_is_not_even_recorded() {
+        let (checker, mut worker) = audited(&PROBE_RULE.replace("ACTION", "block"));
+        checker.load_overrides(&[override_spec("PROBE-001", None, RuleState::Disabled)]);
+        assert!(checker.check(&probe("GET", "/anything", "", &[], "", 1)).is_none());
+        assert!(
+            worker.drain_to_string().is_empty(),
+            "`disabled` means the rule is not evaluated at all — that is what makes it a hole and \
+             `log_only` the tuning tool"
+        );
+    }
+
+    #[test]
+    fn a_host_scoped_override_layers_on_top_of_the_global_one() {
+        let checker =
+            OWASPCheck::from_yaml(&PROBE_RULE.replace("ACTION", "block")).with_config(&OwaspConfig::default());
+        checker.load_overrides(&[
+            override_spec("PROBE-001", None, RuleState::Disabled),
+            override_spec("PROBE-001", Some("noisy-app"), RuleState::Active),
+        ]);
+        assert!(
+            checker.check(&probe_for_host("some-other-host")).is_none(),
+            "the global row governs every host without rows of its own"
+        );
+        assert!(
+            checker.check(&probe_for_host("noisy-app")).is_some(),
+            "a host row must be able to cancel the global one, or per-host scoping is decorative"
+        );
+    }
+
+    #[test]
+    fn a_host_scoped_disable_leaves_every_other_host_enforcing() {
+        let checker =
+            OWASPCheck::from_yaml(&PROBE_RULE.replace("ACTION", "block")).with_config(&OwaspConfig::default());
+        let report = checker.load_overrides(&[override_spec("PROBE-001", Some("noisy-app"), RuleState::Disabled)]);
+        assert_eq!(report.hosts, 1);
+        assert_eq!(
+            checker.override_counts(),
+            (0, 0),
+            "the global layer is untouched by a host-scoped row"
+        );
+        assert!(checker.check(&probe_for_host("noisy-app")).is_none());
+        assert!(checker.check(&probe_for_host("everyone-else")).is_some());
+    }
+
+    #[test]
+    fn both_spellings_of_a_rule_id_resolve() {
+        const RULE: &str = r#"
+version: "1.0"
+rules:
+  - id: CRS-942100
+    name: Probe
+    crs_id: 942100
+    category: sqli
+    severity: critical
+    paranoia: 1
+    field: path
+    operator: contains
+    value: "/"
+    action: block
+"#;
+        let checker = OWASPCheck::from_yaml(RULE).with_config(&OwaspConfig::default());
+        assert!(checker.knows_rule("CRS-942100"));
+        assert!(checker.knows_rule("942100"), "the bare upstream number must resolve");
+        assert!(!checker.knows_rule("942101"));
+
+        let ctx = probe("GET", "/anything", "", &[], "", 1);
+        checker.load_overrides(&[override_spec("942100", None, RuleState::Disabled)]);
+        assert!(
+            checker.check(&ctx).is_none(),
+            "disabling by the upstream number must take effect, not silently miss"
+        );
+    }
+
+    #[test]
+    fn an_override_for_an_unknown_rule_is_reported_not_swallowed() {
+        let checker =
+            OWASPCheck::from_yaml(&PROBE_RULE.replace("ACTION", "block")).with_config(&OwaspConfig::default());
+        let report = checker.load_overrides(&[
+            override_spec("PROBE-001", None, RuleState::Disabled),
+            override_spec("CRS-000000", None, RuleState::Disabled),
+        ]);
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.unknown_rule_ids, vec!["CRS-000000".to_owned()]);
+    }
+
+    #[test]
+    fn a_response_rule_can_be_disabled_independently_of_the_request_ones() {
+        const RULES: &str = r#"
+version: "1.0"
+rules:
+  - id: REQ-001
+    name: Request probe
+    category: probe
+    severity: critical
+    paranoia: 1
+    field: path
+    operator: contains
+    value: "/"
+    action: block
+  - id: RESP-001
+    name: Response probe
+    category: probe
+    severity: critical
+    paranoia: 1
+    field: response_body
+    operator: contains
+    value: "secret"
+    action: block
+"#;
+        let checker = OWASPCheck::from_yaml(RULES).with_config(&OwaspConfig::default());
+        assert_eq!(checker.request_rule_count(), 1);
+        assert_eq!(checker.response_rule_count(), 1);
+
+        checker.load_overrides(&[override_spec("RESP-001", None, RuleState::Disabled)]);
+        let registry = checker.registry(None);
+        let by_id = |id: &str| {
+            registry
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.state)
+                .expect("rule is listed")
+        };
+        assert_eq!(by_id("REQ-001"), RuleState::Active, "the request rule is untouched");
+        assert_eq!(by_id("RESP-001"), RuleState::Disabled);
+        assert!(
+            checker.check(&probe("GET", "/anything", "", &[], "", 1)).is_some(),
+            "disabling a response rule must not disturb the request phase"
+        );
+    }
+
+    #[test]
+    fn the_registry_describes_every_enforced_rule() {
+        let checker = OWASPCheck::from_directory(&crs_dir()).with_config(&OwaspConfig::default());
+        let registry = checker.registry(None);
+        assert_eq!(
+            registry.len(),
+            checker.rule_count(),
+            "the registry is the enforced set, no more and no less"
+        );
+        let sqli = registry
+            .iter()
+            .find(|r| r.id == "CRS-942100")
+            .expect("the shipped set contains CRS-942100");
+        assert_eq!(sqli.crs_id, Some(942_100));
+        assert_eq!(sqli.category, "sqli");
+        assert_eq!(sqli.declared_action, "score");
+        assert_eq!(sqli.severity, "critical");
+        assert_eq!(sqli.state, RuleState::Active);
+        assert_eq!(sqli.phase, "request");
+        assert!(
+            sqli.source.ends_with("sqli.yaml"),
+            "the registry names the file a rule came from: {}",
+            sqli.source
+        );
+        assert!(
+            registry.iter().all(|r| !r.id.is_empty() && !r.name.is_empty()),
+            "every listed rule is identifiable"
+        );
+    }
+
+    #[test]
+    fn an_override_row_is_resolved_the_same_way_wherever_it_is_read() {
+        assert_eq!(RuleState::from_row(Some(false), None), Ok(RuleState::Disabled));
+        assert_eq!(RuleState::from_row(Some(true), None), Ok(RuleState::Active));
+        assert_eq!(RuleState::from_row(None, Some("log")), Ok(RuleState::LogOnly));
+        assert_eq!(RuleState::from_row(Some(true), Some("log")), Ok(RuleState::LogOnly));
+        assert_eq!(RuleState::from_row(None, Some("block")), Ok(RuleState::Active));
+        assert_eq!(RuleState::from_row(None, Some("SCORE")), Ok(RuleState::Active));
+        assert_eq!(
+            RuleState::from_row(None, None),
+            Err(RuleOverrideError::Empty),
+            "a row that changes nothing is a mistake, not a no-op to be stored"
+        );
+        assert_eq!(
+            RuleState::from_row(Some(false), Some("log")),
+            Err(RuleOverrideError::Contradictory)
+        );
+        assert_eq!(
+            RuleState::from_row(None, Some("deny")),
+            Err(RuleOverrideError::UnsupportedAction("deny".to_owned())),
+            "escalating a rule to an unconditional deny is not implemented and must not be stored"
+        );
+    }
+
+    #[test]
+    fn overrides_do_not_change_the_shipped_verdicts_when_none_are_configured() {
+        // The guarantee the go-ftw ratchet depends on: the override layer is
+        // inert until an operator uses it.
+        let checker = OWASPCheck::from_directory(&crs_dir()).with_config(&OwaspConfig::default());
+        let sqli = probe("GET", "/", "id=1'+or+'1'='1", &[], "", 1);
+        let before = checker.check(&sqli).map(|d| d.rule_id);
+        checker.load_overrides(&[]);
+        assert_eq!(checker.check(&sqli).map(|d| d.rule_id), before);
+        assert_eq!(checker.override_counts(), (0, 0));
+    }
+
     /// The headers an ordinary browser sends.
     fn browser_headers() -> Vec<(&'static str, &'static str)> {
         vec![
@@ -5329,46 +6216,50 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
         assert!(checker.check(&clean).is_none(), "the bare request is not the problem");
     }
 
-    /// `action: log` blocks nothing *and records nothing*.
+    /// `action: log` blocks nothing *and is written to the audit log*.
     ///
-    /// [`Self::evaluate`] gives the `Log` arm a `debug!` and no
-    /// [`Contribution`], and [`Self::record_audit`] builds the audit rows from
-    /// the contributions — so a matching `log` rule leaves no audit-log row and
-    /// no `security_events` row either.  At the default log level it produces
-    /// nothing observable at all.
+    /// Both halves are load-bearing and they used to disagree: the `Log` arm of
+    /// [`Self::evaluate_rules`] produced a `debug!` and no [`Contribution`], and
+    /// [`Self::record_audit`] builds the audit rows from the contributions, so a
+    /// matching `log` rule left no audit-log row, no `security_events` row and —
+    /// at the default log level — nothing observable at all.
     ///
-    /// This matters because `rules/README.md` tells rule authors to "start with
-    /// `action: log`, monitor before blocking", and because 104 rules across
-    /// the unloaded directories carry it.  Nothing in the shipped set takes
-    /// this branch — all 288 `rules/owasp-crs/` rules are `action: block` —
-    /// which is why the gap has never shown up in a conformance run.
+    /// That made "start with `action: log`, monitor before blocking", which is
+    /// what `rules/README.md` tells rule authors and what an operator means by
+    /// downgrading a noisy rule to [`RuleState::LogOnly`], an instruction to
+    /// watch silence. The `Log` arm now records a `score 0` contribution, which
+    /// reaches the audit log and nothing else: no anomaly score, no verdict, no
+    /// block. That distinction is the whole difference between `log` and
+    /// `block` and is asserted here in both directions.
     #[test]
-    fn log_action_contributes_no_score_and_no_audit_record() {
-        const RULE: &str = r#"
-version: "1.0"
-rules:
-  - id: PROBE-001
-    name: Matches every request path
-    category: probe
-    severity: critical
-    paranoia: 1
-    field: path
-    operator: contains
-    value: "/"
-    action: ACTION
-"#;
+    fn log_action_is_recorded_in_the_audit_log_and_never_scores() {
         let ctx = probe("GET", "/anything", "", &[], "", 1);
 
-        let logging = OWASPCheck::from_yaml(&RULE.replace("ACTION", "log")).with_config(&OwaspConfig::default());
+        let (logging, mut worker) = audited(&PROBE_RULE.replace("ACTION", "log"));
         assert_eq!(logging.rule_count(), 1, "the log rule is loaded and enforced");
         assert!(
             logging.check(&ctx).is_none(),
             "a `critical` rule with action=log must not block — it contributes no score"
         );
+        let recorded = worker.drain_to_string();
+        assert!(
+            recorded.contains("[ref \"PROBE-001\"]"),
+            "an action=log match must reach the audit log — that is what makes it an observation \
+             mode rather than silence: {recorded}"
+        );
+        assert!(
+            recorded.contains("[score \"0\"]"),
+            "a log-only match contributes nothing: {recorded}"
+        );
+        assert!(
+            !recorded.contains("[id \"949110\"]"),
+            "nothing was blocked, so no blocking-evaluation line: {recorded}"
+        );
 
         // The identical rule with `action: block` does reach the threshold, so
         // the rule and the request are not the reason nothing happened.
-        let blocking = OWASPCheck::from_yaml(&RULE.replace("ACTION", "block")).with_config(&OwaspConfig::default());
+        let blocking =
+            OWASPCheck::from_yaml(&PROBE_RULE.replace("ACTION", "block")).with_config(&OwaspConfig::default());
         assert!(
             blocking.check(&ctx).is_some(),
             "the same rule with action=block blocks, so `log` is what silenced it"

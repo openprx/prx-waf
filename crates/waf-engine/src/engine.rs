@@ -17,8 +17,8 @@ use crate::block_page::render_block_page;
 use crate::checker::{RuleStore, check_ip_blacklist, check_ip_whitelist, check_url_blacklist, check_url_whitelist};
 use crate::checks::{
     AntiHotlinkCheck, BotAction, BotCheck, CcCheck, Check, ContentInspectionState, ContentSecuritySubsystem,
-    ContentVerdict, GeoCheck, InspectionScope, OWASPCheck, RuntimeContentSecurityConfig, ScannerCheck, SemanticAction,
-    SensitiveCheck, UserBotPattern,
+    ContentVerdict, GeoCheck, InspectionScope, OWASPCheck, OverrideLoadReport, RuleOverrideSpec, RuleState,
+    RuntimeContentSecurityConfig, ScannerCheck, SemanticAction, SensitiveCheck, UserBotPattern,
 };
 use crate::community::{CommunityChecker, CommunityReporter, RequestInfo};
 use crate::crowdsec::{AppSecClient, AppSecResult, CrowdSecChecker, FallbackAction, appsec_to_detection};
@@ -312,7 +312,56 @@ impl WafEngine {
         // Reload operator bot patterns
         self.reload_bot_patterns().await?;
 
+        // Reload the per-CRS-rule override layer
+        self.reload_rule_overrides().await?;
+
         Ok(())
+    }
+
+    /// Rebuild the OWASP per-rule override layer from `rule_overrides` and
+    /// publish it to the request path.
+    ///
+    /// Split out of [`Self::reload_rules`] for the same reason
+    /// [`Self::reload_bot_patterns`] is: toggling one rule must not cost a full
+    /// reload of every IP list, custom rule and sensitive pattern. Nothing is
+    /// recompiled here — the CRS rules stay exactly as they were loaded at
+    /// startup; only the table saying how each of them is treated is replaced.
+    ///
+    /// A row the engine cannot act on is dropped **loudly**: an unreadable
+    /// `action_override`, a self-contradictory row, or a host-scoped row whose
+    /// host has gone. The last one matters most — treating a row with an
+    /// unresolvable host as global would silently widen a single-host exemption
+    /// into a fleet-wide one.
+    pub async fn reload_rule_overrides(&self) -> anyhow::Result<OverrideLoadReport> {
+        let rows = self.db.list_rule_overrides().await?;
+        let total = rows.len();
+        let mut specs = Vec::with_capacity(total);
+        for row in rows {
+            if row.host_id.is_some() && row.host_code.is_none() {
+                warn!(
+                    "ignoring rule override {} for {}: it is scoped to a host that no longer exists",
+                    row.id, row.rule_id
+                );
+                continue;
+            }
+            match RuleState::from_row(row.enabled, row.action_override.as_deref()) {
+                Ok(state) => specs.push(RuleOverrideSpec {
+                    rule_id: row.rule_id,
+                    host_code: row.host_code,
+                    state,
+                }),
+                Err(e) => warn!("ignoring rule override {} for {}: {e}", row.id, row.rule_id),
+            }
+        }
+
+        let report = self.owasp.load_overrides(&specs);
+        debug!(
+            "OWASP rule overrides reloaded: {} applied, {} unknown rule id(s), {} rows read",
+            report.applied,
+            report.unknown_rule_ids.len(),
+            total
+        );
+        Ok(report)
     }
 
     /// Rebuild the operator bot-pattern layer from the database and publish it

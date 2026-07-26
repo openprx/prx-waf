@@ -78,6 +78,20 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`action: log` is no longer silent.** The `Log` arm of `evaluate_rules`
+  wrote one `debug!` line and produced no contribution, and the audit log is
+  built from the contributions — so a matching `log` rule left no audit-log
+  row, no `security_events` row, and at the default log level nothing at all.
+  `rules/README.md` told rule authors to "start with `action: log`, monitor
+  before blocking", which was an instruction to watch silence; 104 rules across
+  the unloaded directories carry it. A `log` match is now recorded with
+  `score 0`, which reaches the audit log and nothing else — no anomaly score,
+  no verdict, no block. Without this the new `action_override = "log"` would
+  have been the same trap wearing a new name.
+
+  No shipped rule takes that branch (all 288 `rules/owasp-crs/` rules are
+  `action: block`), so the go-ftw regression numbers are unchanged.
+
 - **Request bodies are now routed by the same body-processor table upstream
   uses, instead of every body being handed to 154 rules that never asked for
   one.** The converter mapped `XML:/*` to the whole body unconditionally, so a
@@ -120,6 +134,49 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   Lane 1 detectors still read the raw body regardless.
 
 ### Added
+
+- **The CRS rules this WAF runs are now visible, and each of them can be turned
+  down or off without a restart.** `OWASPCheck` compiled 285 rules out of 288
+  declared and exposed nothing but the counts: there was no way to ask which
+  rules were enforced, and no way to stop one of them firing short of editing
+  `rules/owasp-crs/` and shipping a new deployment. The `rule_overrides` table
+  migration 0007 created had no reader and no writer in any release, and
+  `RulesManagement.vue` was unrouted because the endpoints it called did not
+  exist — it invented four demo rules on the 404.
+
+  `GET /api/rules/registry` now lists every enforced rule from the live checker
+  — id, name, category, severity, paranoia, phase, declared action, source file
+  and its effective state — alongside the load summary (declared vs enforced,
+  every rejected rule and why, unreadable sources, degraded flag).
+  `/api/rules/overrides` writes the two things the request path can carry out:
+
+  - `enabled = false` — the rule is not evaluated. It cannot match, cannot
+    score and produces no log line. Every write that produces one comes back
+    with a `warning` field saying so in as many words.
+  - `action_override = "log"` — the rule keeps running and every match is
+    written to the audit log, but it contributes nothing to the anomaly score.
+    This is the tuning tool.
+
+  Overrides are global by default and can be scoped to one host
+  (`host_code`), layering on top of the global decision the way
+  `log_only_mode` is per-host. They are published to the request path through
+  an `ArcSwapOption` as a dense per-rule state slice indexed by the rule's
+  position, so a request pays one wait-free atomic load and one already-loaded
+  byte per rule — and with no override configured, one atomic load and nothing
+  else. Nothing is recompiled; an override changes how an already-compiled rule
+  is treated.
+
+  `prx-waf rules list` / `info` now report the rule set the daemon actually
+  compiles, with each rule's effective state, instead of the CLI-only
+  `RuleManager` registry the serving process never builds. `prx-waf rules
+  enable` / `disable` used to resolve the id and then exit non-zero with "not
+  implemented"; they write the database now, take `--host`, `--note`,
+  `--log-only` and `--clear`, and refuse an id that is not in the loaded set.
+
+  Migration 0016 makes the table safe to read: `UNIQUE (rule_id, host_id)` did
+  not constrain the global rows at all, because Postgres treats NULLs as
+  distinct, so one rule could carry any number of contradictory global
+  overrides.
 
 - **Bot detection is configurable at runtime.** `checks/bot.rs` was two
   compile-time `RegexSet`s, so the only way to block a User-Agent was to edit
