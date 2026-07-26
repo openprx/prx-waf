@@ -62,7 +62,7 @@ rhai = { version = "1", features = ["sync"] }
 aho-corasick = "1"
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 instant-acme = "0.7"
-rcgen = "0.13"
+rcgen = "0.14"
 base64 = "0.23"
 # HTML5 parser (Servo html5ever core) for the Lane 2 XSS DOM semantic detector
 # (P-XSS-1). WHATWG-compliant fragment parsing + tree walk; no C toolchain. Our
