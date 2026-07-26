@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.60"
+version = "0.2.61"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -23,7 +23,6 @@ repository = "https://github.com/openprx/prx-waf"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP proxy
-pingora = { version = "0.8", features = ["lb"] }
 pingora-core = { version = "0.8" }
 pingora-proxy = { version = "0.8" }
 pingora-http = { version = "0.8" }
@@ -92,10 +91,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 rustls-pki-types = { version = "1", features = ["std"] }
-tokio-tungstenite = { version = "0.26", default-features = false, features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
-multipart = { version = "0.18", default-features = false, features = ["server"] }
-axum-extra = { version = "0.12", features = ["multipart"] }
 
 # Phase 7 additions
 notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
