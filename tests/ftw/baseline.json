@@ -164,7 +164,7 @@
   "crs_version": "v4.25.0",
   "go_ftw_version": "v1.3.0",
   "recorded_at": "2026-07-26",
-  "recorded_from": "ed275d7 (file part content withheld from the parameter surface); the pre-change side is 4ca40bf, fully re-measured on the same host and identical to the figures this file previously stored",
+  "recorded_from": "ed275d7's engine changes applied to 4ca40bf (file part content withheld from the parameter surface); the pre-change side is 4ca40bf itself, fully re-measured on the same host and identical to the figures this file previously stored. Not literally the ed275d7 tree: the two binaries were built before 4dc3b8b (jsonwebtoken 11, wasmtime 47) landed, so they carry 4ca40bf's dependency set. Neither crate participates in rule evaluation, so the figures hold — but this file exists to be reproducible, and reproducing it means checking out 4ca40bf and applying ed275d7's diff to crates/waf-engine, not checking out ed275d7.",
   "tolerance": 5,
   "modes": {
     "log": {
