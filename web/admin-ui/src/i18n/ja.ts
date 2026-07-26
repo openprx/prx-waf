@@ -232,6 +232,7 @@ export default {
     attackDetected: '攻撃検出',
     certExpiry: '証明書期限切れ',
     highTraffic: '高トラフィック',
+    notAvailable: '未対応',
     backendDown: 'バックエンドダウン',
     webhook: 'Webhook',
     telegram: 'Telegram',

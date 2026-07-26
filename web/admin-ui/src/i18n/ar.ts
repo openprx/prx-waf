@@ -232,6 +232,7 @@ export default {
     attackDetected: 'تم كشف هجوم',
     certExpiry: 'انتهاء الشهادة',
     highTraffic: 'حركة مرور عالية',
+    notAvailable: 'غير متاح بعد',
     backendDown: 'الخادم الخلفي معطل',
     webhook: 'Webhook',
     telegram: 'Telegram',

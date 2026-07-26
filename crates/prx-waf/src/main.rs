@@ -11,6 +11,7 @@ use gateway::{
     ChallengeStore, HostRouter, LoadBalancer, LoadBalancerRegistry, ResponseCache, SslManager, TunnelConfig, WafProxy,
     spawn_health_checker,
 };
+use waf_api::notify_runtime::{MonitoredPool, NotifyRuntime};
 use waf_api::{AppState, start_api_server};
 use waf_common::config::{ApiConfig, AppConfig, ConfigError, SecurityConfig, apply_env_overrides, load_config};
 use waf_engine::checks::ResponseCheckSet;
@@ -1855,6 +1856,9 @@ struct ShutdownGuards {
     /// Keeps the observability-table retention pruner alive while the server
     /// runs.
     _retention: Option<tokio::sync::watch::Sender<bool>>,
+    /// Keeps the notification event producers and dispatcher alive while the
+    /// server runs. Dropping it stops them.
+    _notify: Option<NotifyRuntime>,
 }
 
 /// Async initialization: database, engine, rules, Phases 5 & 6
@@ -1985,6 +1989,10 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
     // Hosts without `backends` are absent from the registry and continue to use
     // their single `remote_host`/`remote_port` upstream (backward compatible).
     let lb_registry = Arc::new(LoadBalancerRegistry::new());
+    // The same `Arc`s are handed to the notification runtime so `backend_down`
+    // alerts observe the health flags this checker maintains, instead of opening
+    // a second set of probes against the operator's upstreams.
+    let mut monitored_pools: Vec<MonitoredPool> = Vec::new();
     for host in router.list() {
         if host.backends.is_empty() {
             continue;
@@ -1996,6 +2004,10 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         // Spawn a background TCP health checker for this pool (every 10s).
         let handle = spawn_health_checker(Arc::clone(&lb), std::time::Duration::from_secs(10));
         std::mem::forget(handle);
+        monitored_pools.push(MonitoredPool {
+            host_code: host.code.clone(),
+            lb: Arc::clone(&lb),
+        });
         lb_registry.register_arc(&host.code, lb);
         info!(
             "Load balancer active for host {} ({} backends, strategy {:?})",
@@ -2213,11 +2225,8 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         )
     };
 
-    let guards = ShutdownGuards {
-        _crowdsec: crowdsec_shutdown_guard,
-        _community: community_shutdown_guard,
-        _retention: retention_shutdown_guard,
-    };
+    // `ShutdownGuards` is assembled at the end of this function: the notification
+    // guard needs the shared `api_state`, which is only built below.
 
     // ACME / Let's Encrypt automatic TLS (M-3). Returns the shared challenge
     // store injected into the proxy so HTTP-01 probes can be answered; an empty
@@ -2252,10 +2261,27 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         None => None,
     };
 
+    let api_state = Arc::new(api_state);
+
+    // Notification delivery. Until this call the admin UI could configure alert
+    // channels and successfully "test send" them, but no real event ever reached
+    // `dispatch_notification` — the channels were connected to nothing. Starting
+    // the runtime installs the bus on the database (so blocked requests raise
+    // `attack_detected` from the existing security-event write path) and spawns
+    // the certificate-expiry and backend-health producers.
+    let notify_guard = waf_api::notify_runtime::start(&config.notifications, &api_state, &db, monitored_pools);
+
+    let guards = ShutdownGuards {
+        _crowdsec: crowdsec_shutdown_guard,
+        _community: community_shutdown_guard,
+        _retention: retention_shutdown_guard,
+        _notify: notify_guard,
+    };
+
     Ok((
         engine,
         router,
-        Arc::new(api_state),
+        api_state,
         acme_challenges,
         lb_registry,
         response_cache,

@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 bytes = { workspace = true }
+# Bounded MPSC transport for the cross-crate notification bus (`notify`).
+# Already in the build graph via every other crate, so this adds no new
+# dependency to the workspace.
+tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }

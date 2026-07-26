@@ -19,7 +19,16 @@
           <select v-model="form.event_type" class="input">
             <option value="attack_detected">{{ $t('notifications.attackDetected') }}</option>
             <option value="cert_expiry">{{ $t('notifications.certExpiry') }}</option>
-            <option value="high_traffic">{{ $t('notifications.highTraffic') }}</option>
+            <!--
+              No producer raises `high_traffic` yet: the WAF has no request-rate
+              counter to compare against a threshold. Offering it as a selectable
+              option would let an operator configure a channel that can never
+              fire — the exact failure this screen already had for every event
+              type. Disabled until a producer exists.
+            -->
+            <option value="high_traffic" disabled>
+              {{ $t('notifications.highTraffic') }} ({{ $t('notifications.notAvailable') }})
+            </option>
             <option value="backend_down">{{ $t('notifications.backendDown') }}</option>
           </select>
           <input v-model="form.host_code" :placeholder="$t('ccProtection.hostCode')" class="input" />

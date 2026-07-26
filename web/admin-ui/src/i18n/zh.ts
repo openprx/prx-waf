@@ -262,6 +262,7 @@ export default {
     attackDetected: '检测到攻击',
     certExpiry: '证书到期',
     highTraffic: '流量异常',
+    notAvailable: '尚未支持',
     backendDown: '后端宕机',
     webhook: 'Webhook',
     telegram: 'Telegram',

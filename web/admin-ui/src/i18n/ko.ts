@@ -232,6 +232,7 @@ export default {
     attackDetected: '공격 탐지',
     certExpiry: '인증서 만료',
     highTraffic: '높은 트래픽',
+    notAvailable: '아직 사용할 수 없음',
     backendDown: '백엔드 다운',
     webhook: 'Webhook',
     telegram: 'Telegram',

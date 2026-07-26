@@ -16,6 +16,59 @@ use crate::models::{
     WasmPluginRow,
 };
 use crate::retention::{DEFAULT_DELETE_BATCH_SIZE, RetentionTable, prune_in_batches};
+use waf_common::notify::{NotificationEvent, NotificationEventKind};
+
+/// The `action` value that means "this request was actually stopped".
+///
+/// Only a real block raises an `attack_detected` notification. `log_only`
+/// (detect-only hosts, the Lane 2 shadow pipeline) and `allow` rows are written
+/// to the same tables but describe traffic that was served, so alerting on them
+/// would flood an operator with non-events.
+const ACTION_BLOCK: &str = "block";
+
+/// Longest request path echoed into a notification body.
+///
+/// The path is attacker-controlled and can be megabytes long; the alert only
+/// needs enough of it to be recognisable. Full detail stays in `security_events`
+/// / `attack_logs`, which the alert points at.
+const NOTIFY_PATH_CHARS: usize = 120;
+
+/// Truncate an attacker-controlled string to a bounded prefix.
+fn clip(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let mut out: String = value.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+/// Render the shared body of an `attack_detected` alert.
+///
+/// `NotificationEvent::new` sanitises and length-caps the result, so hostile
+/// bytes in `path` or `rule_name` cannot break out of the message or inject an
+/// email header.
+fn attack_message(host_code: &str, client_ip: &str, method: &str, path: &str, rule_name: &str) -> String {
+    format!(
+        "The WAF blocked a request.\n\nHost:   {host_code}\nClient: {client_ip}\nRule:   {rule_name}\nRequest: {method} {}",
+        clip(path, NOTIFY_PATH_CHARS)
+    )
+}
+
+/// Build the `attack_detected` event for a blocked request.
+///
+/// The coalescing key is the **host**, deliberately not the rule: a single
+/// scanner trips dozens of distinct rules in a second, and an operator wants one
+/// "host X is under attack" alert, not one per signature.
+fn attack_event(host_code: &str, client_ip: &str, method: &str, path: &str, rule_name: &str) -> NotificationEvent {
+    NotificationEvent::new(
+        NotificationEventKind::AttackDetected,
+        Some(host_code.to_owned()),
+        host_code,
+        &format!("[PRX-WAF] Attack blocked on {host_code}"),
+        &attack_message(host_code, client_ip, method, path, rule_name),
+    )
+}
 
 /// Column projection for every `hosts` read.
 ///
@@ -395,6 +448,19 @@ impl Database {
         .bind(log.created_at)
         .execute(&self.pool)
         .await?;
+
+        // IP/URL blacklist blocks land here rather than in `security_events`
+        // (see `waf_engine::engine::log_attack`), so the notification hook has
+        // to cover both writers to catch every enforced block.
+        if log.action == ACTION_BLOCK {
+            self.publish_notification(attack_event(
+                &log.host_code,
+                &log.client_ip,
+                &log.method,
+                &log.path,
+                &log.rule_name,
+            ));
+        }
         Ok(())
     }
 
@@ -466,6 +532,21 @@ impl Database {
         // Broadcast to WebSocket subscribers
         if let Ok(event_json) = serde_json::to_value(&req) {
             self.broadcast_event(event_json);
+        }
+
+        // Raise an operator notification for real blocks only. This is the
+        // funnel every detector reaches (`waf_engine::engine::log_security_event`
+        // and the Lane 2 semantic sink both end up here), and it already runs
+        // off the request hot path — the engine writes security events from a
+        // detached task, never inline in `request_filter`.
+        if req.action == ACTION_BLOCK {
+            self.publish_notification(attack_event(
+                &req.host_code,
+                &req.client_ip,
+                &req.method,
+                &req.path,
+                &req.rule_name,
+            ));
         }
 
         Ok(())
@@ -818,6 +899,28 @@ impl Database {
             r"SELECT * FROM certificates
                WHERE auto_renew = TRUE AND status = 'active'
                  AND not_after IS NOT NULL AND not_after < $1",
+        )
+        .bind(threshold)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Active certificates whose `not_after` falls inside the next
+    /// `days_ahead` days — including ones that have **already expired**.
+    ///
+    /// Deliberately not the same query as [`Self::list_certificates_due_renewal`]:
+    /// that one is the ACME renewal worklist and filters on `auto_renew = TRUE`,
+    /// because there is nothing it can do about a manually-installed cert. An
+    /// expiry *alert* is exactly the opposite — a hand-managed certificate about
+    /// to lapse is the case an operator most needs to hear about.
+    pub async fn list_certificates_expiring_within(&self, days_ahead: i64) -> Result<Vec<Certificate>, StorageError> {
+        let threshold = chrono::Utc::now() + chrono::Duration::days(days_ahead.max(0));
+        let rows = sqlx::query_as::<_, Certificate>(
+            r"SELECT * FROM certificates
+               WHERE status = 'active'
+                 AND not_after IS NOT NULL AND not_after < $1
+               ORDER BY not_after",
         )
         .bind(threshold)
         .fetch_all(&self.pool)

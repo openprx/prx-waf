@@ -29,22 +29,54 @@ use crate::state::AppState;
 
 // ─── Rate-limit state (in-process) ───────────────────────────────────────────
 
-/// Per `config_id` last-sent timestamp for rate limiting.
-pub type NotifRateLimiter = Arc<DashMap<Uuid, chrono::DateTime<Utc>>>;
+/// Rate-limit bucket identity: one bucket per (config, host).
+///
+/// Keying on the config alone would mean a flood against one host silences
+/// alerts for every other host sharing a channel — an operator watching ten
+/// sites through one webhook would hear about the first one attacked and
+/// nothing else. The host is therefore part of the key.
+pub type NotifRateLimitKey = (Uuid, Option<String>);
+
+/// Per-(config, host) last-sent timestamp for rate limiting.
+pub type NotifRateLimiter = Arc<DashMap<NotifRateLimitKey, chrono::DateTime<Utc>>>;
+
+/// Cap on live rate-limit buckets before stale ones are swept.
+///
+/// Bucket keys come from configured hosts, so this is a defensive bound rather
+/// than an expected one: it guarantees the map cannot grow without limit even
+/// if a future producer starts deriving `host_code` from request data.
+const MAX_RATE_LIMIT_ENTRIES: usize = 4096;
+
+/// Age at which a bucket is considered stale and swept.
+const RATE_LIMIT_ENTRY_TTL: chrono::TimeDelta = chrono::TimeDelta::hours(24);
 
 pub fn new_rate_limiter() -> NotifRateLimiter {
     Arc::new(DashMap::new())
 }
 
-fn is_rate_limited(rl: &NotifRateLimiter, id: Uuid) -> bool {
-    rl.get(&id).is_some_and(|last| {
-        let elapsed = Utc::now().signed_duration_since(*last);
-        elapsed < chrono::Duration::minutes(5)
-    })
+/// Whether this (config, host) bucket is still inside its cooldown.
+///
+/// `window_secs` is the channel's own `rate_limit_secs`; `0` (or negative)
+/// disables the cooldown for that channel.
+fn is_rate_limited(rl: &NotifRateLimiter, key: &NotifRateLimitKey, window_secs: i64) -> bool {
+    if window_secs <= 0 {
+        return false;
+    }
+    let Some(window) = chrono::TimeDelta::try_seconds(window_secs) else {
+        // Only reachable for an absurd stored value; treat it as "no cooldown"
+        // rather than silently muting the channel forever.
+        return false;
+    };
+    rl.get(key)
+        .is_some_and(|last| Utc::now().signed_duration_since(*last) < window)
 }
 
-fn mark_sent(rl: &NotifRateLimiter, id: Uuid) {
-    rl.insert(id, Utc::now());
+fn mark_sent(rl: &NotifRateLimiter, key: NotifRateLimitKey) {
+    rl.insert(key, Utc::now());
+    if rl.len() > MAX_RATE_LIMIT_ENTRIES {
+        let cutoff = Utc::now() - RATE_LIMIT_ENTRY_TTL;
+        rl.retain(|_, last| *last > cutoff);
+    }
 }
 
 // ─── Notification channel trait ───────────────────────────────────────────────
@@ -612,6 +644,12 @@ pub fn build_channel(channel_type: &str, config: &serde_json::Value) -> anyhow::
 
 /// Dispatch a notification event to all matching enabled configs.
 /// This is fire-and-forget; errors are logged but not propagated.
+///
+/// Callers reach this through [`crate::notify_runtime`], which coalesces bursts
+/// so a flood of identical events becomes one call plus a summary. The
+/// per-channel cooldown enforced here is the second, independent limiter: it
+/// honours each channel's stored `rate_limit_secs` and is keyed per (config,
+/// host), so one noisy host cannot mute the rest.
 pub async fn dispatch_notification(
     state: Arc<AppState>,
     event_type: String,
@@ -643,11 +681,32 @@ pub async fn dispatch_notification(
             continue;
         }
 
-        if is_rate_limited(&state.notif_rate_limiter, cfg.id) {
-            let _ = state
+        let rl_key: NotifRateLimitKey = (cfg.id, host_code.clone());
+        if is_rate_limited(&state.notif_rate_limiter, &rl_key, i64::from(cfg.rate_limit_secs)) {
+            // Suppression is never silent: it lands in `notification_log` (the
+            // admin UI renders it) *and* in the process log.
+            tracing::info!(
+                config = %cfg.name,
+                channel = %cfg.channel_type,
+                event_type = %event_type,
+                host_code = host_code.as_deref().unwrap_or("-"),
+                rate_limit_secs = cfg.rate_limit_secs,
+                "notification suppressed by per-channel rate limit"
+            );
+            if let Err(e) = state
                 .db
-                .create_notification_log(Some(cfg.id), &event_type, &cfg.channel_type, "rate_limited", None, None)
-                .await;
+                .create_notification_log(
+                    Some(cfg.id),
+                    &event_type,
+                    &cfg.channel_type,
+                    "rate_limited",
+                    Some(&format!("suppressed: within {}s cooldown", cfg.rate_limit_secs)),
+                    None,
+                )
+                .await
+            {
+                tracing::warn!("failed to record rate_limited notification log: {e}");
+            }
             continue;
         }
 
@@ -664,7 +723,7 @@ pub async fn dispatch_notification(
         match build_channel(&cfg.channel_type, &plain_cfg) {
             Ok(chan) => match chan.send(&payload).await {
                 Ok(()) => {
-                    mark_sent(&state.notif_rate_limiter, cfg.id);
+                    mark_sent(&state.notif_rate_limiter, rl_key);
                     let _ = state
                         .db
                         .create_notification_log(
@@ -862,8 +921,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
     use super::{
-        NotificationConfigView, SECRET_MASK, decrypt_config_with_key, prepare_config_with_key, redact_config,
-        transport_failure,
+        MAX_RATE_LIMIT_ENTRIES, NotifRateLimitKey, NotificationConfigView, SECRET_MASK, decrypt_config_with_key,
+        is_rate_limited, mark_sent, new_rate_limiter, prepare_config_with_key, redact_config, transport_failure,
     };
     use crate::notifications::LazyMasterKey;
     use chrono::Utc;
@@ -1273,6 +1332,82 @@ mod tests {
             !message.contains("127.0.0.1"),
             "endpoint leaked into log text: {message}"
         );
+    }
+
+    // ── ⑤ Per-channel rate limiting ──────────────────────────────────────────
+
+    #[test]
+    fn rate_limit_honours_the_channels_configured_window() {
+        // Regression: the limiter used to hardcode 5 minutes and ignore the
+        // `rate_limit_secs` the operator set in the UI.
+        let rl = new_rate_limiter();
+        let id = Uuid::new_v4();
+        let key: NotifRateLimitKey = (id, Some("h1".to_owned()));
+
+        // Backdate the bucket by a minute so both windows can be evaluated
+        // without sleeping: 1h has not elapsed, 30s has.
+        rl.insert(key.clone(), Utc::now() - chrono::Duration::seconds(60));
+        assert!(is_rate_limited(&rl, &key, 3600), "still inside a 1h cooldown");
+        assert!(!is_rate_limited(&rl, &key, 30), "a 30s cooldown has already elapsed");
+
+        // The old hardcoded 5-minute window would have suppressed this.
+        assert!(
+            !is_rate_limited(&rl, &key, 10),
+            "a 10s cooldown is not the old 5min default"
+        );
+    }
+
+    #[test]
+    fn a_zero_window_disables_the_cooldown() {
+        let rl = new_rate_limiter();
+        let key: NotifRateLimitKey = (Uuid::new_v4(), None);
+        mark_sent(&rl, key.clone());
+        assert!(!is_rate_limited(&rl, &key, 0));
+    }
+
+    #[test]
+    fn one_noisy_host_does_not_mute_the_others() {
+        // Regression: the limiter used to key on config_id alone, so an attack
+        // on one host silenced every other host sharing that channel.
+        let rl = new_rate_limiter();
+        let id = Uuid::new_v4();
+        let noisy: NotifRateLimitKey = (id, Some("under-attack".to_owned()));
+        let quiet: NotifRateLimitKey = (id, Some("other-site".to_owned()));
+
+        mark_sent(&rl, noisy.clone());
+        assert!(is_rate_limited(&rl, &noisy, 3600));
+        assert!(
+            !is_rate_limited(&rl, &quiet, 3600),
+            "a different host on the same channel must still alert"
+        );
+    }
+
+    #[test]
+    fn an_unseen_bucket_is_never_rate_limited() {
+        let rl = new_rate_limiter();
+        let key: NotifRateLimitKey = (Uuid::new_v4(), Some("h1".to_owned()));
+        assert!(!is_rate_limited(&rl, &key, 3600), "the first event always goes out");
+    }
+
+    #[test]
+    fn bucket_map_is_swept_when_it_exceeds_the_cap() {
+        let rl = new_rate_limiter();
+        for i in 0..=MAX_RATE_LIMIT_ENTRIES {
+            rl.insert(
+                (Uuid::new_v4(), Some(format!("h{i}"))),
+                Utc::now() - chrono::Duration::days(2),
+            );
+        }
+        // The insert that crosses the cap triggers the sweep; only the fresh
+        // entry survives, so the map cannot grow without bound.
+        let fresh: NotifRateLimitKey = (Uuid::new_v4(), Some("fresh".to_owned()));
+        mark_sent(&rl, fresh.clone());
+        assert!(
+            rl.len() <= MAX_RATE_LIMIT_ENTRIES,
+            "stale buckets are swept: {}",
+            rl.len()
+        );
+        assert!(rl.contains_key(&fresh), "the entry just written survives the sweep");
     }
 
     #[test]

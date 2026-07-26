@@ -262,6 +262,7 @@ export default {
     attackDetected: 'Attack Detected',
     certExpiry: 'Cert Expiry',
     highTraffic: 'High Traffic',
+    notAvailable: 'not yet available',
     backendDown: 'Backend Down',
     webhook: 'Webhook',
     telegram: 'Telegram',

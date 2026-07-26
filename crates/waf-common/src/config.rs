@@ -61,17 +61,125 @@ pub struct AppConfig {
     /// [`AuditLogConfig`].
     #[serde(default)]
     pub audit_log: AuditLogConfig,
+    /// Delivery of operator notifications (attack / cert-expiry / backend-down)
+    /// to the channels configured in the admin UI.
+    ///
+    /// **On by default**, but inert until at least one notification channel is
+    /// configured — an install with no channels raises no events to anyone. See
+    /// [`NotificationsConfig`].
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+}
+
+/// Runtime settings for operator-notification delivery.
+///
+/// These govern *when* an event becomes an alert. The *where* (email / webhook /
+/// Telegram endpoint, and the per-channel `rate_limit_secs`) is configured per
+/// channel in the admin UI and stored in `notification_configs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    /// Master switch. When `false` no event producer or dispatcher is started
+    /// and nothing is ever sent. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Coalescing window, in seconds.
+    ///
+    /// The first event of a given kind+scope alerts **immediately**; every
+    /// further event with the same scope inside this window is folded into a
+    /// single follow-up summary emitted at the end of the window. This is what
+    /// stops a scanner generating one email per blocked request. Default: 300
+    /// (5 minutes).
+    #[serde(default = "default_notify_coalesce_window_secs")]
+    pub coalesce_window_secs: u64,
+    /// Bounded depth of the in-process event queue. Events published while the
+    /// queue is full are dropped and counted (reported in the log). Default:
+    /// 1024.
+    #[serde(default = "default_notify_queue_capacity")]
+    pub queue_capacity: usize,
+    /// How often certificates are checked for imminent expiry, in seconds.
+    /// Default: 3600 (hourly).
+    #[serde(default = "default_notify_cert_check_secs")]
+    pub cert_expiry_check_interval_secs: u64,
+    /// Start warning this many days before a certificate's `not_after`.
+    /// At most one alert per certificate per day is emitted, escalating as the
+    /// remaining days count down. Default: 14.
+    #[serde(default = "default_notify_cert_warn_days")]
+    pub cert_expiry_warn_days: i64,
+    /// How often upstream backend health is sampled for up/down transitions, in
+    /// seconds. Matches the gateway's own 10s health-check period. Default: 10.
+    #[serde(default = "default_notify_backend_poll_secs")]
+    pub backend_health_poll_secs: u64,
+}
+
+const fn default_notify_coalesce_window_secs() -> u64 {
+    300
+}
+
+const fn default_notify_queue_capacity() -> usize {
+    1024
+}
+
+const fn default_notify_cert_check_secs() -> u64 {
+    3600
+}
+
+const fn default_notify_cert_warn_days() -> i64 {
+    14
+}
+
+const fn default_notify_backend_poll_secs() -> u64 {
+    10
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            coalesce_window_secs: default_notify_coalesce_window_secs(),
+            queue_capacity: default_notify_queue_capacity(),
+            cert_expiry_check_interval_secs: default_notify_cert_check_secs(),
+            cert_expiry_warn_days: default_notify_cert_warn_days(),
+            backend_health_poll_secs: default_notify_backend_poll_secs(),
+        }
+    }
+}
+
+impl NotificationsConfig {
+    /// Reject settings that would make the notification runtime misbehave.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.coalesce_window_secs == 0 {
+            return Err("notifications.coalesce_window_secs must be >= 1".to_owned());
+        }
+        if self.queue_capacity == 0 {
+            return Err("notifications.queue_capacity must be >= 1".to_owned());
+        }
+        if self.cert_expiry_check_interval_secs == 0 {
+            return Err("notifications.cert_expiry_check_interval_secs must be >= 1".to_owned());
+        }
+        if self.cert_expiry_warn_days < 0 {
+            return Err("notifications.cert_expiry_warn_days must be >= 0".to_owned());
+        }
+        if self.backend_health_poll_secs == 0 {
+            return Err("notifications.backend_health_poll_secs must be >= 1".to_owned());
+        }
+        Ok(())
+    }
 }
 
 impl AppConfig {
     /// Cross-field semantic validation applied after deserialisation.
     ///
     /// Validates the Lane 2 semantic content-security config (plan §6.2 strict
-    /// loader rule), the OWASP anomaly-scoring model and the audit log. Returns
-    /// a human-readable error on the first violation.
+    /// loader rule), the OWASP anomaly-scoring model, the audit log and the
+    /// notification runtime. Returns a human-readable error on the first
+    /// violation.
     pub fn validate(&self) -> Result<(), String> {
         self.content_security.validate()?;
         self.owasp.validate()?;
+        self.notifications.validate()?;
         self.audit_log.validate()
     }
 }

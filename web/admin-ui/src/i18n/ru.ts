@@ -232,6 +232,7 @@ export default {
     attackDetected: 'Атака обнаружена',
     certExpiry: 'Истечение сертификата',
     highTraffic: 'Высокий трафик',
+    notAvailable: 'пока недоступно',
     backendDown: 'Бэкенд недоступен',
     webhook: 'Webhook',
     telegram: 'Telegram',

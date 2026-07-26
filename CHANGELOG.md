@@ -9,7 +9,47 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Notifications actually fire now.** Everything around
+  `dispatch_notification` existed — config table, encrypted storage, rate
+  limiter, webhook and email channels, `notification_log`, retention pruning,
+  the UI with a working "test send" — and the function had **zero callers**. An
+  operator could configure alerting, watch the test succeed, and never receive
+  a single real one.
+
+  `attack_detected`, `cert_expiry` and `backend_down` are wired. The event type
+  and its transport live in `waf-common`, the only crate every layer can see,
+  so no crate gained a dependency edge and neither `waf-engine` nor `gateway`
+  was touched: every enforced block already converges on two `waf-storage`
+  writes that are themselves off the hot path. Publishing is a synchronous
+  `try_send` on a bounded channel that never awaits and never allocates — a
+  wedged webhook endpoint cannot reach request handling — and an overflow is
+  counted and logged rather than dropped in silence.
+
+- `high_traffic` is **not** implemented and is now disabled in the UI rather
+  than offered. There is no request counter to build it on:
+  `AppState::increment_requests` and `increment_blocked` have no callers
+  despite the comment saying the proxy layer increments them,
+  `StatsCollector` has none either, and `stats_timeseries` aggregates security
+  events, i.e. attacks rather than traffic. Leaving it selectable would be the
+  same defect this change exists to fix.
+
 ### Fixed
+
+- **The notification rate limiter ignored the interval it was configured
+  with.** `is_rate_limited` hardcoded five minutes while `rate_limit_secs` sat
+  in the database and was displayed in the UI. It was also keyed on the channel
+  alone, so a flood against one host silenced alerts for every other host
+  sharing that channel — an operator watching ten sites through one webhook
+  would hear about the first one attacked and nothing more. It now honours the
+  stored interval and buckets per (config, host), with a bound and a sweep so
+  the map cannot grow without limit.
+
+- **A notification title could inject SMTP headers.** The title reaches the
+  `Subject:` header and is built from attacker-controlled request data, so a CR
+  or LF in a path would have split the header. Control characters are stripped
+  from titles; message bodies keep `\n` and lose everything else.
 
 - **An ordinary file upload is no longer an attack.** A multipart file part's
   *content* was going into the surface the `ARGS`/`REQUEST_BODY` rules read, so

@@ -232,6 +232,7 @@ export default {
     attackDetected: 'Angriff erkannt',
     certExpiry: 'Zertifikatsablauf',
     highTraffic: 'Hoher Datenverkehr',
+    notAvailable: 'noch nicht verfuegbar',
     backendDown: 'Backend ausgefallen',
     webhook: 'Webhook',
     telegram: 'Telegram',
