@@ -14,6 +14,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+use crate::audit::audit_log_middleware;
 use crate::auth::{login, logout, refresh_token, totp_disable, totp_setup, totp_verify};
 use crate::cache_api::{cache_flush, cache_flush_host, cache_flush_key, cache_stats};
 use crate::cluster::{cluster_status, generate_join_token, get_cluster_node, list_cluster_nodes, remove_cluster_node};
@@ -109,7 +110,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins", get(list_plugins))
         .route("/api/tunnels", get(list_tunnels))
         .route("/api/cache/stats", get(cache_stats))
-        .route("/api/audit-log", get(list_audit_log))
         .route("/api/cluster/status", get(cluster_status))
         .route("/api/cluster/nodes", get(list_cluster_nodes))
         .route("/api/cluster/nodes/{id}", get(get_cluster_node))
@@ -126,6 +126,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // ── Admin-only routes: all mutations + sensitive operations ─────────────────
     let admin_routes = Router::new()
+        // Who changed the WAF's own configuration, from where, and whether they
+        // were allowed to. Admin-only rather than read-only: it is a roster of
+        // administrator usernames and their source addresses, which is exactly
+        // what an attacker who has taken a low-privilege account wants next. It
+        // sat in the read-only group while it was still returning nothing.
+        .route("/api/audit-log", get(list_audit_log))
         // Hosts
         .route("/api/hosts", post(create_host))
         .route("/api/hosts/{id}", put(update_host).delete(delete_host))
@@ -191,12 +197,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/crowdsec/test", post(test_crowdsec_connection))
         .route("/api/crowdsec/config", put(update_crowdsec_config))
         // Admin gate runs after require_auth (which injects Claims), before handler.
-        .route_layer(middleware::from_fn(require_admin));
+        .route_layer(middleware::from_fn(require_admin))
+        // Audit trail wraps the admin gate, so a *refused* mutation is recorded
+        // too — the row a review most wants is the one where someone tried.
+        .route_layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware));
 
     // Protected API routes: merge admin-only and read-only groups, then apply the
     // shared middleware stack. Execution order for a request is:
-    //   rate_limit → admin_ip → require_auth (injects Claims) → require_admin* → handler
-    // (*require_admin only on admin_routes via the route_layer above).
+    //   rate_limit → admin_ip → require_auth (injects Claims) → audit* → require_admin* → handler
+    // (*audit and require_admin only on admin_routes via the route_layers above.)
     let protected_routes = admin_routes
         .merge(readonly_routes)
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))

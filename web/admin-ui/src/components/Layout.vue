@@ -17,6 +17,7 @@
         <NavItem to="/certificates" :icon="Lock">{{ $t('nav.certificates') }}</NavItem>
         <NavItem to="/cc-protection" :icon="ShieldCheck">{{ $t('nav.ccProtection') }}</NavItem>
         <NavItem to="/notifications" :icon="Bell">{{ $t('nav.notifications') }}</NavItem>
+        <NavItem to="/audit-log" :icon="ScrollText">{{ $t('nav.auditLog') }}</NavItem>
         <NavItem to="/settings" :icon="Settings">{{ $t('nav.settings') }}</NavItem>
         <div class="pt-2 pb-1 px-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ $t('nav.cluster') }}</div>
         <NavItem to="/cluster" :icon="Network">{{ $t('nav.clusterOverview') }}</NavItem>
@@ -26,10 +27,14 @@
         <NavItem to="/crowdsec-settings" :icon="Cloud">{{ $t('nav.csSettings') }}</NavItem>
         <NavItem to="/crowdsec-decisions" :icon="Ban">{{ $t('nav.csDecisions') }}</NavItem>
         <NavItem to="/crowdsec-stats" :icon="BarChart3">{{ $t('nav.csStats') }}</NavItem>
-        <div class="pt-2 pb-1 px-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ $t('nav.rules') }}</div>
-        <NavItem to="/rules-management" :icon="BookOpen">{{ $t('nav.ruleManager') }}</NavItem>
-        <NavItem to="/rule-sources" :icon="GitBranch">{{ $t('nav.ruleSources') }}</NavItem>
-        <NavItem to="/bot-management" :icon="BotIcon">{{ $t('nav.botDetection') }}</NavItem>
+        <!--
+          The "Rules" section (Rule Manager / Rule Sources / Bot Detection) is
+          intentionally not linked. Those three pages drive `/api/rules/registry`,
+          `/api/rule-sources` and `/api/bot-patterns`, none of which exist, and the
+          subsystem behind them (`waf_engine::RuleManager`) is never constructed by
+          the daemon — it is CLI-only. The views still live in `src/views/` so the
+          work is not lost; see the audit report for what wiring them would take.
+        -->
       </nav>
       <div class="px-4 py-3 border-t border-gray-700 space-y-2">
         <!-- Language switcher -->
@@ -91,9 +96,7 @@ import {
   Cloud,
   Ban,
   BarChart3,
-  BookOpen,
-  GitBranch,
-  Bot as BotIcon,
+  ScrollText,
   Languages,
   Network,
   Key,

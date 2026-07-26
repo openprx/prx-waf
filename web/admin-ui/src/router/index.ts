@@ -14,20 +14,24 @@ const routes = [
   { path: '/certificates', component: () => import('../views/Certificates.vue') },
   { path: '/cc-protection', component: () => import('../views/CCProtection.vue') },
   { path: '/notifications', component: () => import('../views/Notifications.vue') },
+  { path: '/audit-log', component: () => import('../views/AuditLog.vue') },
   { path: '/settings', component: () => import('../views/Settings.vue') },
   // Phase 6: CrowdSec
   { path: '/crowdsec-settings', component: () => import('../views/CrowdSecSettings.vue') },
   { path: '/crowdsec-decisions', component: () => import('../views/CrowdSecDecisions.vue') },
   { path: '/crowdsec-stats', component: () => import('../views/CrowdSecStats.vue') },
-  // Phase 7: Rule management
-  { path: '/rules-management', component: () => import('../views/RulesManagement.vue') },
-  { path: '/rule-sources', component: () => import('../views/RuleSources.vue') },
-  { path: '/bot-management', component: () => import('../views/BotManagement.vue') },
   // Phase 8: Cluster
   { path: '/cluster', component: () => import('../views/ClusterOverview.vue') },
   { path: '/cluster/nodes/:id', component: () => import('../views/ClusterNodeDetail.vue') },
   { path: '/cluster/tokens', component: () => import('../views/ClusterTokens.vue') },
   { path: '/cluster/sync', component: () => import('../views/ClusterSync.vue') },
+  // Phase 7 rule management (`/rules-management`, `/rule-sources`,
+  // `/bot-management`) is deliberately unrouted: the three views call API routes
+  // that do not exist and silently fall back to demo data, and the subsystem they
+  // present (`waf_engine::RuleManager`) is never loaded by the daemon. The views
+  // remain in `src/views/` — this removes the entry, not the work. An old
+  // bookmark now lands on the catch-all below instead of a blank page.
+  { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
 ]
 
 const router = createRouter({

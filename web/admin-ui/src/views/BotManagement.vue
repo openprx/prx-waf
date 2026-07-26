@@ -1,3 +1,15 @@
+<!--
+  UNROUTED — this view is not reachable from the app.
+
+  It drives `/api/bot-patterns`, which does not exist, and silently falls back
+  to a hard-coded demo list when the call 404s. Worse, the promise itself is
+  unmeetable today: bot detection is compiled into `waf-engine`
+  (`checks/bot.rs`, fixed `RegexSet`s built at first use), so no pattern added
+  or disabled here could ever reach the request path.
+
+  Kept on disk rather than deleted — the entry was removed, not the work. See
+  the audit report for what "add a runtime bot-pattern store" would involve.
+-->
 <template>
   <Layout>
     <div class="p-6">

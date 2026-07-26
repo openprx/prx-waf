@@ -1,3 +1,16 @@
+<!--
+  UNROUTED — this view is not reachable from the app.
+
+  It drives `/api/rules/registry`, `/api/rules/reload`, `/api/rules/import` and
+  `PATCH /api/rules/registry/{id}` — none of which exist. On 404 it renders four
+  hard-coded demo rules, and its enable/disable button flips the row
+  "optimistically" so a toggle that persisted nothing still looks like it
+  worked. The registry it presents is `waf_engine::RuleManager`, which the
+  daemon never constructs; enforcement comes from `rules/owasp-crs/` (compiled
+  by `OWASPCheck` at startup) and from the database.
+
+  Kept on disk rather than deleted — the entry was removed, not the work.
+-->
 <template>
   <Layout>
     <div class="p-6">

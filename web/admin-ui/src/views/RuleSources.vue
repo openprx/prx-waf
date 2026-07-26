@@ -1,3 +1,14 @@
+<!--
+  UNROUTED — this view is not reachable from the app.
+
+  It drives `/api/rule-sources`, which does not exist, and its "Built-in
+  sources" panel is a hard-coded list with invented rule counts (15/31/19; the
+  real built-in catalogue holds different numbers). The sources it would manage
+  live in `[[rules.sources]]`, which only the `prx-waf rules` / `sources` CLI
+  subcommands read — the daemon never constructs a `RuleManager`.
+
+  Kept on disk rather than deleted — the entry was removed, not the work.
+-->
 <template>
   <Layout>
     <div class="p-6">

@@ -156,6 +156,27 @@ export const notifApi = {
   test: (id: string) => api.post(`/api/notifications/${id}/test`),
 }
 
+// ─── Admin audit trail ────────────────────────────────────────────────────────
+export interface AuditLogEntry {
+  id: number
+  admin_username: string | null
+  action: string
+  resource_type: string | null
+  resource_id: string | null
+  detail: { status?: number; outcome?: string } | null
+  ip_addr: string | null
+  created_at: string
+}
+export interface AuditLogFilters {
+  admin_username?: string
+  action?: string
+  page?: number
+  page_size?: number
+}
+export const auditApi = {
+  list: (params?: AuditLogFilters) => api.get('/api/audit-log', { params }),
+}
+
 // ─── Status ───────────────────────────────────────────────────────────────────
 export const systemApi = {
   status: () => api.get('/api/status'),

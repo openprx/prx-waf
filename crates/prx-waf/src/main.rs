@@ -534,18 +534,22 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
             }
         }
 
+        // `enable` / `disable` flip a bit on a registry this process built a
+        // moment ago and drops on exit — nothing is persisted and no running
+        // proxy ever sees it. The id is still resolved first, so a typo is
+        // reported as a typo rather than as the missing feature.
         RulesCommands::Enable { rule_id } => {
             let mut manager = RuleManager::new(&config.rules);
             manager.load_all()?;
             manager.enable_rule(&rule_id)?;
-            println!("Rule enabled: {rule_id}");
+            anyhow::bail!("{}", rule_toggle_unimplemented("enable", &rule_id));
         }
 
         RulesCommands::Disable { rule_id } => {
             let mut manager = RuleManager::new(&config.rules);
             manager.load_all()?;
             manager.disable_rule(&rule_id)?;
-            println!("Rule disabled: {rule_id}");
+            anyhow::bail!("{}", rule_toggle_unimplemented("disable", &rule_id));
         }
 
         RulesCommands::Reload => {
@@ -660,7 +664,6 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
 
 // ── Sources commands ──────────────────────────────────────────────────────────
 
-#[allow(clippy::unnecessary_wraps)]
 fn run_sources_cmd(cmd: SourcesCommands, config: &AppConfig) -> anyhow::Result<()> {
     match cmd {
         SourcesCommands::List => {
@@ -682,30 +685,68 @@ fn run_sources_cmd(cmd: SourcesCommands, config: &AppConfig) -> anyhow::Result<(
             }
         }
         SourcesCommands::Add { name, url, format } => {
-            println!("Add source '{name}' ({format}): {url}");
-            println!("Note: add the following to your [rules.sources] config:");
-            println!();
-            println!("[[rules.sources]]");
-            println!("name   = \"{name}\"");
-            println!("url    = \"{url}\"");
-            println!("format = \"{format}\"");
+            anyhow::bail!(
+                "`sources add` is not implemented — nothing was written.\n\
+                 There is no writable rule-source store; `[[rules.sources]]` lives in the config \
+                 file only. Add the entry yourself and restart:\n\n\
+                 \x20 [[rules.sources]]\n\
+                 \x20 name   = \"{name}\"\n\
+                 \x20 url    = \"{url}\"\n\
+                 \x20 format = \"{format}\"\n\n\
+                 {RULE_SOURCES_ARE_CLI_ONLY}"
+            );
         }
         SourcesCommands::Remove { name } => {
-            println!("Remove source '{name}': edit configs/default.toml and remove the [[rules.sources]] entry.");
+            anyhow::bail!(
+                "`sources remove` is not implemented — source '{name}' was not touched.\n\
+                 Delete its `[[rules.sources]]` entry from the config file and restart.\n\n\
+                 {RULE_SOURCES_ARE_CLI_ONLY}"
+            );
         }
         SourcesCommands::Update { name } => {
-            if let Some(name) = name {
-                println!("Updating source '{name}'... (run `prx-waf rules update` to fetch)");
-            } else {
-                println!("Updating all sources... (run `prx-waf rules update` to fetch all)");
-            }
+            let which = name.as_deref().unwrap_or("all sources");
+            anyhow::bail!(
+                "`sources update` is not implemented — '{which}' was not fetched.\n\
+                 Use `prx-waf rules update`, which really does fetch every configured remote \
+                 source.\n\n\
+                 {RULE_SOURCES_ARE_CLI_ONLY}"
+            );
         }
         SourcesCommands::Sync => {
-            println!("Syncing all sources... run `prx-waf rules update` to fetch.");
+            anyhow::bail!(
+                "`sources sync` is not implemented — nothing was fetched.\n\
+                 Use `prx-waf rules update`, which really does fetch every configured remote \
+                 source.\n\n\
+                 {RULE_SOURCES_ARE_CLI_ONLY}"
+            );
         }
     }
     Ok(())
 }
+
+/// Message for `rules enable` / `rules disable`, which have no persistent store.
+fn rule_toggle_unimplemented(verb: &str, rule_id: &str) -> String {
+    format!(
+        "`rules {verb}` is not implemented — rule '{rule_id}' was NOT {verb}d.\n\
+         The registry this command edits is built in-process and discarded on exit; there is no \
+         per-rule enable/disable store, so no running proxy could observe the change.\n\
+         To stop a CRS rule from firing, remove or edit its declaration in `rules/owasp-crs/` and \
+         restart. Database-backed rules (custom Rhai rules, IP/URL lists) can be deleted through \
+         the admin API and take effect immediately.\n\n\
+         {RULE_SOURCES_ARE_CLI_ONLY}"
+    )
+}
+
+/// The one fact every `sources` / `bot` failure message has to carry.
+///
+/// `[rules]` — `dir`, `sources`, `enable_builtin_*`, `hot_reload` — is read by
+/// these CLI subcommands and by nothing else: the daemon never constructs a
+/// [`RuleManager`]. Telling an operator to edit `[[rules.sources]]` without
+/// saying so would trade one false promise for another.
+const RULE_SOURCES_ARE_CLI_ONLY: &str = "Note: `[rules]` (dir / sources / builtin toggles) is consulted by the `rules`, `sources` and \
+     `bot` CLI subcommands only. The running proxy compiles its OWASP CRS set from \
+     `rules/owasp-crs/` at startup and takes every operator-managed rule (hosts, IP/URL lists, \
+     custom Rhai rules, sensitive patterns) from the database.";
 
 // ── Bot commands ──────────────────────────────────────────────────────────────
 
@@ -732,20 +773,27 @@ fn run_bot_cmd(cmd: BotCommands, config: &AppConfig) -> anyhow::Result<()> {
         }
 
         BotCommands::Add { pattern, action } => {
-            println!("Bot pattern added: {pattern} → {action}");
-            println!("Note: persistent storage requires database integration.");
-            println!("To make permanent, add a YAML rule to your rules/ directory:");
-            println!();
-            println!("- id: \"BOT-CUSTOM-001\"");
-            println!("  name: \"Custom bot pattern\"");
-            println!("  category: \"bot\"");
-            println!("  action: \"{action}\"");
-            println!("  pattern: \"{pattern}\"");
+            anyhow::bail!(
+                "`bot add` is not implemented — pattern {pattern:?} ({action}) was NOT added.\n\
+                 Bot detection is compiled in (`waf-engine` `checks/bot.rs`, fixed `RegexSet`s) and \
+                 the `builtin-bot` catalogue this CLI lists is read-only; there is no store to add \
+                 a pattern to.\n\
+                 To block a User-Agent on live traffic today, create a custom rule — those are \
+                 stored in the database and hot-loaded into the running engine:\n\
+                 \x20 Admin UI → Custom Rules, or POST /api/custom-rules with a Rhai script \
+                 matching `request.headers[\"user-agent\"]`.\n\n\
+                 {RULE_SOURCES_ARE_CLI_ONLY}"
+            );
         }
 
         BotCommands::Remove { pattern } => {
-            println!("Remove bot pattern: {pattern}");
-            println!("Note: remove the corresponding rule from your rules/ directory.");
+            anyhow::bail!(
+                "`bot remove` is not implemented — pattern {pattern:?} was NOT removed.\n\
+                 The built-in bot signatures are compiled into the binary and cannot be removed at \
+                 runtime. Delete a custom rule instead (Admin UI → Custom Rules, or \
+                 DELETE /api/custom-rules/{{id}}).\n\n\
+                 {RULE_SOURCES_ARE_CLI_ONLY}"
+            );
         }
 
         BotCommands::Test { user_agent } => {

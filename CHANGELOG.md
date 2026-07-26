@@ -11,6 +11,67 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The `audit_log` table finally has a writer, and the admin UI a page to read
+  it.** The table, a `create_audit_log` function, a `GET /api/audit-log`
+  handler and a 365-day retention policy had all been in place; the function
+  had zero callers, so the endpoint could only ever answer `{"entries":[]}`.
+
+  A middleware now records every state-changing admin call — who, what, from
+  which address, and whether it succeeded. It sits **outside** `require_admin`
+  and inside `require_auth`, so a *refused* attempt is recorded too; an audit
+  trail that logs only successes hides the events most worth reviewing. Reads
+  are not recorded (a dashboard polling `GET /api/status` would bury
+  everything), and request bodies are never recorded — certificate private
+  keys, bouncer keys, SMTP passwords and webhook URLs travel in them.
+
+  This is not duplicated by the other trails: `security_events` and
+  `attack_logs` record what traffic did, `crowdsec_events` what an external
+  decision source did, and `waf-engine`'s same-named `audit_log` is a
+  ModSecurity-format file recording which CRS rules a *request* matched. None
+  of them answers who unblocked an IP or deleted a host — and that is the one
+  question whose evidence outlives the change it describes.
+
+### Changed
+
+- `GET /api/audit-log` moves from the read-only route group to the admin
+  group. It is a roster of administrator usernames and their source addresses,
+  which is precisely what someone holding a low-privilege account wants next.
+  It was harmless in the read-only group only because it returned nothing.
+
+### Removed
+
+- **Three admin pages that could not work are no longer reachable**: Bot
+  Detection, Rule Sources and Rule Manager. Their routes existed and their
+  screens rendered, but no backend route did — `/api/bot-patterns`,
+  `/api/rule-sources`, `/api/rules/registry`, `/api/rules/reload` and
+  `/api/rules/import` all answer 404 — so each fell back to hardcoded demo
+  data, and Rule Sources' built-in counts were simply invented (15/31/19
+  against a real 33 bot and 22 scanner rules). All three also called bare
+  `axios` rather than the configured instance, so they carried no JWT and
+  would have been rejected even if the routes had existed.
+
+  The cause is one level down: `waf_engine::RuleManager`, the subsystem behind
+  all three, is never constructed by the daemon — every reference to it is in a
+  CLI subcommand. The whole `[rules]` config section is therefore dead for a
+  running WAF. What actually enforces is `OWASPCheck::new()`, loading from the
+  hardcoded `rules/owasp-crs`, and a compile-time `RegexSet` in `checks/bot.rs`
+  with no runtime configurability at all. The `bot_patterns`, `rule_sources`
+  and `rule_overrides` tables from migration 0007 have no Rust reader or
+  writer either.
+
+  The screens are kept on disk with a header explaining what connecting them
+  would require, and unknown routes now redirect to the dashboard so an old
+  bookmark does not land on a blank page.
+
+- **Seven CLI subcommands stop reporting success for work they never did**:
+  `bot add`, `bot remove`, `sources add`, `sources remove`, `sources update`,
+  `sources sync`, and `rules enable`/`disable`. They printed a confirmation and
+  exited 0; `bot add` additionally told the operator to drop a YAML file into
+  `rules/`, which the daemon never reads. Each now explains what does work
+  instead — custom rules, which are stored in the database and do reach the
+  engine — and exits non-zero. `bot list`, `bot test`, `sources list` and
+  `rules list` do real work and are untouched.
+
 - **Notifications actually fire now.** Everything around
   `dispatch_notification` existed — config table, encrypted storage, rate
   limiter, webhook and email channels, `notification_log`, retention pruning,
