@@ -14,7 +14,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: args+args_names+body
+    field: args+args_names+body+xml_text
     operator: regex
     value: |-
       (?:get|p(?:(?:os|u)t|atch|rop(?:find|atch))|head|options|co(?:nnect|py)|delete|trac[ek]|m(?:kcol|ove)|(?:un)?lock)[\s\x0b]+[^\s\x0b]+[\s\x0b]+http/[0-9]
@@ -32,7 +32,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: args+args_names+body+cookies+cookies_names
+    field: args+args_names+xml_text+cookies+cookies_names
     operator: regex
     value: '[\n\r][^0-9A-Z_a-z]*?(?:content-(?:type|length)|set-cookie|location):[\s\x0b]*[0-9A-Z_a-z]'
     transform:
@@ -48,7 +48,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: args+args_names+body+cookies+cookies_names
+    field: args+args_names+xml_text+cookies+cookies_names
     operator: regex
     value: (?:\bhttp/\d|<(?:html|meta)\b)
     transform:
@@ -128,7 +128,7 @@ rules:
     category: protocol-attack
     severity: critical
     paranoia: 1
-    field: args+args_names+body+cookies+cookies_names
+    field: args+args_names+xml_text+cookies+cookies_names
     operator: regex
     value: |-
       ^[^!&\(\):<>\|~]*\)[\s\x0b]*(?:\((?:[^!&\(\),<->\|~]+[<>~]?=|[\s\x0b]*[!&\|][\s\x0b]*[\(\)]?[\s\x0b]*)|\)[\s\x0b]*\([\s\x0b]*[!&\|][\s\x0b]*|[!&\|][\s\x0b]*\([^!&\(\),<->\|~]+[<>~]?=[^!&\(\):<>\|~]*)

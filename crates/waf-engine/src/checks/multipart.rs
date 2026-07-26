@@ -190,6 +190,26 @@ impl<'a> Multipart<'a> {
         self.parts.iter().flat_map(Part::header_lines).map(|line| text(line))
     }
 
+    /// `ARGS_POST`: the `name="…"` and payload of every part that is **not** a
+    /// file part, which is exactly what upstream's `MULTIPART` body processor
+    /// puts in the parameter collection.
+    ///
+    /// `ModSecurity` v2 sorts parts into `MULTIPART_FILE` / `MULTIPART_FORMDATA`
+    /// on the presence of `filename=` and `multipart_get_arguments()` walks the
+    /// form-data half only; Coraza does the same. The file half is
+    /// [`Self::files`] / [`Self::files_names`] and its *content* is nobody's
+    /// parameter — see [`Self::payload_surface`] for the full argument and for
+    /// the CRS test that pins it.
+    ///
+    /// A part with no `name=` cannot be a parameter and is skipped, matching
+    /// upstream's requirement that a collection member have a key.
+    pub fn form_args(&self) -> impl Iterator<Item = (Cow<'a, str>, Cow<'a, str>)> {
+        self.parts
+            .iter()
+            .filter(|part| part.filename.is_none())
+            .filter_map(|part| part.name.map(|name| (text(name), text(part.payload))))
+    }
+
     /// What the `ARGS` / `REQUEST_BODY` rules see of this envelope: every
     /// part's quoted parameter values, plus the payload of every part that is
     /// **not a file part**, newline-separated.

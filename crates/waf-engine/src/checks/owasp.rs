@@ -35,6 +35,7 @@ use tracing::{debug, error, info, warn};
 
 use waf_common::{DetectionResult, OwaspConfig, Phase, RequestCtx, ResponseCtx, is_form_urlencoded, split_form_args};
 
+use super::body_processors;
 use super::multipart::{self, Multipart};
 use super::{Check, ResponseCheck};
 use crate::audit_log::{AuditLogSink, RuleHit, ScorePhase, ScoreVerdict};
@@ -615,7 +616,12 @@ impl Surfaces {
     const PATH: u32 = 1 << 0;
     /// `QUERY_STRING`: the whole query string, as one value.
     const QUERY: u32 = 1 << 1;
-    /// `REQUEST_BODY` / `XML:/*`: the whole request body, as one value.
+    /// `REQUEST_BODY`: the whole request body, as one value.
+    ///
+    /// Only the rules that name `REQUEST_BODY` upstream carry this bit. `XML:/*`
+    /// used to be folded into it, which handed 154 rules every byte of every
+    /// body regardless of content type; it now has surfaces of its own
+    /// ([`Self::XML_TEXT`] / [`Self::XML_ATTRS`]).
     const BODY: u32 = 1 << 2;
     /// `REQUEST_COOKIES`: each cookie **value**.
     const COOKIES: u32 = 1 << 3;
@@ -644,6 +650,10 @@ impl Surfaces {
     const FILES_NAMES: u32 = 1 << 14;
     /// `MULTIPART_PART_HEADERS`: each header line of each part, verbatim.
     const MULTIPART_PART_HEADERS: u32 = 1 << 15;
+    /// `XML:/*`: the character data of a body parsed as XML, as one value.
+    const XML_TEXT: u32 = 1 << 16;
+    /// `XML://@*`: each attribute value of a body parsed as XML.
+    const XML_ATTRS: u32 = 1 << 17;
 
     /// Every `ARGS` value bit, i.e. what the bare `ARGS` variable covers.
     const ARGS: u32 = Self::ARGS_GET | Self::ARGS_POST;
@@ -656,7 +666,7 @@ impl Surfaces {
     /// ARGS_POST`); the aggregate spellings come first so the converter's
     /// canonicaliser prefers them and there is exactly one spelling per
     /// meaning.
-    const NAMED: [(&'static str, u32); 18] = [
+    const NAMED: [(&'static str, u32); 20] = [
         ("path", Self::PATH),
         ("path_raw", Self::PATH_RAW),
         ("query", Self::QUERY),
@@ -667,6 +677,8 @@ impl Surfaces {
         ("args_get_names", Self::ARGS_GET_NAMES),
         ("args_post_names", Self::ARGS_POST_NAMES),
         ("body", Self::BODY),
+        ("xml_text", Self::XML_TEXT),
+        ("xml_attrs", Self::XML_ATTRS),
         ("files", Self::FILES),
         ("files_names", Self::FILES_NAMES),
         ("multipart_part_headers", Self::MULTIPART_PART_HEADERS),
@@ -837,7 +849,12 @@ impl Field {
             | "cookies_names"
             | "files"
             | "files_names"
-            | "multipart_part_headers" => Self::Multi(Surfaces::parse(name)?),
+            | "multipart_part_headers"
+            // `XML:/*` is a single value and `XML://@*` a collection, but both
+            // are only populated when the XML body processor ran, so they live
+            // in the surface bitset next to the other body-derived surfaces.
+            | "xml_text"
+            | "xml_attrs" => Self::Multi(Surfaces::parse(name)?),
             // Composite surface list, e.g. `args+cookies`.  Requires a `+` so a
             // single-surface rule keeps using its dedicated field and there is
             // exactly one spelling per meaning.
@@ -930,6 +947,12 @@ impl Field {
                 if view.body_surface_applies(s) {
                     out.push(Cow::Borrowed(view.body.as_ref()));
                 }
+                if s.has(Surfaces::XML_TEXT) && !view.xml().text.is_empty() {
+                    out.push(Cow::Borrowed(view.xml().text.as_str()));
+                }
+                if s.has(Surfaces::XML_ATTRS) {
+                    out.extend(view.xml().attrs.iter().map(|v| Cow::Borrowed(v.as_str())));
+                }
                 if s.has(Surfaces::ARGS_GET) {
                     out.extend(view.args_get().iter().map(|arg| Cow::Borrowed(arg.value.as_str())));
                 }
@@ -992,6 +1015,8 @@ impl Field {
                     || (s.has(Surfaces::PATH_RAW) && f(&ctx.path))
                     || (s.has(Surfaces::QUERY) && f(&view.query))
                     || (view.body_surface_applies(s) && f(&view.body))
+                    || (s.has(Surfaces::XML_TEXT) && !view.xml().text.is_empty() && f(&view.xml().text))
+                    || (s.has(Surfaces::XML_ATTRS) && view.xml().attrs.iter().any(|v| f(v)))
                     || (s.has(Surfaces::ARGS_GET) && view.args_get().iter().any(|a| f(&a.value)))
                     || (s.has(Surfaces::ARGS_GET_NAMES) && view.args_get().iter().any(|a| f(&a.name)))
                     || (s.has(Surfaces::ARGS_POST) && view.args_post().iter().any(|a| f(&a.value)))
@@ -1128,8 +1153,8 @@ struct RequestView<'a> {
     /// place.  Per-parameter `ARGS` members come from [`Self::args_get`]
     /// instead.
     query: Cow<'a, str>,
-    /// `REQUEST_BODY` / `XML:/*`: the body preview as lossy UTF-8, then percent-
-    /// and `+`-decoded.  A multipart envelope is reduced first to the parts that
+    /// `REQUEST_BODY`: the body preview as lossy UTF-8, then percent- and
+    /// `+`-decoded.  A multipart envelope is reduced first to the parts that
     /// are *parameters* — see [`multipart::Multipart::payload_surface`], which
     /// is where the file parts' contents are dropped and why.
     /// Per-parameter `ARGS_POST` members come from [`Self::args_post`].
@@ -1139,13 +1164,21 @@ struct RequestView<'a> {
     /// aside for the fields that read `ARGS_POST` (see
     /// [`Self::body_surface_applies`]).
     body_is_form: bool,
+    /// `XML:/*` and `XML://@*`, from the XML body processor.
+    ///
+    /// Built on first use and empty for every content type upstream would not
+    /// have handed to that processor, which is the whole point of the surface:
+    /// a JSON or plain-text body populates no `XML:` variable upstream and
+    /// populates none here.
+    xml: OnceCell<body_processors::XmlBody>,
     /// `ARGS_GET` / `ARGS_GET_NAMES`, split from the **raw** query string and
     /// then decoded member by member.  Built on first use: a rule set with no
     /// argument rules never pays for it.
     args_get: OnceCell<Vec<Arg>>,
-    /// `ARGS_POST` / `ARGS_POST_NAMES`, from a urlencoded body only.  Empty for
-    /// every other content type — see [`Self::body_surface_applies`] for how
-    /// those bodies stay covered.
+    /// `ARGS_POST` / `ARGS_POST_NAMES`, from whichever body processor upstream
+    /// would have selected: the urlencoded split, the non-file parts of a
+    /// multipart envelope, or the flattened leaves of a JSON document.  Empty
+    /// for a body none of them claims, which upstream leaves to `REQUEST_BODY`.
     args_post: OnceCell<Vec<Arg>>,
     /// The parsed `multipart/form-data` envelope, backing `FILES` /
     /// `FILES_NAMES` / `MULTIPART_PART_HEADERS`.
@@ -1211,11 +1244,25 @@ impl<'a> RequestView<'a> {
             query: percent_decode(&ctx.query, Plus::IsSpace),
             body,
             body_is_form: is_form_urlencoded(content_type),
+            xml: OnceCell::new(),
             args_get: OnceCell::new(),
             args_post: OnceCell::new(),
             multipart,
             memo: RefCell::new(TransformMemo::new()),
         }
+    }
+
+    /// The XML body processor's output, parsed at most once per request and
+    /// only for a `Content-Type` upstream would have routed to it.
+    fn xml(&self) -> &body_processors::XmlBody {
+        self.xml.get_or_init(|| {
+            let content_type = self.ctx.headers.get("content-type").map(String::as_str);
+            if body_processors::is_xml_content_type(content_type) {
+                body_processors::parse_xml(&self.ctx.body_preview)
+            } else {
+                body_processors::XmlBody::default()
+            }
+        })
     }
 
     /// `FILES`: the file name of every `multipart/form-data` file part.
@@ -1253,14 +1300,40 @@ impl<'a> RequestView<'a> {
         self.args_get.get_or_init(|| decode_args(&self.ctx.query))
     }
 
-    /// `ARGS_POST`: the body's parameters when it is a urlencoded form, and
-    /// nothing at all otherwise.
+    /// `ARGS_POST`: the body's parameters, as the body processor upstream would
+    /// have selected produces them.
+    ///
+    /// Three processors populate this collection upstream and all three do so
+    /// here — see [`body_processors`] for the selection table. The dispatch
+    /// order is the order `ModSecurity` resolves it in: a `multipart/form-data`
+    /// content type is never also a urlencoded one, and rule 200001's JSON
+    /// processor only ever sees what neither of the built-in two claimed.
+    ///
+    /// A body no processor claims contributes nothing here, which is exactly
+    /// when upstream's CRS-901340 forces `REQUEST_BODY` instead — the surface
+    /// [`Self::body`] carries.
     fn args_post(&self) -> &[Arg] {
         self.args_post.get_or_init(|| {
-            if !self.body_is_form {
-                return Vec::new();
+            if let Some(envelope) = &self.multipart {
+                return envelope
+                    .form_args()
+                    .map(|(name, value)| Arg {
+                        name: name.into_owned(),
+                        value: value.into_owned(),
+                    })
+                    .collect();
             }
-            decode_args(&String::from_utf8_lossy(&self.ctx.body_preview))
+            if self.body_is_form {
+                return decode_args(&String::from_utf8_lossy(&self.ctx.body_preview));
+            }
+            let content_type = self.ctx.headers.get("content-type").map(String::as_str);
+            if body_processors::is_json_content_type(content_type) {
+                return body_processors::json_args(&self.ctx.body_preview)
+                    .into_iter()
+                    .map(|(name, value)| Arg { name, value })
+                    .collect();
+            }
+            Vec::new()
         })
     }
 
@@ -1273,9 +1346,15 @@ impl<'a> RequestView<'a> {
     /// as one blob re-creates exactly the cross-parameter matching this whole
     /// change removes — a `tab=tab` form post would satisfy CRS-942130's
     /// `word = word` tautology test through the blob while the split members
-    /// correctly do not.  Structured bodies (JSON, XML, multipart) produce no
-    /// `ARGS_POST` members, so for them the blob is the only coverage there is
-    /// and it always applies.
+    /// correctly do not.
+    ///
+    /// The exception is deliberately **not** extended to the JSON and multipart
+    /// processors, even though they now populate `ARGS_POST` too. After the
+    /// `XML:/*` mis-mapping was undone, the only rules still carrying the
+    /// `body` bit are the thirteen that name `REQUEST_BODY` upstream plus the
+    /// handful whose variable list really is the whole request (`all`), and
+    /// narrowing what *those* see is a separate decision with its own
+    /// evidence — not a side effect of fixing the XML surface.
     const fn body_surface_applies(&self, surfaces: Surfaces) -> bool {
         surfaces.has(Surfaces::BODY) && !(self.body_is_form && surfaces.has(Surfaces::ARGS_POST))
     }
@@ -5019,6 +5098,12 @@ Content-Type: application/pdf\r\n\r\n\
 
     /// The narrowed fields must not cost detection: each payload is placed on a
     /// surface the upstream CRS rule genuinely reads.
+    ///
+    /// Every body probe therefore declares the `Content-Type` its payload is
+    /// actually shaped like. That is not a formality: upstream picks the body
+    /// processor — and with it which variables the body populates at all —
+    /// from that header alone ([`body_processors`]), so a `name=value` body
+    /// sent without it reaches neither `ARGS_POST` upstream nor here.
     #[test]
     fn crs_conversion_still_detects_attacks_on_every_surface() {
         let checker = OWASPCheck::from_directory(&crs_dir());
@@ -5075,7 +5160,14 @@ Content-Type: application/pdf\r\n\r\n\
             ),
             (
                 "path traversal in body",
-                probe("POST", "/render", "", &[], "tpl=../../../../etc/passwd", 1),
+                probe(
+                    "POST",
+                    "/render",
+                    "",
+                    &[("content-type", "application/x-www-form-urlencoded")],
+                    "tpl=../../../../etc/passwd",
+                    1,
+                ),
             ),
             (
                 "shellshock in User-Agent",
@@ -5098,7 +5190,14 @@ Content-Type: application/pdf\r\n\r\n\
             ),
             (
                 "rce in a POST body",
-                probe("POST", "/run", "", &[], "cmd=;/bin/cat /etc/passwd", 1),
+                probe(
+                    "POST",
+                    "/run",
+                    "",
+                    &[("content-type", "application/x-www-form-urlencoded")],
+                    "cmd=;/bin/cat /etc/passwd",
+                    1,
+                ),
             ),
             (
                 "php web shell uploaded through multipart",
@@ -5332,7 +5431,18 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
 
     /// Disabling the response-phase web-shell rules must not lose request-phase
     /// web-shell *upload* detection: the CRS 933 PHP-injection rules already
-    /// cover it, and they run against the request body.
+    /// cover it, and they run against the request's parameters.
+    ///
+    /// *Parameters*, not "the body": the 933 rules name
+    /// `REQUEST_COOKIES|REQUEST_COOKIES_NAMES|ARGS_NAMES|ARGS|XML:/*` upstream
+    /// and no `REQUEST_BODY`, so the shell has to arrive somewhere a body
+    /// processor turns into a parameter. Both spellings below do — a urlencoded
+    /// body with no `=` in it is one `ARGS` member whose *name* is the whole
+    /// payload, which is exactly what upstream's URLENCODED processor makes of
+    /// it — and that is the surface the rule reads. A body sent with no
+    /// `Content-Type` at all populates only `REQUEST_BODY`, upstream included;
+    /// that gap is CRS's, not this engine's, and pretending otherwise is what
+    /// the `XML:/*` mis-mapping used to do.
     #[test]
     fn php_webshell_upload_is_still_detected_in_the_request_phase() {
         let checker = OWASPCheck::from_directory(&crs_dir());
@@ -5341,8 +5451,11 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
             "<?php\n$auth_pass=\"\";\necho \"<title>r57 shell</title>\";\n@eval($_POST['cmd']);\n",
             "<?php system($_GET['c']); ?>",
         ] {
+            let mut ctx = make_ctx_with_body(body, 1);
+            ctx.headers
+                .insert("content-type".into(), "application/x-www-form-urlencoded".into());
             let hit = checker
-                .check(&make_ctx_with_body(body, 1))
+                .check(&ctx)
                 .unwrap_or_else(|| panic!("web-shell upload must still be detected: {body}"));
             let id = hit.rule_id.unwrap_or_default();
             assert!(
@@ -5593,11 +5706,25 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
             ),
             (
                 "CRS-933150",
-                probe("POST", "/api/notes", "", &[], "note=array_map('system',$_GET)", 1),
+                probe(
+                    "POST",
+                    "/api/notes",
+                    "",
+                    &[("content-type", "application/x-www-form-urlencoded")],
+                    "note=array_map('system',$_GET)",
+                    1,
+                ),
             ),
             (
                 "CRS-932200",
-                probe("POST", "/run", "", &[], "cmd='/bin/cat /etc/passwd'", 2),
+                probe(
+                    "POST",
+                    "/run",
+                    "",
+                    &[("content-type", "application/x-www-form-urlencoded")],
+                    "cmd='/bin/cat /etc/passwd'",
+                    2,
+                ),
             ),
             ("CRS-942131", probe("GET", "/s", "id=1 or 3>2", &[], "", 2)),
             ("CRS-942521", probe("GET", "/s", "u=admin' or 1", &[], "", 2)),
@@ -6533,12 +6660,6 @@ rules:
     /// them is the "rule scoped to one `ARGS` member, run against a whole
     /// surface" defect any more:
     ///
-    /// * **CRS-932240 on the JSON body** and **CRS-932236 on the multipart
-    ///   upload** are the remaining *whole-body* approximation: CRS reaches
-    ///   into a structured body through `XML:/*`, this engine has no body-node
-    ///   accessor and hands the rule the raw body, and both patterns match
-    ///   across the JSON / MIME framing rather than inside any one value.
-    ///   Splitting those bodies is Lane 2's `struct_extract`, not this check's.
     /// * **CRS-942200 on `q=how+to+select+from+a+menu`** is genuinely upstream:
     ///   the whole `select … from` pattern sits inside the single `q`
     ///   parameter, so per-parameter evaluation reproduces it exactly.
@@ -6554,6 +6675,17 @@ rules:
     /// shell-expression pattern was matching across the `&` and `=` separators
     /// of neighbouring parameters.
     ///
+    /// **CRS-932240 on the JSON body** and **CRS-932236 on the multipart
+    /// upload** left the same way, one change later, and for one reason:
+    /// neither rule names `REQUEST_BODY` upstream. Both reach a structured body
+    /// only through `XML:/*`, which is empty unless the body *is* XML — so
+    /// upstream never showed either of them a JSON document or a MIME envelope,
+    /// and the shell-expression pattern that matched across the JSON / MIME
+    /// framing was matching a surface this engine had invented. Both rules now
+    /// read those bodies the way upstream does, as `ARGS` members produced by
+    /// the JSON and multipart body processors, and no single member is a shell
+    /// expression.
+    ///
     /// The three CRS-920230 entries that used to be here are gone: `@rx
     /// %[0-9a-fA-F]{2}` under `t:none` means "an escape survived the parser",
     /// i.e. double encoding, and now that the query reaches the rule decoded it
@@ -6562,8 +6694,6 @@ rules:
     fn paranoia_2_false_positives_stay_at_the_recorded_baseline() {
         let checker = OWASPCheck::from_directory(&crs_dir());
         let expected: &[(&str, Option<&str>)] = &[
-            ("JSON body with escapes and a percent sign", Some("CRS-932240")),
-            ("multipart upload", Some("CRS-932236")),
             ("search phrase using + as a space", Some("CRS-942200")),
             ("plus-addressed email in a form POST", Some("CRS-942131")),
         ];
@@ -7193,16 +7323,25 @@ rules:
     #[test]
     fn a_multipart_header_over_a_non_multipart_body_does_not_hide_it() {
         let checker = OWASPCheck::from_directory(&crs_dir());
-        let ctx = multipart_ctx("nothing-matches-this", "<?php system($_GET['c']); ?>", 1);
+        // The payload is a `REQUEST_BODY` rule's (CRS-944100), because
+        // `REQUEST_BODY` is the only collection a body no processor could parse
+        // populates — upstream forces it with CRS-901340's
+        // `ctl:forceRequestBodyVariable=On` for exactly this case.
+        let payload = "java.lang.Runtime.getRuntime().exec(\"id\")";
+        let ctx = multipart_ctx("nothing-matches-this", payload, 1);
         let view = RequestView::new(&ctx);
         assert_eq!(
             view.body.as_ref(),
-            "<?php system($_GET['c']); ?>",
+            payload,
             "an unparseable envelope falls back to the whole body"
         );
         assert!(
+            view.args_post().is_empty(),
+            "an envelope that yielded no parts yields no parameters either"
+        );
+        assert!(
             checker.check(&ctx).is_some(),
-            "a web shell must not become invisible by declaring a boundary"
+            "a body must not become invisible by declaring a boundary"
         );
     }
 
@@ -7452,8 +7591,8 @@ rules:
         assert!(args.check(&get).is_some());
         assert!(args.check(&post).is_some());
 
-        // A JSON body is not a form: it produces no `ARGS_POST` members, and the
-        // rules that need to see it read the whole `body` surface instead.
+        // A JSON body is not a form, but upstream's JSON body processor puts its
+        // leaves in the same collection, so `ARGS_POST` reads them here too.
         let json = probe(
             "POST",
             "/",
@@ -7462,8 +7601,29 @@ rules:
             r#"{"k":"needle"}"#,
             1,
         );
-        assert!(args_post.check(&json).is_none(), "JSON leaves are not ARGS_POST");
+        assert!(args_post.check(&json).is_some(), "a JSON leaf is an ARGS_POST member");
+        assert!(
+            OWASPCheck::from_yaml(&yaml("args_post_names")).check(&json).is_none(),
+            "`k` is the member's name, `needle` is not"
+        );
+        // The raw body is still the raw body — the leaves are in addition to it,
+        // never instead of it, for the rules that name `REQUEST_BODY`.
         assert!(OWASPCheck::from_yaml(&yaml("body")).check(&json).is_some());
+
+        // The multipart processor fills the same collection from the parts that
+        // are not files.
+        let envelope = probe(
+            "POST",
+            "/",
+            "",
+            &[("content-type", "multipart/form-data; boundary=b")],
+            "--b\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\nneedle\r\n--b--\r\n",
+            1,
+        );
+        assert!(
+            args_post.check(&envelope).is_some(),
+            "a non-file part is an ARGS_POST member"
+        );
     }
 
     /// A form body is handed over as parameters **or** as one blob, never both.

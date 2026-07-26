@@ -71,6 +71,11 @@ use bytes::Bytes;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
+// Shared with the CRS lane's XML/JSON body processors, which need exactly the
+// same pre-parse nesting guard and the same numeric-character-reference
+// resolver. One implementation, one set of bounds.
+use crate::checks::body_processors::{MAX_PARSE_INPUT_DEPTH, decode_numeric_char_ref, nesting_depth};
+
 /// A structured leaf: a field label plus its (parser-unescaped) value.
 type Leaf = (Cow<'static, str>, String);
 
@@ -78,15 +83,6 @@ type Leaf = (Cow<'static, str>, String);
 /// a documented honest boundary (never a panic), mirroring Lane A's post-parse
 /// `SHELL_WALK_MAX_DEPTH`.
 const MAX_STRUCT_DEPTH: usize = 32;
-
-/// Pre-parse structural nesting guard. A body whose bracket / paren nesting
-/// exceeds this is declined **before** any recursive parser runs, so a
-/// pathologically nested payload can never drive parser recursion into a
-/// worker-stack overflow. Set at/under each parser's own limit (`serde_json` 128,
-/// `async-graphql-parser` selection-set 64) so admitted input is always within the
-/// parser's safe range. GraphQL is additionally backstopped by
-/// [`MAX_GRAPHQL_RAW_OPENS`] because its *value* parser is not depth-limited.
-const MAX_PARSE_INPUT_DEPTH: usize = 64;
 
 /// GraphQL belt-and-suspenders backstop: the maximum number of raw `( [ {` opening
 /// delimiters a GraphQL body may contain (counted with **no** string/comment
@@ -174,40 +170,6 @@ pub(super) fn extract_body_fields(body: &[u8], content_type: Option<&str>, max_f
 /// First non-whitespace byte of `body`, for the content-type-absent sniff.
 fn first_non_ws(body: &[u8]) -> Option<u8> {
     body.iter().copied().find(|b| !b.is_ascii_whitespace())
-}
-
-/// String-aware maximum bracket / paren nesting depth. Counts `{ [ (` opens and
-/// `} ] )` closes, skipping anything inside a `"…"` string (with `\` escaping) so
-/// brackets in a benign string value never inflate the estimate. A cheap linear
-/// pre-parse `DoS` guard — an over-approximation is safe (it only declines more
-/// aggressively), never a panic.
-fn nesting_depth(bytes: &[u8]) -> usize {
-    let mut depth: usize = 0;
-    let mut max: usize = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    for &b in bytes {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' | b'[' | b'(' => {
-                depth += 1;
-                max = max.max(depth);
-            }
-            b'}' | b']' | b')' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    max
 }
 
 /// Whether a JSON object key is a known `NoSQL` operator, the allowlist gate that
@@ -376,21 +338,6 @@ fn flush_xml_text(acc: &mut String, max_fields: usize, out: &mut Vec<Leaf>) {
         push_leaf(out, XML_LABEL, acc);
     }
     acc.clear();
-}
-
-/// Resolve an XML numeric character reference from a `GeneralRef` name: decimal
-/// `#NN` (`&#39;`) or hexadecimal `#xNN` / `#XNN` (`&#x27;`). Returns `None` for a
-/// named entity (`apos`), an out-of-range code point, or malformed digits — the
-/// caller then falls back to the predefined-entity table. Never panics.
-fn decode_numeric_char_ref(name: &str) -> Option<char> {
-    let rest = name.strip_prefix('#')?;
-    // Empty digits make both `from_str_radix` and `parse` fail (→ None), so no
-    // explicit emptiness check is needed.
-    let code = match rest.strip_prefix(['x', 'X']) {
-        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-        None => rest.parse::<u32>().ok()?,
-    };
-    char::from_u32(code)
 }
 
 /// Collect the (entity-unescaped) attribute values of one start/empty element.

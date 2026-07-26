@@ -112,6 +112,11 @@ ENGINE_FIELDS = {
     "files",
     "files_names",
     "multipart_part_headers",
+    # The XML body processor's two selectors. Populated only for a Content-Type
+    # upstream's modsecurity.conf rule 200000 routes to that processor, which is
+    # what makes them different from `body` and why they exist at all.
+    "xml_text",
+    "xml_attrs",
     "content_length",
     "content_type",
     "header_content_type",
@@ -143,7 +148,7 @@ UNMAPPED_PREFIX = "unmapped_"
 # `args_*` and `cookies*` are *collection member* surfaces: the engine runs the
 # rule once per parameter / per cookie.  `query` and `body` are *whole* surfaces
 # — one string covering everything — and back only the ModSecurity variables
-# that really are one string (`QUERY_STRING`, `REQUEST_BODY`, `XML:/*`).
+# that really are one string (`QUERY_STRING`, `REQUEST_BODY`).
 SURFACE_ORDER = [
     "path",
     "path_raw",
@@ -153,6 +158,8 @@ SURFACE_ORDER = [
     "args_get_names",
     "args_post_names",
     "body",
+    "xml_text",
+    "xml_attrs",
     "files",
     "files_names",
     "multipart_part_headers",
@@ -187,6 +194,8 @@ FIELD_SURFACES = {
     "files":                  ("files",),
     "files_names":            ("files_names",),
     "multipart_part_headers": ("multipart_part_headers",),
+    "xml_text":               ("xml_text",),
+    "xml_attrs":              ("xml_attrs",),
     "cookies":           ("cookies",),
     "cookies_names":     ("cookies_names",),
     "headers":           ("headers",),
@@ -198,20 +207,6 @@ FIELD_SURFACES = {
 # Coarse request surface per engine field, kept for callers that only need a
 # single label.
 FIELD_SURFACE = {field: surfaces[0] for field, surfaces in FIELD_SURFACES.items()}
-
-# `XML:/*` selects nodes of a body parsed as XML.  The engine has no XML node
-# accessor, so the variable is approximated by the whole-`body` surface — which
-# is wider than upstream for every body that is not XML.
-#
-# The approximation is withheld from rules whose variable list is *only* the
-# ARGS family (`ARGS|ARGS_NAMES|XML:/*`).  CRS calls those out in their own
-# names — "Restricted SQL Character Anomaly Detection (args)" — because they
-# describe one parameter value, and a whole JSON body trivially clears
-# CRS-942430's "twelve special characters" bar.  Those rules keep the parameter
-# members they asked for; widening them to the raw body would trade one class of
-# false positive for two.  A list that also names cookies or headers already
-# scans several surfaces at once, so the body approximation stays there.
-ARGS_FAMILY_PREFIXES = ("ARGS", "QUERY_STRING", "XML:")
 
 
 def _surface_field(surfaces) -> str:
@@ -287,15 +282,10 @@ def map_variables(var_str: str) -> str:
         return supported[0]
 
     surfaces = set()
-    args_only = True
-    for token, field in zip(positives, fields):
+    for field in fields:
         if field not in ENGINE_FIELDS:
             continue
         surfaces.update(FIELD_SURFACES.get(field, ()))
-        if not token.strip().upper().startswith(ARGS_FAMILY_PREFIXES):
-            args_only = False
-    if args_only:
-        surfaces.discard("body")
     if not surfaces:
         # Only scalar/derived fields (e.g. two size limits); nothing composite
         # to express, so keep the first one rather than inventing a scan.
@@ -365,9 +355,27 @@ def _single_var_map(v: str) -> str:
         return "files_names"
     if v == "MULTIPART_PART_HEADERS":
         return "multipart_part_headers"
-    # XML:/... selects nodes of the request body parsed as XML.
-    if v.startswith("XML:"):
-        return "body"
+    # `XML:<xpath>` selects nodes of the request body **parsed as XML**, and CRS
+    # uses exactly two selectors.  EXACT names only, for the same reason the
+    # multipart collections above are exact: a `startswith` here is what turned
+    # every `XML:` variable into "the whole body" and handed 154 rules the
+    # contents of every JSON, plain-text and arbitrary-content-type body that
+    # upstream never shows them.  `XML:/*` is empty unless ModSecurity selected
+    # the XML body processor for the request's Content-Type
+    # (modsecurity.conf rule 200000), and the engine's surfaces say so.
+    #
+    #   XML:/*     the document element's string value — every descendant text
+    #              and CDATA node concatenated.  Not element names, not
+    #              attributes: `xmlNodeGetContent` does not return those.
+    #   XML://@*   every attribute value, one collection member each.
+    #
+    # Any other XPath falls through to the sentinel at the end of this function,
+    # so a CRS re-sync that introduces one is named in the startup WARN instead
+    # of being silently approximated.
+    if v == "XML:/*":
+        return "xml_text"
+    if v == "XML://@*":
+        return "xml_attrs"
     if v == "REQUEST_BODY":
         return "body"
     if v == "REQUEST_METHOD":
@@ -431,8 +439,9 @@ def _single_var_map(v: str) -> str:
 #
 # For a positive operator, mapping a ModSecurity variable onto a *narrower*
 # engine field can only make the rule match less, which is the safe direction
-# and is why `XML:/*` may be approximated by the whole body and `REQUEST_LINE`
-# by `REQUEST_URI_RAW`.  Negate the same rule and the approximation becomes a
+# and is why `REQUEST_LINE` may be approximated by `REQUEST_URI_RAW` and why a
+# chain link may narrow its head to the ARGS members it needs (see
+# `_per_member_only`).  Negate the same rule and the approximation becomes a
 # fail-open in reverse: "the text the engine can see does not satisfy the
 # pattern" is trivially true for every byte upstream looked at and the engine
 # did not.
@@ -964,27 +973,44 @@ def _collect_chain_children(lines: list[str], index: int) -> list[dict]:
 PER_MEMBER_SURFACES = frozenset({
     "args_get", "args_post", "args_get_names", "args_post_names",
     "cookies", "cookies_names",
+    # `XML://@*` yields one value per attribute.  `xml_text` is deliberately
+    # absent: `XML:/*` is one string covering the whole document.
+    "xml_attrs",
 })
 
 
-def _is_per_member_field(field: str) -> bool:
-    """Whether every value `field` yields is a single collection member."""
+def _per_member_only(field: str) -> str | None:
+    """`field` restricted to its collection-member surfaces.
+
+    Returns the unchanged field when every surface it names is already a
+    member surface, a narrower field when only some are, and `None` when none
+    are — the caller then has nothing left to evaluate and must refuse the rule.
+
+    Narrowing is the safe direction: the rule scans fewer surfaces than upstream
+    and can only miss, never over-block.  Refusing outright is not, because it
+    drops a working detection.
+    """
     if not field:
-        return False
+        return None
     atoms = set()
     for token in field.split("+"):
         mapped = FIELD_SURFACES.get(token)
         if mapped is None:
-            return False
+            return None
         atoms.update(mapped)
-    return bool(atoms) and atoms <= PER_MEMBER_SURFACES
+    kept = atoms & PER_MEMBER_SURFACES
+    if not kept:
+        return None
+    return field if kept == atoms else _surface_field(kept)
 
 
 def build_chain(head_field: str, head_operator: str, head_value: str, head_opts: dict,
-                lines: list[str], index: int) -> tuple[list[dict], bool]:
+                lines: list[str], index: int) -> tuple[list[dict], bool, str]:
     """Build the YAML chain conditions for the rule at `index`.
 
-    Returns `(conditions, head_capture)`.  Raises `ChainUnsupported` when any
+    Returns `(conditions, head_capture, head_field)`.  `head_field` is the
+    head's field after any narrowing a chain link required, and the caller must
+    use it in place of the one it passed in.  Raises `ChainUnsupported` when any
     condition cannot be expressed, in which case the caller must refuse the
     whole rule.
     """
@@ -1024,13 +1050,20 @@ def build_chain(head_field: str, head_operator: str, head_value: str, head_opts:
             # `?tab=tab` reads as a tautology and the rule becomes a false
             # positive generator; that is why this used to be refused outright.
             #
-            # The engine now evaluates the ARGS family per member, so the
-            # refusal is scoped to heads that are still whole surfaces.  The
+            # The engine now evaluates the ARGS family per member, so the head
+            # is narrowed to the member surfaces it names and the rule keeps
+            # working; only a head with no member surface at all is still
+            # refused.  CRS-942130's `ARGS_NAMES|ARGS|XML:/*` is the live case:
+            # the two ARGS collections are per member, `XML:/*` is one string
+            # covering a whole document, and scanning the string for a `word =
+            # word` pair is the very thing this guard exists to prevent.  The
             # *dis*equality form (CRS-942131) never had the problem: a
             # `name=value` separator is not an inequality operator.
-            if operator == "equals" and not negate and "%{" in value \
-                    and not _is_per_member_field(head_field):
-                raise ChainUnsupported("args_self_equality")
+            if operator == "equals" and not negate and "%{" in value:
+                narrowed = _per_member_only(head_field)
+                if narrowed is None:
+                    raise ChainUnsupported("args_self_equality")
+                head_field = narrowed
         _check_macros(operator, value, bound_captures)
         if "%{" in value and bound_source is not None:
             used_providers.add(bound_source)
@@ -1060,7 +1093,7 @@ def build_chain(head_field: str, head_operator: str, head_value: str, head_opts:
         if position >= 0:
             conditions[position]["capture"] = True
 
-    return conditions, -1 in used_providers
+    return conditions, -1 in used_providers, head_field
 
 
 def _split_operator(operator_str: str):
@@ -1259,7 +1292,7 @@ def parse_conf_file(path: str, default_category: str) -> list[dict]:
 
         if "chain" in opts:
             try:
-                chain, head_capture = build_chain(
+                chain, head_capture, head_field = build_chain(
                     rule["field"], rule["operator"], rule["value"], opts, lines, index
                 )
             except ChainUnsupported as unsupported:
@@ -1267,6 +1300,8 @@ def parse_conf_file(path: str, default_category: str) -> list[dict]:
                 # which is always broader than what upstream declares.
                 rule["field"] = f"{UNMAPPED_PREFIX}chained_{unsupported.reason}"
             else:
+                # A chain link may have narrowed the head — never widened it.
+                rule["field"] = head_field
                 if head_capture:
                     rule["capture"] = True
                 rule["chain"] = chain

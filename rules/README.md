@@ -243,6 +243,8 @@ rules:
 | `path`             | Request URI path (without query string)            |
 | `query`            | Query string (all parameters, decoded)             |
 | `body`             | Request body (decoded)                             |
+| `xml_text`         | Character data of an XML request body, as one value |
+| `xml_attrs`        | Each attribute value of an XML request body         |
 | `headers`          | All request headers (name: value pairs)            |
 | `user_agent`       | User-Agent header only                             |
 | `cookies`          | Request cookies                                    |
@@ -272,6 +274,15 @@ traffic while they carried `all`.
 
 An unknown or duplicated surface name is rejected at load time rather than
 quietly scanning less than the rule says.
+
+#### `xml_text` / `xml_attrs` are content-type gated
+
+These are `ModSecurity`'s `XML:/*` and `XML://@*`, and like upstream they are
+populated **only** when the request's `Content-Type` is one the XML body
+processor claims (`text/xml`, `application/xml`, `application/soap+xml`). A JSON
+or plain-text body leaves both empty; a rule that must see such a body names
+`body`. They were folded onto `body` until CRS v4.25.0, which handed 154 rules
+every byte of every body regardless of content type — do not put them back.
 
 #### Fields the engine cannot evaluate
 
