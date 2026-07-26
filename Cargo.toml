@@ -78,7 +78,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "smtp-transport", "builder"] }
 rust-embed = "8"
 mime_guess = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 rand = "0.8"
 totp-lite = "2"
