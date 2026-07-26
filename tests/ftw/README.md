@@ -17,8 +17,8 @@ runs the suite; prints a classified report; and tears everything down again.
 
 ## Where we stand
 
-CRS v4.25.0, go-ftw v1.3.0, 4674 tests, CRS check only. Recorded from
-`52fed37` + the negated-head conversion on 2026-07-25; the same numbers are the
+CRS v4.25.0, go-ftw v1.3.0, 4674 tests, CRS check only. Recorded from `e535a32`
+(the `multipart/form-data` part parser) on 2026-07-26; the same numbers are the
 CI gate in `baseline.json`.
 **A pass rate is meaningless without its mode and its paranoia level — always
 quote all three.**
@@ -30,12 +30,12 @@ the posture ModSecurity v2 + CRS and Coraza are measured in.
 
 | | PL1 | PL2 | PL4 |
 |---|---|---|---|
-| passed | 2743 | 3700 | 4175 |
-| **pass rate** | **58.69%** | **79.16%** | **89.32%** |
-| not-implemented | 238 | 238 | 238 |
-| paranoia-scope | 1507 | 494 | 0 |
+| passed | 2779 | 3742 | 4222 |
+| **pass rate** | **59.46%** | **80.06%** | **90.33%** |
+| not-implemented | 211 | 211 | 211 |
+| paranoia-scope | 1513 | 494 | 0 |
 | over-block | 26 | 32 | 34 |
-| missed-detection | 159 | 209 | 226 |
+| missed-detection | 144 | 194 | 206 |
 | harness | 1 | 1 | 1 |
 
 ### cloud mode — the blocking decision
@@ -44,13 +44,23 @@ WAF enforcing, verdicts from HTTP status codes.
 
 | | PL1 | PL2 | PL4 |
 |---|---|---|---|
-| passed | 3188 | 3753 | 3997 |
-| **pass rate** | **68.21%** | **80.30%** | **85.52%** |
-| not-implemented | 229 | 214 | 201 |
+| passed | 3216 | 3753 | 3997 |
+| **pass rate** | **68.81%** | **80.30%** | **85.52%** |
+| not-implemented | 208 | 195 | 182 |
 | paranoia-scope | 973 | 286 | 0 |
-| over-block | 95 | 229 | 292 |
-| missed-detection | 188 | 191 | 183 |
+| over-block | 95 | 251 | 314 |
+| missed-detection | 181 | 188 | 180 |
 | harness | 1 | 1 | 1 |
+
+Previous recording, for the delta: log `2744 / 3701 / 4176` and cloud
+`3185 / 3750 / 3994` at `3018ac1`, measured the same way on the same host. The
+multipart parser is **+35 / +41 / +46** in log mode with **zero** new failures at
+any level, and **+31 / +3 / +3** in cloud mode. Cloud gains less at PL2/PL4
+because 22 of its wins are cancelled by 22 new `over-block` entries that log mode
+does not see — 19 of them are CRS-920121 correctly firing at PL2 on the HTML
+entity field names in 920120's *negative* tests (`&auml;` contains a `;`, and the
+PL2 sibling has no entity exemption, exactly as upstream), which is the
+`collateral` artefact described below, not a false positive.
 
 PL4 is the level CRS runs its own regression suite at
 (`BLOCKING_PARANOIA: 4` in coreruleset `tests/docker-compose.yml`), so it is
@@ -59,33 +69,33 @@ the same question upstream asks it. PL1 is the shipping default.
 
 For reference: ModSecurity v2 + CRS is 100% (it is the reference
 implementation), Coraza is 100%, ModSecurity v3 is 96–98%. Those are log-mode
-numbers, so **`89.32%` at PL4 is the figure that belongs next to them**; the
+numbers, so **`90.33%` at PL4 is the figure that belongs next to them**; the
 cloud column is a different question with a different answer.
 
 ### Why the two columns disagree in both directions
 
-At PL1 cloud looks *better* (68.21% vs 58.69%) and at PL4 it looks *worse*
-(85.52% vs 89.32%). Neither is noise — a status code is a lossy projection of
+At PL1 cloud looks *better* (68.81% vs 59.46%) and at PL4 it looks *worse*
+(85.52% vs 90.33%). Neither is noise — a status code is a lossy projection of
 the corpus's assertions, and it loses information in both directions. Comparing
-the two failure **sets** at PL4 (368 tests fail in both modes):
+the two failure **sets** at PL4 (344 tests fail in both modes):
 
 | | count | what it is |
 |---|---|---|
-| fails only in cloud | 309 | 258 `over-block`, 41 `missed-detection`, 10 `not-implemented` |
-| fails only in log | 131 | 84 `missed-detection`, 47 `not-implemented` |
+| fails only in cloud | 333 | 280 `over-block`, 41 `missed-detection`, 12 `not-implemented` |
+| fails only in log | 108 | 67 `missed-detection`, 41 `not-implemented` |
 
 * **Cloud invents failures.** A negative test asserts "rule 941100 did not
   fire". Cloud can only ask "did anything block?", so any *other* rule blocking
-  fails it. Those are the 258. Log mode deletes that entire class: `collateral`
+  fails it. Those are the 280. Log mode deletes that entire class: `collateral`
   is structurally impossible when the assertion names an id, because a rule the
   test does not name cannot fail it. All 34 of log mode's PL4 `over-block`
   entries are `same-rule` — real false positives of the rule under test.
 * **Cloud hands out free passes.** A positive test asserts "rule 933151 fired".
   Cloud can only ask "did anything block?", so when an unrelated rule blocks the
   request the test passes without the rule under test ever matching. Those are
-  the 131 — and they are not marginal: 47 of them are for rules that do not
+  the 108 — and they are not marginal: 41 of them are for rules that do not
   exist in `rules/owasp-crs/` at all. The same effect explains PL1, where
-  cloud's `paranoia-scope` is 973 against log mode's 1507: 534 tests for rules
+  cloud's `paranoia-scope` is 973 against log mode's 1513: 540 tests for rules
   that were never even evaluated at PL1 still "passed" in cloud because
   something else blocked.
 
@@ -190,6 +200,23 @@ through `--extra-results`. A solo run that aborts is that one test failing. The
 list is read out of the corpus, not hard-coded, so a CRS bump that marks another
 test `retry_once` cannot silently reintroduce the abort.
 
+**These five are the only part of the score that is not fixed by static inputs,
+so record their verdicts whenever you record a baseline.** At the recording in
+`baseline.json` they are, in both independent runs and at every level:
+
+| | log mode | cloud mode |
+|---|---|---|
+| 959100-1, 959100-3 | pass | pass |
+| 980170-1 | **fail** | pass |
+| 980170-2 | **fail** | **fail** |
+| 980170-3 | pass | pass |
+
+They all sit in `not-implemented` when they fail (`RESPONSE-980-CORRELATION.conf`
+has no converted counterpart), so a flip here moves that bucket by one without
+any rule changing. That is the most likely explanation for the log-mode `+1`
+between the `3018ac1` re-measurement and the figure this file carried before it —
+see the `_comment` block in `baseline.json`.
+
 `hosts.txt` registers every `Host:` value that appears anywhere in the corpus.
 prx-waf answers `404` for an unknown Host, and `404` is a *pass* for negative
 tests — an unregistered host would silently inflate the score. The classifier
@@ -203,16 +230,36 @@ defect:
 
 | bucket | meaning |
 |---|---|
-| `not-implemented` | the rule does not exist in `rules/owasp-crs/` — response phase, `FILES`, `MULTIPART_PART_HEADERS`, `&VAR` counts, `TX` sentinels |
+| `not-implemented` | the rule id is **absent from `rules/owasp-crs/` altogether** — `TX` collection sentinels, `&VAR` counts, `setvar`-driven rules the converter refuses. Note what this does *not* cover: see the trap below |
 | `paranoia-scope` | the rule exists but declares a higher paranoia level than the run enabled; upstream skips it too |
 | `over-block` | a negative test the WAF got wrong. **log mode**: the id the test forbids appeared in the audit log — always a genuine false positive, since a rule the test does not name cannot fail it. **cloud mode**: the request got a `403`; split by `REPLAY=1` into **same-rule** (the rule under test fired) and **collateral** (another CRS rule fired; upstream scores it instead of blocking) |
 | `missed-detection` | a positive test whose rule is present, in scope, and request-phase, but did not match — **the main detection-quality bucket**. In log mode the report names the exact ids that were expected and never logged |
 | `harness` | the response was neither a block nor a pass, e.g. Pingora answered `400` before the WAF saw the request |
 
-A response-phase rule that *is* present in `rules/owasp-crs/` still counts as
-`not-implemented`, not `missed-detection`: the converter emitted it but the
-gateway never hands it a response body, so calling it a detection miss would
-blame the pattern for a plumbing gap.
+### The trap: `not-implemented` is not "the engine cannot evaluate this"
+
+`classify.py` decides this bucket with one test — `if rule is None`, i.e. is the
+id present in the YAML the run was pointed at (`classify.py`, `--rules`). That is
+**not** the same question as "does the engine enforce it", and the difference has
+already misled one round of planning:
+
+* A rule the converter emitted with an `unmapped_*` field is **present in the
+  YAML** and **rejected at load** with a startup `WARN`. It enforces nothing, but
+  `classify.py` sees a rule, so its failures land in **`missed-detection`**.
+  Before the multipart parser landed, all five `FILES` rules (932180, 933110,
+  933111, 933220, 944140) and both `MULTIPART_PART_HEADERS` rules (922120,
+  922130) were in exactly that state — 76 failing tests sitting in
+  `missed-detection`, not in `not-implemented`.
+* So **sizing a capability gap from the `not-implemented` count under-counts it**.
+  The number to size from is the engine's own load summary: the
+  `[unsupported-field]` lines in the startup `WARN`, which name every rule that
+  is declared but not enforced, and `LoadSummary::rejected_field_ids()` behind
+  them.
+
+A response-phase rule that is present in `rules/owasp-crs/` is *not* special
+either, not any more: the gateway feeds it a response body like any other rule,
+so its failures are ordinary missed detections, over-blocks or paranoia-scope
+exclusions and are counted as such.
 
 `REPLAY=1` re-sends every failing test and records the status code, plus the
 rule name lifted out of the block page for anything that returned `403`. In
@@ -222,6 +269,55 @@ rules. In log mode the rule attribution comes from go-ftw itself
 so `REPLAY=1` there earns only the `harness` split: it is what distinguishes "we
 did not detect this" from "Pingora answered `400` before the WAF saw the
 request", which is true in DetectionOnly too.
+
+## Sizing a capability before you build it
+
+Twice now a capability has been sized by counting the regression tests that name
+the rules it would turn on, and twice the estimate has come out roughly double.
+The correction is cheap and mechanical, so it belongs here.
+
+**A rule's test count is an upper bound, not an estimate.** Before committing to a
+number, split the corpus for each rule by *how the test delivers the payload* and
+keep only the transports the change actually implements. The
+`multipart/form-data` parser is the worked example — it was scoped at "100+ tests"
+and delivered **+46** at PL4:
+
+| rule | positive tests | via multipart upload | via `X-Filename`-style **header** | delivered |
+|---|---|---|---|---|
+| 920120 | 20 | 20 | 0 | **20 / 20** |
+| 920121 | 6 | 6 | 0 | **6 / 6** |
+| 922120 | 1 | 1 | 0 | **1 / 1** |
+| 922130 | 4 | 4 | 0 | **4 / 4** |
+| 932180 | 11 | 2 | 9 | **2 / 2** |
+| 933110 | 30 | 3 | 27 | **3 / 3** |
+| 933111 | 6 | 5 | 1 | **5 / 5** |
+| 933220 | 13 | 2 | 11 | **2 / 2** |
+| 944140 | 11 | 2 | 9 | **2 / 2** |
+
+Every multipart-delivered positive test converted — 45 of 45, plus one 930110
+test that the parser earned by adding `FILES` to that rule's surface list. The
+57-test shortfall is not a defect in the parser: those tests send the file name
+in `REQUEST_HEADERS:X-Filename` / `X_Filename` / `X.Filename` / `X-File-Name`,
+because CRS writes both delivery mechanisms into one `SecRule`. Reaching them
+needs a **generic `REQUEST_HEADERS:<name>` accessor** (`Field::parse` currently
+knows six headers by name), which is a different capability that happens to share
+a rule id.
+
+Two more 922 rules are out of reach for a third reason — they need a variable
+store, not a parser:
+
+* **922110** (17 tests) reads `TX:/MULTIPART_HEADERS_CONTENT_TYPES_*/`, a
+  collection that upstream rule 922150 fills in with `setvar`, one entry per
+  part. The converter models no variable store and refuses the rule as not
+  expressible.
+* **922100** (2 tests) is `&MULTIPART_PART_HEADERS:_charset_` — a count over the
+  headers of one *named* part — chained against `ARGS._charset_` and a `setvar`
+  allow-list.
+
+So the three questions to ask of any "N tests" estimate are: *which transport does
+each test use*, *is the variable the rule reads actually the one this change
+produces*, and *does the rule need `setvar`*. The first alone accounted for the
+whole gap here.
 
 ## Exclusions
 

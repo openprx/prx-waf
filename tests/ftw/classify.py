@@ -31,9 +31,16 @@ replay and is exact rather than inferred from a block page.
 Buckets, applied to every FAILED test in this order:
 
   not-implemented   The rule the test targets does not exist in
-                    rules/owasp-crs/ at all. Sub-reason comes from the upstream
-                    SecRule: response phase, FILES, MULTIPART_PART_HEADERS,
-                    header-count (&REQUEST_HEADERS:...), TX sentinel, other.
+                    rules/owasp-crs/ AT ALL. Sub-reason comes from the upstream
+                    SecRule: header-count (&VAR), TX sentinel, upload size
+                    metadata, per-part multipart selector, response phase, other.
+
+                    Read that literally: this bucket answers "is the id in the
+                    YAML", NOT "does the engine enforce it". A rule the
+                    converter emitted with an `unmapped_*` field is present in
+                    the YAML and rejected at load, so its failures land in
+                    missed-detection instead. Size a capability gap from the
+                    engine's startup [unsupported-field] WARN, not from here.
   paranoia-scope    The rule exists but declares a paranoia level above the one
                     this run enabled, so it was never evaluated. Not a defect —
                     the same test fails on ModSecurity at that PL too.
@@ -199,14 +206,33 @@ def missing_reason(rid: str, upstream: dict) -> str:
         # machinery with no converted counterpart — 980xxx correlation, which
         # reads TX state this engine keeps no store for.
         return f"response phase — no converted counterpart (upstream VARIABLES: {variables or 'n/a'})"
-    if "FILES" in variables:
-        return "FILES / upload metadata target is not modelled"
-    if "MULTIPART_PART_HEADERS" in variables:
-        return "MULTIPART_PART_HEADERS target is not modelled"
+    # `&VAR` is a *count* of a collection, and that is the reason the rule is
+    # unconverted whichever collection it counts. It has to be tested before the
+    # per-collection branches below, or `&MULTIPART_PART_HEADERS:_charset_`
+    # (CRS-922100) is reported as a missing multipart accessor when what it
+    # actually needs is a count and a `setvar` allow-list.
     if variables.startswith("&"):
         return "header/variable *count* target (&VAR) is not modelled"
+    # TX before the collection branches. A `TX:/…/` selector is a setvar-state
+    # rule whatever the collection it was populated from is called, and
+    # CRS-922110 reads `TX:/MULTIPART_HEADERS_CONTENT_TYPES_*/` — matching the
+    # substring `MULTIPART_` there would report a missing multipart accessor for
+    # a rule whose real blocker is that nothing ran the `setvar` that fills it.
     if variables.startswith("TX:") or "TX:/" in variables:
         return "TX sentinel — depends on the anomaly-score / setvar state machine"
+    # `FILES` and `FILES_NAMES` themselves ARE modelled — the multipart part
+    # parser feeds them (crates/waf-engine/src/checks/multipart.rs). What is
+    # left here is the upload *metadata* family, which needs sizes and on-disk
+    # temporaries this WAF never produces because it does not spool uploads.
+    if any(v in variables for v in ("FILES_COMBINED_SIZE", "FILES_SIZES", "FILES_TMPNAMES", "FILES_TMP_CONTENT")):
+        return "upload size / temp-file metadata is not modelled (uploads are never spooled to disk)"
+    # Likewise `MULTIPART_PART_HEADERS` as a whole is modelled; the per-part
+    # selector `MULTIPART_PART_HEADERS:<name>` is not, and neither are the
+    # parser-verdict variables (MULTIPART_STRICT_ERROR and friends).
+    if "MULTIPART_PART_HEADERS:" in variables:
+        return "per-part selector MULTIPART_PART_HEADERS:<name> is not modelled"
+    if "MULTIPART_" in variables:
+        return "multipart parser-verdict variable (MULTIPART_STRICT_ERROR etc.) is not modelled"
     return f"not converted (upstream VARIABLES: {variables or 'n/a'})"
 
 
