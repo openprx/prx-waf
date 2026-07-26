@@ -73,7 +73,7 @@ scraper = "0.27"
 # Phase 4 additions
 argon2 = { version = "0.5", features = ["std"] }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "smtp-transport", "builder"] }
 rust-embed = "8"
