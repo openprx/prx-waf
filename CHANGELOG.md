@@ -9,6 +9,49 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Request bodies are now routed by the same body-processor table upstream
+  uses, instead of every body being handed to 154 rules that never asked for
+  one.** The converter mapped `XML:/*` to the whole body unconditionally, so a
+  JSON, plain-text or any-content-type body was scanned by every rule whose
+  upstream target mentions XML. Of the 167 rules whose field carries `body`,
+  **154 got it only from that mapping**; just 13 (920260, 921110, 931110 and
+  the 944 family) really read `REQUEST_BODY` upstream.
+
+  Narrowing `XML:/*` alone would have been a net loss, and finding that out is
+  what this change turned on: upstream does not cover JSON through `XML:/*` at
+  all. It covers it with a JSON body processor that flattens each leaf into
+  `ARGS` — `modsecurity.conf` rule 200001, present in the very image the CRS
+  regression suite scores against. So the fix is the whole table, not one
+  entry: XML selects on rule 200000's content types and yields `XML:/*` as one
+  concatenated text value plus `XML://@*` per attribute (matching
+  `xmlNodeGetContent`, which excludes element names); JSON flattens to `ARGS`
+  with v2's dotted paths; multipart contributes its non-file parts, as it
+  already did.
+
+  go-ftw, CRS v4.25.0, 4674 tests. Log mode — the rule-id-accurate measure —
+  **2779 → 2782 / 3742 → 3746 / 4222 → 4229** at PL1/PL2/PL4 with **zero
+  tests going from pass to fail**, checked as a per-id set difference. Cloud
+  mode drops 91/99/1, and every one of those was cross-checked against log
+  mode: none is lost detection. 104 of the 105 at PL1 fail in log mode both
+  before and after — the rule under test never fired, and the earlier cloud
+  "pass" was a 403 from an unrelated false positive, exactly the noise this
+  file's own header warns about. Over-blocks fall at every level in both
+  modes: log 26/32/34 → 25/31/33, cloud 95/248/311 → 86/235/298.
+
+  Real WAF, enforcing: benign probes blocked went **1/6/6 → 0/3/4** at
+  PL1/PL2/PL4, with the shipped default now at zero. Ten attack probes —
+  SQLi and XSS through query, urlencoded body and JSON body, log4shell in an
+  XML attribute, SSRF in an XML text node, RCE in a multipart form field,
+  traversal in a query — are 403 at every level before and after.
+
+  One honest narrowing: a body with no `Content-Type`, or one outside the four
+  processors, is now seen through the CRS lane only by those 13 `REQUEST_BODY`
+  rules. That matches upstream, where the gap is covered by 920420's
+  content-type allow-list rather than by scanning everything, and prx-waf's own
+  Lane 1 detectors still read the raw body regardless.
+
 ### Added
 
 - **The `audit_log` table finally has a writer, and the admin UI a page to read

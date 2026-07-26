@@ -1,7 +1,12 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
+import type { RouteRecordRaw } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 
-const routes = [
+// Annotated rather than inferred: without it TypeScript widens the array to a
+// single object shape, and the redirect-only entries (which carry no
+// `component`) then fail to match RouteRecordRedirect. Nothing in CI type-checks
+// this file, so the error would only ever have shown up in an editor.
+const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/dashboard' },
   { path: '/login', component: () => import('../views/Login.vue'), meta: { public: true } },
   { path: '/dashboard', component: () => import('../views/Dashboard.vue') },
