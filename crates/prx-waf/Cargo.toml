@@ -22,7 +22,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-regex = { workspace = true }
 ipnet = { workspace = true }
 rustls = { workspace = true }
 
