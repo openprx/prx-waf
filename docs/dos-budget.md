@@ -248,28 +248,37 @@ spells it out behave identically.
 **Why it is on rather than offered.** An unbounded Lane 1 is not a tuning
 preference an operator can be left to discover. Posting a large body — no
 evasion, no authentication, no malformed input — is enough to consume the whole
-process, because the proxy is single-threaded (§5.3).
+process. That was true when the proxy was single-threaded and it is still true
+now that `[proxy] worker_threads` gives it every core (§5.3): a wider data plane
+multiplies the rate at which an attacker's bodies are absorbed, it does not
+change that each one costs hundreds of milliseconds of CPU.
 
-**Provisional measurement.** Ryzen 9 5900HX, shipping `full` posture, 50
-connections, 30 s × 3 rounds, oha 1.11.0 against albedo v0.3.0, the two runs
-back to back one config default apart:
+**Measured.** Ryzen 9 5900HX, WAF pinned to CPUs 0–3, shipped worker-thread
+default, 50 connections, 10 s × 3 rounds, oha 1.11.0 against albedo v0.3.0, two
+runs one config default apart on the same clean committed tree
+(`c5074776`):
 
-| workload | unbounded (`= 0`) | 64 KiB default | |
-|---|--:|--:|---|
-| 64 KiB multipart upload | 42 rps · 24,102 µs/req | 1,726 rps · 580 µs/req | **41× / 42×** |
-| 1 MiB JSON body | 4 rps · 254,119 µs/req | 149 rps · 6,731 µs/req | **37× / 38×** |
+| posture | workload | unbounded (`= 0`) | 64 KiB default | |
+|---|---|--:|--:|---|
+| `lane1` | 64 KiB multipart upload | 93 rps · 42,857 µs/req | 7,049 rps · 565 µs/req | **75.5× / 75.9×** |
+| `lane1` | 1 MiB JSON body | 15 rps · 259,721 µs/req | 726 rps · 5,496 µs/req | **47.2× / 47.3×** |
+| `full` | 64 KiB multipart upload | 94 rps · 42,619 µs/req | 4,237 rps · 939 µs/req | **45.1× / 45.4×** |
+| `full` | 1 MiB JSON body | 15 rps · 266,874 µs/req | 306 rps · 13,073 µs/req | **20.4× / 20.4×** |
+| `passthrough` | multipart *(control)* | 22,902 rps | 21,764 rps | 1.0× |
+| `passthrough` | body-1mb *(control)* | 2,025 rps | 2,130 rps | 1.1× |
 
-**These four numbers are not reproducible and must not be quoted as a result.**
-The host was running a second copy of the performance harness, pinned to the
-same cores, throughout — the confound `tests/perf/README.md` describes and that
-`RESULTS.md` has already voided one run over. The `= 0` / 1 MiB cell in
-particular came out with a 61% round-to-round spread, well past the ~10% above
-which that harness says to read a figure as noise. What survives the
-contamination is the *order of magnitude*, because these are factors of ~40, not
-percentages: the per-request cost on a large body falls from ~10<sup>5</sup> µs
-to ~10<sup>3</sup>–10<sup>4</sup> µs. The reproducible figures will be published
-in [`tests/perf/RESULTS.md`](../tests/perf/RESULTS.md) from a clean host; that
-file is the authority and deliberately carries no provisional number.
+Round-to-round spread is at or below 4.6% on every cell, so these are results
+rather than noise, and the `passthrough` control confirms the key changes
+nothing where no Lane 1 detector is enabled. Full conditions, including how the
+host was made quiet and how that was verified, are in
+[`tests/perf/RESULTS.md`](../tests/perf/RESULTS.md) §2; that file remains the
+authority.
+
+**These supersede the provisional 41× / 37× figures** taken when this default
+landed, which were measured while a second copy of the performance harness ran
+pinned to the same cores and were deliberately kept out of `RESULTS.md`. The
+contamination understated the gain, exactly as its own caveat predicted: the
+clean factors are 75.5× and 47.2×.
 
 The bound costs nothing on the traffic it does not apply to: a small GET, a
 1 KiB JSON POST and a 512 B form POST all carry bodies inside 64 KiB and are
@@ -287,16 +296,20 @@ over the same binary with detection off
 
 | layer | small GET | 1 KiB JSON | 64 KiB upload | 1 MiB body |
 |---|--:|--:|--:|--:|
-| Lane 1 | +83 | +616 | **+21,469** | **+102,228** |
-| CRS PL1 | +88 | +487 | +199 | +4,667 |
-| Lane 2 | +41 | +127 | +74 | +20 |
+| Lane 1, `max_body_bytes = 0` | +137 | +1,057 | **+42,685** | **+257,772** |
+| Lane 1, shipped 64 KiB | +137 | +1,057 | +385 | +3,646 |
+| CRS PL1 | +144 | +801 | +295 | +7,099 |
+| Lane 2 | +66 | +221 | +55 | +342 |
 
 Lane 2 barely moves because §2.1 bounds it; CRS gets *cheaper* at 64 KiB because
 `MAX_BODY_BYTES` skips its body processors past that point (§1.3). Lane 1 had
-neither, and §5.3 means that cost was the throughput of the entire process:
-**single-digit rps of 1 MiB bodies per core, reachable by any unauthenticated
-client that can POST.** That is what the default now removes; the two rightmost
-columns are the cost an operator re-accepts by setting `max_body_bytes = 0`.
+neither, and that cost was the throughput of the entire process: **15 rps of
+1 MiB bodies, reachable by any unauthenticated client that can POST.** That is
+what the default removes — and note what removing it exposes, in the two
+right-hand columns: with Lane 1 bounded, **CRS is now the most expensive layer
+on a 1 MiB body**, because it keeps scanning the raw body after Lane 1 has
+stopped. The first row is the cost an operator re-accepts by setting
+`max_body_bytes = 0`.
 
 **Why one budget rather than one per detector.** All four detectors read the
 body through the single `request_targets` collector
@@ -304,6 +317,12 @@ body through the single `request_targets` collector
 share no work — the per-detector deltas sum to the aggregate within 1–7%, with
 `sqli` +12,284 µs and `xss` +7,704 µs of Lane 1's 21,469 µs on a 64 KiB upload,
 and `rce` +431 / `traversal` +437 making the four of them **99.6%** of it.
+Those per-detector figures come from `tests/perf/results/lane1-bisect.json`,
+which was recorded on the single-threaded, unbounded tree and **has not been
+re-measured**; the structural conclusion they support — that the detectors are
+additive and share no work, so one collector-level cap governs all four — does
+not depend on the absolute values, but do not quote the values themselves
+alongside the numbers above.
 Capping the collector removes the cost from all four at once and keeps the
 coverage statement binary: either Lane 1 read this body or it did not.
 Per-detector control already exists separately, as the per-host
@@ -695,12 +714,24 @@ in `main.rs`). Unset — the shipped default — it follows
 mask this process actually has, not the host's core count; `0` says that
 explicitly; `N > 0` fixes it. The effective count and its origin are logged at
 startup, and a single-threaded data plane on a wider host is a startup `WARN`.
-Confirmed by measurement — the same 16-core host, same pinning, goes from 0.99
-to 3.87 cores consumed — but
-[`tests/perf/RESULTS.md`](../tests/perf/RESULTS.md) has **not** been re-run on
-multiple threads and still records the single-threaded throughput; the
-multi-threaded RPS figures taken here are provisional, since another pinned
-benchmark shared these cores while they were measured.
+
+[`tests/perf/RESULTS.md`](../tests/perf/RESULTS.md) has now been re-recorded on
+the shipped default and its tables are multi-threaded throughout. On four
+Pingora workers pinned to CPUs 0–3 the process consumes **3.88 cores** against
+0.99 single-threaded, and proxy-only throughput on a small GET goes from 24,987
+to 58,078 rps. The gain is real and **sublinear**, and part of the reason is
+already visible in the CPU column rather than needing to be guessed at:
+per-request cost rises from 40 to 67 µs, so the multi-threaded runtime costs
+roughly **+68% CPU per request**. How much of the remaining shortfall is SMT —
+CPUs 0–3 are two physical cores, not four — and how much is contention has
+**not** been separated; the controlled `worker_threads` = 1 / 2 / 4 sweep is
+listed there under what was not measured.
+
+One consequence of the wider data plane is not an improvement, and §4 of that
+page now carries it: because blocked requests are generated 2–3× faster while
+the 20-connection database pool behind them did not change, ten seconds of
+attack traffic now grows the process to **~4 GiB** where the single-threaded
+measurement recorded 420–750 MiB.
 
 Two consequences survive the change. The count is still **static** — there is no
 autoscaling, so a machine that grows CPUs needs a restart to use them — and
@@ -852,11 +883,12 @@ If you are deploying prx-waf, the short version:
    64 KiB produce no structured targets. If your API takes large JSON, the
    `ARGS_POST` rules are not protecting it. This boundary is visible in the
    performance data too: the CRS layer gets *cheaper* on a 64 KiB multipart body
-   (+199 µs) than on a 1 KiB JSON one (+487 µs), precisely because it stopped
-   inspecting.
+   (+295 µs) than on a 1 KiB JSON one (+801 µs), precisely because it stopped
+   inspecting. With Lane 1 now bounded at the same 64 KiB, CRS is the layer that
+   costs the most on a body past it (+7,099 µs on 1 MiB).
 7. **Know that the Lane 1 body budget is on, at 64 KiB (§2.2).** Lane 1 is where
    the time goes: unbounded, on a 64 KiB upload the native regex detectors cost
-   21 ms of CPU per request against Lane 2's 74 µs, and on a 1 MiB body 102 ms.
+   42.7 ms of CPU per request against Lane 2's 55 µs, and on a 1 MiB body 258 ms.
    `[content_security.lane1] max_body_bytes = 65536` bounds it out of the box,
    and neither answer is free:
    * **as shipped**, a body larger than 64 KiB is not scanned by `sqli` / `xss` /
@@ -867,16 +899,22 @@ If you are deploying prx-waf, the short version:
      number to just above them** — that restores Lane 1 coverage for your traffic
      while still bounding what an attacker can spend;
    * **`0` = unlimited** restores full coverage and the DoS with it: body size,
-     not request rate, becomes what exhausts you — single-digit rps of 1 MiB
-     bodies per core (§5.3), attacker-chosen. Choose it only behind a rate
+     not request rate, becomes what exhausts you — **15 rps of 1 MiB bodies for
+     the whole process** (§5.3), attacker-chosen. Choose it only behind a rate
      limiter or a body-size cap.
 
-   The per-host `sqli` / `xss` toggles remain the blunter alternative (those two
-   are 94% of Lane 1's cost) — they remove the detector from *all* traffic,
-   where the budget removes it only from oversized bodies.
+   The per-host `sqli` / `xss` toggles remain the blunter alternative — they
+   remove the detector from *all* traffic, where the budget removes it only from
+   oversized bodies. (That those two detectors were 94% of Lane 1's cost was
+   measured on the unbounded, single-threaded tree and has not been re-measured;
+   see `tests/perf/RESULTS.md` under what was not measured.)
 8. **Watch the logs for queue-drop WARNs**, since there is no metric. Grep for
    `channel full` and `dropped`.
-9. **Expect memory to grow under attack.** Ten seconds of blocked traffic took
-   the process from 110 MiB to 750 MiB in measurement, because every block
-   writes to the database. Where that settles is not established — give the
+9. **Expect memory to grow under attack, and budget in gigabytes.** Ten seconds
+   of blocked traffic took the shipping posture from 106 MiB to **4,065 MiB** in
+   measurement, because every block writes to the database and the pool behind
+   those writes is 20 connections. This got an order of magnitude worse when the
+   data plane went multi-threaded — the single-threaded measurement recorded
+   420–750 MiB — since blocked requests are now produced 2–3× faster and the
+   drain rate did not change. Where it settles is not established. Give the
    process a memory limit and alert on it.

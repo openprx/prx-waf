@@ -1,0 +1,256 @@
+{
+  "_comment": [
+    "prx-waf runtime performance measurement. NOT a CI gate \u2014 see README.md.",
+    "",
+    "Numbers are only comparable against numbers produced by the same",
+    "generator version, on the same hardware, at the same connection",
+    "count and duration. Restate all four whenever a figure is quoted.",
+    "",
+    "`recorded_from.tree` is the commit that was BUILT AND MEASURED, and",
+    "`recorded_from.worktree_state` says whether that tree had uncommitted",
+    "changes. A number measured on a dirty tree is not reproducible and",
+    "says so here rather than in a footnote nobody reads."
+  ],
+  "recorded_from": {
+    "tree": "c5074776649fa3bc47ebff9b762e72b923ee62f6",
+    "worktree_state": "clean"
+  },
+  "environment": {
+    "cpu": "AMD Ryzen 9 5900HX with Radeon Graphics",
+    "cpus": 12,
+    "memory_gib": 30.8,
+    "kernel": "6.12.48+deb13-amd64",
+    "os": "Linux #1 SMP PREEMPT_DYNAMIC Debian 6.12.48-1 (2025-09-20)",
+    "loadavg_1min_at_start": "5.23",
+    "loadavg_1min_at_end": "5.34"
+  },
+  "method": {
+    "generator": "oha 1.11.0",
+    "origin": "albedo v0.3.0 (200, empty body \u2014 a near-zero-work origin, so the measurement is dominated by the subject and not by the backend)",
+    "connections": 50,
+    "duration_s": 10,
+    "rounds_per_cell": 3,
+    "reduction": "median round by RPS; latency taken from that same round",
+    "cpu_pinning": "on (waf 0-3, origin 4-9, generator 10-15)",
+    "proxy_worker_threads": "shipped default (unset \u2014 follows the CPUs the process may use)",
+    "lane1_max_body_bytes": "0",
+    "held_constant": [
+      "response cache OFF in every posture (a hit skips the upstream and would make the WAF measure faster than its own origin)",
+      "geoip OFF (no xdb shipped; leaving it on measures a no-op)",
+      "audit log OFF",
+      "rate limiter, where enabled, is configured never to trigger \u2014 the cost measured is the bucket lookup, not the 429 path"
+    ]
+  },
+  "results": {
+    "passthrough": {
+      "multipart": {
+        "rps": 22902.3,
+        "p50_ms": 2.159,
+        "p95_ms": 3.138,
+        "p99_ms": 3.57,
+        "p999_ms": 4.064,
+        "max_ms": 6.272,
+        "cpu_cores": 3.927,
+        "cpu_us_per_req": 171.47,
+        "cpu_us_per_req_spread_pct": 1.3,
+        "rss_mib": 77.5,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 229032
+        },
+        "errors": {
+          "aborted due to deadline": 49
+        },
+        "requests": 229032,
+        "rounds": 3,
+        "rps_spread_pct": 1.4
+      },
+      "body-1mb": {
+        "rps": 2024.6,
+        "p50_ms": 24.885,
+        "p95_ms": 34.13,
+        "p99_ms": 37.812,
+        "p999_ms": 42.797,
+        "max_ms": 49.131,
+        "cpu_cores": 3.944,
+        "cpu_us_per_req": 1948.09,
+        "cpu_us_per_req_spread_pct": 0.6,
+        "rss_mib": 111.1,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 20200
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 20200,
+        "rounds": 3,
+        "rps_spread_pct": 0.7
+      }
+    },
+    "lane1": {
+      "multipart": {
+        "rps": 93.4,
+        "p50_ms": 554.664,
+        "p95_ms": 812.931,
+        "p99_ms": 902.492,
+        "p999_ms": 1243.243,
+        "max_ms": 1243.243,
+        "cpu_cores": 4.002,
+        "cpu_us_per_req": 42856.87,
+        "cpu_us_per_req_spread_pct": 1.6,
+        "rss_mib": 102.0,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 884
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 884,
+        "rounds": 3,
+        "rps_spread_pct": 1.6
+      },
+      "body-1mb": {
+        "rps": 15.4,
+        "p50_ms": 3909.54,
+        "p95_ms": 5013.271,
+        "p99_ms": 6196.067,
+        "p999_ms": 6578.144,
+        "max_ms": 6578.144,
+        "cpu_cores": 3.999,
+        "cpu_us_per_req": 259720.55,
+        "cpu_us_per_req_spread_pct": 4.7,
+        "rss_mib": 117.6,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 104
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 104,
+        "rounds": 3,
+        "rps_spread_pct": 4.6
+      }
+    },
+    "full": {
+      "multipart": {
+        "rps": 93.9,
+        "p50_ms": 527.858,
+        "p95_ms": 881.599,
+        "p99_ms": 1068.375,
+        "p999_ms": 1460.225,
+        "max_ms": 1460.225,
+        "cpu_cores": 4.001,
+        "cpu_us_per_req": 42619.31,
+        "cpu_us_per_req_spread_pct": 1.9,
+        "rss_mib": 119.1,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 889
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 889,
+        "rounds": 3,
+        "rps_spread_pct": 1.9
+      },
+      "body-1mb": {
+        "rps": 15.0,
+        "p50_ms": 4219.47,
+        "p95_ms": 6249.306,
+        "p99_ms": 6971.246,
+        "p999_ms": 6971.246,
+        "max_ms": 6971.246,
+        "cpu_cores": 4.002,
+        "cpu_us_per_req": 266874.23,
+        "cpu_us_per_req_spread_pct": 2.6,
+        "rss_mib": 138.7,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 100
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 100,
+        "rounds": 3,
+        "rps_spread_pct": 2.7
+      }
+    }
+  },
+  "attribution": {
+    "multipart": {
+      "passthrough": {
+        "rps": 22902.3,
+        "p99_ms": 3.57,
+        "p999_ms": 4.064,
+        "cpu_us_per_req": 171.47
+      },
+      "lane1": {
+        "rps": 93.4,
+        "p99_ms": 902.492,
+        "p999_ms": 1243.243,
+        "cpu_us_per_req": 42856.87,
+        "rps_vs_passthrough_pct": -99.6,
+        "p99_vs_passthrough_ms": 898.922,
+        "cpu_us_vs_passthrough": 42685.4,
+        "cpu_pct_vs_passthrough": 24893.8
+      },
+      "full": {
+        "rps": 93.9,
+        "p99_ms": 1068.375,
+        "p999_ms": 1460.225,
+        "cpu_us_per_req": 42619.31,
+        "rps_vs_passthrough_pct": -99.6,
+        "p99_vs_passthrough_ms": 1064.805,
+        "cpu_us_vs_passthrough": 42447.84,
+        "cpu_pct_vs_passthrough": 24755.3
+      },
+      "_sum_of_parts_check": {
+        "sum_of_layer_cpu_us_deltas": 42685.4,
+        "measured_full_cpu_us_delta": 42447.84
+      }
+    },
+    "body-1mb": {
+      "passthrough": {
+        "rps": 2024.6,
+        "p99_ms": 37.812,
+        "p999_ms": 42.797,
+        "cpu_us_per_req": 1948.09
+      },
+      "lane1": {
+        "rps": 15.4,
+        "p99_ms": 6196.067,
+        "p999_ms": 6578.144,
+        "cpu_us_per_req": 259720.55,
+        "rps_vs_passthrough_pct": -99.2,
+        "p99_vs_passthrough_ms": 6158.255,
+        "cpu_us_vs_passthrough": 257772.46,
+        "cpu_pct_vs_passthrough": 13232.1
+      },
+      "full": {
+        "rps": 15.0,
+        "p99_ms": 6971.246,
+        "p999_ms": 6971.246,
+        "cpu_us_per_req": 266874.23,
+        "rps_vs_passthrough_pct": -99.3,
+        "p99_vs_passthrough_ms": 6933.434,
+        "cpu_us_vs_passthrough": 264926.14,
+        "cpu_pct_vs_passthrough": 13599.3
+      },
+      "_sum_of_parts_check": {
+        "sum_of_layer_cpu_us_deltas": 257772.46,
+        "measured_full_cpu_us_delta": 264926.14
+      }
+    }
+  }
+}

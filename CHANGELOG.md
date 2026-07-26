@@ -14,11 +14,17 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 - **`[content_security.lane1] max_body_bytes` now defaults to `65536` instead of
   `0` (unlimited), and an over-budget body now degrades the verdict instead of
   being skipped silently.** Unbounded, the four Lane 1 regex detectors cost
-  21.5 ms of CPU on a 64 KiB upload and 102 ms on a 1 MiB body, and the proxy
-  runs on one worker thread — so a large POST, with no evasion and no
-  authentication, was enough to take the process down. 64 KiB is the boundary
-  the CRS body processors already draw (`MAX_BODY_BYTES`), so both detection
-  chains now stop reading a request body at the same size.
+  42.7 ms of CPU on a 64 KiB upload and 258 ms on a 1 MiB body — so a large
+  POST, with no evasion and no authentication, was enough to take the process
+  down at 93 and 15 requests per second respectively. 64 KiB is the boundary the
+  CRS body processors already draw (`MAX_BODY_BYTES`), so both detection chains
+  now stop reading a request body at the same size. Measured on a quiet host,
+  one config default apart, the bound is worth **×75.5 on a 64 KiB upload and
+  ×47.2 on a 1 MiB body** for the `lane1` posture (×45.1 and ×20.4 for the full
+  shipping stack); the `passthrough` control does not move, as it should not.
+  These supersede the provisional ×41 / ×37 recorded when the default landed,
+  which were taken while a second benchmark shared the same cores and were kept
+  out of `tests/perf/RESULTS.md` for that reason.
 
   **This reduces detection coverage.** `sqli` / `xss` / `rce` / `dir_traversal`
   see none of a body over 64 KiB — not a truncated prefix, none of it. If your
@@ -172,15 +178,18 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   came from; a single-threaded data plane on a wider host, however it arose,
   is a `WARN` naming the ceiling.
 
-  Verified by measurement, one binary, 1 thread versus the default, with the
-  harness's own pinning: the process goes from **0.99 cores to 3.87** and
-  throughput rises with it, sublinearly — the multi-threaded runtime costs
-  something per request, and that cost lands on the 1 → 2 thread step rather
-  than on each thread after it. Detection cost per request is unchanged; this
-  buys cores, nothing else. **The throughput figures are provisional**: a second
-  pinned benchmark was running on the same cores of the same host, so absolute
-  RPS is not comparable with the baseline in `tests/perf/RESULTS.md`, which has
-  not been re-run and still records the single-threaded numbers.
+  `tests/perf/RESULTS.md` has since been re-recorded on a quiet host and is
+  multi-threaded throughout. On four workers pinned to two physical cores the
+  process consumes **3.88 cores** against 0.99, and proxy-only throughput on a
+  small GET goes **24,987 → 58,078 rps**. The gain is sublinear, and part of the
+  reason is measured rather than guessed: per-request CPU rises from 40 to
+  67 µs, so the multi-threaded runtime costs about **+68% CPU per request**. How
+  much of the rest is SMT and how much is contention is not yet separated — the
+  controlled 1 / 2 / 4-thread sweep is listed there as not measured. One
+  second-order effect is not an improvement: attack-driven memory growth rose
+  from 420–750 MiB to ~4 GiB in ten seconds, because blocked requests are now
+  produced 2–3× faster while the 20-connection database pool behind them is
+  unchanged.
 
 - **The CRS rules this WAF runs are now visible, and each of them can be turned
   down or off without a restart.** `OWASPCheck` compiled 285 rules out of 288

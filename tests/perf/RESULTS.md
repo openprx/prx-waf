@@ -1,275 +1,339 @@
 # Measured runtime performance
 
-Recorded **2026-07-26** by `tests/perf/run.sh` from tree `87aa1bc`, with **no
-modifications to tracked sources** — the only files not in the commit were this
-harness and its documentation, so the binary under test is exactly what
-`87aa1bc` builds. Methodology, and why the two reference postures are what they
-are, is in [README.md](README.md). Raw data: [`results/`](results/).
+Recorded **2026-07-26** by `tests/perf/run.sh` from tree
+`c5074776649fa3bc47ebff9b762e72b923ee62f6`, working tree **clean** — no tracked
+or untracked file differed from that commit while the binary was built or while
+any figure below was taken. That commit changes only the harness; the WAF
+sources it builds are byte-identical to `39d4fb2`, the tip of the two default
+changes this page exists to re-measure. Methodology, and why the two reference
+postures are what they are, is in [README.md](README.md). Raw data:
+[`results/`](results/).
 
 | | |
 |---|---|
-| CPU | AMD Ryzen 9 5900HX, 16 logical cores |
+| CPU | AMD Ryzen 9 5900HX — **8 physical cores, 16 logical** (2-way SMT) |
 | Memory | 30.8 GiB |
 | Kernel | 6.12.48+deb13-amd64 |
 | Generator | `oha` 1.11.0, `c=50`, 10 s × 3 rounds, median round |
 | Origin | `albedo` v0.3.0 (200, empty body) |
-| Pinning | WAF cores 0–3, origin 4–9, generator 10–15 |
-| Host load (1 min) | 2.93 at start → 3.00 at end |
+| Pinning | WAF **CPUs 0–3**, origin 4–9, generator 10–15 |
+| Proxy worker threads | 4 — the shipped default, resolved from the pinned set |
+| `lane1 max_body_bytes` | 65536 — the shipped default |
+| Host load (1 min) | 1.76 at start → 7.59 at end |
 
-The host was **not** idle — this is a developer machine with a stable background
-load of ~3. An earlier run of the same matrix, taken while three `rustc`
-processes came and went, is not reported here: the load fell from 19.9 to 3.9
-*during* the run, so posture order was confounded with host load and several
-rows moved by 40–140% between rounds. The numbers below come from the re-run at
-stable load, and the per-row spread columns are published so a reader can check
-that claim rather than take it. The two runs agreed on every conclusion below;
-only the noise level differed.
+**CPUs 0–3 are two physical cores, not four.** `thread_siblings_list` pairs
+0–1 and 2–3, so the WAF's pinned set is two cores' worth of execution resources
+presented as four hardware threads. Every "4 threads" figure below means four
+Pingora workers on two physical cores. This is also where the shipping default
+comes from: `[proxy] worker_threads` is unset, and `available_parallelism`
+reads the **affinity mask**, not `nproc`, so `taskset -c 0-3` makes the shipped
+default 4. Startup says so verbatim:
+
+> Proxy worker threads: 4 — `[proxy] worker_threads` is unset, so the data plane
+> follows the CPUs it may run on (4 CPU(s) available to this process).
+
+### Host state, and what "quiet" now has to mean
+
+The host is a developer workstation and was not idle. One process — a
+`chrome-devtools` MCP browser child — burns a steady **1.000 core**, and has for
+35 hours. Rather than measure around it, all 20 of its processes were pinned to
+CPUs 4–15 before the first round, along with every other background process
+heavy enough to matter, so that **cores 0–3 belong to the WAF alone**. That was
+verified rather than assumed, by comparing the busy jiffies on cores 0–3 against
+the subject's own `utime+stime` over the same window, twice, mid-run:
+
+| sample | cores 0–3 busy | prx-waf CPU | unaccounted |
+|---|--:|--:|--:|
+| 8.0 s | 3.885 cores | 3.898 cores | −0.014 |
+| 10.0 s | 3.846 cores | 3.863 cores | −0.017 |
+
+The residual is negative and of order 0.01 cores, which is the cost of reading
+two counters a few hundred microseconds apart: **nothing but prx-waf ran on the
+subject's cores.** The browser still shares CPUs 4–15 with the origin and the
+generator — one core out of twelve — so it costs the reference rows a little
+headroom and the subject rows nothing.
+
+**The old page's "load ≈ 3" quiet criterion is retired, because it measured a
+single-threaded era.** A load average cannot separate the subject from the host
+now that the subject alone contributes four runnable threads: the 7.59 recorded
+at the end of this run decomposes as prx-waf 3.86 + browser 1.00 + albedo ≈ 1.5
++ oha ≈ 1.5, and it means the benchmark was working, not that the host was busy.
+The criterion this page uses instead is the one that survives multithreading:
+**no measurable CPU on the subject's cores other than the subject**, checked
+during the run, plus per-row spread columns the reader can audit. Those spreads
+are the visible payoff: **47 of the 54 `c=50` cells have both spread columns
+under 3%**, against rows that moved 20–140% on the page this replaces. Six of
+the seven exceptions are the `origin` reference and the `attack` workload —
+neither of which carries a conclusion here — and the seventh is
+`crs-pl4`/`form-post` at 10.9%, which should be read as noise per the README's
+own rule.
 
 **Read the layer attribution from CPU µs/req, not from RPS.** See
 [README.md § Metrics](README.md#metrics-and-which-one-to-trust).
 
 ---
 
+## What changed since the last recording
+
+The previous edition of this page was measured on tree `87aa1bc` and every table
+in it has been superseded, because two shipped defaults changed underneath it:
+
+* **`d457e0d` wired `[proxy] worker_threads` to Pingora.** Before it,
+  `Server::new(None)` took `ServerConf::default()`, whose `threads: 1` sized the
+  entire data plane, and no configuration key could change it — the process held
+  13 OS threads and consumed 0.99 cores. **Every number on the old page was a
+  single-thread number.** They were correct for what they measured and are not
+  comparable to anything below.
+* **`39d4fb2` changed `[content_security.lane1] max_body_bytes` from `0`
+  (unlimited) to `65536`.** The old page's `lane1` and `full` rows for
+  `multipart` and `body-1mb` therefore described a posture that now requires
+  explicitly setting the key back to `0`. That posture is still measured here,
+  as the contrast in §2 — it is just no longer what ships.
+
+Both changes were benchmarked when they landed, on a host that was concurrently
+running a second copy of this harness pinned to the same cores. Those figures
+were labelled provisional and deliberately kept out of this file. They are
+superseded by the numbers below and should not be quoted; where a provisional
+figure can be compared, it **understated** the gain, exactly as its own caveat
+predicted.
+
+---
+
 ## Headline
 
-### 1. The proxy was single-threaded when this was measured. Throughput did not scale with cores.
+### 1. The proxy uses every core it is given, and the gain is real but sublinear
 
-At saturation the prx-waf process holds **13 OS threads** but consumes
-**0.99 cores** — on a 16-core machine. Adding cores adds nothing.
+At saturation on a small GET, `passthrough` now consumes **3.88 of its 4 pinned
+hardware threads** and serves **58,078 rps**, against 24,987 rps at 0.99 cores
+on the single-threaded tree. That is **×2.32 throughput for ×3.92 CPU**, on a
+pinned set that is physically two cores. The shipping `full` posture saturates
+the set slightly harder still, at 3.97 cores, and the process now holds 16 OS
+threads where it held 13.
 
-The cause is in the source, not in the configuration: `Server::new(None)`
-(`crates/prx-waf/src/main.rs:1389`) falls back to Pingora's
-`ServerConf::default()`, which sets `threads: 1`
-(`pingora-core-0.8.1/src/server/configuration/mod.rs:137`), and the proxy
-service is added with a bare `add_tcp` and no thread override
-(`main.rs:1450-1452`). **On tree `87aa1bc` there is no config key to change
-it.**
+| workload | passthrough, 1 thread (`87aa1bc`) | passthrough, shipped default (4 threads) | |
+|---|--:|--:|--:|
+| get-small | 24,987 rps | **58,078 rps** | ×2.32 |
+| json-post | 18,677 rps | **45,832 rps** | ×2.45 |
+| form-post | 16,916 rps | **45,560 rps** | ×2.69 |
+| multipart | 7,546 rps | **21,764 rps** | ×2.88 |
+| body-1mb | 912 rps | **2,130 rps** | ×2.34 |
 
-Everything else on this page is therefore a *per-thread* number. On tree
-`87aa1bc`, horizontal scaling — more processes, more nodes — is the only lever
-available.
+The two ends of that comparison come from different runs on different trees, so
+read them as a change of era rather than as a controlled ratio. **The controlled
+`worker_threads` = 1 / 2 / 4 sweep on one tree and one host is not in this
+edition** — see § What was not measured. What this edition does establish, from
+the CPU column rather than from RPS, is that per-request cost rose when the data
+plane went wide: `passthrough`/get-small costs **67 µs/req** here against
+**40 µs/req** single-threaded, i.e. roughly **+68% CPU per request** for the
+multi-threaded runtime. Throughput rising by less than the thread count is
+therefore not a mystery to be explained later; most of it is already visible
+and paid for in that column. **Which part of the remainder is SMT (four threads
+on two cores) and which is contention has not been separated**, and needs the
+sweep plus a physical-core pinning to answer.
 
-> **Fixed after this page was recorded, and not yet re-measured.** `[proxy]
-> worker_threads` now sizes the data plane and defaults to the CPUs the process
-> may use, so the ceiling described in this section no longer applies to the
-> shipped default. **No figure on this page has been re-run for it**, and none
-> should be read as the multi-threaded number. The re-measurement is pending;
-> until it lands, treat every table here as one thread's worth of work.
+### 2. Bounding Lane 1's body budget is worth 20–75×, and that is the largest single number on this page
 
-### 2. Detection cost is dominated by body size, which is why Lane 1 now has a budget
+Same binary, same host, same run parameters, one config default apart. `0`
+restores the pre-`39d4fb2` posture; `65536` is what ships:
+
+| posture | workload | `max_body_bytes = 0` | `= 65536` (shipped) | gain |
+|---|---|--:|--:|--:|
+| lane1 | multipart (64 KiB) | 93 rps · 42,857 µs/req | **7,049 rps · 565 µs/req** | **×75.5** |
+| lane1 | body-1mb (1 MiB) | 15 rps · 259,721 µs/req | **726 rps · 5,496 µs/req** | **×47.2** |
+| full | multipart (64 KiB) | 94 rps · 42,619 µs/req | **4,237 rps · 939 µs/req** | **×45.1** |
+| full | body-1mb (1 MiB) | 15 rps · 266,874 µs/req | **306 rps · 13,073 µs/req** | **×20.4** |
+| passthrough | multipart | 22,902 rps | 21,764 rps | ×1.0 — control |
+| passthrough | body-1mb | 2,025 rps | 2,130 rps | ×1.1 — control |
+
+Round-to-round spread is **at or below 4.6% on every cell**, including the
+`= 0` ones, so these are results and not noise. The `passthrough` control moves
+by 0–10%, confirming the key changes nothing where no Lane 1 detector is on.
+
+The provisional figures taken under contamination were 41× and 37×; the clean
+numbers are **75.5× and 47.2×**. The contamination understated the gain, which
+is what its own caveat said it would do, and is why nothing was published from
+it. `docs/dos-budget.md` §2.2 now carries these figures.
+
+Unbounded, the four Lane 1 regex detectors cost **42.7 ms of CPU on a 64 KiB
+upload and 258 ms on a 1 MiB body**, as a delta over the same binary with
+detection off. At the shipped default those fall to **385 µs and 3.6 ms**. The
+operational statement the old page made — that an unbounded Lane 1 served **93
+requests per second of 64 KiB uploads and 15 requests per second of 1 MiB
+bodies**, reachable by any unauthenticated client that can POST, with no evasion
+of any kind — survives the re-measurement almost unchanged, and it is now a
+statement about a posture an operator has to select deliberately rather than
+about the one they get out of the box.
+
+**What the default costs.** The `sqli` / `xss` / `rce` / `dir_traversal`
+detectors see **none** of a body over 64 KiB — not a truncated prefix, none of
+it. CRS (past its own 64 KiB structured cap), Lane 2 and every non-body surface
+still inspect the request, every skip is counted and WARNed, and the verdict
+carries `degraded` so "not inspected" cannot be read downstream as "inspected
+and clean". See [`docs/dos-budget.md` §2.2](../../docs/dos-budget.md).
+
+### 3. Detection cost, per layer
 
 CPU µs per request, as a delta over `passthrough` (the same binary with
-detection off):
+detection off), at the shipped defaults:
 
 | layer | get-small | json-post (1 KiB) | form-post (512 B) | multipart (64 KiB) | body-1mb (1 MiB) |
 |---|--:|--:|--:|--:|--:|
-| **passthrough** (absolute µs/req) | 40 | 53 | 59 | 131 | 1,091 |
-| Lane 1 regex detectors | +83 | +616 | +479 | **+21,469** | **+102,228** |
-| OWASP CRS PL1 | +88 | +487 | +282 | +199 | +4,667 |
-| OWASP CRS PL2 | +134 | +688 | +420 | +268 | +4,782 |
-| OWASP CRS PL4 | +171 | +1,102 | +473 | +244 | +4,894 |
-| Lane 2 semantic (shadow) | +41 | +127 | +74 | +74 | **+20** |
-| rate limiter | −1 | −3 | −8 | +5 | −174 |
-| **full** (shipping default) | +216 | +1,245 | +858 | **+21,172** | **+107,836** |
+| **passthrough** (absolute µs/req) | 67 | 85 | 85 | 180 | 1,850 |
+| Lane 1 regex detectors | +137 | +1,057 | +917 | +385 | +3,646 |
+| OWASP CRS PL1 | +144 | +801 | +468 | +295 | +7,099 |
+| OWASP CRS PL2 | +218 | +1,137 | +682 | +390 | +7,779 |
+| OWASP CRS PL4 | +236 | +1,638 | +852 | +433 | +8,041 |
+| Lane 2 semantic (shadow) | +66 | +221 | +117 | +55 | +342 |
+| rate limiter | +2 | +2 | +1 | −2 | +65 |
+| **full** (shipping default) | +350 | +2,148 | +1,543 | +759 | +11,223 |
 
-Lane 1 costs **21.5 ms of CPU on a 64 KiB upload and 102 ms on a 1 MiB body.**
-That is not a percentage overhead; it is a different order of magnitude. In
-throughput terms:
+Two shapes are worth naming. **CRS is now the most expensive layer on a 1 MiB
+body by a wide margin** (+7,099 µs against Lane 1's +3,646), which is the direct
+consequence of §2: Lane 1 stops reading at 64 KiB and CRS keeps scanning the raw
+body. On the old page the order was the other way round and Lane 1 was 22× CRS.
+And **Lane 1 is no longer body-dominated at the shipped default** — its
+multipart delta (+385 µs) is now *smaller* than its json-post delta (+1,057 µs),
+because the 64 KiB upload exceeds the budget and the 1 KiB JSON does not.
 
-| posture | get-small | json-post | form-post | multipart | body-1mb |
-|---|--:|--:|--:|--:|--:|
-| origin (no proxy) | 171,856 | 161,335 | 118,226 | 81,185 | 26,680 |
-| passthrough | 24,987 | 18,677 | 16,916 | 7,546 | 912 |
-| lane1 | 8,124 | 1,494 | 1,860 | **46** | **10** |
-| crs-pl1 | 7,827 | 1,851 | 2,934 | 3,028 | 174 |
-| crs-pl2 | 5,758 | 1,348 | 2,088 | 2,501 | 170 |
-| crs-pl4 | 4,749 | 888 | 1,873 | 2,661 | 167 |
-| lane2 | 12,377 | 5,550 | 7,540 | 4,855 | 896 |
-| cc | 25,906 | 19,751 | 19,723 | 7,336 | 1,085 |
-| **full (shipping default)** | **3,918** | **771** | **1,092** | **47** | **9** |
+### 4. The layer with a documented work budget is still the cheapest
 
-**Every table above was taken with Lane 1 unbounded, which was the shipping
-default when they were recorded and is no longer.** `[content_security.lane1]
-max_body_bytes` now defaults to `65536`, so the two right-hand columns of the
-`lane1` and `full` rows describe the posture an operator gets by setting
-`max_body_bytes = 0`, not the one they get out of the box. The rest of the page
-is unaffected: every other workload's body is inside 64 KiB, so the budget never
-binds on it and the figures stand as the shipped ones.
-
-Read like that, this was the operationally important finding on the page: an
-unbounded Lane 1 served **47 requests per second of 64 KiB file uploads and 9
-requests per second of 1 MiB request bodies, per core** — a number reachable by
-any unauthenticated client that can POST, with no evasion of any kind.
-
-**The shipped-default rows for those two workloads are not yet re-measured, and
-no provisional figure has been written into this file.** The change that
-introduced the default was benchmarked, but on a host that was simultaneously
-running a second copy of this harness pinned to the same cores — the exact
-confound the note at the top of this page says invalidates a run. Rather than
-publish a number that cannot be reproduced, the two rows are left as they were,
-labelled above for what they now are. The direction is not in doubt (the
-per-request cost falls by more than an order of magnitude on both workloads);
-the magnitude will be restated here from a clean run.
-
-**What the default buys and what it costs.** The `sqli` / `xss` / `rce` /
-`dir_traversal` detectors now see **none** of a body over 64 KiB — not a
-truncated prefix, none of it. CRS (past its own 64 KiB structured cap), Lane 2
-and every non-body surface still inspect the request, every skip is counted and
-WARNed, and the verdict carries `degraded` so "not inspected" cannot be read
-downstream as "inspected and clean". See
-[`docs/dos-budget.md` §2.2](../../docs/dos-budget.md).
-
-### 3. The layer with a documented work budget is the only one that stays cheap
-
-Notice the shape of the Lane 2 row: **+41, +127, +74, +74, +20 µs** — it barely
-moves as the body grows from nothing to 1 MiB, and it is *cheapest* on the
-largest body. That is not luck. Lane 2 has an explicit, operator-visible work
-budget (`[content_security.budget]`: `max_field_input_bytes = 16 KiB`,
+Lane 2's row — **+66, +221, +117, +55, +342 µs** — barely moves as the body
+grows from nothing to 1 MiB, and it is *cheaper* on a 64 KiB multipart body than
+on a 1 KiB JSON one. That is not luck. Lane 2 has an explicit, operator-visible
+work budget (`[content_security.budget]`: `max_field_input_bytes = 16 KiB`,
 `max_preprocess_output_bytes_total = 512 KiB`, `max_decode_rounds = 3`), and the
 budget does exactly what it says — past its caps the lane stops working and
 marks the verdict `degraded`.
 
 CRS is intermediate: its structured body processing is capped at 64 KiB
-(`MAX_BODY_BYTES`, `checks/body_processors.rs:48`), which is precisely why the
-CRS row *drops* from +487 µs on a 1 KiB JSON body to +199 µs on a 64 KiB
-multipart one — past 64 KiB the body processor is skipped entirely and CRS sees
-no structured targets at all. **The performance data and the fail-open
-behaviour documented in [`docs/dos-budget.md`](../../docs/dos-budget.md) are the
-same fact seen from two sides.** CRS still pays for raw-body scanning, which is
-why the 1 MiB column is +4,667 µs.
+(`MAX_BODY_BYTES`, `checks/body_processors.rs:48`), which is why the CRS row
+*drops* from +801 µs on a 1 KiB JSON body to +295 µs on a 64 KiB multipart one —
+past 64 KiB the body processor is skipped entirely and CRS sees no structured
+targets at all. It still pays for raw-body scanning, which is the +7,099 µs in
+the 1 MiB column. **The performance data and the fail-open behaviour documented
+in [`docs/dos-budget.md`](../../docs/dos-budget.md) are the same fact seen from
+two sides.**
 
-Lane 1 had no equivalent budget when these numbers were taken, which is what
-the 1 MiB column measures: its only bounds were the 64 KiB scan window and the
-10 MiB total ceiling, so cost tracked body size all the way up. That is now
-fixed at the default rather than merely offered: `[content_security.lane1]
-max_body_bytes` ships at `65536`, the same boundary CRS already draws, so the
-`lane1` and `full` rows for `multipart` and `body-1mb` above are the
-`max_body_bytes = 0` posture and not the shipped one. The price is that those
-four detectors see none of an oversized body, head included. See
-`docs/dos-budget.md` §2.2.
-
-### 4. Inside Lane 1, two detectors are 94% of the cost
-
-`POSTURES=lane1-sqli,lane1-xss,… tests/perf/run.sh`, µs/req over `passthrough`:
-
-| detector | multipart (64 KiB) | json-post (1 KiB) |
-|---|--:|--:|
-| sqli | **+12,284** | **+354** |
-| xss | **+7,704** | **+179** |
-| rce | +431 | +5 |
-| traversal | +437 | +2 |
-| sensitive | +75 | −7 |
-| scanner | +24 | −7 |
-| bot | −6 | +5 |
-| *sum of the seven* | *20,949* | *531* |
-| **all seven together (`lane1`)** | **21,158** | **568** |
-
-The parts sum to the whole within 1–7%, so the detectors are **additive** — they
-share no work. `sqli` and `xss` alone are 94% of Lane 1 on both workloads.
-
-The same additivity holds at the lane level: summed layer deltas versus the
-measured `full` posture come to 210 vs 216 µs (get-small), 1,227 vs 1,245
-(json-post) and 21,747 vs 21,172 (multipart) — within 3%. **No work is shared
-between Lane 1, CRS and Lane 2.** Each re-derives what it needs.
+Lane 1 now has an equivalent budget, and §2 is what it bought. The three lanes
+now stop reading a request body at the same 64 KiB boundary, so an operator has
+one number to reason about instead of three that disagreed.
 
 ### 5. The rate limiter is free
 
-−1 to +5 µs/req across every workload, i.e. below the measurement floor. The
-per-IP token-bucket lookup costs nothing worth counting. (Measured with the
-limiter configured never to fire, so this is the cost healthy traffic pays.)
+−2 to +2 µs/req on every workload except the 1 MiB body, where it is +65 µs —
+all of it at or near the measurement floor. The per-IP token-bucket lookup costs
+nothing worth counting. (Measured with the limiter configured never to fire, so
+this is the cost healthy traffic pays.)
 
-### 6. Sustained attack traffic multiplies memory by 4–7×
+### 6. Sustained attack traffic now multiplies memory by up to 65×, not 4–7×
 
 Peak RSS during a 10 s flood of a SQLi payload, versus the same posture on
 benign traffic:
 
-| posture | RSS, benign (get-small) | RSS, attack flood |
-|---|--:|--:|
-| passthrough (nothing detected) | 59 MiB | 110 MiB |
-| lane1 | 75 MiB | **454 MiB** |
-| crs-pl1 | 63 MiB | **574 MiB** |
-| crs-pl2 | 67 MiB | **750 MiB** |
-| full | 80 MiB | **420 MiB** |
+| posture | RSS, benign (get-small) | RSS, attack flood | attack rps | growth |
+|---|--:|--:|--:|--:|
+| passthrough (nothing detected) | 63 MiB | 113 MiB | 51,580 | ×1.8 |
+| cc (limiter only — the control) | 62 MiB | 113 MiB | 50,592 | ×1.8 |
+| lane2 (shadow, blocks nothing) | 71 MiB | 120 MiB | 15,939 | ×1.7 |
+| lane1 | 88 MiB | **2,255 MiB** | 18,481 | **×25.6** |
+| crs-pl1 | 76 MiB | **4,918 MiB** | 14,775 | **×64.7** |
+| crs-pl2 | 94 MiB | **1,761 MiB** | 11,725 | ×18.7 |
+| crs-pl4 | 100 MiB | **4,118 MiB** | 11,191 | ×41.2 |
+| **full (shipping default)** | 106 MiB | **4,065 MiB** | 19,020 | **×38.3** |
 
-Every blocked request writes a `security_event` and an `attack_log` row, and the
-database pool is 20 connections (`storage.max_connections`). Ten seconds of
-attack traffic is enough to grow the process to 750 MiB. The harness does not
-run long enough to say where this settles — **whether it plateaus or continues
-is not established by this measurement, and it should be, because "attacker
-controls your memory growth" is the shape of a DoS.** The `cc` row is the
-control: with only the rate limiter on, nothing is detected, nothing is written,
-and RSS stays at 110 MiB.
+**This got dramatically worse, and multithreading is why.** The old
+single-threaded page recorded 420–750 MiB under the same flood; the shipping
+posture now reaches **4.0 GiB in ten seconds**. Nothing about the write path
+changed — every blocked request still writes a `security_event` and an
+`attack_log` row, and the database pool is still 20 connections
+(`storage.max_connections`) — but the data plane now generates blocked requests
+2–3× faster while the drain rate behind those 20 connections did not move, so
+the queue in front of them grows that much faster.
+
+The two controls make the attribution unambiguous: `cc` and `passthrough` detect
+nothing, write nothing, and stay at 113 MiB; `lane2` is in its shipping shadow
+posture, observes without blocking, and stays at 120 MiB. **The growth is the
+persistence path, not the detection.**
+
+The harness does not run long enough to say where this settles — **whether it
+plateaus or continues is not established by this measurement, and it should be,
+because "attacker controls your memory growth" is the shape of a DoS, and the
+number is now measured in gigabytes rather than hundreds of megabytes.**
 
 ### 7. The proxy hop itself is not free either
 
-`origin → passthrough` on a small GET is **171,856 → 24,987 RPS, −85%**, at 40 µs
-of CPU per request. Some of that is a genuine second hop (two TCP connections,
-two HTTP parses, a copy) and some of it is the single-thread ceiling in §1: at
-24,987 RPS the WAF is already at 0.99 cores, so it is CPU-bound, not
-architecture-bound. The origin figure is itself albedo-limited (5.55 of its 6
-pinned cores), so the true no-proxy ceiling is higher than 171 k — treat the
+`origin → passthrough` on a small GET is **169,700 → 58,078 rps, −66%**, at 67 µs
+of CPU per request. That is a real second hop — two TCP connections, two HTTP
+parses, a copy — and at 58,078 rps the WAF is consuming 3.90 of its 4 pinned
+threads, so it is CPU-bound on two physical cores rather than
+architecture-bound. The origin figure is itself albedo-limited, so treat the
 origin row as "far above the WAF", not as an exact number.
+
+The gap narrowed from −85.5% to −66% purely because the WAF got its cores back;
+the origin barely moved (171,856 → 169,700 rps).
 
 ---
 
 ## Latency
 
 At `c=50` every prx-waf posture is saturated, so the p50/p95/p99 columns in the
-full tables are **queueing delay, not service time** — `lane1`/`body-1mb` shows
-p99 = 9.8 s, which is 50 connections queueing behind one thread doing 102 ms of
-work each, not a 9.8 s request. Quoting those as "the latency the WAF adds"
-would be wrong.
+full tables are **queueing delay, not service time**. Quoting them as "the
+latency the WAF adds" would be wrong.
 
 Re-run at `c=4`, where the cheap postures are no longer saturated, the added
 latency is:
 
 | workload | origin p50 | passthrough p50 | **full** p50 | **full** p99 | WAF adds (p50) |
 |---|--:|--:|--:|--:|--:|
-| get-small | 0.05 ms | 0.17 ms | **0.99 ms** | 1.50 ms | **+0.94 ms** |
-| json-post (1 KiB) | 0.05 ms | 0.21 ms | **5.10 ms** | 7.86 ms | **+5.05 ms** |
-| multipart (64 KiB) | 0.08 ms | 0.34 ms | **84.31 ms** | 127.36 ms | **+84.2 ms** |
+| get-small | 0.05 ms | 0.12 ms | **0.47 ms** | 0.78 ms | **+0.42 ms** |
+| json-post (1 KiB) | 0.06 ms | 0.14 ms | **2.24 ms** | 3.62 ms | **+2.18 ms** |
+| multipart (64 KiB) | 0.09 ms | 0.20 ms | **0.98 ms** | 1.56 ms | **+0.90 ms** |
 
-Those rows have a round-to-round spread below 2%, so they are results rather
-than noise.
+Every row has a round-to-round spread below 1%, so these are results rather than
+noise.
 
-**A shipping-default prx-waf adds about 1 ms to a small GET and about 5 ms to a
-1 KiB JSON POST.** For most APIs that is an acceptable price. The 64 KiB upload
-row is not: 84 ms.
+**A shipping-default prx-waf adds about 0.4 ms to a small GET, about 2.2 ms to a
+1 KiB JSON POST, and about 0.9 ms to a 64 KiB upload.**
 
-One caveat on that last row, in the interests of not overstating it — at `c=4`
-the multipart posture is *still* saturated. One thread doing 21 ms of CPU per
-request tops out at ~47 RPS whatever the concurrency, so 84 ms is four requests
-queueing behind 21 ms of work each. The honest statement is "**21 ms of CPU
-service time, which becomes 84 ms of observed latency at a concurrency of
-four**" — and it degrades linearly from there.
+**The upload row is the headline change on this page.** The previous edition
+recorded **+84.2 ms** for that same 64 KiB multipart request and said plainly
+that the figure was not acceptable. It is now **+0.90 ms**, a 94× improvement,
+and both defaults contributed: the body budget removed 42 ms of Lane 1 CPU per
+request, and the wider data plane absorbed what remained. The old caveat that
+the multipart posture was *still saturated at `c=4`* no longer applies either —
+at 3,976 rps against 4 connections it is not queueing, so 0.98 ms is service
+time and not a queue.
 
 ---
 
 ## Full tables
 
-`c=50`, saturation. Generated by the harness; the machine-readable form is
+`c=50`, saturation, shipping defaults throughout. Generated by the harness; the
+machine-readable form is
 [`results/c50-saturation.json`](results/c50-saturation.json).
 
-The `full` and `lane1` rows are labelled *shipping default* because they were
-when this ran. For **multipart** and **body-1mb** they no longer are: those two
-bodies exceed the 64 KiB `[content_security.lane1] max_body_bytes` that now
-ships, so read those rows as the `max_body_bytes = 0` posture. Every other
-workload is unaffected.
+One row does not measure what its name says, and did not on the previous page
+either: **`crs-pl4` / `json-post` answers every request with 403.** PL4 blocks
+the harness's benign 1 KiB API payload, so that cell measures the block path,
+not the proxied path, and is not comparable to the other `json-post` rows. It is
+left in place, labelled, rather than deleted — a paranoia level that rejects an
+ordinary JSON write is a fact about PL4 worth seeing. The old page reported it
+as an ordinary throughput number with no such note.
 
 <!-- BEGIN c50 -->
 ### get-small
 
 | posture | RPS | vs origin | p50 | p95 | p99 | p99.9 | CPU µs/req | vs base | RSS | RPS spread | µs spread |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| origin (no proxy) | 171,856 | — | 0.22 | 0.72 | 1.24 | 2.25 | 32.18 | — | 14 MiB | 2.4% | 2.0% |
-| passthrough (proxy, no detection) | 24,987 | -85.5% | 1.90 | 2.65 | 2.81 | 3.33 | 39.74 | — | 59 MiB | 1.8% | 2.0% |
-| + Lane 1 regex detectors | 8,124 | -95.3% | 6.13 | 7.14 | 8.10 | 10.77 | 122.84 | +83.10 | 75 MiB | 10.7% | 11.5% |
-| + OWASP CRS PL1 | 7,827 | -95.4% | 6.41 | 7.29 | 7.53 | 9.52 | 127.50 | +87.76 | 63 MiB | 0.5% | 0.5% |
-| + OWASP CRS PL2 | 5,758 | -96.6% | 8.78 | 9.70 | 9.88 | 13.08 | 173.66 | +133.92 | 67 MiB | 1.6% | 1.6% |
-| + OWASP CRS PL4 | 4,749 | -97.2% | 10.07 | 15.15 | 21.56 | 25.91 | 210.38 | +170.64 | 69 MiB | 9.2% | 8.8% |
-| + Lane 2 semantic (shadow) | 12,377 | -92.8% | 4.01 | 4.91 | 5.12 | 5.68 | 80.67 | +40.93 | 64 MiB | 0.4% | 0.4% |
-| + rate limiter | 25,906 | -84.9% | 1.82 | 2.54 | 2.69 | 3.11 | 38.33 | -1.41 | 58 MiB | 3.3% | 3.5% |
-| full (shipping default) | 3,918 | -97.7% | 12.95 | 14.00 | 15.17 | 19.97 | 255.47 | +215.73 | 80 MiB | 0.1% | 0.3% |
+| origin (no proxy) | 169,700 | — | 0.22 | 0.73 | 1.31 | 3.18 | 31.08 | — | 14 MiB | 2.2% | 2.9% |
+| passthrough (proxy, no detection) | 58,078 | -65.8% | 0.85 | 1.22 | 1.40 | 1.94 | 66.69 | — | 63 MiB | 1.4% | 1.2% |
+| + Lane 1 regex detectors | 19,446 | -88.5% | 2.55 | 3.69 | 4.18 | 4.72 | 203.95 | +137.26 | 88 MiB | 0.4% | 0.5% |
+| + OWASP CRS PL1 | 18,763 | -88.9% | 2.64 | 3.83 | 4.34 | 4.85 | 211.16 | +144.47 | 76 MiB | 0.4% | 0.3% |
+| + OWASP CRS PL2 | 13,946 | -91.8% | 3.55 | 5.16 | 5.86 | 6.61 | 284.68 | +217.99 | 94 MiB | 0.6% | 0.5% |
+| + OWASP CRS PL4 | 13,103 | -92.3% | 3.78 | 5.50 | 6.25 | 7.05 | 302.88 | +236.19 | 100 MiB | 0.1% | 0.0% |
+| + Lane 2 semantic (shadow) | 29,457 | -82.6% | 1.68 | 2.42 | 2.73 | 3.11 | 132.81 | +66.12 | 71 MiB | 0.6% | 0.6% |
+| + rate limiter | 56,590 | -66.7% | 0.87 | 1.25 | 1.43 | 1.92 | 68.60 | +1.91 | 62 MiB | 0.7% | 0.5% |
+| full (shipping default) | 9,517 | -94.4% | 5.21 | 7.60 | 8.62 | 9.67 | 417.04 | +350.35 | 106 MiB | 0.8% | 0.9% |
 
 Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests served — read the layer attribution from this column, not from RPS: it measures work done per request, which is a property of the code, whereas RPS also measures whatever else the host was doing. `vs base` is µs/req minus the `passthrough` row. **The `origin` row's µs/req is albedo's CPU, not prx-waf's** — it is a different program, so compare µs/req only between prx-waf postures; use the RPS column for the origin comparison. RSS is the peak seen while sampling at 5 Hz. The two `spread` columns are (best − worst) over the rounds as a share of the median; treat any figure whose spread is above ~10% as noise rather than as a result.
 
@@ -277,15 +341,15 @@ Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests s
 
 | posture | RPS | vs origin | p50 | p95 | p99 | p99.9 | CPU µs/req | vs base | RSS | RPS spread | µs spread |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| origin (no proxy) | 161,335 | — | 0.24 | 0.77 | 1.28 | 2.01 | 34.43 | — | 14 MiB | 1.3% | 1.2% |
-| passthrough (proxy, no detection) | 18,677 | -88.4% | 2.57 | 3.44 | 3.74 | 4.36 | 53.33 | — | 60 MiB | 1.4% | 1.4% |
-| + Lane 1 regex detectors | 1,494 | -99.1% | 33.58 | 36.53 | 56.08 | 64.79 | 669.30 | +615.97 | 77 MiB | 19.3% | 23.4% |
-| + OWASP CRS PL1 | 1,851 | -98.9% | 27.44 | 28.81 | 29.14 | 43.74 | 540.68 | +487.35 | 67 MiB | 0.5% | 0.4% |
-| + OWASP CRS PL2 | 1,348 | -99.2% | 37.79 | 45.25 | 48.49 | 54.59 | 741.63 | +688.30 | 71 MiB | 0.3% | 0.1% |
-| + OWASP CRS PL4 | 888 | -99.4% | 56.68 | 74.14 | 86.67 | 104.87 | 1155.51 | +1102.18 | 82 MiB | 4.3% | 4.7% |
-| + Lane 2 semantic (shadow) | 5,550 | -96.6% | 9.09 | 10.19 | 10.64 | 12.14 | 180.00 | +126.67 | 66 MiB | 10.6% | 11.9% |
-| + rate limiter | 19,751 | -87.8% | 2.42 | 3.21 | 3.42 | 3.81 | 50.38 | -2.95 | 59 MiB | 1.1% | 1.0% |
-| full (shipping default) | 771 | -99.5% | 66.20 | 69.06 | 72.00 | 97.41 | 1298.75 | +1245.42 | 86 MiB | 0.7% | 0.8% |
+| origin (no proxy) | 160,776 | — | 0.24 | 0.77 | 1.30 | 2.42 | 33.67 | — | 14 MiB | 7.5% | 1.2% |
+| passthrough (proxy, no detection) | 45,832 | -71.5% | 1.08 | 1.55 | 1.77 | 2.28 | 85.04 | — | 66 MiB | 0.4% | 0.5% |
+| + Lane 1 regex detectors | 3,492 | -97.8% | 14.12 | 20.93 | 23.61 | 26.50 | 1142.49 | +1057.45 | 91 MiB | 0.9% | 0.9% |
+| + OWASP CRS PL1 | 4,501 | -97.2% | 10.98 | 16.15 | 18.45 | 20.55 | 885.62 | +800.58 | 83 MiB | 0.7% | 0.7% |
+| + OWASP CRS PL2 | 3,266 | -98.0% | 15.11 | 22.39 | 25.64 | 29.86 | 1221.74 | +1136.70 | 102 MiB | 0.3% | 0.3% |
+| + OWASP CRS PL4 | 2,312 | -98.6% | 21.56 | 30.93 | 35.33 | 39.06 | 1723.33 | +1638.29 | 416 MiB | 2.3% | 2.2% |
+| + Lane 2 semantic (shadow) | 12,914 | -92.0% | 3.83 | 5.58 | 6.34 | 7.27 | 306.09 | +221.05 | 76 MiB | 0.3% | 0.3% |
+| + rate limiter | 44,886 | -72.1% | 1.10 | 1.58 | 1.80 | 2.31 | 86.82 | +1.78 | 66 MiB | 0.3% | 0.3% |
+| full (shipping default) | 1,789 | -98.9% | 27.59 | 40.60 | 46.59 | 51.71 | 2233.34 | +2148.30 | 116 MiB | 0.5% | 0.4% |
 
 Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests served — read the layer attribution from this column, not from RPS: it measures work done per request, which is a property of the code, whereas RPS also measures whatever else the host was doing. `vs base` is µs/req minus the `passthrough` row. **The `origin` row's µs/req is albedo's CPU, not prx-waf's** — it is a different program, so compare µs/req only between prx-waf postures; use the RPS column for the origin comparison. RSS is the peak seen while sampling at 5 Hz. The two `spread` columns are (best − worst) over the rounds as a share of the median; treat any figure whose spread is above ~10% as noise rather than as a result.
 
@@ -293,15 +357,15 @@ Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests s
 
 | posture | RPS | vs origin | p50 | p95 | p99 | p99.9 | CPU µs/req | vs base | RSS | RPS spread | µs spread |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| origin (no proxy) | 118,226 | — | 0.27 | 1.03 | 3.17 | 11.19 | 36.04 | — | 14 MiB | 101.0% | 26.0% |
-| passthrough (proxy, no detection) | 16,916 | -85.7% | 2.85 | 3.97 | 4.58 | 5.99 | 58.82 | — | 61 MiB | 8.2% | 8.9% |
-| + Lane 1 regex detectors | 1,860 | -98.4% | 27.33 | 28.84 | 30.37 | 38.52 | 538.12 | +479.30 | 78 MiB | 0.5% | 0.5% |
-| + OWASP CRS PL1 | 2,934 | -97.5% | 17.31 | 18.40 | 18.68 | 26.56 | 341.11 | +282.29 | 67 MiB | 0.0% | 0.1% |
-| + OWASP CRS PL2 | 2,088 | -98.2% | 24.35 | 25.60 | 25.90 | 33.44 | 479.12 | +420.30 | 71 MiB | 0.3% | 0.5% |
-| + OWASP CRS PL4 | 1,873 | -98.4% | 27.09 | 28.79 | 34.60 | 42.20 | 531.67 | +472.85 | 120 MiB | 11.1% | 14.9% |
-| + Lane 2 semantic (shadow) | 7,540 | -93.6% | 6.49 | 7.94 | 12.19 | 14.63 | 132.37 | +73.55 | 66 MiB | 8.1% | 8.3% |
-| + rate limiter | 19,723 | -83.3% | 2.42 | 3.21 | 3.43 | 3.88 | 50.35 | -8.47 | 60 MiB | 1.4% | 1.5% |
-| full (shipping default) | 1,092 | -99.1% | 46.98 | 48.70 | 49.86 | 65.09 | 917.06 | +858.24 | 86 MiB | 0.5% | 0.8% |
+| origin (no proxy) | 158,728 | — | 0.24 | 0.78 | 1.34 | 2.83 | 33.86 | — | 15 MiB | 11.1% | 1.4% |
+| passthrough (proxy, no detection) | 45,560 | -71.3% | 1.08 | 1.56 | 1.78 | 2.23 | 85.47 | — | 68 MiB | 0.3% | 0.4% |
+| + Lane 1 regex detectors | 3,982 | -97.5% | 12.38 | 18.27 | 20.88 | 23.25 | 1002.69 | +917.22 | 93 MiB | 0.3% | 0.3% |
+| + OWASP CRS PL1 | 7,192 | -95.5% | 6.89 | 10.09 | 11.42 | 12.92 | 553.49 | +468.02 | 86 MiB | 0.3% | 0.4% |
+| + OWASP CRS PL2 | 5,197 | -96.7% | 9.53 | 13.99 | 15.90 | 18.08 | 767.14 | +681.67 | 103 MiB | 0.2% | 0.2% |
+| + OWASP CRS PL4 | 4,233 | -97.3% | 11.65 | 17.59 | 20.33 | 23.66 | 937.47 | +852.00 | 520 MiB | 10.9% | 9.8% |
+| + Lane 2 semantic (shadow) | 19,410 | -87.8% | 2.55 | 3.70 | 4.20 | 4.85 | 202.83 | +117.36 | 76 MiB | 0.2% | 0.3% |
+| + rate limiter | 44,832 | -71.8% | 1.10 | 1.59 | 1.81 | 2.45 | 86.82 | +1.35 | 67 MiB | 0.6% | 0.6% |
+| full (shipping default) | 2,452 | -98.5% | 20.04 | 29.63 | 33.35 | 38.06 | 1628.67 | +1543.20 | 118 MiB | 0.5% | 0.6% |
 
 Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests served — read the layer attribution from this column, not from RPS: it measures work done per request, which is a property of the code, whereas RPS also measures whatever else the host was doing. `vs base` is µs/req minus the `passthrough` row. **The `origin` row's µs/req is albedo's CPU, not prx-waf's** — it is a different program, so compare µs/req only between prx-waf postures; use the RPS column for the origin comparison. RSS is the peak seen while sampling at 5 Hz. The two `spread` columns are (best − worst) over the rounds as a share of the median; treat any figure whose spread is above ~10% as noise rather than as a result.
 
@@ -309,15 +373,15 @@ Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests s
 
 | posture | RPS | vs origin | p50 | p95 | p99 | p99.9 | CPU µs/req | vs base | RSS | RPS spread | µs spread |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| origin (no proxy) | 81,185 | — | 0.43 | 1.59 | 3.44 | 8.04 | 62.83 | — | 14 MiB | 64.6% | 10.1% |
-| passthrough (proxy, no detection) | 7,546 | -90.7% | 6.10 | 10.75 | 14.24 | 21.79 | 131.46 | — | 72 MiB | 24.4% | 26.7% |
-| + Lane 1 regex detectors | 46 | -99.9% | 1059.19 | 2092.03 | 2092.24 | 2092.28 | 21600.74 | +21469.28 | 88 MiB | 6.9% | 6.7% |
-| + OWASP CRS PL1 | 3,028 | -96.3% | 16.70 | 18.03 | 18.70 | 25.39 | 330.59 | +199.13 | 74 MiB | 1.5% | 1.6% |
-| + OWASP CRS PL2 | 2,501 | -96.9% | 20.26 | 21.58 | 22.30 | 26.28 | 399.37 | +267.91 | 78 MiB | 2.6% | 2.8% |
-| + OWASP CRS PL4 | 2,661 | -96.7% | 19.04 | 20.47 | 21.15 | 26.77 | 375.83 | +244.37 | 118 MiB | 2.2% | 2.4% |
-| + Lane 2 semantic (shadow) | 4,855 | -94.0% | 10.12 | 12.45 | 19.86 | 30.14 | 205.75 | +74.29 | 75 MiB | 7.5% | 7.3% |
-| + rate limiter | 7,336 | -91.0% | 6.84 | 7.90 | 8.31 | 9.15 | 136.04 | +4.58 | 69 MiB | 14.1% | 15.8% |
-| full (shipping default) | 47 | -99.9% | 1084.19 | 1747.74 | 1748.08 | 1806.03 | 21303.15 | +21171.69 | 96 MiB | 2.1% | 2.1% |
+| origin (no proxy) | 89,098 | — | 0.42 | 1.37 | 2.58 | 6.53 | 57.83 | — | 14 MiB | 13.8% | 0.3% |
+| passthrough (proxy, no detection) | 21,764 | -75.6% | 2.27 | 3.32 | 3.80 | 4.56 | 180.12 | — | 78 MiB | 2.1% | 1.9% |
+| + Lane 1 regex detectors | 7,049 | -92.1% | 7.03 | 10.27 | 11.75 | 13.35 | 564.64 | +384.52 | 101 MiB | 0.6% | 0.6% |
+| + OWASP CRS PL1 | 8,358 | -90.6% | 5.92 | 8.69 | 9.85 | 11.14 | 474.98 | +294.86 | 93 MiB | 0.6% | 0.7% |
+| + OWASP CRS PL2 | 6,966 | -92.2% | 7.13 | 10.40 | 11.77 | 13.30 | 570.50 | +390.38 | 112 MiB | 1.0% | 1.2% |
+| + OWASP CRS PL4 | 6,470 | -92.7% | 7.66 | 11.21 | 12.77 | 14.67 | 613.25 | +433.13 | 520 MiB | 3.4% | 3.1% |
+| + Lane 2 semantic (shadow) | 16,712 | -81.2% | 2.96 | 4.32 | 4.90 | 5.61 | 234.69 | +54.57 | 86 MiB | 0.9% | 0.8% |
+| + rate limiter | 22,070 | -75.2% | 2.24 | 3.27 | 3.75 | 4.50 | 177.66 | -2.46 | 77 MiB | 1.6% | 1.6% |
+| full (shipping default) | 4,237 | -95.2% | 11.66 | 17.23 | 19.59 | 22.20 | 939.49 | +759.37 | 127 MiB | 0.3% | 0.3% |
 
 Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests served — read the layer attribution from this column, not from RPS: it measures work done per request, which is a property of the code, whereas RPS also measures whatever else the host was doing. `vs base` is µs/req minus the `passthrough` row. **The `origin` row's µs/req is albedo's CPU, not prx-waf's** — it is a different program, so compare µs/req only between prx-waf postures; use the RPS column for the origin comparison. RSS is the peak seen while sampling at 5 Hz. The two `spread` columns are (best − worst) over the rounds as a share of the median; treat any figure whose spread is above ~10% as noise rather than as a result.
 
@@ -325,15 +389,15 @@ Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests s
 
 | posture | RPS | vs origin | p50 | p95 | p99 | p99.9 | CPU µs/req | vs base | RSS | RPS spread | µs spread |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| origin (no proxy) | 26,680 | — | 1.17 | 5.78 | 9.26 | 13.97 | 147.11 | — | 246 MiB | 1.9% | 2.1% |
-| passthrough (proxy, no detection) | 912 | -96.6% | 56.30 | 67.33 | 72.52 | 79.74 | 1090.56 | — | 110 MiB | 31.8% | 37.3% |
-| + Lane 1 regex detectors | 10 | -100.0% | 8753.92 | 9705.77 | 9797.00 | 9797.00 | 103318.86 | +102228.30 | 96 MiB | 49.5% | 89.6% |
-| + OWASP CRS PL1 | 174 | -99.3% | 300.95 | 340.67 | 349.62 | 361.52 | 5757.31 | +4666.75 | 112 MiB | 1.0% | 1.0% |
-| + OWASP CRS PL2 | 170 | -99.4% | 308.66 | 350.44 | 364.36 | 381.99 | 5872.22 | +4781.66 | 115 MiB | 1.5% | 1.7% |
-| + OWASP CRS PL4 | 167 | -99.4% | 310.40 | 353.40 | 378.56 | 391.89 | 5984.32 | +4893.76 | 122 MiB | 2.1% | 2.1% |
-| + Lane 2 semantic (shadow) | 896 | -96.6% | 57.29 | 66.20 | 70.51 | 75.97 | 1110.33 | +19.77 | 115 MiB | 0.8% | 0.8% |
-| + rate limiter | 1,085 | -95.9% | 47.56 | 54.05 | 57.19 | 61.64 | 916.13 | -174.43 | 109 MiB | 0.2% | 0.2% |
-| full (shipping default) | 9 | -100.0% | 8231.32 | 9918.75 | 9964.65 | 9964.65 | 108926.41 | +107835.85 | 104 MiB | 28.2% | 37.1% |
+| origin (no proxy) | 26,889 | — | 1.16 | 5.61 | 9.19 | 13.89 | 145.92 | — | 246 MiB | 1.4% | 0.2% |
+| passthrough (proxy, no detection) | 2,130 | -92.1% | 23.58 | 32.45 | 36.30 | 40.41 | 1849.76 | — | 110 MiB | 1.3% | 1.3% |
+| + Lane 1 regex detectors | 726 | -97.3% | 68.69 | 95.04 | 107.84 | 121.56 | 5495.99 | +3646.23 | 177 MiB | 0.3% | 0.3% |
+| + OWASP CRS PL1 | 447 | -98.3% | 111.77 | 155.28 | 176.14 | 194.94 | 8948.74 | +7098.98 | 171 MiB | 0.7% | 0.7% |
+| + OWASP CRS PL2 | 415 | -98.5% | 120.87 | 169.21 | 189.43 | 206.08 | 9628.71 | +7778.95 | 183 MiB | 0.5% | 0.5% |
+| + OWASP CRS PL4 | 404 | -98.5% | 124.82 | 171.81 | 187.64 | 203.67 | 9890.86 | +8041.10 | 520 MiB | 0.3% | 0.3% |
+| + Lane 2 semantic (shadow) | 1,803 | -93.3% | 27.95 | 38.06 | 42.17 | 47.72 | 2192.10 | +342.34 | 116 MiB | 0.7% | 0.8% |
+| + rate limiter | 2,058 | -92.3% | 24.50 | 33.34 | 36.98 | 41.19 | 1914.62 | +64.86 | 113 MiB | 0.3% | 0.1% |
+| full (shipping default) | 306 | -98.9% | 165.15 | 220.79 | 247.59 | 268.03 | 13072.66 | +11222.90 | 189 MiB | 0.7% | 0.6% |
 
 Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests served — read the layer attribution from this column, not from RPS: it measures work done per request, which is a property of the code, whereas RPS also measures whatever else the host was doing. `vs base` is µs/req minus the `passthrough` row. **The `origin` row's µs/req is albedo's CPU, not prx-waf's** — it is a different program, so compare µs/req only between prx-waf postures; use the RPS column for the origin comparison. RSS is the peak seen while sampling at 5 Hz. The two `spread` columns are (best − worst) over the rounds as a share of the median; treat any figure whose spread is above ~10% as noise rather than as a result.
 
@@ -341,25 +405,26 @@ Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests s
 
 | posture | RPS | vs origin | p50 | p95 | p99 | p99.9 | CPU µs/req | vs base | RSS | RPS spread | µs spread |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| origin (no proxy) | 151,612 | — | 0.25 | 0.78 | 1.52 | 3.02 | 36.96 | — | 47 MiB | 0.6% | 0.5% |
-| passthrough (proxy, no detection) | 7,869 | -94.8% | 4.63 | 14.81 | 18.71 | 25.41 | 78.16 | — | 110 MiB | 140.8% | 47.0% |
-| + Lane 1 regex detectors | 7,976 | -94.7% | 7.67 | 8.50 | 9.04 | 10.09 | 130.27 | +52.11 | 454 MiB | 37.5% | 55.5% |
-| + OWASP CRS PL1 | 5,776 | -96.2% | 6.39 | 14.20 | 14.79 | 15.53 | 180.58 | +102.42 | 574 MiB | 3.5% | 4.3% |
-| + OWASP CRS PL2 | 4,648 | -96.9% | 8.18 | 18.29 | 19.64 | 22.06 | 223.09 | +144.93 | 750 MiB | 2.8% | 3.1% |
-| + OWASP CRS PL4 | 4,479 | -97.0% | 10.97 | 18.93 | 20.03 | 20.77 | 230.65 | +152.49 | 571 MiB | 2.4% | 4.7% |
-| + Lane 2 semantic (shadow) | 6,963 | -95.4% | 7.24 | 8.47 | 8.88 | 10.25 | 152.09 | +73.93 | 114 MiB | 0.9% | 2.2% |
-| + rate limiter | 24,809 | -83.6% | 1.90 | 2.65 | 2.85 | 3.54 | 40.03 | -38.13 | 110 MiB | 0.7% | 0.7% |
-| full (shipping default) | 7,892 | -94.8% | 7.76 | 8.71 | 9.23 | 9.77 | 131.66 | +53.50 | 420 MiB | 54.8% | 103.6% |
+| origin (no proxy) | 153,075 | — | 0.25 | 0.77 | 1.52 | 3.02 | 36.50 | — | 44 MiB | 2.0% | 0.5% |
+| passthrough (proxy, no detection) | 51,580 | -66.3% | 0.95 | 1.40 | 1.74 | 2.39 | 75.15 | — | 113 MiB | 1.7% | 1.6% |
+| + Lane 1 regex detectors | 18,481 | -87.9% | 2.69 | 3.99 | 4.53 | 5.16 | 212.38 | +137.23 | 2255 MiB | 1.2% | 1.1% |
+| + OWASP CRS PL1 | 14,775 | -90.3% | 3.37 | 5.03 | 5.74 | 6.55 | 265.38 | +190.23 | 4918 MiB | 3.5% | 3.6% |
+| + OWASP CRS PL2 | 11,725 | -92.3% | 4.27 | 6.32 | 7.14 | 8.01 | 335.77 | +260.62 | 1761 MiB | 2.6% | 2.6% |
+| + OWASP CRS PL4 | 11,191 | -92.7% | 4.48 | 6.66 | 7.59 | 8.67 | 351.97 | +276.82 | 4118 MiB | 0.5% | 0.4% |
+| + Lane 2 semantic (shadow) | 15,939 | -89.6% | 3.10 | 4.53 | 5.21 | 6.31 | 245.50 | +170.35 | 120 MiB | 1.5% | 1.5% |
+| + rate limiter | 50,592 | -66.9% | 0.97 | 1.43 | 1.75 | 2.40 | 76.59 | +1.44 | 113 MiB | 0.4% | 0.5% |
+| full (shipping default) | 19,020 | -87.6% | 2.61 | 3.92 | 4.47 | 5.19 | 206.15 | +131.00 | 4065 MiB | 4.5% | 4.7% |
 
 Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests served — read the layer attribution from this column, not from RPS: it measures work done per request, which is a property of the code, whereas RPS also measures whatever else the host was doing. `vs base` is µs/req minus the `passthrough` row. **The `origin` row's µs/req is albedo's CPU, not prx-waf's** — it is a different program, so compare µs/req only between prx-waf postures; use the RPS column for the origin comparison. RSS is the peak seen while sampling at 5 Hz. The two `spread` columns are (best − worst) over the rounds as a share of the median; treat any figure whose spread is above ~10% as noise rather than as a result.
+
 <!-- END c50 -->
 
 ---
 
 ## Unsaturated latency (c=4)
 
-Same harness, same tree, `c=4` instead of `c=50`, three postures dropped for
-time. Machine-readable form:
+Same harness, same tree, same defaults, `c=4` instead of `c=50`, three postures
+dropped for time. Machine-readable form:
 [`results/c4-latency.json`](results/c4-latency.json).
 
 <!-- BEGIN c4 -->
@@ -367,12 +432,12 @@ time. Machine-readable form:
 
 | posture | RPS | vs origin | p50 | p95 | p99 | p99.9 | CPU µs/req | vs base | RSS | RPS spread | µs spread |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| origin (no proxy) | 72,779 | — | 0.05 | 0.08 | 0.10 | 0.20 | 38.21 | — | 14 MiB | 1.2% | 1.9% |
-| passthrough (proxy, no detection) | 23,359 | -67.9% | 0.17 | 0.23 | 0.25 | 0.33 | 42.51 | — | 54 MiB | 0.9% | 0.9% |
-| + Lane 1 regex detectors | 8,528 | -88.3% | 0.47 | 0.67 | 0.69 | 0.79 | 117.02 | +74.51 | 74 MiB | 0.4% | 0.2% |
-| + OWASP CRS PL1 | 7,973 | -89.0% | 0.50 | 0.72 | 0.75 | 0.92 | 125.17 | +82.66 | 57 MiB | 0.8% | 0.8% |
-| + Lane 2 semantic (shadow) | 11,902 | -83.6% | 0.33 | 0.47 | 0.50 | 0.54 | 83.85 | +41.34 | 59 MiB | 0.7% | 0.7% |
-| full (shipping default) | 3,998 | -94.5% | 0.99 | 1.47 | 1.50 | 1.69 | 250.11 | +207.60 | 76 MiB | 0.3% | 0.2% |
+| origin (no proxy) | 71,620 | — | 0.05 | 0.08 | 0.10 | 0.21 | 38.82 | — | 13 MiB | 0.9% | 1.1% |
+| passthrough (proxy, no detection) | 32,362 | -54.8% | 0.12 | 0.15 | 0.17 | 0.26 | 78.68 | — | 57 MiB | 0.6% | 0.7% |
+| + Lane 1 regex detectors | 15,404 | -78.5% | 0.25 | 0.33 | 0.39 | 0.44 | 204.23 | +125.55 | 83 MiB | 0.3% | 0.3% |
+| + OWASP CRS PL1 | 14,907 | -79.2% | 0.26 | 0.36 | 0.41 | 0.44 | 211.32 | +132.64 | 70 MiB | 0.5% | 0.2% |
+| + Lane 2 semantic (shadow) | 21,465 | -70.0% | 0.18 | 0.23 | 0.28 | 0.32 | 137.58 | +58.90 | 66 MiB | 0.3% | 0.3% |
+| full (shipping default) | 8,243 | -88.5% | 0.47 | 0.67 | 0.78 | 0.86 | 409.30 | +330.62 | 100 MiB | 0.4% | 0.5% |
 
 Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests served — read the layer attribution from this column, not from RPS: it measures work done per request, which is a property of the code, whereas RPS also measures whatever else the host was doing. `vs base` is µs/req minus the `passthrough` row. **The `origin` row's µs/req is albedo's CPU, not prx-waf's** — it is a different program, so compare µs/req only between prx-waf postures; use the RPS column for the origin comparison. RSS is the peak seen while sampling at 5 Hz. The two `spread` columns are (best − worst) over the rounds as a share of the median; treat any figure whose spread is above ~10% as noise rather than as a result.
 
@@ -380,12 +445,12 @@ Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests s
 
 | posture | RPS | vs origin | p50 | p95 | p99 | p99.9 | CPU µs/req | vs base | RSS | RPS spread | µs spread |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| origin (no proxy) | 69,292 | — | 0.05 | 0.07 | 0.10 | 0.20 | 44.78 | — | 14 MiB | 1.0% | 0.7% |
-| passthrough (proxy, no detection) | 18,691 | -73.0% | 0.21 | 0.29 | 0.31 | 0.37 | 53.18 | — | 54 MiB | 1.7% | 1.8% |
-| + Lane 1 regex detectors | 1,603 | -97.7% | 2.49 | 3.71 | 3.78 | 4.41 | 623.86 | +570.68 | 74 MiB | 0.6% | 0.4% |
-| + OWASP CRS PL1 | 1,891 | -97.3% | 2.11 | 3.15 | 3.19 | 3.58 | 528.32 | +475.14 | 58 MiB | 0.9% | 1.0% |
-| + Lane 2 semantic (shadow) | 5,734 | -91.7% | 0.68 | 1.02 | 1.05 | 1.18 | 174.03 | +120.85 | 59 MiB | 0.9% | 0.8% |
-| full (shipping default) | 781 | -98.9% | 5.10 | 7.66 | 7.86 | 8.77 | 1280.10 | +1226.92 | 79 MiB | 0.3% | 0.2% |
+| origin (no proxy) | 68,041 | — | 0.06 | 0.08 | 0.10 | 0.21 | 45.30 | — | 14 MiB | 0.5% | 0.4% |
+| passthrough (proxy, no detection) | 28,346 | -58.3% | 0.14 | 0.17 | 0.19 | 0.29 | 95.04 | — | 57 MiB | 0.4% | 0.6% |
+| + Lane 1 regex detectors | 3,369 | -95.0% | 1.17 | 1.47 | 1.81 | 2.25 | 1096.99 | +1001.95 | 84 MiB | 0.7% | 0.5% |
+| + OWASP CRS PL1 | 4,255 | -93.7% | 0.92 | 1.27 | 1.50 | 1.73 | 851.52 | +756.48 | 74 MiB | 0.6% | 0.3% |
+| + Lane 2 semantic (shadow) | 11,177 | -83.6% | 0.35 | 0.48 | 0.56 | 0.61 | 301.79 | +206.75 | 68 MiB | 0.1% | 0.3% |
+| full (shipping default) | 1,748 | -97.4% | 2.24 | 2.98 | 3.62 | 4.26 | 2135.64 | +2040.60 | 107 MiB | 0.8% | 0.3% |
 
 Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests served — read the layer attribution from this column, not from RPS: it measures work done per request, which is a property of the code, whereas RPS also measures whatever else the host was doing. `vs base` is µs/req minus the `passthrough` row. **The `origin` row's µs/req is albedo's CPU, not prx-waf's** — it is a different program, so compare µs/req only between prx-waf postures; use the RPS column for the origin comparison. RSS is the peak seen while sampling at 5 Hz. The two `spread` columns are (best − worst) over the rounds as a share of the median; treat any figure whose spread is above ~10% as noise rather than as a result.
 
@@ -393,20 +458,91 @@ Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests s
 
 | posture | RPS | vs origin | p50 | p95 | p99 | p99.9 | CPU µs/req | vs base | RSS | RPS spread | µs spread |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| origin (no proxy) | 45,696 | — | 0.08 | 0.11 | 0.13 | 0.24 | 68.61 | — | 14 MiB | 0.4% | 0.8% |
-| passthrough (proxy, no detection) | 11,580 | -74.7% | 0.34 | 0.49 | 0.52 | 0.57 | 86.09 | — | 55 MiB | 0.8% | 0.7% |
-| + Lane 1 regex detectors | 47 | -99.9% | 85.38 | 127.81 | 128.86 | 151.09 | 21345.77 | +21259.68 | 74 MiB | 0.6% | 0.8% |
-| + OWASP CRS PL1 | 3,845 | -91.6% | 1.04 | 1.51 | 1.58 | 1.76 | 260.06 | +173.97 | 59 MiB | 0.8% | 0.7% |
-| + Lane 2 semantic (shadow) | 7,861 | -82.8% | 0.51 | 0.73 | 0.77 | 0.88 | 126.96 | +40.87 | 60 MiB | 1.0% | 1.0% |
-| full (shipping default) | 48 | -99.9% | 84.31 | 126.34 | 127.36 | 127.50 | 21078.36 | +20992.27 | 80 MiB | 0.4% | 0.4% |
+| origin (no proxy) | 45,055 | — | 0.09 | 0.11 | 0.13 | 0.26 | 68.84 | — | 14 MiB | 0.0% | 0.4% |
+| passthrough (proxy, no detection) | 19,169 | -57.5% | 0.20 | 0.26 | 0.31 | 0.38 | 146.64 | — | 62 MiB | 0.7% | 1.2% |
+| + Lane 1 regex detectors | 6,567 | -85.4% | 0.60 | 0.76 | 0.95 | 1.11 | 529.05 | +382.41 | 86 MiB | 0.2% | 0.3% |
+| + OWASP CRS PL1 | 7,732 | -82.8% | 0.50 | 0.68 | 0.83 | 0.91 | 438.15 | +291.51 | 77 MiB | 0.1% | 0.3% |
+| + Lane 2 semantic (shadow) | 14,646 | -67.5% | 0.26 | 0.37 | 0.41 | 0.46 | 205.99 | +59.35 | 71 MiB | 1.0% | 1.0% |
+| full (shipping default) | 3,976 | -91.2% | 0.98 | 1.27 | 1.56 | 1.84 | 904.73 | +758.09 | 110 MiB | 0.7% | 0.3% |
 
 Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests served — read the layer attribution from this column, not from RPS: it measures work done per request, which is a property of the code, whereas RPS also measures whatever else the host was doing. `vs base` is µs/req minus the `passthrough` row. **The `origin` row's µs/req is albedo's CPU, not prx-waf's** — it is a different program, so compare µs/req only between prx-waf postures; use the RPS column for the origin comparison. RSS is the peak seen while sampling at 5 Hz. The two `spread` columns are (best − worst) over the rounds as a share of the median; treat any figure whose spread is above ~10% as noise rather than as a result.
+
 <!-- END c4 -->
+
+---
+
+## Lane 1 unbounded (`max_body_bytes = 0`)
+
+The contrast behind §2, and the posture every release before `39d4fb2` shipped.
+Same tree, same host, same run parameters; only `[content_security.lane1]
+max_body_bytes` differs, set to `0`. Machine-readable form:
+[`results/lane1-unbounded.json`](results/lane1-unbounded.json).
+
+`passthrough` is included as the control: it has no Lane 1 detector enabled, so
+the key must not move it, and it does not.
+
+<!-- BEGIN lane1-unbounded -->
+### multipart
+
+| posture | RPS | vs origin | p50 | p95 | p99 | p99.9 | CPU µs/req | vs base | RSS | RPS spread | µs spread |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| passthrough (proxy, no detection) | 22,902 | — | 2.16 | 3.14 | 3.57 | 4.06 | 171.47 | — | 78 MiB | 1.4% | 1.3% |
+| + Lane 1 regex detectors | 93 | — | 554.66 | 812.93 | 902.49 | 1243.24 | 42856.87 | +42685.40 | 102 MiB | 1.6% | 1.6% |
+| full (shipping default) | 94 | — | 527.86 | 881.60 | 1068.38 | 1460.22 | 42619.31 | +42447.84 | 119 MiB | 1.9% | 1.9% |
+
+Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests served — read the layer attribution from this column, not from RPS: it measures work done per request, which is a property of the code, whereas RPS also measures whatever else the host was doing. `vs base` is µs/req minus the `passthrough` row. **The `origin` row's µs/req is albedo's CPU, not prx-waf's** — it is a different program, so compare µs/req only between prx-waf postures; use the RPS column for the origin comparison. RSS is the peak seen while sampling at 5 Hz. The two `spread` columns are (best − worst) over the rounds as a share of the median; treat any figure whose spread is above ~10% as noise rather than as a result.
+
+### body-1mb
+
+| posture | RPS | vs origin | p50 | p95 | p99 | p99.9 | CPU µs/req | vs base | RSS | RPS spread | µs spread |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| passthrough (proxy, no detection) | 2,025 | — | 24.89 | 34.13 | 37.81 | 42.80 | 1948.09 | — | 111 MiB | 0.7% | 0.6% |
+| + Lane 1 regex detectors | 15 | — | 3909.54 | 5013.27 | 6196.07 | 6578.14 | 259720.55 | +257772.46 | 118 MiB | 4.6% | 4.7% |
+| full (shipping default) | 15 | — | 4219.47 | 6249.31 | 6971.25 | 6971.25 | 266874.23 | +264926.14 | 139 MiB | 2.7% | 2.6% |
+
+Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests served — read the layer attribution from this column, not from RPS: it measures work done per request, which is a property of the code, whereas RPS also measures whatever else the host was doing. `vs base` is µs/req minus the `passthrough` row. **The `origin` row's µs/req is albedo's CPU, not prx-waf's** — it is a different program, so compare µs/req only between prx-waf postures; use the RPS column for the origin comparison. RSS is the peak seen while sampling at 5 Hz. The two `spread` columns are (best − worst) over the rounds as a share of the median; treat any figure whose spread is above ~10% as noise rather than as a result.
+
+<!-- END lane1-unbounded -->
 
 ---
 
 ## What was not measured
 
+Three of these are gaps this edition opened and intends to close; the rest are
+standing exclusions.
+
+* **The `worker_threads` = 1 / 2 / 4 scaling curve.** This is the notable gap.
+  §1 compares the shipped 4-thread default against the old single-threaded
+  *tree*, which conflates the thread count with 27 commits of other change, and
+  it reports the per-request CPU cost of going wide (+68% on a small GET) from
+  the one column that is directly comparable. What it cannot do is give a
+  controlled curve. The harness gained a `WORKER_THREADS` knob in the same
+  commit these figures were taken on, precisely for this, and the run was
+  started and not completed. Until it lands, **do not read §1's ×2.32 as "the
+  scaling factor"** — it is a change of era measured across two trees.
+* **Whether the sublinearity is SMT or contention.** CPUs 0–3 are two physical
+  cores, so a 4-thread run has at most 2 cores of real execution resource and
+  some of the shortfall is structural rather than a defect. Separating them
+  needs the sweep above repeated with the WAF on four *physical* cores
+  (`WAF_CPUS=0-7` with the origin and generator moved aside). Candidate
+  contention sites — shared stats counters, the rate-limit map, the database
+  pool — are hypotheses, not findings; no profile was taken.
+* **Where Lane 1's time goes, per detector.** The old page's §4 bisected Lane 1
+  into its seven detectors and found `sqli` and `xss` were 94% of the cost. That
+  table was taken with unbounded bodies and has been dropped rather than
+  reprinted, because the shipped default changes which requests reach those
+  detectors at all: on the 64 KiB multipart workload the budget now withholds
+  the body entirely, so the old per-detector split describes the
+  `max_body_bytes = 0` posture. The re-run — `POSTURES=passthrough,lane1-sqli,…`
+  under `LANE1_MAX_BODY_BYTES=0`, which reproduces the old question, plus the
+  `json-post` column which is inside 64 KiB and so is also the shipped figure —
+  was scheduled and not run. `results/lane1-bisect.json` still holds the
+  `87aa1bc` data and is **not** consistent with the rest of this page.
+* **Where the multi-threaded runtime's +68% per-request CPU goes.** Measured,
+  not attributed. No profiler was run against any posture here.
+* **Whether attack-driven memory growth plateaus** (§6). Ten seconds is not long
+  enough to answer it, and at 4 GiB the answer matters more than it did at
+  750 MiB.
 * **CrowdSec.** Both the LAPI bouncer and the AppSec path need an external
   CrowdSec instance. The bouncer's hot path is a cache lookup, and AppSec's is
   an awaited HTTP call with a 500 ms default timeout
@@ -423,26 +559,33 @@ Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests s
 * **HTTP/2 and HTTP/3.**
 * **Sustained load.** The longest continuous measurement is 10 s. Nothing here
   says what happens after an hour — see §6.
-* **Where Lane 1's time actually goes.** §4 localises it to the sqli and xss
-  detectors, but not to a line. Both use a single `RegexSet` pass rather than
-  looping patterns, so the naive explanation is ruled out. One structural
-  amplifier is visible in the source and is worth checking first:
-  `request_targets` (`crates/waf-engine/src/checks/mod.rs:272-284`) materialises
-  the body up to **three times** — raw, url-decoded, and recursively
-  url-decoded, the last via `url_decode_recursive` which allocates a fresh
-  `String` on each of up to 5 passes (`checks/mod.rs:182-190`). That is
-  allocation and copying proportional to body size before a single regex runs.
-  **This is a hypothesis, not a finding** — confirming it needs a profiler, and
-  that is the natural next step.
 
 ## Reproducing
 
 ```bash
 tests/perf/run.sh                                    # the c=50 matrix
-POSTURES=passthrough,lane1-sqli,lane1-xss,lane1 \
-  WORKLOADS=multipart tests/perf/run.sh              # the Lane 1 bisect
-CONNECTIONS=4 tests/perf/run.sh                      # unsaturated latency
+CONNECTIONS=4 \
+  POSTURES=origin,passthrough,lane1,crs-pl1,lane2,full \
+  WORKLOADS=get-small,json-post,multipart \
+  tests/perf/run.sh                                  # unsaturated latency
+LANE1_MAX_BODY_BYTES=0 POSTURES=passthrough,lane1,full \
+  WORKLOADS=multipart,body-1mb tests/perf/run.sh     # the body-budget contrast
 ```
 
-Expect ~35 minutes for the full matrix. Run it on an otherwise idle machine and
-check the spread columns before believing anything.
+And the two runs this edition owes:
+
+```bash
+for t in 1 2 4; do                                   # the scaling curve
+  WORKER_THREADS=$t POSTURES=passthrough,lane1,crs-pl1,full \
+    WORKLOADS=get-small,json-post tests/perf/run.sh
+done
+LANE1_MAX_BODY_BYTES=0 \
+  POSTURES=passthrough,lane1-sqli,lane1-xss,lane1-rce,lane1-traversal,lane1-sensitive,lane1-scan,lane1-bot,lane1 \
+  WORKLOADS=multipart,json-post tests/perf/run.sh    # the Lane 1 bisect
+```
+
+Expect ~35 minutes for the `c=50` matrix. Run it on a machine whose subject
+cores nothing else can touch — `taskset` the background hogs away rather than
+hoping, then verify it by comparing `/proc/stat` on those cores against the
+subject's own `utime+stime` while a round is in flight — and check the spread
+columns before believing anything.

@@ -418,31 +418,36 @@ HostRouter → Upstream (with load balancing)
 Measured with [`tests/perf/run.sh`](tests/perf/run.sh); full numbers, conditions
 and caveats in [`tests/perf/RESULTS.md`](tests/perf/RESULTS.md).
 
-On an AMD Ryzen 9 5900HX (16 cores), shipping default configuration, plaintext
-HTTP/1.1, `oha` at 50 connections against a near-zero-work origin:
+On an AMD Ryzen 9 5900HX (8 physical cores, 16 logical), shipping default
+configuration, plaintext HTTP/1.1, `oha` at 50 connections against a
+near-zero-work origin, with the WAF pinned to four hardware threads on two
+physical cores:
 
 | workload | origin | prx-waf, no detection | prx-waf, shipping default | added latency (p50, unsaturated) |
 |---|--:|--:|--:|--:|
-| small GET | 171,856 rps | 24,987 rps | **3,918 rps** | **+0.94 ms** |
-| 1 KiB JSON POST | 161,335 rps | 18,677 rps | **771 rps** | **+5.05 ms** |
-| 64 KiB multipart upload | 81,185 rps | 7,546 rps | **47 rps** | +84 ms |
-| 1 MiB body POST | 26,680 rps | 912 rps | **9 rps** | not measured |
+| small GET | 169,700 rps | 58,078 rps | **9,517 rps** | **+0.42 ms** |
+| 1 KiB JSON POST | 160,776 rps | 45,832 rps | **1,789 rps** | **+2.18 ms** |
+| 64 KiB multipart upload | 89,098 rps | 21,764 rps | **4,237 rps** | **+0.90 ms** |
+| 1 MiB body POST | 26,889 rps | 2,130 rps | **306 rps** | not measured |
 
 Three things an operator should know before deploying:
 
-* **These are per-thread numbers.** The table was measured on a single Pingora
-  worker thread, which is all any release before `[proxy] worker_threads` could
-  use. That key now sizes the data plane and defaults to the CPUs the process
-  may use, so a default install multiplies these figures — by less than the
-  thread count, since the multi-threaded runtime costs something per request.
-  The table has not been re-run on multiple threads yet.
-* **Cost is driven by request-body size, not request rate.** A small GET costs
-  ~216 µs of CPU; a 64 KiB upload costs ~21 ms. Almost all of that is the Lane 1
-  regex detectors, and 94% of *that* is the `sqli` and `xss` detectors.
-  `[content_security.lane1] max_body_bytes` caps it — off by default, since
-  turning it on means those detectors stop reading oversized bodies entirely.
-* **Sustained attack traffic grows memory 4–7×** (110 MiB → 750 MiB in ten
-  seconds), because every blocked request writes to the database.
+* **These are four-worker-thread numbers on two physical cores.** `[proxy]
+  worker_threads` sizes the data plane and, unset, follows the CPUs the process
+  may actually use — the cgroup quota and affinity mask, not `nproc`. Releases
+  before it ran the whole data plane on one thread whatever the machine, and
+  every figure recorded then was roughly 2–3× lower.
+* **Cost is driven by request-body size, not request rate — and the shipped
+  defaults now bound it.** `[content_security.lane1] max_body_bytes` defaults to
+  64 KiB, the same boundary CRS already draws, which is worth **20–75×** on
+  large-body workloads: a 64 KiB upload costs 565 µs of CPU under Lane 1 against
+  42.7 ms unbounded. The price is that `sqli` / `xss` / `rce` / `dir_traversal`
+  see none of a body over 64 KiB — not a truncated prefix, none of it. Raise the
+  key if your application legitimately posts larger bodies.
+* **Sustained attack traffic grows memory to gigabytes** (106 MiB → 4.1 GiB in
+  ten seconds), because every blocked request writes to the database through a
+  20-connection pool. This got worse, not better, when the data plane went wide.
+  Give the process a memory limit.
 
 Resource limits, queue capacities, timeouts and what happens when each is
 exceeded are documented separately in [`docs/dos-budget.md`](docs/dos-budget.md).

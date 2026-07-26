@@ -1,5 +1,18 @@
 {
   "_comment": [
+    "SUPERSEDED AND NOT CONSISTENT WITH THE REST OF tests/perf/results/.",
+    "",
+    "This file was recorded on tree 87aa1bc, which predates BOTH shipped-default",
+    "changes the other files in this directory measure: the proxy data plane ran",
+    "on ONE worker thread, and [content_security.lane1] max_body_bytes was 0",
+    "(unlimited). Its multipart column therefore describes a posture that now",
+    "requires setting that key back to 0 explicitly.",
+    "",
+    "It is kept because the question it answers -- which of the seven Lane 1",
+    "detectors the time goes to -- has not been re-measured, and a stale answer",
+    "that says so is better than none. Do not compare its numbers against",
+    "c50-saturation.json, c4-latency.json or lane1-unbounded.json.",
+    "",
     "prx-waf runtime performance measurement. NOT a CI gate \u2014 see README.md.",
     "",
     "Numbers are only comparable against numbers produced by the same",
