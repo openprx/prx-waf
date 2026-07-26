@@ -26,7 +26,6 @@ use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
 use prx_waf_fuzz::{clamp, request, split_selector, text};
-use waf_engine::checks::Check;
 use waf_engine::checks::owasp::OWASPCheck;
 
 static CHECK: OnceLock<OWASPCheck> = OnceLock::new();

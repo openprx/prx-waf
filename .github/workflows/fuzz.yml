@@ -45,6 +45,41 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+  # ---------------------------------------------------------------------------
+  # PINNED NIGHTLY — temporary, and the pin is the whole reason this line exists.
+  #
+  # WHY: nightly-2026-07-24 (rustc 89c61a754) introduced an ICE that makes
+  # `tokio` 1.53.1 — a transitive dependency of `gateway`, and therefore of every
+  # fuzz target — fail to compile:
+  #
+  #   error: internal compiler error: rustc_codegen_ssa/src/mir/operand.rs:291:18:
+  #     not immediate: OperandRef(Uninit @ ...
+  #     UnsafeCell<MaybeUninit<runtime::task::Notified<Arc<multi_thread::handle::Handle>>>>)
+  #
+  # It is NOT a sanitizer problem. A plain `cargo +nightly-2026-07-24 build
+  # --release` of tokio 1.53.1 reproduces it with no RUSTFLAGS at all, so
+  # dropping `-Zsanitizer=address` or the sancov flags would cost real detection
+  # power and still not build. Nor is it fixable by moving tokio: 1.53.1 is the
+  # newest release, and the dependency arrives through `gateway`/`pingora`.
+  #
+  # Bisected against tokio 1.53.1:
+  #   nightly-2026-07-23 (rustc 6f72b5dd5, 2026-07-22)  OK   <- pinned here
+  #   nightly-2026-07-24 (rustc 89c61a754, 2026-07-23)  ICE  <- first bad
+  #   nightly-2026-07-25 (rustc da86f4d07, 2026-07-24)  ICE
+  #
+  # Upstream: rust-lang/rust#159815 (I-ICE, regression-from-stable-to-nightly).
+  # Root cause is rust-lang/rust#157797, which added `OperandValue::Uninit` but
+  # missed the `PassMode::Direct | PassMode::Pair` branch of
+  # `codegen_return_terminator`. Fix in flight as rust-lang/rust#159825.
+  #
+  # HOW TO UNPIN: when #159825 (or an equivalent) has ridden a nightly, delete
+  # this variable and restore the two `${{ env.FUZZ_NIGHTLY }}` references below
+  # to plain `nightly`. Do not guess the date — the `unpin-check` job at the
+  # bottom of this file probes the floating nightly every Monday and says so in
+  # the run summary the moment the pin becomes unnecessary.
+  # ---------------------------------------------------------------------------
+  FUZZ_NIGHTLY: nightly-2026-07-23
+
 jobs:
   fuzz:
     # Regression mode on every PR/push (short, seeded); soak mode on the weekly
@@ -53,12 +88,6 @@ jobs:
     runs-on: ubuntu-latest
     # 30 min ceiling covers the longest soak (1800s of fuzzing) plus the build.
     timeout-minutes: 60
-    env:
-      # cargo-fuzz shells out to `cargo build` with `-Zsanitizer=address`, which
-      # stable rejects. Pinning the toolchain here rather than relying on the
-      # installer having made nightly the default keeps the job working even if
-      # a future step installs a stable toolchain alongside it.
-      RUSTUP_TOOLCHAIN: nightly
     strategy:
       # One target's crash must not cancel the others — we want the full picture
       # in a single run, not the first failure.
@@ -78,8 +107,11 @@ jobs:
           persist-credentials: false
 
       # cargo-fuzz needs nightly for -Z sanitizer / -C instrument-coverage.
+      # `toolchain:` overrides the action's default of floating `nightly`; see
+      # the FUZZ_NIGHTLY block at the top for why it is pinned and how to lift.
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: ${{ env.FUZZ_NIGHTLY }}
           components: llvm-tools-preview
 
       # `fuzz/` is its own workspace (see fuzz/Cargo.toml), so it needs its own
@@ -89,7 +121,15 @@ jobs:
           workspaces: fuzz
           key: fuzz-${{ matrix.target }}
 
+      # RUSTUP_TOOLCHAIN is set per step rather than job-wide because the
+      # `unpin-check` job below deliberately needs the floating nightly. Setting
+      # it explicitly (instead of relying on the installer having made this the
+      # default) keeps the job working even if a later step installs stable
+      # alongside it — cargo-fuzz shells out to `cargo build` with
+      # `-Zsanitizer=address`, which stable rejects.
       - name: Install cargo-fuzz
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.FUZZ_NIGHTLY }}
         run: cargo install cargo-fuzz --locked --version ^0.13
 
       - name: Determine run length
@@ -141,6 +181,7 @@ jobs:
       - name: Fuzz ${{ matrix.target }}
         working-directory: fuzz
         env:
+          RUSTUP_TOOLCHAIN: ${{ env.FUZZ_NIGHTLY }}
           TARGET: ${{ matrix.target }}
           SECONDS_BUDGET: ${{ steps.budget.outputs.seconds }}
           # owasp_crs loads the real CRS rule set; resolve it from the checkout
@@ -186,3 +227,88 @@ jobs:
           path: fuzz/corpus/${{ matrix.target }}/
           if-no-files-found: ignore
           retention-days: 14
+
+  # ===========================================================================
+  # Is the FUZZ_NIGHTLY pin still needed?
+  #
+  # A pin with no expiry is how a two-day workaround becomes a two-year one, so
+  # this job builds a fuzz target against the *floating* nightly every Monday
+  # and reports whether the ICE is gone. It is a probe, not a gate:
+  #
+  #   * It never runs on push/pull_request, so it is not in the merge path.
+  #   * The `fuzz` jobs above stay pinned and still fail hard on a real crash —
+  #     nothing here weakens them, and neither uses `continue-on-error`.
+  #   * Its expected steady state is "upstream still broken", which is not a
+  #     repository failure and is reported as a notice, not a red X.
+  #
+  # It does still fail for real when the floating nightly breaks in a way that
+  # is NOT the known ICE, because that is a new problem worth a red X.
+  # ===========================================================================
+  unpin-check:
+    name: Nightly pin still needed?
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Deliberately unpinned: probing today's nightly is the entire point.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-fuzz
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: cargo install cargo-fuzz --locked --version ^0.13
+
+      - name: Probe floating nightly
+        working-directory: fuzz
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+          PRX_WAF_FUZZ_RULES_DIR: ${{ github.workspace }}/rules/owasp-crs
+        run: |
+          # Deliberately no `set -e`: a failing build is the expected outcome
+          # while the upstream ICE is unfixed. This step classifies that failure
+          # instead of inheriting it.
+          set -uo pipefail
+
+          version="$(rustc --version)"
+          echo "Probing with: $version"
+
+          # struct_extract stands in for all seven targets: they share the whole
+          # dependency tree, and tokio is what ICEs.
+          cargo fuzz build struct_extract 2>&1 | tee probe.log
+          status="${PIPESTATUS[0]}"
+
+          {
+            echo "## Nightly pin probe"
+            echo
+            echo "- Pinned toolchain: \`${FUZZ_NIGHTLY}\`"
+            echo "- Probed toolchain: \`${version}\`"
+            echo "- Tracking: rust-lang/rust#159815, fix rust-lang/rust#159825"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$status" -eq 0 ]; then
+            {
+              echo "**The pin is no longer needed.** The floating nightly builds the"
+              echo "fuzz targets. Remove \`FUZZ_NIGHTLY\` from this workflow and restore"
+              echo "the two references to plain \`nightly\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Fuzz nightly pin can be removed::${version} builds the fuzz targets; drop FUZZ_NIGHTLY from .github/workflows/fuzz.yml"
+            exit 0
+          fi
+
+          if grep -q "internal compiler error" probe.log; then
+            echo "Still broken upstream — the pin stays. No action needed." >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Fuzz nightly pin still required::${version} still ICEs; keeping FUZZ_NIGHTLY"
+            exit 0
+          fi
+
+          # Not the known ICE: something else broke, and that deserves a red X.
+          echo "Probe failed WITHOUT an ICE — a new failure, not the tracked one." >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Fuzz nightly probe failed unexpectedly::Build failed on ${version} without an internal compiler error"
+          exit 1
