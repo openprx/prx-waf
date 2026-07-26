@@ -257,7 +257,7 @@
   "crs_version": "v4.25.0",
   "go_ftw_version": "v1.3.0",
   "recorded_at": "2026-07-26",
-  "recorded_from": "PLACEHOLDER-SHA - the commit that adds the generic `header:<name>` accessor. Measured on the working tree of that change applied to a3b7647 (crowdsec.fallback_action); the pre-change side is a3b7647 itself, fully re-measured on the same host in both modes and identical - passed AND every bucket - to the figures this file previously stored. Fill in the real sha at merge; this field has been wrong twice before (once an uncommitted tree, once a sha carrying unrelated work), so it is left deliberately unfillable rather than guessed.",
+  "recorded_from": "0e6addc - the commit that adds the generic `header:<name>` accessor. Measured on the working tree of that change applied to a3b7647 (crowdsec.fallback_action); the pre-change side is a3b7647 itself, fully re-measured on the same host in both modes and identical - passed AND every bucket - to the figures this file previously stored. Fill in the real sha at merge; this field has been wrong twice before (once an uncommitted tree, once a sha carrying unrelated work), so it is left deliberately unfillable rather than guessed.",
   "tolerance": 5,
   "modes": {
     "log": {
