@@ -164,7 +164,7 @@
   "crs_version": "v4.25.0",
   "go_ftw_version": "v1.3.0",
   "recorded_at": "2026-07-26",
-  "recorded_from": "UNCOMMITTED working tree on top of 4ca40bf (file part content withheld from the parameter surface) — REPLACE WITH THE COMMIT SHA when this lands; the pre-change side is 4ca40bf, fully re-measured on the same host and identical to the figures this file previously stored",
+  "recorded_from": "ed275d7 (file part content withheld from the parameter surface); the pre-change side is 4ca40bf, fully re-measured on the same host and identical to the figures this file previously stored",
   "tolerance": 5,
   "modes": {
     "log": {
