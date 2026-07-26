@@ -39,9 +39,9 @@ Two things follow that are worth internalising before the tables:
   the limits below are **detection-bypass budgets, not availability budgets** —
   the number tells an attacker how much payload to put past the cut.
 * **Two groups of limits are configurable from `configs/default.toml`**: the
-  Lane 2 work budget (§2.1) and the Lane 1 body budget (§2.2). The second ships
-  **disabled**, so out of the box only the first one binds. A third small group
-  is env-var only. Everything else needs a recompile.
+  Lane 2 work budget (§2.1) and the Lane 1 body budget (§2.2). Both bind out of
+  the box. A third small group is env-var only. Everything else needs a
+  recompile.
 
 ---
 
@@ -152,7 +152,9 @@ A JSON body of 64 KiB + 1 produces *no structured targets at all* — every
 rules reading `REQUEST_BODY` still fire; but structured-target coverage stops
 dead at 64 KiB while the *body* ceiling is 10 MiB. The gap between those two
 numbers (64 KiB vs 10 MiB) is the structured-inspection blind spot, and it is
-not configurable.
+not configurable. It is also the number the Lane 1 body budget (§2.2) now
+defaults to, deliberately: past 64 KiB both detection chains stop reading a
+request body, so there is one boundary to reason about rather than two.
 
 XML entity expansion: there is no billion-laughs counter, and none is needed —
 custom `<!ENTITY>` DTD definitions are never expanded, only predefined and
@@ -227,26 +229,61 @@ exhaustion clear the verdict would hand an attacker a one-request kill switch.
 regex work per request. It is the primary Lane 2 knob if the WAF is CPU-bound —
 but on a large body it is not the term that dominates; §2.2 is.
 
-### 2.2 The Lane 1 body budget — present, and off by default
+### 2.2 The Lane 1 body budget — 64 KiB, on by default
 
-`[content_security.lane1] max_body_bytes` in `configs/default.toml:536-574`
-(shipped **commented out**), compiled at
-`crates/waf-engine/src/checks/content_security/config.rs:134` and enforced by
-`Lane1BodyBudget::admits_body` (`crates/waf-engine/src/checks/mod.rs:321-330`),
-which `request_targets` (`crates/waf-engine/src/checks/mod.rs:418`) consults at
-`:462` before it builds the body-derived targets.
+`[content_security.lane1] max_body_bytes` in `configs/default.toml:694`,
+compiled at `crates/waf-engine/src/checks/content_security/config.rs:137` and
+enforced by `Lane1BodyBudget::admits_body`
+(`crates/waf-engine/src/checks/mod.rs:337-346`), which `request_targets`
+(`crates/waf-engine/src/checks/mod.rs:448`) consults at `:492` before it builds
+the body-derived targets. The serialized default lives in
+`crates/waf-common/src/content_security_config.rs`
+(`DEFAULT_LANE1_MAX_BODY_BYTES`), so a config that omits the key and one that
+spells it out behave identically.
 
 | Key | Default | Applies to | Exceed behaviour |
 |---|---|---|---|
-| `max_body_bytes` | **`0` = unlimited** | the four frozen Lane 1 detectors (`SQLi` / XSS / RCE / traversal) | **skip** — the body contributes no target at all, counted and logged |
+| `max_body_bytes` | **65536** (`0` = unlimited) | the four frozen Lane 1 detectors (`SQLi` / XSS / RCE / traversal) | **degrade** — the body contributes no target at all; counted, WARNed, and the verdict is marked `degraded` |
 
-**The default is a deliberate no-op.** `0` means unlimited, and a deployment
-that never sets the key inspects exactly the bytes it always did; the only added
-work on the request path is one integer comparison. Nothing below happens unless
-an operator opts in.
+**Why it is on rather than offered.** An unbounded Lane 1 is not a tuning
+preference an operator can be left to discover. Posting a large body — no
+evasion, no authentication, no malformed input — is enough to consume the whole
+process, because the proxy is single-threaded (§5.3).
 
-**Why the knob exists.** Lane 1 is where the CPU goes. CPU µs/request over the
-same binary with detection off ([`tests/perf/RESULTS.md`](../tests/perf/RESULTS.md)):
+**Provisional measurement.** Ryzen 9 5900HX, shipping `full` posture, 50
+connections, 30 s × 3 rounds, oha 1.11.0 against albedo v0.3.0, the two runs
+back to back one config default apart:
+
+| workload | unbounded (`= 0`) | 64 KiB default | |
+|---|--:|--:|---|
+| 64 KiB multipart upload | 42 rps · 24,102 µs/req | 1,726 rps · 580 µs/req | **41× / 42×** |
+| 1 MiB JSON body | 4 rps · 254,119 µs/req | 149 rps · 6,731 µs/req | **37× / 38×** |
+
+**These four numbers are not reproducible and must not be quoted as a result.**
+The host was running a second copy of the performance harness, pinned to the
+same cores, throughout — the confound `tests/perf/README.md` describes and that
+`RESULTS.md` has already voided one run over. The `= 0` / 1 MiB cell in
+particular came out with a 61% round-to-round spread, well past the ~10% above
+which that harness says to read a figure as noise. What survives the
+contamination is the *order of magnitude*, because these are factors of ~40, not
+percentages: the per-request cost on a large body falls from ~10<sup>5</sup> µs
+to ~10<sup>3</sup>–10<sup>4</sup> µs. The reproducible figures will be published
+in [`tests/perf/RESULTS.md`](../tests/perf/RESULTS.md) from a clean host; that
+file is the authority and deliberately carries no provisional number.
+
+The bound costs nothing on the traffic it does not apply to: a small GET, a
+1 KiB JSON POST and a 512 B form POST all carry bodies inside 64 KiB and are
+inspected exactly as before, for the price of one integer comparison.
+
+**The alignment is the point.** 64 KiB is the CRS body processors'
+`MAX_BODY_BYTES` (§1.3), so both detection chains now stop reading a request
+body at the same size. Before this default, a 100 KiB JSON body produced no
+`ARGS_POST` targets for CRS and full regex scanning for Lane 1 — two boundaries,
+one of them invisible. Now there is one number to know.
+
+**Why the knob exists at all.** Lane 1 is where the CPU goes. CPU µs/request
+over the same binary with detection off
+([`tests/perf/RESULTS.md`](../tests/perf/RESULTS.md)), with Lane 1 unbounded:
 
 | layer | small GET | 1 KiB JSON | 64 KiB upload | 1 MiB body |
 |---|--:|--:|--:|--:|
@@ -256,13 +293,14 @@ same binary with detection off ([`tests/perf/RESULTS.md`](../tests/perf/RESULTS.
 
 Lane 2 barely moves because §2.1 bounds it; CRS gets *cheaper* at 64 KiB because
 `MAX_BODY_BYTES` skips its body processors past that point (§1.3). Lane 1 had
-neither, and §5.3 means that cost is the throughput of the entire process:
-**~9 rps of 1 MiB bodies per core, reachable by any unauthenticated client that
-can POST.**
+neither, and §5.3 means that cost was the throughput of the entire process:
+**single-digit rps of 1 MiB bodies per core, reachable by any unauthenticated
+client that can POST.** That is what the default now removes; the two rightmost
+columns are the cost an operator re-accepts by setting `max_body_bytes = 0`.
 
 **Why one budget rather than one per detector.** All four detectors read the
 body through the single `request_targets` collector
-(`crates/waf-engine/src/checks/mod.rs:418`), and the measurements show they
+(`crates/waf-engine/src/checks/mod.rs:448`), and the measurements show they
 share no work — the per-detector deltas sum to the aggregate within 1–7%, with
 `sqli` +12,284 µs and `xss` +7,704 µs of Lane 1's 21,469 µs on a 64 KiB upload,
 and `rce` +431 / `traversal` +437 making the four of them **99.6%** of it.
@@ -271,11 +309,15 @@ coverage statement binary: either Lane 1 read this body or it did not.
 Per-detector control already exists separately, as the per-host
 `defense_config.sqli` / `.xss` toggles.
 
-**Skip, not truncate — and that is a real loss.** Past the budget, **zero** body
-bytes are examined by those four detectors. A payload anywhere in an oversized
-body — including its first byte — is invisible to Lane 1. Truncation would at
-least catch prefix payloads, and it is not offered, for two reasons worth
-stating rather than hiding:
+**Skip, not truncate — and at the default that is a real loss on real traffic.**
+Past the budget, **zero** body bytes are examined by those four detectors. A
+payload anywhere in an oversized body — including its first byte — is invisible
+to Lane 1. This is the price of the default, stated plainly: an install that
+accepts uploads or large JSON now has `sqli` / `xss` / `rce` / `dir_traversal`
+looking at none of those bodies. What is bought with it is that the same install
+survives someone sending them at volume. Truncation would at least catch prefix
+payloads, and it is not offered, for two reasons worth stating rather than
+hiding:
 
 * it cannot bound the work. The gateway hands the body over as a sequence of
   ≤68 KiB windows (§1.2), each in its own `RequestCtx`, so "scan the first N
@@ -304,16 +346,39 @@ over:** with a budget at or above the 68 KiB maximum window, a chunked body of
 unknown length satisfies both terms and is scanned in full. Budgets below the
 64 KiB window size are unaffected.
 
-**It is never silent.** Every skip increments a process counter
-(`lane1_body_skips()`) and, at most once per 30 s, emits a WARN naming the
-budget, the observed size, the host and the path — the same drop-and-count
-discipline as the queue sinks in §3, and with the same limitation: **log-only,
-not exported as a metric.** Grep for `Lane 1 body budget exceeded`. Read the
-counter as a rate signal, not a request count: it counts *detector invocations*,
-so one oversized request contributes up to four per body window (four detectors,
-each collecting its own targets). A non-zero budget also announces itself once
-at startup (`Lane 1 body budget ACTIVE`), so "is this on?" is answerable from
-the log rather than from the config file.
+**It is a degrade, not a silent skip — the distinction the table at the top of
+this document draws.** Three records are written, and the third is the one that
+matters to anything reading a verdict:
+
+* a process counter (`lane1_body_skips()`);
+* a WARN, at most once per 30 s, naming the budget, the observed size, the host
+  and the path — the same drop-and-count discipline as the queue sinks in §3,
+  and with the same limitation: **log-only, not exported as a metric.** Grep for
+  `Lane 1 body budget exceeded`. Read the counter as a rate signal, not a request
+  count: it counts *detector invocations*, so one oversized request contributes
+  up to four per body window (four detectors, each collecting its own targets);
+* **`degraded` on the verdict.** `ContentSecuritySubsystem::evaluate_scoped`
+  (`crates/waf-engine/src/checks/content_security/mod.rs:324`) marks the
+  request's `ContentInspectionState` when the budget withheld a body from a
+  detector the host actually has enabled. That flag reaches
+  `SemanticVerdict::degraded` through `score()` and is persisted as the
+  observation's `degraded` / `exhausted` columns. Without it, "Lane 2 reported
+  nothing" would be indistinguishable from "the request was inspected and is
+  clean" — the failure mode where an uninspected request is read downstream as a
+  passed one.
+
+  Two limits on that record, stated rather than implied. The flag folds together
+  with Lane 2's own budget exhaustion (§2.1), so neither the column nor the
+  verdict says *which* budget degraded the request — the WARN log does. And a
+  `degraded` verdict is persisted only when Lane 2 also produced a signal, since
+  `dispatch_semantic` writes an observation for signal-bearing requests only;
+  writing one per oversized body would put an attacker-triggered database insert
+  on the benign path, which is the surface §7.9 warns about. For a benign
+  oversized body the counter and the WARN are the record.
+
+The budget's state is announced once at startup either way: `Lane 1 body budget
+ACTIVE` with the byte count, or a WARN naming the DoS surface when it is `0`. So
+"is this on?" is answerable from the log rather than from the config file.
 
 ---
 
@@ -760,12 +825,14 @@ If you are deploying prx-waf, the short version:
    idle streams; `stream_exempt = true` spares them but hands the exemption to
    any client that sends `Accept: text/event-stream`.
 2. **Size for one core of proxy throughput per process.** On a Ryzen 9 5900HX
-   that is ~3,900 rps for a small GET, ~770 rps for a 1 KiB JSON POST and
-   **47 rps for a 64 KiB upload**, in the shipping default configuration
+   that is ~3,900 rps for a small GET and ~770 rps for a 1 KiB JSON POST
    ([`tests/perf/RESULTS.md`](../tests/perf/RESULTS.md)). Horizontal scaling
-   (more processes / more nodes) is the only lever. **Request-body size, not
-   request rate, is what will exhaust you** — budget against your upload
-   traffic, not your average RPS.
+   (more processes / more nodes) is the only lever. Large bodies used to be far
+   worse than that — 47 rps for a 64 KiB upload — which is what the Lane 1 body
+   budget in item 7 now bounds; if you raise that budget to cover your uploads,
+   those figures come back. **Request-body size, not request rate, is what
+   will exhaust you** — budget against your upload traffic, not your average
+   RPS.
 3. **`cache.max_size_mb` is literal megabytes** — set it to the memory you are
    willing to give cached responses and it will be respected (§4.1). It is no
    longer "entries ÷ 16"; if you had set it low to compensate for that, raise
@@ -787,18 +854,22 @@ If you are deploying prx-waf, the short version:
    performance data too: the CRS layer gets *cheaper* on a 64 KiB multipart body
    (+199 µs) than on a 1 KiB JSON one (+487 µs), precisely because it stopped
    inspecting.
-7. **Decide the Lane 1 body budget deliberately — it ships off (§2.2).** Lane 1
-   is where the time goes: on a 64 KiB upload the native regex detectors cost
+7. **Know that the Lane 1 body budget is on, at 64 KiB (§2.2).** Lane 1 is where
+   the time goes: unbounded, on a 64 KiB upload the native regex detectors cost
    21 ms of CPU per request against Lane 2's 74 µs, and on a 1 MiB body 102 ms.
-   `[content_security.lane1] max_body_bytes` bounds it, and the shipped default
-   (`0` = unlimited) keeps the historical coverage *and* the historical DoS
-   surface. Neither answer is free:
-   * **leave it at 0** and body size, not request rate, is what exhausts you —
-     ~9 rps of 1 MiB bodies per core (§5.3), attacker-chosen;
-   * **set it** — just above the largest body your application legitimately
-     posts — and anything larger is not scanned by `sqli` / `xss` / `rce` /
-     `dir_traversal` at all. Not truncated: not scanned. CRS, Lane 2 and the
-     non-body surfaces still inspect it, and every skip is counted and WARNed.
+   `[content_security.lane1] max_body_bytes = 65536` bounds it out of the box,
+   and neither answer is free:
+   * **as shipped**, a body larger than 64 KiB is not scanned by `sqli` / `xss` /
+     `rce` / `dir_traversal` at all. Not truncated: not scanned. CRS (past its
+     own 64 KiB structured cap), Lane 2 and the non-body surfaces still inspect
+     it, every skip is counted and WARNed, and the verdict is marked `degraded`.
+     If your application legitimately posts bodies larger than this, **raise the
+     number to just above them** — that restores Lane 1 coverage for your traffic
+     while still bounding what an attacker can spend;
+   * **`0` = unlimited** restores full coverage and the DoS with it: body size,
+     not request rate, becomes what exhausts you — single-digit rps of 1 MiB
+     bodies per core (§5.3), attacker-chosen. Choose it only behind a rate
+     limiter or a body-size cap.
 
    The per-host `sqli` / `xss` toggles remain the blunter alternative (those two
    are 94% of Lane 1's cost) — they remove the detector from *all* traffic,

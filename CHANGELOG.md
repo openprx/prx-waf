@@ -11,6 +11,23 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`[content_security.lane1] max_body_bytes` now defaults to `65536` instead of
+  `0` (unlimited), and an over-budget body now degrades the verdict instead of
+  being skipped silently.** Unbounded, the four Lane 1 regex detectors cost
+  21.5 ms of CPU on a 64 KiB upload and 102 ms on a 1 MiB body, and the proxy
+  runs on one worker thread — so a large POST, with no evasion and no
+  authentication, was enough to take the process down. 64 KiB is the boundary
+  the CRS body processors already draw (`MAX_BODY_BYTES`), so both detection
+  chains now stop reading a request body at the same size.
+
+  **This reduces detection coverage.** `sqli` / `xss` / `rce` / `dir_traversal`
+  see none of a body over 64 KiB — not a truncated prefix, none of it. If your
+  application legitimately posts larger bodies, raise the key to just above
+  them. `0` still means unlimited and now logs a startup WARN naming the DoS
+  surface it reopens. Skips are counted, WARNed, and marked `degraded` on the
+  semantic verdict so an uninspected request cannot be read downstream as an
+  inspected one. See `docs/dos-budget.md` §2.2.
+
 - **`rules/` now says which of its directories the engine loads, and the answer
   is one of seven.** `OWASPCheck::new()` reads `rules/owasp-crs/` from a
   hardcoded path and nothing else; the 275 rules under `advanced/`,

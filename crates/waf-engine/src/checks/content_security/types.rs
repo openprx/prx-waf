@@ -471,7 +471,17 @@ pub struct SemanticVerdict {
     pub primary_result: Option<waf_common::DetectionResult>,
     /// All signals, for persistence / dashboards (plan §13.1).
     pub signals: Vec<DetectionSignal>,
-    /// Budget was exhausted → a semantic-only miss window (plan §12.4).
+    /// Part of this request was never inspected (plan §12.4).
+    ///
+    /// Two sources set it, and they are deliberately folded into one flag
+    /// because a consumer's question is the same either way — "is this verdict a
+    /// complete view of the request?":
+    ///
+    /// * the Lane 2 work budget ran out (`ContentInspectionState`, §2.1 of
+    ///   `docs/dos-budget.md`) — a semantic-only miss window;
+    /// * the Lane 1 body budget withheld the request body from the four frozen
+    ///   detectors (`content_security.lane1.max_body_bytes`, §2.2) — which is
+    ///   what makes that budget a *degrade* rather than a silent skip.
     ///
     /// Purely observational (D1): it marks that some part of the request was never
     /// inspected, so the signal set may be incomplete. It does **not** weaken the

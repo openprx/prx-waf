@@ -136,7 +136,16 @@ impl ContentSecuritySubsystem {
         // value governs all of them and they cannot drift apart. The shipped
         // default is `UNLIMITED`, i.e. the historical target set.
         let lane1_body_budget = config.lane1_body_budget;
-        if !lane1_body_budget.is_unlimited() {
+        if lane1_body_budget.is_unlimited() {
+            // `0` is a deliberate operator choice and the process should say so:
+            // it restores full body coverage AND the unbounded per-request CPU
+            // that made a large POST a denial-of-service primitive.
+            tracing::warn!(
+                "Lane 1 body budget DISABLED (content_security.lane1.max_body_bytes = 0): every request \
+                 body is inspected in full by the sqli/xss/rce/traversal detectors, so per-request CPU \
+                 tracks body size up to the 10 MiB inspection ceiling. See docs/dos-budget.md §2.2."
+            );
+        } else {
             tracing::info!(
                 max_body_bytes = lane1_body_budget.max_body_bytes(),
                 "Lane 1 body budget ACTIVE: request bodies larger than this are not inspected by the \
@@ -289,6 +298,30 @@ impl ContentSecuritySubsystem {
         // silently diverging on the production path (codex A-3).
         if let ContentVerdict::LegacyVeto { result } = self.evaluate(ctx) {
             return ContentVerdict::LegacyVeto { result };
+        }
+
+        // ── Lane 1 body budget: degrade, not silent skip ─────────────────────
+        // The four detectors already count and WARN when the budget withholds a
+        // body (`checks::record_lane1_body_skip`), but a counter is a rate
+        // signal, not a per-request fact. Without this, a request whose body was
+        // never read is indistinguishable downstream from one that was read and
+        // found clean — "no detection" would silently mean "no inspection".
+        //
+        // Marking the shared inspection state is what turns the skip into the
+        // `degrade` behaviour docs/dos-budget.md defines: the flag rides through
+        // `score()` onto `SemanticVerdict::degraded` and into the persisted
+        // observation's `degraded` / `exhausted` columns. It is recorded before
+        // Lane 2 runs so a Lane 2 verdict on this request can never claim a
+        // complete view of it.
+        //
+        // Gated on a detector that would actually have read the body: with all
+        // four per-host toggles off, Lane 1 reads nothing regardless of size and
+        // there is no miss to report. Gated on a body that exists, because a
+        // request without one lost nothing.
+        let defense = &ctx.host_config.defense_config;
+        let lane1_reads_bodies = defense.sqli || defense.xss || defense.rce || defense.dir_traversal;
+        if lane1_reads_bodies && self.config.lane1_body_budget.withholds_body(ctx) {
+            state.mark_degraded();
         }
 
         // ── Lane 2: additive semantic scoring (off by default) ───────────────
@@ -1758,8 +1791,8 @@ mod tests {
     }
 
     /// The Lane 1 body budget is a config value, and a config value is worth
-    /// nothing until it reaches the code. These three assertions are the wiring:
-    /// default → unlimited → detected; configured → skipped; and the *whole*
+    /// nothing until it reaches the code. These assertions are the wiring:
+    /// `0` → unlimited → detected; the shipped default → skipped; and the *whole*
     /// Lane 1 set moves together (traversal, not just `SQLi`, stops seeing it).
     #[test]
     fn lane1_body_budget_is_threaded_from_config_into_the_frozen_detectors() {
@@ -1775,12 +1808,12 @@ mod tests {
             req
         };
 
-        // Default config: no budget. Both payloads are vetoed by Lane 1.
-        let unbudgeted = ContentSecuritySubsystem::new();
-        assert!(
-            unbudgeted.config().lane1_body_budget.is_unlimited(),
-            "the zero-config default must be unlimited"
-        );
+        // `max_body_bytes = 0`: no budget. Both payloads are vetoed by Lane 1.
+        let unbudgeted = ContentSecuritySubsystem::with_config(RuntimeContentSecurityConfig {
+            lane1_body_budget: crate::checks::Lane1BodyBudget::UNLIMITED,
+            ..RuntimeContentSecurityConfig::default()
+        });
+        assert!(unbudgeted.config().lane1_body_budget.is_unlimited());
         for payload in [&sqli_body, &trav_body] {
             assert!(
                 matches!(
@@ -1791,12 +1824,15 @@ mod tests {
             );
         }
 
-        // Same subsystem with a 64 KiB Lane 1 budget compiled in: both payloads
-        // are now invisible to Lane 1 — the coverage this knob trades away.
-        let budgeted = ContentSecuritySubsystem::with_config(RuntimeContentSecurityConfig {
-            lane1_body_budget: crate::checks::Lane1BodyBudget::from_bytes(64 * 1024),
-            ..RuntimeContentSecurityConfig::default()
-        });
+        // The zero-config subsystem carries the shipped 64 KiB budget: both
+        // payloads are invisible to Lane 1 — the coverage this default trades
+        // away for a bound on per-request CPU.
+        let budgeted = ContentSecuritySubsystem::new();
+        assert_eq!(
+            budgeted.config().lane1_body_budget,
+            crate::checks::Lane1BodyBudget::DEFAULT,
+            "the zero-config default must carry the 64 KiB budget"
+        );
         for payload in [&sqli_body, &trav_body] {
             assert!(
                 matches!(budgeted.evaluate(&body_ctx(payload)), ContentVerdict::None),
@@ -2052,6 +2088,139 @@ mod tests {
                     .collect::<Vec<_>>()
             );
             assert_eq!(verdict.recommendation, SemanticAction::None, "{family}");
+        }
+    }
+
+    // ── Lane 1 body budget: degrade, not silent skip ─────────────────────────
+
+    /// The Lane 1 budget these tests configure. Deliberately far below the
+    /// shipped 64 KiB, so the body that exceeds it can stay small — see
+    /// [`lane1_budget_isolated_rt`].
+    const TEST_LANE1_BUDGET: usize = 4 * 1024;
+
+    /// A request carrying an 8 KiB body — over [`TEST_LANE1_BUDGET`], and inside
+    /// every Lane 2 cap.
+    fn over_budget_ctx() -> RequestCtx {
+        let mut req = ctx();
+        req.path = "/upload".to_string();
+        req.body_preview = Bytes::from(vec![b'a'; 8 * 1024]);
+        req.content_length = 8 * 1024;
+        req
+    }
+
+    /// A config under which the only thing that can set `degraded` on these
+    /// requests is the Lane 1 body budget.
+    ///
+    /// The isolation is the point, and it is why the budget here is 4 KiB rather
+    /// than the shipped 64 KiB. Lane 2 degrades on large bodies for reasons of
+    /// its own — the 16 KiB per-field cap, and detector-level caps that are
+    /// compile-time constants no config can lift — so *any* body over 64 KiB
+    /// degrades the verdict whether or not Lane 1 had anything to do with it. A
+    /// test written at the shipped size would pass with the Lane 1 half deleted.
+    /// A small body under a small budget cannot pass by accident.
+    fn lane1_budget_isolated_rt(max_body_bytes: usize) -> RuntimeContentSecurityConfig {
+        let mut source = enabled_enforce_source();
+        source.enforcement_mode = "enforce".to_string();
+        source.rollout_bps = 10_000;
+        source.lane1.max_body_bytes = max_body_bytes;
+        RuntimeContentSecurityConfig::compile(&source).expect("valid")
+    }
+
+    /// The whole point of the change. An over-budget body is not read by the four
+    /// frozen detectors, and the verdict has to *say so* — otherwise "Lane 2
+    /// found nothing" reads downstream as "the request was inspected and is
+    /// clean", when the body was never looked at by Lane 1 at all.
+    #[test]
+    fn an_over_budget_body_degrades_the_verdict() {
+        let sub = ContentSecuritySubsystem::with_config(lane1_budget_isolated_rt(TEST_LANE1_BUDGET));
+        let mut st = ContentInspectionState::default();
+        match sub.evaluate_scoped(&over_budget_ctx(), InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => {
+                assert!(
+                    v.degraded,
+                    "a body withheld from Lane 1 must be recorded on the verdict, not merely counted"
+                );
+            }
+            other => panic!("expected Semantic, got {other:?}"),
+        }
+        assert!(st.is_degraded(), "the shared inspection state carries it too");
+    }
+
+    /// And at the shipped size, with the shipped budgets, end to end.
+    #[test]
+    fn the_shipped_default_degrades_an_over_sized_body() {
+        let sub = ContentSecuritySubsystem::with_config(enabled_enforce_cfg());
+        assert_eq!(
+            sub.config().lane1_body_budget,
+            crate::checks::Lane1BodyBudget::DEFAULT,
+            "precondition: a config that omits [content_security.lane1] gets 64 KiB"
+        );
+        let mut req = ctx();
+        req.body_preview = Bytes::from(vec![b'a'; 96 * 1024]);
+        req.content_length = 96 * 1024;
+        let mut st = ContentInspectionState::new(sub.config().budget);
+        match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => assert!(v.degraded),
+            other => panic!("expected Semantic, got {other:?}"),
+        }
+    }
+
+    /// The compiled default really is the 64 KiB budget, so the test above is
+    /// exercising the shipped number and not a value it invented.
+    #[test]
+    fn the_compiled_default_budget_is_sixty_four_kib() {
+        let rt = RuntimeContentSecurityConfig::compile(&ContentSecurityConfig::default()).expect("valid");
+        assert_eq!(rt.lane1_body_budget, crate::checks::Lane1BodyBudget::DEFAULT);
+        assert_eq!(rt.lane1_body_budget.max_body_bytes(), 64 * 1024);
+        assert_eq!(
+            RuntimeContentSecurityConfig::default().lane1_body_budget,
+            crate::checks::Lane1BodyBudget::DEFAULT
+        );
+    }
+
+    /// The flag has to stay meaningful, so it may not fire on a body the budget
+    /// admits.
+    #[test]
+    fn an_in_budget_body_does_not_degrade_the_verdict() {
+        let sub = ContentSecuritySubsystem::with_config(lane1_budget_isolated_rt(TEST_LANE1_BUDGET));
+        let mut st = ContentInspectionState::default();
+        match sub.evaluate_scoped(&ctx(), InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => assert!(!v.degraded),
+            other => panic!("expected Semantic, got {other:?}"),
+        }
+    }
+
+    /// `max_body_bytes = 0` restores full Lane 1 coverage, so there is no miss to
+    /// report and the verdict must not claim one.
+    #[test]
+    fn an_unlimited_budget_never_degrades() {
+        let rt = lane1_budget_isolated_rt(0);
+        assert!(rt.lane1_body_budget.is_unlimited());
+        let sub = ContentSecuritySubsystem::with_config(rt);
+        let mut st = ContentInspectionState::default();
+        match sub.evaluate_scoped(&over_budget_ctx(), InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => assert!(!v.degraded, "unlimited inspects everything"),
+            other => panic!("expected Semantic, got {other:?}"),
+        }
+    }
+
+    /// With every Lane 1 body-reading detector off for the host, no detector was
+    /// denied anything — flagging that request degraded would be noise that
+    /// devalues the flag on the requests where it matters.
+    #[test]
+    fn a_host_with_lane1_off_is_not_degraded_by_the_budget() {
+        let sub = ContentSecuritySubsystem::with_config(lane1_budget_isolated_rt(TEST_LANE1_BUDGET));
+        let mut req = over_budget_ctx();
+        let mut host = HostConfig::default();
+        host.defense_config.sqli = false;
+        host.defense_config.xss = false;
+        host.defense_config.rce = false;
+        host.defense_config.dir_traversal = false;
+        req.host_config = Arc::new(host);
+        let mut st = ContentInspectionState::default();
+        match sub.evaluate_scoped(&req, InspectionScope::Body, &mut st) {
+            ContentVerdict::Semantic(v) => assert!(!v.degraded),
+            other => panic!("expected Semantic, got {other:?}"),
         }
     }
 

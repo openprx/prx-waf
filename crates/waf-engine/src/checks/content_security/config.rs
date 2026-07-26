@@ -62,8 +62,9 @@ pub struct RuntimeContentSecurityConfig {
     pub rollout_salt: String,
     pub budget: Budget,
     /// Lane 1's request-body admission cap. Compiled from
-    /// `[content_security.lane1]`; [`Lane1BodyBudget::UNLIMITED`] by default, so
-    /// a config that does not mention it leaves Lane 1 exactly as it was.
+    /// `[content_security.lane1]`; [`Lane1BodyBudget::DEFAULT`] (64 KiB) when the
+    /// config does not mention it, because an unbounded Lane 1 is a `DoS` surface
+    /// rather than a neutral starting point.
     ///
     /// It lives on this struct because [`super::ContentSecuritySubsystem`] owns
     /// *both* lanes — it is the one place that constructs the four frozen Lane 1
@@ -74,8 +75,10 @@ pub struct RuntimeContentSecurityConfig {
 }
 
 impl Default for RuntimeContentSecurityConfig {
-    /// The zero-config default: the entire lane is off, shadow mode, global
-    /// generic dialect, HPP off, no rollout, empty scoring.
+    /// The zero-config default: the entire Lane 2 lane is off, shadow mode,
+    /// global generic dialect, HPP off, no rollout, empty scoring — and the
+    /// Lane 1 body budget at its 64 KiB default, which is a Lane 1 property and
+    /// therefore applies even with Lane 2 off.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -86,7 +89,7 @@ impl Default for RuntimeContentSecurityConfig {
             rollout_bps: 0,
             rollout_salt: String::new(),
             budget: Budget::default(),
-            lane1_body_budget: Lane1BodyBudget::UNLIMITED,
+            lane1_body_budget: Lane1BodyBudget::DEFAULT,
             breaker: BreakerConfig::default(),
             scoring: RuntimeScoringConfig::default(),
         }

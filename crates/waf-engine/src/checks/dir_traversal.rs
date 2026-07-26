@@ -88,7 +88,14 @@ pub struct DirTraversalCheck {
 }
 
 impl DirTraversalCheck {
-    /// The detector with **no** body budget — the historical behaviour.
+    /// The detector with **no** body budget — the pre-budget behaviour.
+    ///
+    /// Not the shipping construction: the engine builds all four detectors
+    /// through [`Self::with_body_budget`] with the compiled
+    /// `[content_security.lane1]` budget, which defaults to 64 KiB. This
+    /// constructor exists for callers that thread no operator config at all —
+    /// the G1 parity suite and unit tests — where an unbounded body is what the
+    /// frozen comparison needs.
     pub const fn new() -> Self {
         Self {
             body_budget: Lane1BodyBudget::UNLIMITED,

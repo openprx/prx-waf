@@ -676,34 +676,39 @@ max_preprocess_output_bytes_total = 524288
 max_field_input_bytes = 16384         # per-field input cap, checked before any decode/alloc
 max_decode_rounds = 3
 
-# ── Lane 1 body budget — OFF BY DEFAULT, and read this before turning it on ───
+# ── Lane 1 body budget — ON BY DEFAULT at 64 KiB, and here is what it costs ───
 # The only work budget that applies to Lane 1: the four frozen legacy regex
 # detectors (sqli / xss / rce / dir_traversal). Lane 2 has the caps above and the
 # CRS body processors stop at a hardcoded 64 KiB; Lane 1 had nothing, so its cost
 # tracked body size all the way to the 10 MiB inspection ceiling.
 #
-# WHAT IT COSTS YOU TO LEAVE IT AT 0 (the default). Measured on a Ryzen 9 5900HX,
-# CPU µs per request over the same binary with detection off (tests/perf/RESULTS.md):
+# WHY IT IS ON. Measured on a Ryzen 9 5900HX, CPU µs per request over the same
+# binary with detection off (tests/perf/RESULTS.md), UNBOUNDED:
 #
 #             small GET   1 KiB JSON   64 KiB upload   1 MiB body
 #   Lane 1        +83        +616         +21,469       +102,228
 #   CRS PL1       +88        +487            +199         +4,667
 #   Lane 2        +41        +127             +74            +20
 #
-# Those figures were measured on one worker thread, so read them PER CORE: ~47
-# rps of 64 KiB uploads and ~9 rps of 1 MiB bodies per thread. `worker_threads`
-# above multiplies that, it does not change it — body size, not request rate, is
-# what exhausts prx-waf, and it is reachable by any unauthenticated client that
-# can POST.
+# Those figures were measured on one worker thread, so read them PER THREAD: an
+# unbounded Lane 1 serves ~47 rps of 64 KiB uploads and ~9 rps of 1 MiB bodies
+# per thread. `worker_threads` above multiplies that, it does not change it —
+# body size, not request rate, is what exhausts prx-waf, and it needs no evasion
+# of any kind, just an unauthenticated client that can POST. That is a denial of
+# service, not a tuning preference, which is why the bound ships on. With it, the
+# per-request cost on those two workloads drops by more than an order of
+# magnitude (docs/dos-budget.md §2.2).
 #
-# WHAT IT COSTS YOU TO TURN IT ON. A body larger than `max_body_bytes` is SKIPPED
-# by those four detectors — not truncated. Zero body bytes are examined, so a
-# payload anywhere in an oversized body is invisible to Lane 1. Still inspected:
-# the path, query string, cookies, the scanned request headers, every CRS rule
-# (its own 64 KiB structured cap, unlimited raw-body scan) and Lane 2 (its own
-# budget). Every skip is counted and logged (WARN, at most one line per 30 s) —
-# it is never silent. This is the same "skip past the cap" semantic the CRS body
-# processors already use, deliberately, so there is one rule to learn.
+# WHAT IT COSTS YOU. A body larger than `max_body_bytes` is SKIPPED by those four
+# detectors — not truncated. Zero body bytes are examined, so a payload anywhere
+# in an oversized body is invisible to Lane 1. Still inspected: the path, query
+# string, cookies, the scanned request headers, every CRS rule (its own 64 KiB
+# structured cap, unlimited raw-body scan) and Lane 2 (its own budget). Every skip
+# is counted, WARNed (at most one line per 30 s) and marked `degraded` on the
+# verdict — "not inspected" is never allowed to look like "inspected and clean".
+# This is the same "skip past the cap" semantic the CRS body processors already
+# use, deliberately, so there is one rule to learn and one boundary — 64 KiB — at
+# which both detection chains stop reading a body.
 #
 # HOW TO SIZE IT. Set it just above the largest body your application legitimately
 # posts. If you take file uploads, note that the budget is judged from the
@@ -712,10 +717,13 @@ max_decode_rounds = 3
 # A chunked request declares no length; with a budget at or above ~68 KiB such a
 # body still gets scanned in full.
 #
-# [content_security.lane1]
-# max_body_bytes = 0                  # 0 = UNLIMITED (default: no behaviour change)
-#                                     # e.g. 65536 → bodies over 64 KiB are not
-#                                     # inspected by sqli/xss/rce/dir_traversal
+# `0` MEANS UNLIMITED, and it is a DoS surface. It restores full Lane 1 body
+# coverage together with the unbounded per-request CPU above; the process logs a
+# WARN at startup when it is set. Choose it deliberately, with a rate limiter or
+# a body-size cap in front.
+[content_security.lane1]
+max_body_bytes = 65536                # 64 KiB, same boundary as the CRS body
+                                      # processors. 0 = UNLIMITED (see above).
 
 [content_security.breaker]            # anomaly-rate circuit breaker
 window_secs = 300

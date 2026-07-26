@@ -44,7 +44,7 @@ pub struct ContentSecurityConfig {
     pub rollout_salt: String,
     /// Deterministic `DoS` work-budget caps (plan §12.2).
     pub budget: SemanticBudgetConfig,
-    /// Lane 1 (frozen legacy regex detectors) work budget. **Unlimited by
+    /// Lane 1 (frozen legacy regex detectors) work budget. **64 KiB by
     /// default** — see [`Lane1BudgetConfig`].
     pub lane1: Lane1BudgetConfig,
     /// Anomaly-rate circuit-breaker parameters (plan §13.3).
@@ -139,32 +139,54 @@ impl Default for SemanticBudgetConfig {
     }
 }
 
+/// Shipped default for [`Lane1BudgetConfig::max_body_bytes`]: 64 KiB.
+///
+/// The same number as the CRS body processors' `MAX_BODY_BYTES`
+/// (`waf-engine/src/checks/body_processors.rs`), on purpose — past 64 KiB the
+/// CRS structured targets already stop, so aligning Lane 1 with it means one
+/// coverage boundary to reason about instead of two.
+pub const DEFAULT_LANE1_MAX_BODY_BYTES: usize = 64 * 1024;
+
 /// Lane 1 work budget — the **request-body** admission cap for the four frozen
 /// legacy regex detectors (`SQLi` / XSS / RCE / traversal).
 ///
 /// Lane 2 has [`SemanticBudgetConfig`] and the CRS body processors have their
-/// own hardcoded 64 KiB `MAX_BODY_BYTES`; Lane 1 historically had neither, and
-/// its cost therefore tracked body size all the way to the 10 MiB inspection
-/// ceiling. This is the knob that bounds it.
+/// own hardcoded 64 KiB `MAX_BODY_BYTES`; Lane 1 had neither, and its cost
+/// therefore tracked body size all the way to the 10 MiB inspection ceiling —
+/// 102 ms of CPU on a 1 MiB body, which at one proxy worker thread is ~9 rps
+/// per process, reachable by any unauthenticated client that can POST. This is
+/// the knob that bounds it.
 ///
-/// **Default: unlimited (`max_body_bytes = 0`).** An install that never sets it
-/// inspects exactly the same bytes it always did — the only added work on the
-/// request path is one integer comparison.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// **Default: [`DEFAULT_LANE1_MAX_BODY_BYTES`] (64 KiB).** An install that never
+/// mentions the key gets the bound, because the unbounded posture is a denial of
+/// service an attacker reaches without evading a single detector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Lane1BudgetConfig {
     /// Largest request body, in bytes, that the four Lane 1 detectors will read.
     ///
-    /// `0` means **unlimited** (the shipped default and the historical
-    /// behaviour). With a non-zero value, a request whose body exceeds it has
-    /// its body **skipped entirely** by Lane 1 — not truncated: zero body bytes
-    /// are examined by `SQLi` / XSS / RCE / traversal. Path, query string,
-    /// cookies and the scanned request headers are unaffected, and CRS + Lane 2
-    /// still see the body under their own budgets.
+    /// A request whose body exceeds it has its body **skipped entirely** by
+    /// Lane 1 — not truncated: zero body bytes are examined by `SQLi` / XSS /
+    /// RCE / traversal. Path, query string, cookies and the scanned request
+    /// headers are unaffected, and CRS + Lane 2 still see the body under their
+    /// own budgets. The miss is counted, logged at `WARN` and recorded on the
+    /// verdict as `degraded`; it is never silent.
     ///
-    /// This is a real reduction in detection coverage, deliberately traded for a
-    /// bound on per-request CPU. See `docs/dos-budget.md`.
+    /// `0` means **unlimited** and remains available for an operator who
+    /// deliberately wants every byte inspected. It is a `DoS` surface: per-request
+    /// CPU then tracks body size to the 10 MiB ceiling with nothing bounding it.
+    ///
+    /// The default trades a real reduction in detection coverage for a bound on
+    /// per-request CPU. See `docs/dos-budget.md` §2.2.
     pub max_body_bytes: usize,
+}
+
+impl Default for Lane1BudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: DEFAULT_LANE1_MAX_BODY_BYTES,
+        }
+    }
 }
 
 /// Anomaly-rate circuit-breaker parameters (plan §13.3). Values are calibrated

@@ -754,9 +754,13 @@ impl WafEngine {
             request_score: i16::from(verdict.request_score),
             recommendation: recommendation.to_string(),
             degraded: verdict.degraded,
-            // P1b: budget exhaustion is the sole degradation source, so
-            // `exhausted` mirrors `degraded`; the schema keeps them distinct for
-            // future non-budget degradations.
+            // Still mirrors `degraded`. There are now two degradation sources —
+            // the Lane 2 work budget and the Lane 1 body budget — and the verdict
+            // folds them into one flag, so this column cannot separate them
+            // either. It is kept rather than dropped because the schema is
+            // written and read by tooling; treat both columns as "part of this
+            // request was never inspected", and read the WARN log
+            // (`Lane 1 body budget exceeded`) when the distinction matters.
             exhausted: verdict.degraded,
             pipeline: "semantic".to_string(),
             schema_version: 1,

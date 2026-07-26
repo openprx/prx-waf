@@ -270,19 +270,35 @@ fn header_decoded_label(name: &str) -> &'static str {
 ///
 /// # Default
 ///
-/// [`Self::UNLIMITED`]. A deployment that never sets the key inspects exactly
-/// the bytes it always did; the only added work is the integer comparison in
-/// [`Self::admits_body`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// [`Self::DEFAULT`] — 64 KiB, the same boundary the CRS body processors already
+/// draw. An unbounded Lane 1 is not a tuning preference an operator can be left
+/// to discover: it is a denial of service reachable by posting a large body, no
+/// detector evasion required. [`Self::UNLIMITED`] stays available for an operator
+/// who deliberately chooses the coverage over the bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lane1BodyBudget {
     /// Largest body Lane 1 will read, in bytes. `0` = unlimited.
     max_body_bytes: usize,
 }
 
+impl Default for Lane1BodyBudget {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 impl Lane1BodyBudget {
-    /// No cap — every byte the gateway hands over is inspected. The default, and
-    /// the behaviour of every prx-waf that shipped before this budget existed.
+    /// No cap — every byte the gateway hands over is inspected. The behaviour of
+    /// every prx-waf that shipped before this budget existed, and what
+    /// `max_body_bytes = 0` still selects.
     pub const UNLIMITED: Self = Self { max_body_bytes: 0 };
+
+    /// The shipped default: 64 KiB, aligned with the CRS body processors'
+    /// `MAX_BODY_BYTES` so both detection chains stop reading a body at the same
+    /// size.
+    pub const DEFAULT: Self = Self {
+        max_body_bytes: waf_common::content_security_config::DEFAULT_LANE1_MAX_BODY_BYTES,
+    };
 
     /// Build a budget from an operator-supplied byte count. `0` = unlimited.
     #[must_use]
@@ -326,6 +342,19 @@ impl Lane1BodyBudget {
             return false;
         }
         usize::try_from(ctx.content_length).is_ok_and(|declared| declared <= self.max_body_bytes)
+    }
+
+    /// Whether this request **carries** a body that the budget will withhold from
+    /// the Lane 1 detectors.
+    ///
+    /// [`Self::admits_body`] answers a detector's question ("may I read this?")
+    /// and says `true` for a request with no body at all. This answers the
+    /// subsystem's question ("was something withheld?"), which is what
+    /// [`super::content_security::ContentSecuritySubsystem::evaluate_scoped`]
+    /// needs to mark the verdict `degraded`: a body that does not exist was not
+    /// missed.
+    pub(crate) fn withholds_body(self, ctx: &RequestCtx) -> bool {
+        !ctx.body_preview.is_empty() && !self.admits_body(ctx)
     }
 }
 
@@ -395,8 +424,8 @@ fn record_lane1_body_skip(ctx: &RequestCtx, budget: Lane1BodyBudget) {
         host = %ctx.host,
         path = %ctx.path,
         "Lane 1 body budget exceeded: the request body was NOT inspected by the sqli/xss/rce/traversal \
-         detectors (content_security.lane1.max_body_bytes). Path, query, cookies and headers were still \
-         inspected, as were CRS and Lane 2."
+         detectors (content_security.lane1.max_body_bytes, default 65536). The verdict is marked \
+         degraded. Path, query, cookies and headers were still inspected, as were CRS and Lane 2."
     );
 }
 
@@ -413,8 +442,9 @@ fn record_lane1_body_skip(ctx: &RequestCtx, budget: Lane1BodyBudget) {
 /// additionally scanned in raw + single-decoded form.
 ///
 /// `body_budget` gates **only** the three body-derived entries; every other
-/// surface is collected unconditionally. [`Lane1BodyBudget::UNLIMITED`] — the
-/// shipped default — reproduces the historical target set byte for byte.
+/// surface is collected unconditionally. [`Lane1BodyBudget::UNLIMITED`]
+/// reproduces the pre-budget target set byte for byte; the shipped default
+/// ([`Lane1BodyBudget::DEFAULT`], 64 KiB) drops all three for a larger body.
 pub(crate) fn request_targets(ctx: &RequestCtx, body_budget: Lane1BodyBudget) -> Vec<(&'static str, String)> {
     let mut targets = Vec::new();
 
@@ -539,16 +569,44 @@ mod tests {
         body
     }
 
+    /// The shipped default is 64 KiB — the same boundary the CRS body processors
+    /// draw (`body_processors::MAX_BODY_BYTES`), so both detection chains stop
+    /// reading a body at the same size. Pinned because the number is quoted in
+    /// `configs/default.toml`, `docs/dos-budget.md` §2.2 and
+    /// `tests/perf/RESULTS.md`, and a silent change would make all three wrong.
     #[test]
-    fn unlimited_is_the_default_budget() {
-        assert!(Lane1BodyBudget::default().is_unlimited());
+    fn the_default_budget_is_sixty_four_kib() {
+        assert_eq!(Lane1BodyBudget::DEFAULT.max_body_bytes(), 64 * 1024);
+        assert_eq!(Lane1BodyBudget::default(), Lane1BodyBudget::DEFAULT);
+        assert!(!Lane1BodyBudget::default().is_unlimited());
+        assert_eq!(
+            waf_common::content_security_config::Lane1BudgetConfig::default().max_body_bytes,
+            64 * 1024,
+            "the serialized config default must agree with the compiled one, or a config \
+             that omits the key would behave differently from one that spells it out"
+        );
+    }
+
+    /// `0` keeps meaning *unlimited*, not *zero*. An operator who deliberately
+    /// wants every byte inspected — accepting the CPU that comes with it — must
+    /// still be able to say so.
+    #[test]
+    fn zero_still_means_unlimited() {
         assert!(Lane1BodyBudget::UNLIMITED.is_unlimited());
         assert!(Lane1BodyBudget::from_bytes(0).is_unlimited());
         assert!(!Lane1BodyBudget::from_bytes(1).is_unlimited());
+
+        // And it is not merely a flag: the body is actually read.
+        let ctx = ctx_with_body(one_mib_body_with_trailing_marker("NEEDLE"), None);
+        let targets = request_targets(&ctx, Lane1BodyBudget::from_bytes(0));
+        assert!(
+            targets.iter().any(|(loc, v)| *loc == "body" && v.ends_with("NEEDLE")),
+            "an explicit 0 must inspect a 1 MiB body to its last byte"
+        );
     }
 
-    /// The zero-behaviour-change guarantee: with the shipped default, a 1 MiB
-    /// body is read to its last byte.
+    /// The pre-budget behaviour, still reachable: with no cap a 1 MiB body is
+    /// read to its last byte.
     #[test]
     fn unlimited_budget_reads_a_one_mib_body_to_its_last_byte() {
         let ctx = ctx_with_body(one_mib_body_with_trailing_marker("NEEDLE"), None);
