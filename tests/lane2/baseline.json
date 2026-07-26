@@ -64,7 +64,7 @@
   "trade this harness exists to price."
  ],
  "recorded_at": "2026-07-26",
- "recorded_from": "PLACEHOLDER-SHA — the commit that adds tests/lane2/. Measured on that tree with configs/default.toml unmodified; replace this string with the real sha when the change lands.",
+ "recorded_from": "c644606 — the commit that adds tests/lane2/. Measured on that tree with configs/default.toml unmodified; replace this string with the real sha when the change lands.",
  "corpus": {
   "attack": 170,
   "benign": 220,
