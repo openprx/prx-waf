@@ -9,6 +9,39 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **The RUSTSEC-2023-0071 exemption is now argued against jsonwebtoken 11.0.0
+  source, line by line.** It is the only entry in `deny.toml` whose case is
+  "compiled but unreachable" rather than "not in the graph", so the rsa Marvin
+  timing sidechannel — which has no fixed release upstream — rests entirely on
+  waf-api never reaching an RSA private-key operation. That claim had only been
+  checked against 10.4.0. Re-checked against 11.0.0: `from_secret` hardcodes
+  `AlgorithmFamily::Hmac` behind a private field on both the encoding and
+  decoding side, `decode()` rejects a mismatched `alg` header before the
+  verifier factory is invoked, and `Validation::default()` is still exactly
+  `[HS256]`. 11.0 is strictly tighter than 10.4: the four algorithm checks used
+  to sit behind `validate_signature`, which `insecure_disable_signature_
+  validation()` could switch off; that field and method are gone and the checks
+  are unconditional.
+
+  Recorded alongside it: `jws::decode` does *not* pre-check the allow-list
+  before constructing a verifier, so switching to it would put attacker-chosen
+  `alg` in front of the RSA verifier. Nothing in this repo uses it, and the
+  exemption's reasoning now says so explicitly.
+
+### Changed
+
+- **jsonwebtoken 10 → 11.** `Validation` is built with struct-update syntax
+  instead of field reassignment; the lint only started firing because the
+  private `validate_signature` field that suppressed it was removed.
+- **wasmtime 44 → 47.** No API used by `plugins/manager.rs` changed signature.
+  47 enables the GC and exception-handling proposals by default, which would
+  widen the bytecode a plugin may contain, but `config.rs:2519-2520` gates both
+  on the `gc` Cargo feature and this build sets `default-features = false`, so
+  the accepted set is unchanged. The four WASI advisories fixed in 45/46 do not
+  apply — `wasmtime-wasi` is not in the tree.
+
 ### Added
 
 - **A real multipart/form-data part parser, exposing `FILES`, `FILES_NAMES`

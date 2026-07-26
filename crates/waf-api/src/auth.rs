@@ -54,8 +54,14 @@ pub fn generate_access_token(user_id: Uuid, username: &str, role: &str, secret: 
 }
 
 pub fn validate_access_token(token: &str, secret: &str) -> anyhow::Result<Claims> {
-    let mut v = Validation::default();
-    v.leeway = 0;
+    // `Validation::default()` == `Validation::new(Algorithm::HS256)`, i.e. `algorithms` is
+    // exactly `[HS256]`; `decode()` rejects any other `alg` header before a verifier is even
+    // constructed. Keep it that way — widening `algorithms` would make the RSA code path in
+    // jsonwebtoken reachable (see the RUSTSEC-2023-0071 entry in deny.toml).
+    let v = Validation {
+        leeway: 0,
+        ..Validation::default()
+    };
     let data = decode::<Claims>(token, &DecodingKey::from_secret(secret.as_bytes()), &v)?;
     Ok(data.claims)
 }

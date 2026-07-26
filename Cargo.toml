@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.37"
+version = "0.2.38"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -72,7 +72,7 @@ scraper = "0.27"
 
 # Phase 4 additions
 argon2 = { version = "0.5", features = ["std"] }
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 aes-gcm = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "smtp-transport", "builder"] }
@@ -85,7 +85,7 @@ totp-lite = "2"
 data-encoding = "2"
 
 # Phase 5 additions
-wasmtime = { version = "44.0.0", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "anyhow"] }
+wasmtime = { version = "47.0.0", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "anyhow"] }
 moka = { version = "0.12", features = ["future"] }
 quinn = { version = "0.11", features = ["rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }

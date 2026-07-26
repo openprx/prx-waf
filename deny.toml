@@ -69,16 +69,69 @@ ignore = [
     # remove-when: pingora-core migrates off derivative (e.g. to derive-where / educe).
     { id = "RUSTSEC-2024-0388", reason = "derivative: unmaintained build-time derive macro, pingora 0.8 transitive" },
     # rsa 0.9.10 Marvin timing sidechannel — NO fixed release exists upstream (patched = []).
-    # Real path: rsa -> jsonwebtoken (rust_crypto) -> waf-api, so the crate IS compiled. However
-    # waf-api signs and verifies JWTs exclusively with HMAC (EncodingKey/DecodingKey::from_secret
-    # => HS256, Validation::default() locks the algorithm to HS256, see crates/waf-api/src/auth.rs).
-    # The RSA private-key operations Marvin targets are never invoked, so it is not exploitable here.
+    # Real path: rsa -> jsonwebtoken (rust_crypto) -> waf-api, so the crate IS compiled. This is the
+    # only entry in this file whose argument is "compiled but unreachable", so the reachability
+    # claim is spelled out below against the actual vendored source rather than asserted.
     #
-    # Removal paths evaluated & rejected on 2026-07-19 (goal: get rsa out of Cargo.lock entirely):
-    #   1. jsonwebtoken HMAC-only feature trim — IMPOSSIBLE. jsonwebtoken 10.3/10.4 gate all
-    #      RustCrypto algorithms behind one monolithic `rust_crypto` feature that hard-bundles
-    #      rsa together with hmac (features = [ed25519-dalek, hmac, p256, p384, rand, rsa, sha2]);
-    #      there is no HMAC-only sub-feature, so rsa cannot be excluded while keeping HS256.
+    # UNREACHABILITY PROOF — re-done on 2026-07-25 against jsonwebtoken 11.0.0 source
+    # (the earlier version of this comment only cited 10.4.0; 11.0.0 was read line by line and
+    # is strictly tighter, see "what 11.0 changed" at the end). Paths below are relative to
+    # the vendored crate root ~/.cargo/registry/src/*/jsonwebtoken-11.0.0/.
+    #
+    #   1. rsa is still in the graph. Cargo.toml:53-61 defines
+    #      `rust_crypto = ["dep:ed25519-dalek","dep:hmac","dep:p256","dep:p384","dep:rand","dep:rsa","dep:sha2"]`
+    #      and Cargo.toml:125-127 pins `rsa = "0.9.6"` (optional). Still one monolithic feature,
+    #      still no HMAC-only sub-feature. Cargo.lock keeps rsa 0.9.10.
+    #   2. The only call sites in this repo are crates/waf-api/src/auth.rs:51 (encode) and
+    #      auth.rs:65 (decode). `rg 'jsonwebtoken|insecure_decode|jws::'` over crates/ finds
+    #      nothing else: no `dangerous::insecure_decode`, no `jws::decode`, no custom
+    #      `CryptoProvider::install_default` for jsonwebtoken.
+    #   3. Signing side: encoding.rs:34-36 `EncodingKey::from_secret` hardcodes
+    #      `family: AlgorithmFamily::Hmac`. The `family` field is private (encoding.rs:21-25) and
+    #      has only a getter (`:29-31`) — no API can retag an HMAC key as RSA. encoding.rs:151-154
+    #      then rejects the call outright when `key.family != header.alg.family()`, so
+    #      `Header::default()` (header.rs:273-278 => `Algorithm::default()` => HS256,
+    #      algorithms.rs:41-46) is the only header that can be signed with our key.
+    #      The signer factory (crypto/rust_crypto/mod.rs:91-108) therefore only ever reaches the
+    #      `Algorithm::HS256` arm at :93; the RS*/PS* arms at :98-103 — the ones that call
+    #      `try_sign_rsa` -> `RsaPrivateKey::from_pkcs1_der` + `SigningKey::sign_with_rng`
+    #      (crypto/rust_crypto/rsa.rs:24-41), which IS the Marvin-affected private-key operation —
+    #      are unreachable.
+    #   4. Verifying side: decoding.rs:95-100 `DecodingKey::from_secret` likewise hardcodes
+    #      `family: AlgorithmFamily::Hmac` with a private field (decoding.rs:77-81).
+    #      decoding.rs:270-291 `decode()` checks `!validation.algorithms.contains(&header.alg)`
+    #      at :278-280 and returns InvalidAlgorithm BEFORE the verifier factory runs at :282, so a
+    #      forged `alg: RS256` header cannot even construct an RSA verifier.
+    #      verify_signature_body (decoding.rs:325-351) re-checks family (:336-340) and membership
+    #      (:342-344) unconditionally afterwards.
+    #   5. `Validation::default()` is HS256-only: validation.rs:161-165 `fn default() -> Self {
+    #      Self::new(Algorithm::HS256) }` -> `new` (:110-112) -> `new_impl` (:119-137) sets
+    #      `algorithms: vec![alg]`. So `validation.algorithms == [HS256]` exactly. auth.rs:61-64
+    #      overrides only `leeway`; every other field, including `algorithms`, comes from Default.
+    #      `required_spec_claims` is byte-identical to 10.4.0: `{"exp"}` (validation.rs:120-124).
+    #   6. Belt and braces: even if 3./4. were bypassed, crypto/rust_crypto/rsa.rs:103-106
+    #      (`define_rsa_verifier`) and :75-77 (`define_rsa_signer`) reject any key whose
+    #      `family() != AlgorithmFamily::Rsa` with InvalidKeyFormat before touching rsa math.
+    #      Our keys are always AlgorithmFamily::Hmac. Two independent barriers, not one.
+    #   Conclusion: rsa's Marvin-affected code is linked in but has no reachable caller here.
+    #
+    # What 11.0 changed, and in which direction: 10.4.0 gated all four checks in decoding.rs
+    # (10.4.0 decoding.rs:283, :337, :341, :349, :353) on a `pub(crate) validate_signature` flag
+    # that `Validation::insecure_disable_signature_validation()` could clear. 11.0.0 deleted the
+    # field and the method (CHANGELOG "BREAKING: `Validation.insecure_disable_signature_validation`
+    # has been removed") and made all four checks unconditional; the opt-out now lives in the
+    # separate `dangerous::insecure_decode` entry point (lib.rs:15-18), which we do not call.
+    # 11.0 also made HMAC signer construction verify the algorithm family. Net effect on this
+    # exemption: strictly stronger. `Algorithm` becoming `#[non_exhaustive]` (algorithms.rs:42)
+    # does not affect us — we never match on it.
+    #
+    # Removal paths evaluated & rejected on 2026-07-19, re-checked against 11.0.0 on 2026-07-25
+    # (goal: get rsa out of Cargo.lock entirely):
+    #   1. jsonwebtoken HMAC-only feature trim — STILL IMPOSSIBLE in 11.0.0. All RustCrypto
+    #      algorithms remain behind one monolithic `rust_crypto` feature that hard-bundles rsa
+    #      together with hmac (Cargo.toml:53-61, features = [ed25519-dalek, hmac, p256, p384,
+    #      rand, rsa, sha2]); there is no HMAC-only sub-feature, so rsa cannot be excluded while
+    #      keeping HS256. 11.0.0's "implicit features removed" change did not split this up.
     #   2. jsonwebtoken `aws_lc_rs` backend — TECHNICALLY WORKS (rsa leaves the tree, all 13 auth
     #      unit tests pass with auth.rs unchanged) but REJECTED: it re-adds aws-lc-rs/aws-lc-sys,
     #      directly reversing commit 1b7e23f which deliberately purged aws-lc-rs so that `ring`
