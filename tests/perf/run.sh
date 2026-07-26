@@ -94,6 +94,25 @@ DURATION="${DURATION:-10}"                     # seconds of measured load per ro
 WARMUP="${WARMUP:-3}"                          # seconds of unmeasured load first
 CONNECTIONS="${CONNECTIONS:-50}"
 
+# Two knobs that select a CONFIGURATION rather than a workload, because both
+# defaults changed after the first matrix was recorded and a table that cannot
+# state which side of the change it is on is not comparable to anything.
+#
+#   WORKER_THREADS         empty = the shipped default, i.e. `[proxy]
+#                          worker_threads` unset, which follows the CPUs the
+#                          process may use — under `taskset -c $WAF_CPUS` that
+#                          is the size of the pinned set, not `nproc`. N pins
+#                          the data plane to N threads; 1 reproduces every
+#                          release before the key was wired up.
+#   LANE1_MAX_BODY_BYTES   empty = the shipped default (65536). 0 restores the
+#                          unbounded Lane 1 that shipped before it, which is
+#                          the posture the pre-budget tables measured.
+#
+# Both are written into the generated TOML rather than exported, so the config
+# file left in $WORK is a complete record of what was measured.
+WORKER_THREADS="${WORKER_THREADS:-}"
+LANE1_MAX_BODY_BYTES="${LANE1_MAX_BODY_BYTES:-}"
+
 WORK="${WORK:-${TMPDIR:-/tmp}/prx-waf-perf}"
 OUT="${OUT:-$WORK/reports}"
 SRC="${SRC:-$REPO_ROOT}"
@@ -119,6 +138,16 @@ LOAD_CPUS="${LOAD_CPUS:-10-15}"
 
 log() { printf '\033[1;36m[perf]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[perf] %s\033[0m\n' "$*" >&2; exit 1; }
+
+# A typo in either knob must not silently fall through to the shipped default:
+# the whole point of them is to say which posture a table describes.
+case "$WORKER_THREADS" in ''|[0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;;
+  *) die "WORKER_THREADS must be a non-negative integer or empty, got '$WORKER_THREADS'" ;;
+esac
+case "$LANE1_MAX_BODY_BYTES" in ''|*[!0-9]*)
+  [ -z "$LANE1_MAX_BODY_BYTES" ] ||
+    die "LANE1_MAX_BODY_BYTES must be a non-negative integer or empty, got '$LANE1_MAX_BODY_BYTES'" ;;
+esac
 
 # What state was the tree in when this was measured?
 #
@@ -426,6 +455,7 @@ listen_addr = "127.0.0.1:$WAF_PORT"
 listen_addr_tls = "127.0.0.1:$WAF_TLS_PORT"
 trust_proxy_headers = false
 smuggling_detection = true
+$([ -n "$WORKER_THREADS" ] && printf 'worker_threads = %s' "$WORKER_THREADS")
 
 [api]
 listen_addr = "127.0.0.1:$API_PORT"
@@ -492,14 +522,32 @@ EOF
       # The Lane 2 block is lifted verbatim out of configs/default.toml rather
       # than retyped, so the measured posture is the SHIPPING posture
       # (log_only + rollout_bps = 0) and cannot drift from it.
+      #
+      # LANE1_MAX_BODY_BYTES rewrites the one key it names in place. Appending a
+      # second `[content_security.lane1]` table would be a duplicate-key TOML
+      # error, and appending a bare `max_body_bytes` would land in whichever
+      # table happens to be last in the shipped file.
       echo
-      sed -n '/^\[content_security\]/,$p' "$SRC/configs/default.toml"
+      if [ -n "$LANE1_MAX_BODY_BYTES" ]; then
+        sed -n '/^\[content_security\]/,$p' "$SRC/configs/default.toml" |
+          sed "s/^max_body_bytes = .*/max_body_bytes = $LANE1_MAX_BODY_BYTES  # overridden by tests\/perf\/run.sh/"
+      else
+        sed -n '/^\[content_security\]/,$p' "$SRC/configs/default.toml"
+      fi
     else
+      # Lane 2 off. The Lane 1 body budget still applies here — it is compiled
+      # out of `[content_security.lane1]` whatever `enabled` says, because it
+      # governs the four legacy regex detectors and not the semantic lane — so
+      # the override has to be written on this branch too, or the `lane1` and
+      # `crs-*` postures would silently keep the shipped 64 KiB.
       cat <<'EOF'
 
 [content_security]
 enabled = false
 EOF
+      if [ -n "$LANE1_MAX_BODY_BYTES" ]; then
+        printf '\n[content_security.lane1]\nmax_body_bytes = %s\n' "$LANE1_MAX_BODY_BYTES"
+      fi
     fi
   } >"$dst"
 }
@@ -609,6 +657,8 @@ run_round() {                          # $1 posture, $2 workload, $3 round, $4 b
 log "hardware: $(nproc) cpus, $(awk '/^model name/{sub(/^model name[ \t]*:[ \t]*/,""); print; exit}' /proc/cpuinfo)"
 log "kernel:   $(uname -r)"
 log "plan:     postures=[$POSTURES] workloads=[$WORKLOADS] rounds=$ROUNDS duration=${DURATION}s conns=$CONNECTIONS pin=$PIN"
+log "pinning:  waf=$WAF_CPUS origin=$ORIGIN_CPUS generator=$LOAD_CPUS"
+log "config:   worker_threads=${WORKER_THREADS:-<shipped default: the CPUs the process may use>} lane1.max_body_bytes=${LANE1_MAX_BODY_BYTES:-<shipped default: 65536>}"
 
 # The 1-minute load average at the start and end of the run. A benchmark host
 # that was busy with unrelated work produces numbers that are real but not
@@ -712,6 +762,8 @@ python3 "$SCRIPT_DIR/summarize.py" \
   --raw "$RESULTS" --out "$OUT/summary.json" --markdown "$OUT/summary.md" \
   --duration "$DURATION" --connections "$CONNECTIONS" --rounds "$ROUNDS" \
   --oha "$OHA_VERSION" --albedo "$ALBEDO_VERSION" --pin "$PIN" \
+  --waf-cpus "$WAF_CPUS" --origin-cpus "$ORIGIN_CPUS" --load-cpus "$LOAD_CPUS" \
+  --worker-threads "$WORKER_THREADS" --lane1-max-body-bytes "$LANE1_MAX_BODY_BYTES" \
   --load-before "$LOAD_BEFORE" --load-after "$(awk '{print $1}' /proc/loadavg)" \
   --tree "$(cd "$SRC" && git rev-parse HEAD 2>/dev/null || echo unknown)" \
   --dirty "$(worktree_state)"

@@ -9,6 +9,8 @@ tests/perf/run.sh                                  # every posture, every worklo
 POSTURES=origin,passthrough,full tests/perf/run.sh # the three that matter most
 WORKLOADS=get-small ROUNDS=5 tests/perf/run.sh     # one workload, tighter median
 DURATION=30 CONNECTIONS=100 tests/perf/run.sh
+WORKER_THREADS=1 tests/perf/run.sh                 # the pre-0.2.63 data plane
+LANE1_MAX_BODY_BYTES=0 tests/perf/run.sh           # unbounded Lane 1 bodies
 ```
 
 One command brings up Postgres, an `albedo` origin and prx-waf, drives load with
@@ -153,6 +155,23 @@ checks and deployment scripts.)
 * Benign traffic produces no detections, so the Postgres write path is off the
   hot path for five of the six workloads. It is very much *on* the hot path for
   `attack`, which is part of why that row is not comparable.
+
+### Two settings the harness will change on request
+
+Everything above is fixed. Two things are not, because their **defaults
+changed** after the first matrix was recorded, and a table that cannot say which
+side of the change it sits on is comparable to nothing:
+
+| Knob | Default | What the other setting is |
+|---|---|---|
+| `WORKER_THREADS` | unset — `[proxy] worker_threads` follows the CPUs the process may use | `WORKER_THREADS=1` is the single-threaded data plane every release before 0.2.63 had, whatever the machine |
+| `LANE1_MAX_BODY_BYTES` | unset — 64 KiB, the shipped default since 0.2.64 | `LANE1_MAX_BODY_BYTES=0` is unbounded Lane 1, which is what every release before it did |
+
+Under pinning the worker-thread default follows `taskset`, not `nproc`:
+`available_parallelism` reads the affinity mask, so the default run is
+`WAF_CPUS`-wide. Both settings are written into the generated TOML in `$WORK`
+and recorded in `summary.json` under `method`, so a summary always states which
+posture produced it.
 
 ---
 

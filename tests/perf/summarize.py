@@ -160,6 +160,15 @@ def main() -> int:
     ap.add_argument("--dirty", required=True)
     ap.add_argument("--load-before", default="")
     ap.add_argument("--load-after", default="")
+    # The core sets used to be a hardcoded string in this file, so a run that
+    # moved them recorded a pinning it did not use.
+    ap.add_argument("--waf-cpus", default="")
+    ap.add_argument("--origin-cpus", default="")
+    ap.add_argument("--load-cpus", default="")
+    # Empty means the shipped default was used, which is a different statement
+    # from any particular number and is recorded as such.
+    ap.add_argument("--worker-threads", default="")
+    ap.add_argument("--lane1-max-body-bytes", default="")
     args = ap.parse_args()
 
     records: list[dict] = []
@@ -280,7 +289,20 @@ def main() -> int:
             "duration_s": args.duration,
             "rounds_per_cell": args.rounds,
             "reduction": "median round by RPS; latency taken from that same round",
-            "cpu_pinning": "on (waf 0-3, origin 4-9, generator 10-15)" if args.pin == "1" else "off",
+            "cpu_pinning": (
+                f"on (waf {args.waf_cpus}, origin {args.origin_cpus}, "
+                f"generator {args.load_cpus})"
+            ) if args.pin == "1" else "off",
+            # The two settings whose defaults changed under this harness. Under
+            # pinning the shipped worker-thread default follows the WAF's core
+            # set, not `nproc`, so the pinning line above is load-bearing for
+            # reading it.
+            "proxy_worker_threads": (
+                args.worker_threads or "shipped default (unset — follows the CPUs the process may use)"
+            ),
+            "lane1_max_body_bytes": (
+                args.lane1_max_body_bytes or "shipped default (65536)"
+            ),
             "held_constant": [
                 "response cache OFF in every posture (a hit skips the upstream "
                 "and would make the WAF measure faster than its own origin)",
