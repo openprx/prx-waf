@@ -83,18 +83,89 @@ const HOST_COLUMNS: &str = "id, code, host, port, ssl, guard_status, remote_host
      host(remote_ip) AS remote_ip, cert_file, key_file, remarks, start_status, exclude_url_log, \
      is_enable_load_balance, load_balance_stage, defense_json, log_only_mode, created_at, updated_at";
 
-/// Reject a non-IP `remote_ip` in the repo layer so a bad value surfaces as a
-/// clean [`StorageError::InvalidInput`] instead of a raw Postgres `22P02`
-/// bubbling up from the `::inet` cast. `None` (→ SQL `NULL`) is always allowed.
-fn validate_remote_ip(remote_ip: Option<&str>) -> Result<(), StorageError> {
-    if let Some(ip) = remote_ip
-        && ip.parse::<std::net::IpAddr>().is_err()
-    {
+/// Column projection for every `attack_logs` read.
+///
+/// Same reason as [`HOST_COLUMNS`]: `client_ip` is `INET` while [`AttackLog`]
+/// decodes it as `String`, and sqlx has no `INET` codec here, so a bare
+/// `SELECT *` fails to decode. `host(client_ip)` renders the bare address with
+/// no `/32`|`/128` suffix, so an insert round-trips byte-for-byte.
+const ATTACK_LOG_COLUMNS: &str = "id, host_code, host, host(client_ip) AS client_ip, method, path, query, \
+     rule_id, rule_name, action, phase, detail, request_headers, geo_info, created_at";
+
+/// Reject a value that is not a bare IP address so it surfaces as a clean
+/// [`StorageError::InvalidInput`] instead of a raw Postgres `22P02` bubbling up
+/// out of an `::inet` cast.
+fn validate_ip(field: &str, value: &str) -> Result<(), StorageError> {
+    if value.parse::<std::net::IpAddr>().is_err() {
         return Err(StorageError::InvalidInput(format!(
-            "remote_ip must be a valid IP address, got: {ip}"
+            "{field} must be a valid IP address, got: {value}"
         )));
     }
     Ok(())
+}
+
+/// Reject a non-IP `remote_ip` before the `::inet` cast. `None` (→ SQL `NULL`)
+/// is always allowed.
+fn validate_remote_ip(remote_ip: Option<&str>) -> Result<(), StorageError> {
+    remote_ip.map_or_else(|| Ok(()), |ip| validate_ip("remote_ip", ip))
+}
+
+/// Reject an `addr/prefix` that Postgres would refuse, so a bad CIDR in a
+/// user-supplied filter becomes a 400 rather than a raw `22P02` 500.
+fn validate_cidr(value: &str) -> Result<(), StorageError> {
+    let invalid = || StorageError::InvalidInput(format!("client_ip must be an IP or CIDR, got: {value}"));
+    let Some((addr, prefix)) = value.split_once('/') else {
+        return Err(invalid());
+    };
+    let addr: std::net::IpAddr = addr.parse().map_err(|_| invalid())?;
+    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let bits: u32 = prefix.parse().map_err(|_| invalid())?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    if bits > max {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Blank filter values (the admin UI binds its inputs to `""`) mean "no
+/// filter", not "match the empty string".
+fn filter_value(raw: Option<&String>) -> Option<&str> {
+    raw.map(|s| s.trim()).filter(|s| !s.is_empty())
+}
+
+/// SQL comparison for the optional `client_ip` filter on `attack_logs`.
+///
+/// The column is `INET`, so a bare text parameter has no matching operator at
+/// all (`42883: operator does not exist: inet = text`) — the predicate has to
+/// name the cast. Two shapes are accepted and they deliberately do *not* share
+/// one operator:
+///
+/// * a plain address uses `=`, which `idx_attack_logs_client_ip` (btree) can
+///   serve — this is the overwhelmingly common lookup;
+/// * a CIDR uses `<<=` (contained-within-or-equal), which is the reason the
+///   column is `INET` in the first place: "everything from 10.0.0.0/8" is what
+///   an operator asks during an incident. btree cannot index `<<=`, so it is
+///   only reached when the caller actually passed a network.
+///
+/// The value itself always stays a bound parameter; only the operator is chosen
+/// in Rust, from a closed set of two literals.
+fn client_ip_predicate(filter: Option<&str>) -> Result<&'static str, StorageError> {
+    const EXACT: &str = "client_ip = $2::inet";
+    match filter {
+        // No filter: `$2` is SQL NULL and the `IS NULL` arm short-circuits, so
+        // either operator is inert. Keep the indexable one.
+        None => Ok(EXACT),
+        Some(value) if value.contains('/') => {
+            validate_cidr(value)?;
+            Ok("client_ip <<= $2::inet")
+        }
+        Some(value) => {
+            validate_ip("client_ip", value)?;
+            Ok(EXACT)
+        }
+    }
 }
 
 /// Serialise an optional [`DefenseConfig`](waf_common::DefenseConfig) for the
@@ -425,12 +496,18 @@ impl Database {
     // ─── Attack Logs ─────────────────────────────────────────────────────────
 
     pub async fn create_attack_log(&self, log: AttackLog) -> Result<(), StorageError> {
+        // `client_ip` is `INET NOT NULL`; without the explicit cast Postgres
+        // rejects the text parameter outright (`42804`). The only caller runs
+        // detached and downgrades the failure to a `warn!`, so a silent break
+        // here means the table simply never fills — validate first so a bad
+        // address is a named error instead of a raw `22P02`.
+        validate_ip("client_ip", &log.client_ip)?;
         sqlx::query(
             r"INSERT INTO attack_logs (
                 id, host_code, host, client_ip, method, path, query,
                 rule_id, rule_name, action, phase, detail,
                 request_headers, geo_info, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+            ) VALUES ($1,$2,$3,$4::inet,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
         )
         .bind(log.id)
         .bind(&log.host_code)
@@ -470,35 +547,35 @@ impl Database {
         let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
         let offset = (page - 1) * page_size;
 
-        // Count query
-        let total: i64 = sqlx::query_scalar(
-            r"SELECT COUNT(*) FROM attack_logs
-               WHERE ($1::text IS NULL OR host_code = $1)
-                 AND ($2::text IS NULL OR client_ip = $2)
+        let client_ip = filter_value(query.client_ip.as_ref());
+        // Only the operator varies, and only across two hard-coded literals;
+        // every value below is still a bound parameter.
+        let ip_pred = client_ip_predicate(client_ip)?;
+        let filters = format!(
+            "WHERE ($1::text IS NULL OR host_code = $1)
+                 AND ($2::text IS NULL OR {ip_pred})
                  AND ($3::text IS NULL OR action = $3)
                  AND ($4::text IS NULL OR geo_info->>'iso_code' = $4)
-                 AND ($5::text IS NULL OR geo_info->>'country' ILIKE '%' || $5 || '%')",
-        )
-        .bind(&query.host_code)
-        .bind(&query.client_ip)
-        .bind(&query.action)
-        .bind(&query.iso_code)
-        .bind(&query.country)
-        .fetch_one(&self.pool)
-        .await?;
+                 AND ($5::text IS NULL OR geo_info->>'country' ILIKE '%' || $5 || '%')"
+        );
 
-        let rows = sqlx::query_as::<_, AttackLog>(
-            r"SELECT * FROM attack_logs
-               WHERE ($1::text IS NULL OR host_code = $1)
-                 AND ($2::text IS NULL OR client_ip = $2)
-                 AND ($3::text IS NULL OR action = $3)
-                 AND ($4::text IS NULL OR geo_info->>'iso_code' = $4)
-                 AND ($5::text IS NULL OR geo_info->>'country' ILIKE '%' || $5 || '%')
+        // Count query
+        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM attack_logs {filters}"))
+            .bind(&query.host_code)
+            .bind(client_ip)
+            .bind(&query.action)
+            .bind(&query.iso_code)
+            .bind(&query.country)
+            .fetch_one(&self.pool)
+            .await?;
+
+        let rows = sqlx::query_as::<_, AttackLog>(&format!(
+            "SELECT {ATTACK_LOG_COLUMNS} FROM attack_logs {filters}
                ORDER BY created_at DESC
-               LIMIT $6 OFFSET $7",
-        )
+               LIMIT $6 OFFSET $7"
+        ))
         .bind(&query.host_code)
-        .bind(&query.client_ip)
+        .bind(client_ip)
         .bind(&query.action)
         .bind(&query.iso_code)
         .bind(&query.country)
