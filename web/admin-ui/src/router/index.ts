@@ -30,12 +30,15 @@ const routes: RouteRecordRaw[] = [
   { path: '/cluster/nodes/:id', component: () => import('../views/ClusterNodeDetail.vue') },
   { path: '/cluster/tokens', component: () => import('../views/ClusterTokens.vue') },
   { path: '/cluster/sync', component: () => import('../views/ClusterSync.vue') },
-  // Phase 7 rule management (`/rules-management`, `/rule-sources`,
-  // `/bot-management`) is deliberately unrouted: the three views call API routes
-  // that do not exist and silently fall back to demo data, and the subsystem they
-  // present (`waf_engine::RuleManager`) is never loaded by the daemon. The views
-  // remain in `src/views/` — this removes the entry, not the work. An old
-  // bookmark now lands on the catch-all below instead of a blank page.
+  // Phase 7 rule management: `/bot-management` is routed again now that
+  // `/api/bot-patterns` exists and `checks/bot.rs` reads a hot-reloadable store.
+  { path: '/bot-management', component: () => import('../views/BotManagement.vue') },
+  // `/rules-management` and `/rule-sources` stay unrouted: they call
+  // `/api/rules/registry` and `/api/rule-sources`, which do not exist, and the
+  // subsystem they present (`waf_engine::RuleManager`) is still never loaded by
+  // the daemon. The views remain in `src/views/` — this removes the entry, not
+  // the work. An old bookmark lands on the catch-all below instead of a blank
+  // page.
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
 ]
 

@@ -6,14 +6,14 @@ use crate::db::Database;
 use crate::error::StorageError;
 use crate::models::{
     AdminUser, AllowIp, AllowUrl, AttackLog, AttackLogQuery, AuditLogEntry, AuditLogQuery, BlockIp, BlockUrl,
-    Certificate, CreateAdminUser, CreateCertificate, CreateCrowdSecEvent, CreateCustomRule, CreateHost, CreateIpRule,
-    CreateLbBackend, CreateNotificationConfig, CreateSecurityEvent, CreateSemanticObservation, CreateSensitivePattern,
-    CreateTunnel, CreateUrlRule, CreateWasmPlugin, CrowdSecConfigRow, CrowdSecDecisionRow, CrowdSecEventQuery,
-    CrowdSecEventRow, CustomRule, GeoDistEntry, GeoStats, Host, HotlinkConfig, LabeledCount, LbBackend,
-    NotificationConfig, NotificationLog, RefreshToken, SecurityEvent, SecurityEventQuery, SemanticObservation,
-    SemanticObservationFilter, SemanticObservationQuery, SensitivePattern, StatsOverview, TimeSeriesPoint, TopEntry,
-    TunnelRow, UpdateCertificatePem, UpdateHost, UpdateNotificationConfig, UpsertCrowdSecConfig, UpsertHotlinkConfig,
-    WasmPluginRow,
+    BotPattern, Certificate, CreateAdminUser, CreateBotPattern, CreateCertificate, CreateCrowdSecEvent,
+    CreateCustomRule, CreateHost, CreateIpRule, CreateLbBackend, CreateNotificationConfig, CreateSecurityEvent,
+    CreateSemanticObservation, CreateSensitivePattern, CreateTunnel, CreateUrlRule, CreateWasmPlugin,
+    CrowdSecConfigRow, CrowdSecDecisionRow, CrowdSecEventQuery, CrowdSecEventRow, CustomRule, GeoDistEntry, GeoStats,
+    Host, HotlinkConfig, LabeledCount, LbBackend, NotificationConfig, NotificationLog, RefreshToken, SecurityEvent,
+    SecurityEventQuery, SemanticObservation, SemanticObservationFilter, SemanticObservationQuery, SensitivePattern,
+    StatsOverview, TimeSeriesPoint, TopEntry, TunnelRow, UpdateBotPattern, UpdateCertificatePem, UpdateHost,
+    UpdateNotificationConfig, UpsertCrowdSecConfig, UpsertHotlinkConfig, WasmPluginRow,
 };
 use crate::retention::{DEFAULT_DELETE_BATCH_SIZE, RetentionTable, prune_in_batches};
 use waf_common::notify::{NotificationEvent, NotificationEventKind};
@@ -1063,6 +1063,99 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(r.rows_affected() > 0)
+    }
+
+    // ─── Bot Patterns ─────────────────────────────────────────────────────────
+
+    /// Every operator bot pattern, newest last.
+    ///
+    /// `enabled_only` is what the engine passes on reload; the admin API passes
+    /// `false` so a disabled rule is still listed and can be switched back on.
+    pub async fn list_bot_patterns(&self, enabled_only: bool) -> Result<Vec<BotPattern>, StorageError> {
+        let rows = if enabled_only {
+            sqlx::query_as::<_, BotPattern>("SELECT * FROM bot_patterns WHERE enabled = TRUE ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query_as::<_, BotPattern>("SELECT * FROM bot_patterns ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?
+        };
+        Ok(rows)
+    }
+
+    /// How many patterns the engine would load right now. Used to enforce the
+    /// engine's `MAX_USER_PATTERNS` cap at the API boundary, so an operator is
+    /// told the set is full instead of writing a row that would be dropped on
+    /// the next reload.
+    pub async fn count_enabled_bot_patterns(&self) -> Result<i64, StorageError> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM bot_patterns WHERE enabled = TRUE")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// Insert one pattern. The regex itself is validated by the caller (the API
+    /// and the CLI both run `waf_engine::checks::bot::validate_user_pattern`),
+    /// which is where the compiler lives.
+    pub async fn create_bot_pattern(&self, req: CreateBotPattern) -> Result<BotPattern, StorageError> {
+        let row = sqlx::query_as::<_, BotPattern>(
+            r"INSERT INTO bot_patterns (name, pattern, pattern_type, action, description, enabled)
+               VALUES ($1,$2,$3,$4,$5,$6) RETURNING *",
+        )
+        .bind(&req.name)
+        .bind(&req.pattern)
+        .bind(req.pattern_type.as_deref().unwrap_or("ua"))
+        .bind(req.action.as_deref().unwrap_or("block"))
+        .bind(&req.description)
+        .bind(req.enabled.unwrap_or(true))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Patch one pattern. A `None` field keeps its stored value — including
+    /// `description`, which therefore cannot be cleared through this call.
+    pub async fn update_bot_pattern(&self, id: i32, req: UpdateBotPattern) -> Result<Option<BotPattern>, StorageError> {
+        let row = sqlx::query_as::<_, BotPattern>(
+            r"UPDATE bot_patterns
+                 SET name        = COALESCE($2, name),
+                     pattern     = COALESCE($3, pattern),
+                     action      = COALESCE($4, action),
+                     description = COALESCE($5, description),
+                     enabled     = COALESCE($6, enabled),
+                     updated_at  = NOW()
+               WHERE id = $1
+               RETURNING *",
+        )
+        .bind(id)
+        .bind(&req.name)
+        .bind(&req.pattern)
+        .bind(&req.action)
+        .bind(&req.description)
+        .bind(req.enabled)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn delete_bot_pattern(&self, id: i32) -> Result<bool, StorageError> {
+        let r = sqlx::query("DELETE FROM bot_patterns WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Delete by exact pattern text — what `prx-waf bot remove <pattern>` needs
+    /// when the operator has the regex but not the id. Returns the number of
+    /// rows removed.
+    pub async fn delete_bot_patterns_by_pattern(&self, pattern: &str) -> Result<u64, StorageError> {
+        let r = sqlx::query("DELETE FROM bot_patterns WHERE pattern = $1")
+            .bind(pattern)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
     }
 
     // ─── Hotlink Configs ──────────────────────────────────────────────────────

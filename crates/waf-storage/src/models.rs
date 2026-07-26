@@ -168,6 +168,48 @@ pub struct SensitivePattern {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Operator-managed bot detection pattern (`bot_patterns`).
+///
+/// Additive to the catalogue compiled into `waf-engine`: a row here adds a
+/// User-Agent signature or whitelists one, it never removes a built-in.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct BotPattern {
+    pub id: i32,
+    pub name: String,
+    pub pattern: String,
+    /// `ua` — the only surface the bot checker inspects. `ip` / `behavior` are
+    /// reserved by the 0007 schema and refused at the API boundary.
+    pub pattern_type: String,
+    /// `block` or `allow`.
+    pub action: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Create bot pattern request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateBotPattern {
+    pub name: String,
+    pub pattern: String,
+    pub pattern_type: Option<String>,
+    pub action: Option<String>,
+    pub description: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+/// Update bot pattern request. Every field is optional; omitted fields keep
+/// their stored value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateBotPattern {
+    pub name: Option<String>,
+    pub pattern: Option<String>,
+    pub action: Option<String>,
+    pub description: Option<String>,
+    pub enabled: Option<bool>,
+}
+
 /// Hotlink configuration entry
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct HotlinkConfig {

@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod auth;
+pub mod bot_patterns;
 pub mod cache_api;
 pub mod cluster;
 pub mod cluster_sync_hook;

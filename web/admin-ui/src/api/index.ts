@@ -125,6 +125,58 @@ export const customRulesApi = {
   delete: (id: string) => api.delete(`/api/custom-rules/${id}`),
 }
 
+// ─── Bot Detection ────────────────────────────────────────────────────────────
+// All five routes are admin-only, reads included: the list is a detection
+// signature set plus every whitelist that lets a request skip bot detection.
+export interface BotPattern {
+  /** Numeric row id for operator patterns; the rule id string for built-ins. */
+  id: number | string
+  /** Detection id as it appears in security events (`BOT-007`, `BOT-USER-3`). */
+  rule_id?: string
+  name: string
+  pattern: string
+  action: string
+  description?: string | null
+  enabled: boolean
+  source: 'builtin' | 'user'
+  category: 'good' | 'bad' | 'user'
+  created_at?: string
+  updated_at?: string
+}
+export interface BotPatternLimits {
+  max_user_patterns: number
+  max_pattern_len: number
+  max_name_len: number
+}
+export interface BotPatternList {
+  builtin: BotPattern[]
+  user: BotPattern[]
+  /** What the request path is running now — disabled rows are excluded. */
+  active_user_patterns: number
+  limits: BotPatternLimits
+}
+export interface BotTestMatch {
+  id: string
+  name: string
+  action: string
+  source: 'builtin' | 'user'
+}
+export interface BotTestResult {
+  user_agent: string
+  verdict: 'allow' | 'block' | 'no-match'
+  matches: BotTestMatch[]
+}
+export const botPatternsApi = {
+  list: () => api.get('/api/bot-patterns'),
+  create: (data: { name: string; pattern: string; action: string; description?: string }) =>
+    api.post('/api/bot-patterns', data),
+  update: (id: number, data: Partial<{ name: string; pattern: string; action: string; description: string; enabled: boolean }>) =>
+    api.put(`/api/bot-patterns/${id}`, data),
+  delete: (id: number) => api.delete(`/api/bot-patterns/${id}`),
+  /** Evaluate a UA with the engine's own matcher (JS RegExp cannot parse `(?i)`). */
+  test: (userAgent: string) => api.get('/api/bot-patterns/test', { params: { user_agent: userAgent } }),
+}
+
 // ─── Certificates ─────────────────────────────────────────────────────────────
 export const certsApi = {
   list: (hostCode?: string) => api.get('/api/certificates', { params: { host_code: hostCode } }),

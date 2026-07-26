@@ -14,7 +14,10 @@ pub mod sql_injection;
 pub mod xss;
 
 pub use anti_hotlink::AntiHotlinkCheck;
-pub use bot::BotCheck;
+pub use bot::{
+    BUILTIN_BAD_BOTS, BUILTIN_GOOD_BOTS, BotAction, BotCheck, BotMatch, BotPatternError, BotPatternLoadReport,
+    BuiltinBotRule, MAX_USER_PATTERN_LEN, MAX_USER_PATTERNS, UserBotPattern, user_rule_id, validate_user_pattern,
+};
 pub use cc::CcCheck;
 pub use content_security::{
     AttackKind, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict, EnforcementMode, InspectionScope,

@@ -27,13 +27,14 @@
         <NavItem to="/crowdsec-settings" :icon="Cloud">{{ $t('nav.csSettings') }}</NavItem>
         <NavItem to="/crowdsec-decisions" :icon="Ban">{{ $t('nav.csDecisions') }}</NavItem>
         <NavItem to="/crowdsec-stats" :icon="BarChart3">{{ $t('nav.csStats') }}</NavItem>
+        <div class="pt-2 pb-1 px-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ $t('nav.rules') }}</div>
+        <NavItem to="/bot-management" :icon="BotIcon">{{ $t('nav.botDetection') }}</NavItem>
         <!--
-          The "Rules" section (Rule Manager / Rule Sources / Bot Detection) is
-          intentionally not linked. Those three pages drive `/api/rules/registry`,
-          `/api/rule-sources` and `/api/bot-patterns`, none of which exist, and the
-          subsystem behind them (`waf_engine::RuleManager`) is never constructed by
-          the daemon — it is CLI-only. The views still live in `src/views/` so the
-          work is not lost; see the audit report for what wiring them would take.
+          Rule Manager and Rule Sources are still not linked: they drive
+          `/api/rules/registry` and `/api/rule-sources`, neither of which exists,
+          and the subsystem behind them (`waf_engine::RuleManager`) is never
+          constructed by the daemon — it is CLI-only. The views still live in
+          `src/views/` so the work is not lost.
         -->
       </nav>
       <div class="px-4 py-3 border-t border-gray-700 space-y-2">
@@ -97,6 +98,7 @@ import {
   Ban,
   BarChart3,
   ScrollText,
+  Bot as BotIcon,
   Languages,
   Network,
   Key,

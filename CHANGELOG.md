@@ -54,6 +54,49 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Bot detection is configurable at runtime.** `checks/bot.rs` was two
+  compile-time `RegexSet`s, so the only way to block a User-Agent was to edit
+  Rust and ship a binary. It now carries a second, operator-owned layer backed
+  by the `bot_patterns` table — which migration 0007 created and nothing had
+  ever read or written.
+
+  A pattern added through `POST /api/bot-patterns` or `prx-waf bot add` is
+  compiled, published to the request path through an `ArcSwapOption`, and
+  matching on the **next request**; no restart, no reload of anything else. The
+  request-path read is wait-free, and with no operator patterns configured it is
+  one atomic load — the cost a deployment that never opens the page has always
+  paid. Nothing is ever compiled on the request path: a pattern is compiled when
+  it is saved (an invalid regex is a `400` naming the syntax error, never a
+  stored row that fails later) and again when the set is rebuilt.
+
+  Operator patterns are **additive**. Precedence is operator `allow` → operator
+  `block` → built-in allow → built-in block, so a whitelist can clear a false
+  positive the built-ins produce, and an explicit block overrides the
+  search-engine bypass. Switching an individual built-in off is not possible;
+  that is what `rule_overrides` is for and it remains unimplemented.
+
+  Because operators supply the regexes, the set is bounded on the three axes
+  that matter: 500 bytes per pattern, 512 enabled patterns, and a 64 KiB
+  compiled-program budget per pattern (16 MiB combined). The `regex` crate does
+  not backtrack, so matching is linear in the User-Agent length and independent
+  of the pattern count; the limits exist to refuse patterns that ask for an
+  enormous automaton, not to bound match time.
+
+  The built-in catalogue is now data (`BUILTIN_GOOD_BOTS` / `BUILTIN_BAD_BOTS`)
+  rather than an inline array of pattern strings, so the API, the admin UI and
+  `prx-waf bot list` enumerate the same 32 signatures (19 allow, 13 block) the
+  `RegexSet`s are built from — the listed catalogue is the running one by
+  construction. Detection ids are unchanged (`BOT-001`…); operator hits report
+  `BOT-USER-<id>`.
+
+  `GET /api/bot-patterns/test?user_agent=…` evaluates a UA with the engine's own
+  matcher. The admin page used to test in the browser with JavaScript's
+  `RegExp`, which cannot parse the inline `(?i)` every shipped pattern starts
+  with, and so reported "no match" for User-Agents the WAF blocks.
+
+  Migration 0015 adds `bot_patterns.name`: 0007 shipped the table with a
+  500-character `pattern` and a free-form `description` and no label.
+
 - **The `audit_log` table finally has a writer, and the admin UI a page to read
   it.** The table, a `create_audit_log` function, a `GET /api/audit-log`
   handler and a 365-day retention policy had all been in place; the function
@@ -83,13 +126,14 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Removed
 
-- **Three admin pages that could not work are no longer reachable**: Bot
-  Detection, Rule Sources and Rule Manager. Their routes existed and their
+- **Two admin pages that could not work are no longer reachable**: Rule Sources
+  and Rule Manager. (Bot Detection was unrouted alongside them and is routed
+  again above, now that it has a backend.) Their routes existed and their
   screens rendered, but no backend route did — `/api/bot-patterns`,
   `/api/rule-sources`, `/api/rules/registry`, `/api/rules/reload` and
   `/api/rules/import` all answer 404 — so each fell back to hardcoded demo
   data, and Rule Sources' built-in counts were simply invented (15/31/19
-  against a real 33 bot and 22 scanner rules). All three also called bare
+  against a real 32 bot and 36 scanner patterns). All three also called bare
   `axios` rather than the configured instance, so they carried no JWT and
   would have been rejected even if the routes had existed.
 
@@ -112,8 +156,16 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   exited 0; `bot add` additionally told the operator to drop a YAML file into
   `rules/`, which the daemon never reads. Each now explains what does work
   instead — custom rules, which are stored in the database and do reach the
-  engine — and exits non-zero. `bot list`, `bot test`, `sources list` and
-  `rules list` do real work and are untouched.
+  engine — and exits non-zero. `sources list` and `rules list` do real work and
+  are untouched.
+
+  `bot add` and `bot remove` are implemented for real above and write to
+  `bot_patterns`; they say plainly that an already-running proxy keeps its
+  snapshot until `POST /api/reload` or a restart, which is the difference
+  between them and the admin API. `bot list` and `bot test` now read the
+  running semantics — the built-in catalogue plus the operator rows, with
+  precedence applied — instead of the `rules/` YAML catalogue the daemon never
+  loads.
 
 - **Notifications actually fire now.** Everything around
   `dispatch_notification` existed — config table, encrypted storage, rate

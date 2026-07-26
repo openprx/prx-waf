@@ -16,8 +16,9 @@ use crate::audit_log::{AuditLogSink, spawn_worker_if_runtime as spawn_audit_work
 use crate::block_page::render_block_page;
 use crate::checker::{RuleStore, check_ip_blacklist, check_ip_whitelist, check_url_blacklist, check_url_whitelist};
 use crate::checks::{
-    AntiHotlinkCheck, BotCheck, CcCheck, Check, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict,
-    GeoCheck, InspectionScope, OWASPCheck, RuntimeContentSecurityConfig, ScannerCheck, SemanticAction, SensitiveCheck,
+    AntiHotlinkCheck, BotAction, BotCheck, CcCheck, Check, ContentInspectionState, ContentSecuritySubsystem,
+    ContentVerdict, GeoCheck, InspectionScope, OWASPCheck, RuntimeContentSecurityConfig, ScannerCheck, SemanticAction,
+    SensitiveCheck, UserBotPattern,
 };
 use crate::community::{CommunityChecker, CommunityReporter, RequestInfo};
 use crate::crowdsec::{AppSecClient, AppSecResult, CrowdSecChecker, FallbackAction, appsec_to_detection};
@@ -28,6 +29,11 @@ use crate::rules::registry::RuleRegistry;
 use crate::semantic_sink::{
     EVENT_CHANNEL_CAPACITY, OBSERVATION_CHANNEL_CAPACITY, SemanticObservationSink, spawn_worker_if_runtime,
 };
+
+/// The only `bot_patterns.pattern_type` the bot checker inspects. The 0007
+/// schema also reserves `ip` and `behavior`; IP-based blocking is the IP rule
+/// lists' job and behavioural detection is CC's, so neither belongs here.
+const BOT_PATTERN_TYPE_UA: &str = "ua";
 
 /// WAF engine configuration
 #[derive(Debug, Clone, Default)]
@@ -72,6 +78,14 @@ pub struct WafEngine {
     /// preventing the double-counting that would otherwise occur when a request
     /// with a body is inspected again in [`inspect_body`].
     cc_check: CcCheck,
+    /// Bot checker handle, held **in addition to** the copy inside
+    /// `header_checkers`.
+    ///
+    /// [`BotCheck`] is a cloneable handle over one shared `ArcSwapOption`, so
+    /// this is the same pattern storage the request path reads — not a second
+    /// copy. It is kept here because the checker vector is `Box<dyn Check>` and
+    /// a reload needs the concrete type to publish a new snapshot.
+    bot_check: BotCheck,
     /// Header-phase-only detectors (scanner / bot). Not re-run for body content.
     header_checkers: Vec<Box<dyn Check>>,
     /// Content-security subsystem — owns the content-type detectors
@@ -147,8 +161,11 @@ impl WafEngine {
         // CC is a dedicated field (single counting point — see field docs).
         let cc_check = CcCheck::new();
 
-        // Header-phase-only detectors.
-        let header_checkers: Vec<Box<dyn Check>> = vec![Box::new(ScannerCheck::new()), Box::new(BotCheck::new())];
+        // Header-phase-only detectors. The bot checker goes in twice by handle
+        // (see the `bot_check` field docs) so `reload_rules` can republish the
+        // operator pattern set that the vector's copy is reading.
+        let bot_check = BotCheck::new();
+        let header_checkers: Vec<Box<dyn Check>> = vec![Box::new(ScannerCheck::new()), Box::new(bot_check.clone())];
 
         // Content-type detectors — owned by the content-security subsystem,
         // re-used by both the header and body phases (same frozen order). The
@@ -174,6 +191,7 @@ impl WafEngine {
             db,
             config,
             cc_check,
+            bot_check,
             header_checkers,
             content_security,
             owasp,
@@ -291,7 +309,63 @@ impl WafEngine {
             self.hotlink.set_config(&row.host_code, config);
         }
 
+        // Reload operator bot patterns
+        self.reload_bot_patterns().await?;
+
         Ok(())
+    }
+
+    /// Rebuild the operator bot-pattern layer from the database and publish it
+    /// to the request path.
+    ///
+    /// Split out of [`Self::reload_rules`] so a bot-pattern mutation costs one
+    /// small query instead of a full rule reload (IP/URL lists, every custom
+    /// rule, every sensitive pattern, every hotlink config). Rows that are
+    /// disabled, that name a `pattern_type` the bot checker does not inspect, or
+    /// whose `action` the request path cannot carry out are dropped here with a
+    /// warning — the API refuses to create them, so reaching this branch means
+    /// the row was written straight into the database.
+    pub async fn reload_bot_patterns(&self) -> anyhow::Result<()> {
+        let rows = self.db.list_bot_patterns(true).await?;
+        let total = rows.len();
+        let patterns: Vec<UserBotPattern> = rows
+            .into_iter()
+            .filter_map(|row| {
+                if row.pattern_type != BOT_PATTERN_TYPE_UA {
+                    warn!(
+                        "ignoring bot pattern {} ({:?}): pattern_type {:?} is not inspected by the bot checker",
+                        row.id, row.name, row.pattern_type
+                    );
+                    return None;
+                }
+                let Some(action) = BotAction::parse(&row.action) else {
+                    warn!(
+                        "ignoring bot pattern {} ({:?}): action {:?} is not one the request path can carry out",
+                        row.id, row.name, row.action
+                    );
+                    return None;
+                };
+                Some(UserBotPattern {
+                    id: row.id,
+                    name: row.name,
+                    pattern: row.pattern,
+                    action,
+                })
+            })
+            .collect();
+
+        let report = self.bot_check.load_user_patterns(patterns);
+        debug!(
+            "Bot patterns reloaded: {} active, {} unusable, {} rows read",
+            report.loaded, report.rejected, total
+        );
+        Ok(())
+    }
+
+    /// The bot checker the request path is running, so the admin API can list
+    /// and test against the live pattern set rather than a second copy.
+    pub const fn bot_check(&self) -> &BotCheck {
+        &self.bot_check
     }
 
     // ── Cluster data-plane sync (worker consume side) ───────────────────────────

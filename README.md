@@ -404,6 +404,9 @@ Content-Type: application/json
 | DELETE | `/api/custom-rules/:id` | Delete custom rule |
 | GET/POST | `/api/sensitive-patterns` | List / add sensitive word patterns |
 | DELETE | `/api/sensitive-patterns/:id` | Delete sensitive pattern |
+| GET/POST | `/api/bot-patterns` | Built-in bot catalogue + operator patterns / add one (admin-only, reads included) |
+| PUT/DELETE | `/api/bot-patterns/:id` | Update / delete an operator bot pattern |
+| GET | `/api/bot-patterns/test` | Evaluate a `user_agent` against the live rule set |
 | GET/POST | `/api/hotlink-config` | Get / set anti-hotlink config |
 | GET/POST | `/api/lb-backends` | List / add load-balancer backends |
 | DELETE | `/api/lb-backends/:id` | Delete LB backend |

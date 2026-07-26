@@ -16,9 +16,10 @@ use waf_api::{AppState, start_api_server};
 use waf_common::config::{ApiConfig, AppConfig, ConfigError, SecurityConfig, apply_env_overrides, load_config};
 use waf_engine::checks::ResponseCheckSet;
 use waf_engine::{
-    CrowdSecClient, CrowdSecConfig, EnforcementMode, ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource,
-    RuleManager, RuntimeContentSecurityConfig, WafEngine, WafEngineConfig, XdbUpdater, cache_policy_from_str,
-    init_community, init_crowdsec, spawn_auto_updater, spawn_ip_feed_sync,
+    BUILTIN_BAD_BOTS, BUILTIN_GOOD_BOTS, BotAction, BotCheck, CrowdSecClient, CrowdSecConfig, EnforcementMode,
+    ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource, MAX_USER_PATTERNS, RuleManager,
+    RuntimeContentSecurityConfig, UserBotPattern, WafEngine, WafEngineConfig, XdbUpdater, cache_policy_from_str,
+    init_community, init_crowdsec, spawn_auto_updater, spawn_ip_feed_sync, validate_user_pattern,
 };
 use waf_storage::Database;
 
@@ -245,19 +246,25 @@ enum SourcesCommands {
 /// Bot detection sub-commands
 #[derive(Subcommand, Debug)]
 enum BotCommands {
-    /// List known bot signatures
+    /// List bot signatures: the compiled-in catalogue plus operator patterns
     List,
-    /// Add a bot pattern
+    /// Add an operator bot pattern (stored in the database)
     Add {
         /// Regex pattern to match against User-Agent
         pattern: String,
-        /// Action: block | log | captcha | allow
+        /// Action: block | allow
         #[arg(long, default_value = "block")]
         action: String,
+        /// Short label shown in listings (defaults to the pattern)
+        #[arg(long)]
+        name: Option<String>,
+        /// Free-form note about why this pattern exists
+        #[arg(long)]
+        description: Option<String>,
     },
-    /// Remove a bot pattern
+    /// Remove an operator bot pattern by numeric id or exact pattern text
     Remove {
-        /// Pattern to remove
+        /// Numeric id (the digits after `BOT-USER-`) or the exact pattern
         pattern: String,
     },
     /// Test a User-Agent string against all bot rules
@@ -359,7 +366,10 @@ fn main() -> anyhow::Result<()> {
             run_sources_cmd(sub, &config)?;
         }
         Commands::Bot(sub) => {
-            run_bot_cmd(sub, &config)?;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(run_bot_cmd(sub, &config))?;
         }
         Commands::Geoip(sub) => {
             tokio::runtime::Builder::new_current_thread()
@@ -737,83 +747,183 @@ fn rule_toggle_unimplemented(verb: &str, rule_id: &str) -> String {
     )
 }
 
-/// The one fact every `sources` / `bot` failure message has to carry.
+/// The one fact every `sources` / `rules` failure message has to carry.
 ///
 /// `[rules]` — `dir`, `sources`, `enable_builtin_*`, `hot_reload` — is read by
 /// these CLI subcommands and by nothing else: the daemon never constructs a
 /// [`RuleManager`]. Telling an operator to edit `[[rules.sources]]` without
 /// saying so would trade one false promise for another.
-const RULE_SOURCES_ARE_CLI_ONLY: &str = "Note: `[rules]` (dir / sources / builtin toggles) is consulted by the `rules`, `sources` and \
-     `bot` CLI subcommands only. The running proxy compiles its OWASP CRS set from \
-     `rules/owasp-crs/` at startup and takes every operator-managed rule (hosts, IP/URL lists, \
-     custom Rhai rules, sensitive patterns) from the database.";
+const RULE_SOURCES_ARE_CLI_ONLY: &str = "Note: `[rules]` (dir / sources / builtin toggles) is consulted by the `rules` and `sources` \
+     CLI subcommands only. The running proxy compiles its OWASP CRS set from `rules/owasp-crs/` \
+     at startup and takes every operator-managed rule (hosts, IP/URL lists, custom Rhai rules, \
+     sensitive patterns, bot patterns) from the database.";
 
 // ── Bot commands ──────────────────────────────────────────────────────────────
 
-#[allow(clippy::significant_drop_tightening)]
-fn run_bot_cmd(cmd: BotCommands, config: &AppConfig) -> anyhow::Result<()> {
+/// What every mutating `bot` sub-command has to say.
+///
+/// The CLI writes to the database directly; a `prx-waf run` process already
+/// serving traffic is holding its own compiled snapshot and will not notice.
+/// Saying "added" without saying this is how an operator ends up believing a
+/// rule is live when it is not.
+const BOT_RELOAD_NOTE: &str = "A running proxy keeps its current snapshot until it reloads. \
+     Apply it with `POST /api/reload` (Admin UI → any rule change triggers one) or restart the \
+     process. Changes made through the Admin UI / `POST /api/bot-patterns` take effect \
+     immediately and need none of this.";
+
+/// Load the operator bot patterns into a detached [`BotCheck`], the way the
+/// engine does at startup, so `bot list` / `bot test` report the *running*
+/// semantics (precedence, whitelisting, skipped rows) and not a re-implementation.
+async fn bot_checker_from_db(
+    db: &waf_storage::Database,
+) -> anyhow::Result<(BotCheck, Vec<waf_storage::models::BotPattern>)> {
+    let rows = db.list_bot_patterns(false).await?;
+    let patterns: Vec<UserBotPattern> = rows
+        .iter()
+        .filter(|r| r.enabled && r.pattern_type == "ua")
+        .filter_map(|r| {
+            BotAction::parse(&r.action).map(|action| UserBotPattern {
+                id: r.id,
+                name: r.name.clone(),
+                pattern: r.pattern.clone(),
+                action,
+            })
+        })
+        .collect();
+    let checker = BotCheck::new();
+    checker.load_user_patterns(patterns);
+    Ok((checker, rows))
+}
+
+async fn run_bot_cmd(cmd: BotCommands, config: &AppConfig) -> anyhow::Result<()> {
+    let db = waf_storage::Database::connect(&config.storage.database_url, config.storage.max_connections).await?;
+
     match cmd {
         BotCommands::List => {
-            let mut manager = RuleManager::new(&config.rules);
-            manager.load_all()?;
-            let reg = manager.registry.read();
-            let bot_rules = reg.filter_by_category("bot");
+            let (_, rows) = bot_checker_from_db(&db).await?;
 
-            println!("{:<20} {:<40} {:<8} Tags", "ID", "Name", "Action");
-            println!("{}", "-".repeat(100));
-            for rule in bot_rules {
+            println!("{:<16} {:<46} {:<8} {:<8} Pattern", "ID", "Name", "Action", "Source");
+            println!("{}", "-".repeat(120));
+            for r in BUILTIN_GOOD_BOTS.iter().chain(BUILTIN_BAD_BOTS) {
                 println!(
-                    "{:<20} {:<40} {:<8} {}",
-                    truncate(&rule.id, 19),
-                    truncate(&rule.name, 39),
-                    rule.action,
-                    rule.tags.join(", "),
+                    "{:<16} {:<46} {:<8} {:<8} {}",
+                    truncate(r.id, 15),
+                    truncate(r.name, 45),
+                    r.action.as_str(),
+                    "builtin",
+                    r.pattern,
                 );
             }
+            for r in &rows {
+                let source = if r.enabled { "user" } else { "user-off" };
+                println!(
+                    "{:<16} {:<46} {:<8} {:<8} {}",
+                    truncate(&waf_engine::user_rule_id(r.id), 15),
+                    truncate(&r.name, 45),
+                    truncate(&r.action, 7),
+                    source,
+                    r.pattern,
+                );
+            }
+            println!();
+            println!(
+                "{} built-in signatures ({} allow, {} block), {} operator pattern(s) — {} enabled.",
+                BUILTIN_GOOD_BOTS.len() + BUILTIN_BAD_BOTS.len(),
+                BUILTIN_GOOD_BOTS.len(),
+                BUILTIN_BAD_BOTS.len(),
+                rows.len(),
+                rows.iter().filter(|r| r.enabled).count(),
+            );
         }
 
-        BotCommands::Add { pattern, action } => {
-            anyhow::bail!(
-                "`bot add` is not implemented — pattern {pattern:?} ({action}) was NOT added.\n\
-                 Bot detection is compiled in (`waf-engine` `checks/bot.rs`, fixed `RegexSet`s) and \
-                 the `builtin-bot` catalogue this CLI lists is read-only; there is no store to add \
-                 a pattern to.\n\
-                 To block a User-Agent on live traffic today, create a custom rule — those are \
-                 stored in the database and hot-loaded into the running engine:\n\
-                 \x20 Admin UI → Custom Rules, or POST /api/custom-rules with a Rhai script \
-                 matching `request.headers[\"user-agent\"]`.\n\n\
-                 {RULE_SOURCES_ARE_CLI_ONLY}"
+        BotCommands::Add {
+            pattern,
+            action,
+            name,
+            description,
+        } => {
+            // Compile before writing: the same check the admin API runs, so a
+            // bad regex is a non-zero exit here rather than a row the engine
+            // silently skips forever.
+            if let Err(e) = validate_user_pattern(&pattern) {
+                anyhow::bail!("pattern {pattern:?} was NOT added: {e}");
+            }
+            let parsed = BotAction::parse(&action).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pattern {pattern:?} was NOT added: unsupported action {action:?}. Only \
+                     \"block\" and \"allow\" are implemented — detect-without-blocking is a \
+                     per-host setting (log_only_mode), not a per-rule one, and there is no \
+                     challenge/captcha subsystem."
+                )
+            })?;
+            let enabled = db.count_enabled_bot_patterns().await?;
+            if enabled >= i64::try_from(MAX_USER_PATTERNS).unwrap_or(i64::MAX) {
+                anyhow::bail!(
+                    "pattern {pattern:?} was NOT added: the operator set is full \
+                     ({MAX_USER_PATTERNS} enabled patterns). Disable or remove one first."
+                );
+            }
+
+            let name = name.unwrap_or_else(|| truncate(&pattern, 100));
+            let row = db
+                .create_bot_pattern(waf_storage::models::CreateBotPattern {
+                    name,
+                    pattern,
+                    pattern_type: Some("ua".to_string()),
+                    action: Some(parsed.as_str().to_string()),
+                    description,
+                    enabled: Some(true),
+                })
+                .await?;
+            println!(
+                "Added {} — {} ({}): {}",
+                waf_engine::user_rule_id(row.id),
+                row.name,
+                row.action,
+                row.pattern
             );
+            println!("{BOT_RELOAD_NOTE}");
         }
 
         BotCommands::Remove { pattern } => {
-            anyhow::bail!(
-                "`bot remove` is not implemented — pattern {pattern:?} was NOT removed.\n\
-                 The built-in bot signatures are compiled into the binary and cannot be removed at \
-                 runtime. Delete a custom rule instead (Admin UI → Custom Rules, or \
-                 DELETE /api/custom-rules/{{id}}).\n\n\
-                 {RULE_SOURCES_ARE_CLI_ONLY}"
-            );
+            // Accept either the numeric row id (what `bot list` shows after the
+            // `BOT-USER-` prefix) or the exact pattern text.
+            let removed = if let Ok(id) = pattern.parse::<i32>() {
+                u64::from(db.delete_bot_pattern(id).await?)
+            } else {
+                db.delete_bot_patterns_by_pattern(&pattern).await?
+            };
+            if removed == 0 {
+                anyhow::bail!(
+                    "no operator bot pattern matched {pattern:?} — nothing was removed.\n\
+                     Give the numeric id from `prx-waf bot list` (the digits after `BOT-USER-`) or \
+                     the exact pattern text. Built-in signatures are compiled into the binary and \
+                     cannot be removed; add an `allow` pattern to whitelist a User-Agent they catch."
+                );
+            }
+            println!("Removed {removed} operator bot pattern(s) matching {pattern:?}.");
+            println!("{BOT_RELOAD_NOTE}");
         }
 
         BotCommands::Test { user_agent } => {
-            let mut manager = RuleManager::new(&config.rules);
-            manager.load_all()?;
-            let reg = manager.registry.read();
-            let bot_rules = reg.filter_by_category("bot");
-
-            let mut matched = false;
-            for rule in bot_rules {
-                if let Some(pattern) = &rule.pattern
-                    && let Ok(re) = regex::Regex::new(pattern.as_str())
-                    && re.is_match(user_agent.as_str())
-                {
-                    println!("MATCH: {} — {} (action: {})", rule.id, rule.name, rule.action);
-                    matched = true;
-                }
-            }
-            if !matched {
+            let (checker, _) = bot_checker_from_db(&db).await?;
+            let matches = checker.explain(&user_agent);
+            if matches.is_empty() {
                 println!("No bot rules matched: {user_agent}");
+            } else {
+                for m in &matches {
+                    let source = if m.builtin { "builtin" } else { "user" };
+                    println!("MATCH: {} — {} (action: {}, {source})", m.id, m.name, m.action.as_str());
+                }
+                // Precedence, not just membership — mirrors `BotCheck::check`.
+                if let Some(first) = matches.first() {
+                    let verdict = match first.action {
+                        BotAction::Allow => "ALLOW (whitelisted; bot detection stops here)",
+                        BotAction::Block => "BLOCK",
+                    };
+                    println!();
+                    println!("Verdict: {verdict} — decided by {}", first.id);
+                }
             }
         }
     }

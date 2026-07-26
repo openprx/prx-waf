@@ -16,6 +16,9 @@ use tracing::{info, warn};
 
 use crate::audit::audit_log_middleware;
 use crate::auth::{login, logout, refresh_token, totp_disable, totp_setup, totp_verify};
+use crate::bot_patterns::{
+    create_bot_pattern, delete_bot_pattern, list_bot_patterns, test_bot_pattern, update_bot_pattern,
+};
 use crate::cache_api::{cache_flush, cache_flush_host, cache_flush_key, cache_stats};
 use crate::cluster::{cluster_status, generate_join_token, get_cluster_node, list_cluster_nodes, remove_cluster_node};
 use crate::crowdsec::{
@@ -149,6 +152,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Custom rules
         .route("/api/custom-rules", post(create_custom_rule))
         .route("/api/custom-rules/{id}", delete(delete_custom_rule))
+        // Bot detection patterns — reads are admin-only too, deliberately: the
+        // list is a detection signature set plus every whitelist that lets a
+        // request skip bot detection, which is an evasion recipe in the hands of
+        // a compromised low-privilege account. See `bot_patterns.rs`.
+        .route("/api/bot-patterns", get(list_bot_patterns).post(create_bot_pattern))
+        .route("/api/bot-patterns/test", get(test_bot_pattern))
+        .route(
+            "/api/bot-patterns/{id}",
+            put(update_bot_pattern).delete(delete_bot_pattern),
+        )
         // Sensitive patterns
         .route("/api/sensitive-patterns", post(create_sensitive_pattern))
         .route("/api/sensitive-patterns/{id}", delete(delete_sensitive_pattern))
