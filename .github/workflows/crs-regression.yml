@@ -98,7 +98,7 @@ jobs:
           --health-retries 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -107,7 +107,7 @@ jobs:
         with:
           key: crs-regression
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -117,7 +117,7 @@ jobs:
       # The pinned CRS checkout and the two Go tools are the slow part and never
       # change between runs at a fixed pin, so cache them on the pins themselves.
       - name: Cache CRS corpus and go-ftw
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ${{ runner.temp }}/ftw-work-${{ matrix.mode }}/coreruleset-v4.25.0
@@ -145,7 +145,7 @@ jobs:
 
       - name: Upload reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crs-regression-${{ matrix.mode }}-pl${{ matrix.pl }}
           path: ${{ runner.temp }}/ftw-work-${{ matrix.mode }}/reports/
