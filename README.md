@@ -363,6 +363,40 @@ HostRouter → Upstream (with load balancing)
 
 ---
 
+## Performance
+
+Measured with [`tests/perf/run.sh`](tests/perf/run.sh); full numbers, conditions
+and caveats in [`tests/perf/RESULTS.md`](tests/perf/RESULTS.md).
+
+On an AMD Ryzen 9 5900HX (16 cores), shipping default configuration, plaintext
+HTTP/1.1, `oha` at 50 connections against a near-zero-work origin:
+
+| workload | origin | prx-waf, no detection | prx-waf, shipping default | added latency (p50, unsaturated) |
+|---|--:|--:|--:|--:|
+| small GET | 171,856 rps | 24,987 rps | **3,918 rps** | **+0.94 ms** |
+| 1 KiB JSON POST | 161,335 rps | 18,677 rps | **771 rps** | **+5.05 ms** |
+| 64 KiB multipart upload | 81,185 rps | 7,546 rps | **47 rps** | +84 ms |
+| 1 MiB body POST | 26,680 rps | 912 rps | **9 rps** | not measured |
+
+Three things an operator should know before deploying:
+
+* **These are per-core numbers, and one core is all you get.** The proxy service
+  runs on a single Pingora worker thread (`Server::new(None)` → `threads: 1`)
+  and there is no configuration key to change it. Scale horizontally.
+* **Cost is driven by request-body size, not request rate.** A small GET costs
+  ~216 µs of CPU; a 64 KiB upload costs ~21 ms. Almost all of that is the Lane 1
+  regex detectors, and 94% of *that* is the `sqli` and `xss` detectors.
+* **Sustained attack traffic grows memory 4–7×** (110 MiB → 750 MiB in ten
+  seconds), because every blocked request writes to the database.
+
+Resource limits, queue capacities, timeouts and what happens when each is
+exceeded are documented separately in [`docs/dos-budget.md`](docs/dos-budget.md).
+
+This is deliberately **not** a CI gate — see
+[`tests/perf/README.md`](tests/perf/README.md#why-this-is-not-a-ci-gate).
+
+---
+
 ## API Reference
 
 The management API listens on `0.0.0.0:9527` by default (as shipped in `configs/default.toml`; the code-level struct default is `127.0.0.1:9527`, but every documented run path here loads `configs/default.toml`, which overrides it — see `[security] admin_ip_allowlist` to restrict access). All endpoints (except `/api/auth/login`) require a JWT Bearer token.
