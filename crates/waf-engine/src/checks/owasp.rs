@@ -1129,7 +1129,9 @@ struct RequestView<'a> {
     /// instead.
     query: Cow<'a, str>,
     /// `REQUEST_BODY` / `XML:/*`: the body preview as lossy UTF-8, then percent-
-    /// and `+`-decoded (a multipart envelope is reduced to its payloads first).
+    /// and `+`-decoded.  A multipart envelope is reduced first to the parts that
+    /// are *parameters* — see [`multipart::Multipart::payload_surface`], which
+    /// is where the file parts' contents are dropped and why.
     /// Per-parameter `ARGS_POST` members come from [`Self::args_post`].
     body: Cow<'a, str>,
     /// `true` when the request body is `application/x-www-form-urlencoded`, so
@@ -1172,7 +1174,8 @@ impl<'a> RequestView<'a> {
         let multipart = content_type
             .and_then(multipart_boundary)
             .map(|boundary| multipart::parse(&ctx.body_preview, boundary));
-        // A multipart envelope is not `ARGS`; see `Multipart::payload_surface`.
+        // A multipart envelope is not `ARGS`, and a file part inside one is not
+        // `ARGS` even by approximation; see `Multipart::payload_surface`.
         //
         // The one case that must *not* take that path is an envelope nothing
         // could be parsed out of — a `multipart/form-data` content type over a
@@ -6933,8 +6936,8 @@ rules:
         let view = RequestView::new(&ctx);
         assert_eq!(
             view.body.as_ref(),
-            "file\nreport.pdf\n%PDF-1.4 hello",
-            "part payloads and the quoted parameter values, not the envelope"
+            "file\nreport.pdf",
+            "the quoted parameter values, not the envelope and not the file's content"
         );
 
         let checker = OWASPCheck::from_directory(&crs_dir());
@@ -7086,6 +7089,99 @@ rules:
                 );
             }
         }
+    }
+
+    /// A real binary upload is not an attack, and the rule set must be able to
+    /// say so about bytes it has no say over.
+    ///
+    /// [`Self::benign_uploads_are_not_blocked`] uses hand-written stand-ins for
+    /// file content (`%PDF-1.7 ...`), which is exactly the content a false
+    /// positive hides behind: the failure mode is *density*, not any particular
+    /// byte. A JPEG's entropy-coded segment is a uniform draw over 0..=255, so
+    /// every two-byte SQL operator (`||`, `<<`, `--`, `';`) and every shell
+    /// construct (`${`, `$(`, backtick) occurs in it as a matter of arithmetic —
+    /// a 16 KB file contains each of them several times over.
+    ///
+    /// The fixture below is that argument made deterministic: every byte value,
+    /// in an order that plants the specific sequences the PL1/PL2 SQL injection,
+    /// RCE, PHP and XSS rules hunt for. Before file content was withheld from the
+    /// parameter surface this blocked at PL1, and so did every real PDF and JPEG
+    /// measured against it.
+    #[test]
+    fn a_binary_upload_is_not_an_attack() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        // The literals are what a regex engine finds in high-entropy bytes, not
+        // an attempt at an attack: an operator, a comment introducer, a brace
+        // expansion, a variable interpolation, a tag opener, a NUL.
+        let mut content = String::from("||<<--';${$(`\0<x\"*,z/*!*/#\n\x0b~7@@v If( 0x41414141");
+        for byte in 0u8..=255 {
+            content.push(char::from(byte));
+        }
+        content.push_str(&content.clone());
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"report.pdf\"\r\n\
+             Content-Type: application/pdf\r\n\r\n{content}\r\n--b--\r\n"
+        );
+        for paranoia in [1u8, 2, 4] {
+            let ctx = multipart_ctx("b", &body, paranoia);
+            assert!(
+                checker.check(&ctx).is_none(),
+                "PL{paranoia}: binary upload blocked: {:?}",
+                checker.check(&ctx)
+            );
+        }
+
+        // The same bytes submitted as an ordinary form field are a parameter,
+        // and a parameter carrying them is exactly what these rules are for.
+        // This half is what stops the fix above from degenerating into "stop
+        // looking at request bodies".
+        let as_field = format!("--b\r\nContent-Disposition: form-data; name=\"doc\"\r\n\r\n{content}\r\n--b--\r\n");
+        assert!(
+            checker.check(&multipart_ctx("b", &as_field, 1)).is_some(),
+            "a non-file part must keep its coverage"
+        );
+    }
+
+    /// Moving a payload into a file part is not an evasion channel.
+    ///
+    /// It is the first thing to check when a detection surface is narrowed, and
+    /// the answer is that the narrowing tracks how the *origin* parses the same
+    /// envelope: `filename=` is what puts a part in PHP's `$_FILES` instead of
+    /// `$_POST`, and the equivalent split in Rails, Django, multer and Spring.
+    /// A payload the application will never evaluate as a parameter is not an
+    /// injection into that application — what it becomes is a stored file, and
+    /// the rules that police stored files read the declared name, which is
+    /// still fully inspected.
+    #[test]
+    fn a_file_part_is_not_a_hiding_place_for_the_rules_that_matter() {
+        let checker = OWASPCheck::from_directory(&crs_dir());
+        let upload = |disposition: &str, payload: &str| {
+            format!("--b\r\nContent-Disposition: form-data; {disposition}\r\n\r\n{payload}\r\n--b--\r\n")
+        };
+        // Every one of these is judged on the *file name*, which is where the
+        // upload attacks that matter actually live.
+        for disposition in [
+            "name=\"f\"; filename=\"shell.php\"",
+            "name=\"f\"; filename=\"cmd.jsp\"",
+            "name=\"f\"; filename=\"../../etc/passwd\"",
+            "name=\"f\"; filename=\"a.php;.jpg\"",
+            "name=\"f\"; filename=\"x'or 1=1--.png\"",
+        ] {
+            let body = upload(disposition, "harmless bytes");
+            assert!(
+                checker.check(&multipart_ctx("b", &body, 1)).is_some(),
+                "PL1: hostile upload not caught: {disposition}"
+            );
+        }
+        // And a part with no `filename=` is a parameter however it is dressed:
+        // a `Content-Type: application/pdf` on a non-file part does not buy
+        // silence, because the origin will not treat it as a file either.
+        let disguised = "--b\r\nContent-Disposition: form-data; name=\"c\"\r\nContent-Type: application/pdf\r\n\r\n\
+             <?php system($_GET['c']); ?>\r\n--b--\r\n";
+        assert!(
+            checker.check(&multipart_ctx("b", disguised, 1)).is_some(),
+            "a web shell in a non-file part must still be caught"
+        );
     }
 
     /// A `multipart/form-data` content type over a body that carries no such

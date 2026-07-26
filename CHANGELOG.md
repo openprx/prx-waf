@@ -9,6 +9,60 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **An ordinary file upload is no longer an attack.** A multipart file part's
+  *content* was going into the surface the `ARGS`/`REQUEST_BODY` rules read, so
+  the SQLi and XSS patterns ran over PDF and JPEG bytes. Measured against a
+  real WAF in enforcing mode: at **PL1** a plain PDF was answered 403 by
+  932130/941100/941130 and a JPEG by 933210/932130/942190; at **PL2** eight of
+  nine benign uploads were blocked by **20 distinct rules**. The engine-level
+  diagnostics name the bytes: CRS-942120 matched `<<` in `%PDF-1.7…<</Length 3
+  0 R/Filter/FlateDeco`, CRS-942440 matched a NUL in `����\0\x10JFIF`,
+  CRS-942200 matched a whole CSV row. Those byte sequences are unavoidable in
+  binary content, not a coincidence — the surface was defined wrong, and it was
+  never only the three rules first reported.
+
+  No engine this rule set targets lets a file's bytes reach an `ARGS`-family
+  variable. ModSecurity v2 sorts parts on whether `filename=` is present and
+  `multipart_get_arguments()` has no file branch at all; Coraza sends file
+  parts to a temp file or `io.Discard`; v3 does route them away too, and its
+  additional raw `REQUEST_BODY` is the long-open defect ModSecurity#2146,
+  reported against exactly this symptom. CRS asserts it in its own corpus:
+  `942540.yaml` test 6 uploads a `text/markdown` part reading `my name is
+  'foo'; and I work on CRS.` and requires 942540 **not** to fire — which also
+  rules out the tempting half-measure of still scanning "text-like" uploads by
+  Content-Type, since the file CRS insists must go unscanned is text.
+
+  The split follows the origin's own parse — `filename=` is what puts a part in
+  PHP's `$_FILES` instead of `$_POST`, and Rails, Django, multer and Spring key
+  off it too — so a payload moved into a file part is one the application will
+  never evaluate as a parameter. What it becomes instead is a stored file, and
+  that is the `FILES` rules' job; they are untouched. A part whose
+  `Content-Disposition` is too malformed to yield a filename is not treated as
+  a file and keeps its payload on the surface.
+
+  go-ftw, CRS v4.25.0, 4674 tests: log mode unchanged at 2779/3742/4222 with
+  an **empty set difference** in the failing test ids at every paranoia level —
+  removing an entire detection surface cost nothing on the corpus it was
+  supposed to serve. Cloud mode moves 6 tests, each accounted for: PL2/PL4 gain
+  920121-5, 933110-29 and 942540-6, all three CRS negative tests that upload
+  attack-looking content and assert no rule fires; PL1 loses 933111-1/-2/-3,
+  which is not lost detection — 933111 is a PL3 rule that cannot fire at PL1,
+  those requests were being 403'd by the false positive itself, and cloud mode
+  cannot tell one blocker from another. They pass at cloud PL2, cloud PL4 and
+  log PL4, where 933111 is in scope and catches them through `FILES` as
+  upstream does.
+
+  Benign regression, enforcing, all three paranoia levels: pdf, jpg, xlsx, csv,
+  a CJK filename, multi-file plus text fields, an empty file input and the CRS
+  markdown case all answer 200 with no rule matched. Twelve upload attacks —
+  php/jsp webshell names, `.htaccess`, traversal, double extension, SQLi and
+  XSS in the filename, webshells in ordinary fields, a bogus boundary — all
+  still 403. `php-webshell-name` used to match 933100/933110/933130/933160 and
+  now matches only **933110**, the one rule upstream reads `FILES` for: the
+  reason it blocks changed from coincidence to the upstream semantics.
+
 ### Security
 
 - **The RUSTSEC-2023-0071 exemption is now argued against jsonwebtoken 11.0.0

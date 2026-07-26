@@ -1,7 +1,10 @@
 //! `multipart/form-data` envelope parsing (RFC 2046 §5.1, RFC 7578).
 //!
-//! This exists to back three `ModSecurity` variables the CRS request-phase rule
-//! set is written against and that cannot be approximated by any other surface:
+//! Two jobs, and the second one is what keeps ordinary uploads out of the block
+//! log: telling the rule set which parts are *files*, so their contents can be
+//! kept out of the parameter surface ([`Multipart::payload_surface`]), and
+//! backing three `ModSecurity` variables that cannot be approximated by any
+//! other surface:
 //!
 //! * `FILES` — the `filename="…"` of every part that declares one, i.e. the
 //!   name the file had on the client. CRS-920120, CRS-920121, CRS-932180,
@@ -187,13 +190,57 @@ impl<'a> Multipart<'a> {
         self.parts.iter().flat_map(Part::header_lines).map(|line| text(line))
     }
 
-    /// What `REQUEST_BODY` holds for this envelope: each part's quoted
-    /// parameter values followed by its payload, newline-separated.
+    /// What the `ARGS` / `REQUEST_BODY` rules see of this envelope: every
+    /// part's quoted parameter values, plus the payload of every part that is
+    /// **not a file part**, newline-separated.
     ///
-    /// The MIME envelope itself — boundary lines and header *names* — is
-    /// deliberately absent. Handing it over is a false-positive generator:
-    /// CRS-921120 hunts `\r\n…content-type:` as a response-splitting payload,
-    /// which every ordinary file upload contains verbatim.
+    /// # The MIME envelope is absent
+    ///
+    /// Boundary lines and header *names* are deliberately left out. Handing
+    /// them over is a false-positive generator: CRS-921120 hunts
+    /// `\r\n…content-type:` as a response-splitting payload, which every
+    /// ordinary file upload contains verbatim.
+    ///
+    /// # A file part's *content* is absent, and that is upstream's rule
+    ///
+    /// A part that declares `filename=` is a file, and no engine this rule set
+    /// was written for lets a file's bytes reach an `ARGS`-family or
+    /// `REQUEST_BODY` variable:
+    ///
+    /// * `ModSecurity` v2 sorts each part into `MULTIPART_FILE` or
+    ///   `MULTIPART_FORMDATA` purely on whether `filename=` was present
+    ///   (`apache2/msc_multipart.c`), and `multipart_get_arguments()` walks the
+    ///   `MULTIPART_FORMDATA` parts only — there is no file branch. `REQUEST_BODY`
+    ///   itself is never even generated for a multipart request.
+    /// * `ModSecurity` v3 routes file parts to `FILES*` and only the remaining
+    ///   parts to `ARGS_POST`. It *does* also expose the whole raw body as
+    ///   `REQUEST_BODY`, which is the known false-positive defect
+    ///   `owasp-modsecurity/ModSecurity#2146` — open since 2019 and reported
+    ///   against exactly this symptom.
+    /// * Coraza copies a file part to a temp file or to `io.Discard` and adds
+    ///   only non-file parts to `ARGS_POST`; it sets no `REQUEST_BODY` at all.
+    ///
+    /// CRS states the same assumption in its own corpus rather than only in its
+    /// engines: `tests/.../942540.yaml` test 6 uploads a `text/markdown` part
+    /// whose content is `my name is 'foo'; and I work on CRS.` and asserts
+    /// CRS-942540 must **not** fire. That pattern (`^(?:[^']*'…)[\s\x0b]*;`)
+    /// matches those bytes exactly, so the test can only pass on an engine that
+    /// keeps file content out of `ARGS`. It also rules out the tempting
+    /// half-measure of scanning "text-like" uploads by `Content-Type`: the file
+    /// CRS insists must go unscanned *is* text.
+    ///
+    /// The split is not a concession to false positives either. It mirrors how
+    /// the origin parses the same envelope — PHP's `$_FILES` vs `$_POST`, and
+    /// the equivalent split in Rails, Django, multer and Spring, all key off
+    /// `filename=` too — so a payload moved into a file part is a payload the
+    /// application will not evaluate as a parameter. What it *does* become is a
+    /// stored file, which is the `FILES` rules' beat: CRS-933110, CRS-933111,
+    /// CRS-932180, CRS-944140 and friends read the declared file name, and
+    /// [`Self::files`] feeds them.
+    ///
+    /// A part whose `Content-Disposition` is malformed enough that no
+    /// `filename=` can be read out of it is *not* a file part and keeps its
+    /// payload here, which is the safe direction to be wrong in.
     pub fn payload_surface(&self) -> String {
         let mut out = String::new();
         let mut push = |bytes: &[u8]| {
@@ -209,7 +256,13 @@ impl<'a> Multipart<'a> {
             for quoted in part.quoted_values() {
                 push(quoted);
             }
-            push(part.payload);
+            // `filename.is_some()` and not "a non-empty file name": `filename=""`
+            // is what a browser sends for an untouched file input, upstream v2
+            // and v3 both classify it as a file part, and it is the same test
+            // `files()` and `files_names()` above already apply.
+            if part.filename.is_none() {
+                push(part.payload);
+            }
         }
         out
     }
@@ -568,7 +621,56 @@ mod tests {
                 "Content-Disposition: form-data; name=\"note\"",
             ]
         );
-        assert_eq!(mp.payload_surface(), "file\nreport.pdf\n%PDF-1.4 hello\nnote\nhi");
+        assert_eq!(
+            mp.payload_surface(),
+            "file\nreport.pdf\nnote\nhi",
+            "the file part's content is not a parameter; the ordinary field's is"
+        );
+    }
+
+    /// A file part's bytes are not a parameter, and a form field's bytes are.
+    ///
+    /// The two halves are one test on purpose: excluding file content is only
+    /// correct while the ordinary fields beside it stay covered, and a change
+    /// that dropped both would look like a false-positive fix.
+    #[test]
+    fn only_a_file_parts_content_is_withheld_from_the_parameter_surface() {
+        // Bytes that CRS-942440 (`[';]--`) and CRS-942120 (`||`) both read as
+        // SQL, which is what a binary upload looks like to those rules.
+        let sqlish = "a';-- b || c";
+        let as_file = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"q.pdf\"\r\n\r\n{sqlish}\r\n--b--\r\n"
+        );
+        assert_eq!(
+            parse(as_file.as_bytes(), "b").payload_surface(),
+            "doc\nq.pdf",
+            "a file part contributes its declared names and nothing else"
+        );
+
+        // The same bytes in a part with no `filename=` are an ordinary form
+        // field, exactly as `ARGS_POST` would carry them upstream.
+        let as_field = format!("--b\r\nContent-Disposition: form-data; name=\"doc\"\r\n\r\n{sqlish}\r\n--b--\r\n");
+        assert_eq!(
+            parse(as_field.as_bytes(), "b").payload_surface(),
+            format!("doc\n{sqlish}"),
+            "a non-file part is a parameter and must stay visible"
+        );
+
+        // `filename=""` is what a browser sends for a file input the user never
+        // touched. Upstream v2 and v3 both sort it as a file part on the
+        // parameter's presence, and so do `files()` / `files_names()` here.
+        let empty_name =
+            format!("--b\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"\"\r\n\r\n{sqlish}\r\n--b--\r\n");
+        assert_eq!(parse(empty_name.as_bytes(), "b").payload_surface(), "doc");
+
+        // A `Content-Disposition` too broken to yield a file name is not a file
+        // part, and its payload keeps its coverage — the safe way to be wrong.
+        let broken =
+            format!("--b\r\nContent-Disposition: form-data; name=\"doc\"; filename=q.pdf\r\n\r\n{sqlish}\r\n--b--\r\n");
+        assert!(
+            parse(broken.as_bytes(), "b").payload_surface().contains(sqlish),
+            "an unreadable filename parameter must not withhold the payload"
+        );
     }
 
     /// LF-only line endings are the corpus's own spelling and must parse.
@@ -578,7 +680,7 @@ mod tests {
         let mp = parse(body.as_bytes(), "b");
         assert!(!mp.malformed());
         assert_eq!(owned(mp.files()), ["a.php"]);
-        assert_eq!(mp.payload_surface(), "f\na.php\nx");
+        assert_eq!(mp.payload_surface(), "f\na.php", "`x` is file content, not a parameter");
     }
 
     /// A semicolon inside a quoted parameter is part of the value, not a
