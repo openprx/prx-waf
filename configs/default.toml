@@ -319,6 +319,30 @@ cors_origins = []
 # bounds how long they are kept), or when the database is read-only. The startup
 # log then WARNs that the fail-open window is back.
 
+# ── [rules] — read by the CLI, NOT by the running proxy ───────────────────────
+#
+# There is a `[rules]` section in the config schema (`dir`, `hot_reload`,
+# `reload_debounce_ms`, `enable_builtin_owasp`, `enable_builtin_bot`,
+# `enable_builtin_scanner`, `[[rules.sources]]`). It is deliberately absent
+# here, because setting it would not change what the daemon does.
+#
+# `RuleManager` — the only consumer of those keys — is constructed exclusively
+# by the `rules`, `sources` and `bot` CLI subcommands
+# (`crates/prx-waf/src/main.rs`). The serving process never builds one. What the
+# request path actually uses is:
+#
+#   * the OWASP CRS set, compiled at startup from `rules/owasp-crs/`, a
+#     hardcoded path (`crates/waf-engine/src/checks/owasp.rs:53`). `rules.dir`
+#     does not move it and `enable_builtin_owasp = false` does not switch it
+#     off. Tune it with `[owasp]` below and with the per-host paranoia level.
+#   * every operator-managed rule — hosts, IP and URL lists, custom rules,
+#     sensitive-data patterns — from the database, over the admin API.
+#
+# The other directories under `rules/` (`advanced/`, `owasp-api/`,
+# `modsecurity/`, `cve-patches/`, `bot-detection/`, `custom/`) are not loaded by
+# anything, by decision rather than by omission: see the audit table in
+# `rules/README.md`.
+
 # ── OWASP CRS anomaly scoring ─────────────────────────────────────────────────
 #
 # How the OWASP CRS phase turns rule matches into one verdict.

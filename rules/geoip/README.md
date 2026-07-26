@@ -1,89 +1,70 @@
-# GeoIP Rules
+# Geographic rules are not YAML rules
 
-Rules in this directory are evaluated against the GeoIP information resolved
-from the client IP address on every request.
+There used to be a `country-blocklist.yaml` here. It could never have worked,
+and it has been removed. This file records why, so nobody writes another one.
 
-## Prerequisites
+## Why a YAML rule cannot make a geographic decision
 
-1. Enable GeoIP in your configuration:
+Four independent reasons, each on its own fatal:
+
+1. **This directory is not loaded.** The engine reads exactly one rule
+   directory, `rules/owasp-crs/`, from a hardcoded path
+   (`crates/waf-engine/src/checks/owasp.rs:53`).
+2. **`geo_iso` / `geo_isp` are not fields.** `Field::parse`
+   (`crates/waf-engine/src/checks/owasp.rs:809-864`) has no geographic
+   variant, so both rules were rejected as `UnsupportedField` when loaded
+   experimentally — 2 declared, 0 compiled.
+3. **`in` is not an operator.** The loader accepts `not_in`, not `in`
+   (`owasp.rs:3067-3096`).
+4. **The OWASP phase cannot see `ctx.geo`.** Its `RequestView` is built from
+   the HTTP surfaces only; the resolved GeoIP record never reaches it.
+
+## How to actually block by country
+
+Through the **custom-rules engine**, which is a different subsystem with a
+different storage format and its own admin API.
+
+1. Enable GeoIP and fetch the databases:
 
 ```toml
 [geoip]
 enabled = true
 ipv4_xdb_path = "data/ip2region_v4.xdb"
 ipv6_xdb_path = "data/ip2region_v6.xdb"
-cache_policy   = "full_memory"   # full_memory | vector_index | no_cache
+cache_policy  = "full_memory"   # full_memory | vector_index | no_cache
 ```
-
-2. The xdb files are downloaded automatically when you run `prx-waf geoip download`,
-   or manually:
 
 ```bash
-mkdir -p data/
-curl -L -o data/ip2region_v4.xdb \
-  "https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v4.xdb"
-curl -L -o data/ip2region_v6.xdb \
-  "https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v6.xdb"
+prx-waf geoip download
 ```
 
-## Supported rule fields
+2. Create the rule over the admin API:
 
-| `field`        | Matches                                     | Example value      |
-|----------------|---------------------------------------------|--------------------|
-| `geo_iso`      | ISO 3166-1 alpha-2 code (uppercase)         | `"CN"`, `"US"`     |
-| `geo_country`  | Full country name                           | `"China"`          |
-| `geo_province` | Province / state                            | `"Guangdong"`      |
-| `geo_city`     | City                                        | `"Shenzhen"`       |
-| `geo_isp`      | ISP / network operator                      | `"ChinaNet"`       |
-
-These fields can be used in both YAML rules (via the `field` key) and in
-custom Rhai scripted rules (e.g. `ctx.geo_iso == "CN"`).
-
-## Example rules
-
-### Block a list of countries by ISO code
-
-```yaml
-- id: "GEO-COUNTRY-001"
-  name: "Block high-risk countries"
-  category: "geo"
-  severity: "high"
-  paranoia: 1
-  field: "geo_iso"
-  operator: "in"
-  value: ["KP", "IR", "SY"]
-  action: "block"
-  tags: ["geoip", "country-block"]
+```bash
+curl -X POST http://localhost:16827/api/custom-rules \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "name": "Block high-risk countries",
+        "enabled": true,
+        "priority": 100,
+        "conditions": [
+          {"field": "geo_iso", "operator": "in_list", "value": "KP,IR,SY"}
+        ],
+        "action": "block"
+      }'
 ```
 
-### Allow only specific countries (block all others)
+The supported condition fields are `geo_iso`, `geo_country`, `geo_province`,
+`geo_city` and `geo_isp` (`crates/waf-engine/src/rules/engine.rs:36-47`), with
+`in_list` / `not_in_list` / `cidr_match` among the operators
+(`engine.rs:53-68`). Rules are stored in Postgres, take effect immediately, and
+are broadcast to the rest of the cluster.
 
-Load this rule via the `GeoCheck::load_rules` API with `GeoRuleMode::AllowOnly`
-to restrict access to an explicit allowlist.
+## Known gap
 
-### Log requests from a specific ISP
-
-```yaml
-- id: "GEO-ISP-001"
-  name: "Log ChinaNet traffic"
-  category: "geo"
-  severity: "info"
-  field: "geo_isp"
-  operator: "contains"
-  value: "ChinaNet"
-  action: "log"
-  tags: ["geoip", "isp"]
-```
-
-## Performance
-
-ip2region uses a binary xdb format with three cache modes:
-
-| Mode           | Memory (IPv4) | Memory (IPv6) | Query latency |
-|----------------|---------------|---------------|---------------|
-| `full_memory`  | ~20 MB        | ~200 MB       | ~120 ns       |
-| `vector_index` | ~2 MB         | ~2 MB         | ~27 µs        |
-| `no_cache`     | ~1 MB         | ~1 MB         | ~54 µs        |
-
-`full_memory` is recommended for production deployments where memory is
-available; it adds negligible per-request latency.
+`GeoCheck` (`crates/waf-engine/src/checks/geo.rs`) is a second, fully
+implemented geographic matcher with an `AllowOnly` fail-closed mode — and it
+has no production wiring at all. `GeoCheck::load_rules` is called only from its
+own `#[cfg(test)]` block, so the check runs on every request against an
+permanently empty rule table. Use the custom-rules engine until that is
+resolved either way.

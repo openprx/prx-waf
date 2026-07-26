@@ -10,16 +10,18 @@ CVE virtual patches and custom application-level controls.
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Quick Start](#quick-start)
-3. [Directory Layout](#directory-layout)
-4. [Paranoia Levels](#paranoia-levels)
-5. [Rule Format Specification](#rule-format-specification)
-6. [Writing Custom Rules](#writing-custom-rules)
-7. [Updating Rules](#updating-rules)
-8. [Validation](#validation)
-9. [Statistics](#statistics)
-10. [Licensing](#licensing)
-11. [Contributing](#contributing)
+2. [What the running WAF actually loads](#what-the-running-waf-actually-loads)
+3. [Quick Start](#quick-start)
+4. [Directory Layout](#directory-layout)
+5. [Paranoia Levels](#paranoia-levels)
+6. [Rule Format Specification](#rule-format-specification)
+7. [Writing Custom Rules](#writing-custom-rules)
+8. [Updating Rules](#updating-rules)
+9. [Validation](#validation)
+10. [Statistics](#statistics)
+11. [Audit: why the other directories are off](#audit-why-the-other-directories-are-off)
+12. [Licensing](#licensing)
+13. [Contributing](#contributing)
 
 ---
 
@@ -32,9 +34,28 @@ prx-waf uses a declarative, YAML-based rule format. Each rule describes:
 - **What to match** — pattern or value
 - **What to do** — action (block, log, allow)
 
-Rules are grouped into files by category and loaded by the WAF engine at
-startup. The engine evaluates each incoming request against all enabled
-rules in paranoia-level order.
+## What the running WAF actually loads
+
+**Exactly one directory: `rules/owasp-crs/`.** It is a hardcoded path
+(`crates/waf-engine/src/checks/owasp.rs:53`, `DEFAULT_RULES_DIR`), read once by
+`OWASPCheck::new()` during engine startup (`crates/waf-engine/src/engine.rs:141`).
+
+Every other directory below — `advanced/`, `owasp-api/`, `modsecurity/`,
+`cve-patches/`, `bot-detection/`, `custom/` — is **not loaded by the running
+proxy**, and never has been. `grep -rn "rules/advanced" crates/ --include=*.rs`
+returns nothing. There is no configuration switch that turns them on: the
+`[rules]` TOML section (`dir` / `sources` / `enable_builtin_*` / `hot_reload`)
+is read by the `rules`, `sources` and `bot` **CLI subcommands only** — the
+daemon never constructs a `RuleManager`
+(`crates/prx-waf/src/main.rs:740-750`). And `RuleManager::load_from_dir`
+(`crates/waf-engine/src/rules/manager.rs:360-395`) does not recurse into
+sub-directories anyway.
+
+This is not an oversight waiting to be fixed by pointing the loader at the
+other directories. Those 275 rules were audited in full against the real
+loader and against benign business traffic — see
+[Audit: why the other directories are off](#audit-why-the-other-directories-are-off)
+below. Most of them **must not** be loaded.
 
 ---
 
@@ -57,12 +78,17 @@ python tools/validate.py rules/custom/myapp.yaml
 
 ## Directory Layout
 
+Exactly one of these directories is loaded by the running proxy; the arrows say
+which. See [Audit](#audit-why-the-other-directories-are-off) for why the rest
+are off.
+
 ```
 rules/
 ├── README.md                  ← You are here
 ├── sync-config.yaml           ← Upstream source configuration
 │
-├── owasp-crs/                 ← OWASP ModSecurity Core Rule Set (converted)
+├── owasp-crs/                 ← ★ THE ONLY DIRECTORY THE PROXY LOADS
+│                                (OWASP ModSecurity Core Rule Set, converted)
 │   ├── README.md
 │   ├── sqli.yaml              ← SQL injection (CRS 942xxx)
 │   ├── xss.yaml               ← Cross-site scripting (CRS 941xxx)
@@ -86,24 +112,23 @@ rules/
 │       ├── sql-errors.data
 │       └── ...                ← 20+ wordlist files
 │
-├── modsecurity/               ← ModSecurity community-inspired rules
+├── modsecurity/               ← NOT LOADED — ModSecurity community-inspired rules
 │   ├── README.md
 │   ├── ip-reputation.yaml     ← Bot/scanner/proxy detection
 │   ├── dos-protection.yaml    ← DoS and abnormal request detection
 │   ├── data-leakage.yaml      ← PII and credential leak detection
 │   └── response-checks.yaml   ← Response inspection
 │
-├── cve-patches/               ← Targeted CVE virtual patches
+├── cve-patches/               ← NOT LOADED — targeted CVE virtual patches
 │   ├── README.md
 │   ├── 2021-log4shell.yaml    ← CVE-2021-44228, CVE-2021-45046
 │   ├── 2022-spring4shell.yaml ← CVE-2022-22965, CVE-2022-22963
 │   ├── 2022-text4shell.yaml   ← CVE-2022-42889
 │   ├── 2023-moveit.yaml       ← CVE-2023-34362, CVE-2023-36934
-│   ├── 2024-xz-backdoor.yaml  ← CVE-2024-3094
 │   ├── 2024-recent.yaml       ← 2024 high-profile CVEs
 │   └── 2025-recent.yaml       ← 2025 high-profile CVEs
 │
-├── advanced/                  ← Advanced attack detection
+├── advanced/                  ← NOT LOADED — advanced attack detection
 │   ├── README.md
 │   ├── ssrf.yaml              ← Server-Side Request Forgery
 │   ├── xxe.yaml               ← XML External Entity injection
@@ -112,17 +137,16 @@ rules/
 │   ├── prototype-pollution.yaml ← JavaScript prototype pollution
 │   └── webshell-upload.yaml   ← Webshell upload attempts
 │
-├── bot-detection/             ← Bot and crawler detection
+├── bot-detection/             ← NOT LOADED — bot and crawler detection
 │   ├── README.md
 │   ├── crawlers.yaml          ← Known web crawlers and scrapers
 │   ├── scraping.yaml          ← Automated scraping behavior
 │   └── credential-stuffing.yaml ← Credential stuffing detection
 │
-├── geoip/                     ← Geographic IP blocking rules
-│   ├── README.md
-│   └── country-blocklist.yaml ← Block requests by country code
+├── geoip/                     ← README only; geographic rules are not YAML rules
+│   └── README.md
 │
-├── owasp-api/                 ← OWASP API Security Top 10 rules
+├── owasp-api/                 ← NOT LOADED — OWASP API Security Top 10
 │   ├── README.md
 │   ├── broken-auth.yaml       ← API1: Broken Object Level Authorization
 │   ├── data-exposure.yaml     ← API3: Excessive Data Exposure
@@ -130,7 +154,7 @@ rules/
 │   ├── mass-assignment.yaml   ← API6: Mass Assignment
 │   └── rate-abuse.yaml        ← API4: Lack of Resources & Rate Limiting
 │
-├── custom/                    ← Site-specific / application rules
+├── custom/                    ← NOT LOADED — annotated template only
 │   ├── README.md
 │   └── example.yaml           ← Annotated example rules
 │
@@ -290,9 +314,25 @@ Rule files may also carry a field the loader deliberately refuses:
 
 | Field                    | Meaning                                                      |
 |--------------------------|--------------------------------------------------------------|
-| `response_body`          | Needs the response; there is no response-inspection hook yet |
-| `response_status`        | Same                                                         |
 | `unmapped_<variable>`    | A `ModSecurity` variable with no accessor (see below)        |
+| `geo_iso` / `geo_isp` / `geo_country` / `geo_province` / `geo_city` | Geographic fields. **Not** part of this schema — see [Geographic rules](#geographic-rules-are-not-yaml-rules) |
+
+`response_body` and `response_status` *are* supported and are **not** in this
+table: a rule naming either joins the response pipeline (`ResponseCheck`) and
+is scored against the separate outbound threshold. 59 of the shipped
+`owasp-crs/` rules are response-phase rules.
+
+#### Geographic rules are not YAML rules
+
+`Field::parse` (`crates/waf-engine/src/checks/owasp.rs:809-864`) has no
+geographic field, and there is no path from the OWASP phase to `ctx.geo`, so a
+YAML rule can never make a decision based on country, ISP or city. Country
+blocking is done through the **custom-rules engine**, whose
+`ConditionField` enum does have `GeoIso` / `GeoCountry` / `GeoProvince` /
+`GeoCity` / `GeoIsp` (`crates/waf-engine/src/rules/engine.rs:36-47`), with
+`in_list` / `not_in_list` / `cidr_match` operators, stored in Postgres and
+managed over `POST /api/custom-rules`. It needs `[geoip] enabled = true` and
+the xdb files (`prx-waf geoip download`).
 
 These rules are counted, rejected, and named in the startup `WARN`, which is
 the supported way to record "converted, but not enforceable". Never substitute
@@ -310,31 +350,47 @@ a colon. Current `unmapped_*` fields, all produced by `tools/modsec2yaml.py`:
 
 ### Operator Reference
 
-| Operator        | Description                                                         |
-|-----------------|---------------------------------------------------------------------|
-| `regex`         | Match field against a PCRE-compatible regular expression            |
-| `contains`      | Field contains the literal string in `value`                        |
-| `not_in`        | Field value is NOT in the comma-separated list in `value`           |
-| `gt`            | Field value (numeric) is greater than `value`                       |
-| `lt`            | Field value (numeric) is less than `value`                          |
-| `ge`            | Field value (numeric) is greater than or equal to `value`           |
-| `le`            | Field value (numeric) is less than or equal to `value`              |
-| `equals`        | Field value exactly equals `value` (case-sensitive)                 |
-| `detect_sqli`   | SQL injection detection via libinjection (value: `"true"` or `""`)  |
-| `detect_xss`    | XSS detection via libinjection (value: `"true"` or `""`)            |
-| `pm_from_file`  | Phrase-match against a wordlist file in `owasp-crs/data/`           |
-| `pm`            | Phrase-match against an inline list (value: comma-separated)        |
+This is the complete set the loader accepts
+(`crates/waf-engine/src/checks/owasp.rs:3067-3096`). Anything else is rejected
+at load time as `UnsupportedOperator` — the rule is not silently skipped, it is
+named in the startup `WARN`.
+
+| Operator        | `value` type   | Description                                                         |
+|-----------------|----------------|---------------------------------------------------------------------|
+| `regex`         | string         | Rust `regex` crate. **No lookaround, no backreferences** — see below |
+| `contains`      | string         | Field contains the literal string in `value`                        |
+| `starts_with`   | string         | Field starts with `value`                                           |
+| `ends_with`     | string         | Field ends with `value`                                             |
+| `equals`        | string         | Field value exactly equals `value` (case-sensitive)                 |
+| `not_in`        | list of strings| Field value is NOT one of the listed values (scalar fields only)    |
+| `gt`            | **integer**    | Field value (numeric) is greater than `value`                       |
+| `lt`            | **integer**    | Field value (numeric) is less than `value`                          |
+| `contains_any`  | string or list | Phrase-match (`@pm`) against an inline phrase set                   |
+| `pm_from_file`  | string         | Phrase-match against a wordlist file in `owasp-crs/data/`           |
+| `detect_sqli`   | any            | SQL injection detection via libinjection                            |
+| `detect_xss`    | any            | XSS detection via libinjection                                      |
+
+`gt` / `lt` take a YAML **integer**. `value: "1024"` is a string and is
+rejected as `InvalidValueType`; write `value: 1024`.
+
+The regex engine is `regex`, not PCRE. `(?!…)`, `(?<=…)` and `\1` are
+compile errors, and the rule is dropped with `InvalidRegex` at startup.
 
 ### Action Reference
 
-| Action     | Description                                              |
-|------------|----------------------------------------------------------|
-| `block`    | Reject the request with a 403 Forbidden response         |
-| `log`      | Allow the request but log the match (monitoring mode)    |
-| `allow`    | Explicitly allow the request (overrides other rules)     |
-| `deny`     | Alias for `block`                                        |
-| `redirect` | Redirect the request (engine-specific configuration)     |
-| `drop`     | Silently drop the connection                             |
+| Action                    | Description                                                                       |
+|---------------------------|-----------------------------------------------------------------------------------|
+| `block` / `score`         | Add this rule's severity to the anomaly score, keep evaluating (upstream `block`) |
+| `deny` / `drop` / `reject`| Block immediately, whatever the score is                                          |
+| `log` / `pass` / `alert`  | Record the match, contribute nothing — **see [`action: log` is silent](#action-log-is-silent)** |
+
+`block` does **not** mean "deny". It means what `SecDefaultAction` says
+upstream, which for CRS is "add to the score and continue". Whether it ends in
+a 403 depends on the severity and the threshold: with the shipped numbers a
+single `critical` reaches the inbound threshold on its own, and a single
+`error` does so in the response phase.
+
+There is no `allow` and no `redirect`; both are rejected at load time.
 
 ---
 
@@ -395,7 +451,18 @@ rules:
 
 ### Tips for Good Rules
 
-- **Start with `action: log`** — monitor before blocking to avoid false positives.
+- **`action: log` is not an observation mode today** — it writes one `debug!`
+  line, contributes no score and produces no audit-log row. See
+  [`action: log` is silent](#action-log-is-silent). Until that changes, "log
+  first" has to mean replaying traffic against the rule offline, not shipping
+  it as `log` and watching.
+- **Prefer `severity` over `action` to soften a rule.** A `warning` (3) rule
+  needs a second hit to reach the inbound threshold of 5, which is the
+  gradient CRS is built on; `critical` (5) is an unconditional block dressed
+  up as a score.
+- **Name the narrowest surface.** `all` walks every header value and every
+  cookie value. Almost every false positive found in the audit came from a
+  pattern that was fine on `args+body` and catastrophic on `all`.
 - **Be specific with anchors** — use `^` and `$` in regexes to prevent partial matches.
 - **Use non-capturing groups** — `(?:...)` instead of `(...)` for clarity.
 - **Add comments** — YAML comments (`#`) are your future self's best friend.
@@ -523,19 +590,131 @@ python tools/validate.py rules/custom/myapp.yaml
 
 ## Statistics
 
-Current rule inventory (as of the last sync):
+Two different numbers, and conflating them is how this table used to claim
+"558 rules" for a WAF that enforces 285.
 
-| Source       | Files | Rules | Description                        |
-|--------------|-------|-------|------------------------------------|
-| OWASP CRS    | 24    | 276   | OWASP ModSecurity Core Rule Set v4 |
-| ModSecurity  | 4     | 46    | ModSecurity community rules        |
-| CVE Patches  | 7     | 43    | Targeted CVE virtual patches       |
-| Advanced     | 6     | 77    | SSRF, XXE, SSTI, deserialization, prototype pollution, webshell upload |
-| Bot Detection| 3     | 42    | Crawlers, scraping, credential stuffing |
-| GeoIP        | 1     | 2     | Geographic IP blocking             |
-| OWASP API    | 5     | 64    | OWASP API Security Top 10          |
-| Custom       | 1     | 8     | Example / template rules           |
-| **Total**    | **51**| **558**| |
+**Declared** is what is written in the YAML. **Compiled** is what the loader
+turned into an enforceable matcher; the difference is rejected at startup with
+a reason (`LoadSummary`, reported at `WARN`). **Enforced** is what the running
+proxy evaluates — which is `owasp-crs/` and nothing else.
+
+Measured by running the real loader (`OWASPCheck::from_directory`) over each
+directory; reproduced by `rule_directory_load_status_is_pinned` in
+`crates/waf-engine/src/checks/owasp.rs`.
+
+| Directory        | Files | Declared | Compiled | Enforced by the proxy |
+|------------------|-------|----------|----------|-----------------------|
+| `owasp-crs/`     | 24    | 288      | 285      | **285** (226 request + 59 response) |
+| `advanced/`      | 6     | 77       | 75       | 0 |
+| `owasp-api/`     | 5     | 64       | 61       | 0 |
+| `modsecurity/`   | 4     | 46       | 40       | 0 |
+| `cve-patches/`   | 6     | 39       | 39       | 0 |
+| `bot-detection/` | 3     | 42       | 42       | 0 |
+| `custom/`        | 1     | 7        | 7        | 0 |
+| **Total**        | 49    | 563      | 549      | **285** |
+
+---
+
+## Audit: why the other directories are off
+
+All 275 unloaded rules were audited against the real loader and against a
+benign-traffic corpus at the shipped defaults (paranoia 1, anomaly scoring on,
+`critical` = 5 against an inbound threshold of 5 — so **one `critical` rule
+match blocks the request on its own**).
+
+The measured false-positive rate is the decisive number. Loading each
+directory on its own and replaying 52 ordinary business requests (browser page
+views, REST/JSON APIs, form posts, uploads, GraphQL, common API-client
+user-agents, requests carrying `X-Forwarded-For` from an internal load
+balancer):
+
+| Directory        | Benign requests blocked | One-shot blockers (`block` + `critical` + PL1) |
+|------------------|-------------------------|------------------------------------------------|
+| `owasp-crs/`     | 5 / 52 (pre-existing)   | — |
+| `advanced/`      | **7 / 52**              | 70 of 77 |
+| `owasp-api/`     | **3 / 52**              | 21 of 64 |
+| `cve-patches/`   | 0 / 52                  | 26 of 43 |
+| `bot-detection/` | 0 / 52                  | 7 of 42 |
+| `modsecurity/`   | 0 / 52                  | 7 of 46 |
+| `custom/`        | 0 / 52                  | 1 of 7 |
+
+A `0 / 52` is not a clean bill of health: 104 of the 275 rules are
+`action: log`, which contributes no score and therefore cannot appear as a
+block (see [`action: log` is silent](#action-log-is-silent) below).
+
+### Confirmed against a running WAF
+
+The table above comes from driving `OWASPCheck` directly. The same conclusion
+was reproduced end to end — real binary, enforcing (`log_only_mode = false`),
+Postgres, an `albedo` origin, and 40 requests sent with `curl` — by copying
+`advanced/*.yaml` into the loaded directory, which is precisely what "just
+point the loader at them" amounts to:
+
+| | rules active | benign requests blocked | log4shell control |
+|---|---|---|---|
+| shipped (`owasp-crs/` only)     | 285 | 3 / 40  | 403 |
+| `owasp-crs/` + `advanced/`      | 360 | **10 / 40** | 403 |
+
+The seven newly blocked requests were: all four carrying an `X-Forwarded-For`
+with a private address, a request whose only unusual feature was a `_ga`
+analytics cookie (`ADV-SSRF-015` reads a 10-digit timestamp as a
+decimal-encoded IP), a CMS saving a Jinja template, and a crash report
+containing a Java stack trace.
+
+The three the shipped set already blocks are pre-existing CRS behaviour, not
+something these directories caused: an ops form posting
+`redis://10.0.0.5:6379` (`CRS-931100`, RFI), a crash report naming
+`org.springframework…`, and a rich-text field holding an XHTML doctype. They
+are recorded here because a false-positive number is only meaningful against a
+baseline.
+
+### Per-directory verdict
+
+| Directory | Verdict | Why |
+|---|---|---|
+| `advanced/` | **do not load** | `ADV-SSRF-001/002/003/004` are `field: all` + `critical` + PL1, and `all` includes **every request header value**. Any request carrying `X-Forwarded-For: …, 10.0.1.7` — i.e. every request behind an internal load balancer, which is this product's normal deployment — is blocked by a single rule. Measured: 4/4 such requests 403. `ssti.yaml` blocks ordinary template syntax (`{% block content %}`, `{{ settings.theme }}`), so any CMS or rich-text feature breaks. `prototype-pollution.yaml` and the back half of `xxe.yaml` are genuinely good; the rest is not. |
+| `owasp-api/` | **do not load** | `API-MASS-001/002/010` block on `"role":"admin"`, `"is_admin":true` and `role`+`is_admin` appearing in the same body — i.e. every admin panel, every signup form that echoes the user object back, and every OpenAI-compatible request (`{"role":"system"}`). `broken-auth.yaml`'s JWT-attack rules are sound; the rate-abuse file cannot work at all (rate limiting is stateful, this check is not — see `crates/waf-engine/src/checks/cc.rs`). |
+| `modsecurity/` | **do not load** | 16 of 46 duplicate something already enforced: CRS rules (`DOS-001`→`CRS-920160`, `DOS-006`→`CRS-911100`, `RESP-002`→`CRS-953120`, `RESP-004`→`CRS-950130`, `RESP-010`→`CRS-953100`) or a real subsystem (`sensitive.rs`, `cc.rs`, `ip_feed.rs`, `scanner.rs`). `data-leakage.yaml`'s 12 rules are named "… in response" but use `field: body`, which is the **request** body — the phase is inverted. `MODSEC-IPREP-004` is `critical` on a bare `canvas` substring, which blocks the Canvas LMS mobile app. |
+| `cve-patches/` | **mostly do not load** | `2022-spring4shell.yaml` is the one file worth enabling as-is (CRS covers it only at PL2). Against that: `CVE-2025-NEXT-010` is `field: method` / `^PUT$` — every REST update; `CVE-2025-NEXT-004` matches `WebKit/…Safari|iPhone|iPad`, i.e. most browsers on earth; `CVE-2023-MOVEIT-003` fires on the PHP standard function `move_uploaded_file`; several rules are structurally dead (see below). |
+| `bot-detection/` | **do not load** | `BOT-CRAWL-009` scores `AhrefsBot`, `SemrushBot`, `Sogou` and `YandexBot`, all four of which are on the engine's own good-bot allowlist (`crates/waf-engine/src/checks/bot.rs`) — and that allowlist does not protect them, because a `None` from `BotCheck` does not short-circuit the pipeline. ~20 of 42 duplicate `bot.rs` / `scanner.rs` more weakly. Scraping and credential stuffing are volumetric; `cc.rs` is the mechanism that can actually see them. |
+| `custom/` | **template only, by design** | `example.yaml` is an annotated example for a hypothetical shop. It has no `enabled` key, so loading the directory would enforce the example on real traffic (`CUSTOM-APP-002` is `critical` on `/assets/*.sh`). The supported way to add your own rules is the custom-rules engine behind `POST /api/custom-rules` (`crates/waf-engine/src/rules/engine.rs`), which is a different format and a different code path. |
+
+### Failure modes worth knowing before writing any rule
+
+These bit the audited rules repeatedly. Each is verified against the engine, not inferred.
+
+* **`field: headers` matches the name and the value separately**, never
+  `Name: value` (`crates/waf-engine/src/checks/owasp.rs:1033`:
+  `ctx.headers.iter().any(|(name, value)| f(name) || f(value))`). Any pattern
+  containing a literal `Content-Range:` / `X-Forwarded-For:` can never match.
+* **`field: cookies` yields cookie *values* only**, not names
+  (`owasp.rs:1034`). A pattern containing `SVPNCOOKIE=` never matches.
+* **`path`, `query` and `body` are already percent-decoded** and `+` is already
+  a space. A pattern written against `%ADd+allow_url_include` never matches on
+  those surfaces; header and cookie values are the undecoded ones.
+* **`field: all` walks every request header value and every cookie value.**
+  Reach for the narrowest surface list instead — see
+  [Composite fields](#composite-fields).
+* **`severity: critical` at paranoia 1 with `action: block` is an
+  unconditional block**, because `critical` = 5 and the inbound threshold is 5.
+  It is not "a strong signal that contributes to a score"; it is a 403 on the
+  first match.
+
+### `action: log` is silent
+
+`RuleAction::Log` writes one `debug!` line and returns
+(`crates/waf-engine/src/checks/owasp.rs:3593-3598`). It contributes no score,
+and — because the audit log is built from the scoring contributions
+(`record_audit`, `owasp.rs:3621`) — it produces **no audit-log record and no
+`security_events` row**. At the default log level it produces nothing at all.
+
+So the advice under [Tips for Good Rules](#tips-for-good-rules) — "start with
+`action: log`, monitor before blocking" — does not currently work for
+YAML rules. Nothing takes that branch today: all 288 shipped `owasp-crs/`
+rules are `action: block`. Anyone enabling one of the audited directories in
+"observe mode" would be observing silence, which is why 104 `action: log`
+rules across those directories have never produced a single false-positive
+report. Pinned by `log_action_contributes_no_score_and_no_audit_record`.
 
 ---
 

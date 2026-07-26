@@ -5236,6 +5236,145 @@ Content-Disposition: form-data; name=\"file\"; filename=\"shell.php\"\r\n\r\n\
         }
     }
 
+    /// The `rules/` tree holds seven rule directories and the engine loads
+    /// exactly one of them ([`DEFAULT_RULES_DIR`]).  The other six are not
+    /// dead weight by accident — they were audited rule by rule and left off
+    /// for cause (`rules/README.md`, "Audit: why the other directories are
+    /// off").
+    ///
+    /// This pins what each directory *would* contribute if someone pointed the
+    /// loader at it, so the audit's arithmetic stays checkable and so a rule
+    /// added to one of them cannot arrive unnoticed.  `declared` is what the
+    /// YAML says; `compiled` is what survives
+    /// [`Loader::compile`].  Where they differ, the gap is a rule this engine
+    /// cannot evaluate — usually a PCRE-only regex, which `regex` rejects.
+    #[test]
+    fn rule_directory_load_status_is_pinned() {
+        // (directory, declared, compiled)
+        let expected = [
+            ("owasp-crs", 288, 285),
+            ("advanced", 77, 75),
+            ("owasp-api", 64, 61),
+            ("modsecurity", 46, 40),
+            ("cve-patches", 39, 39),
+            ("bot-detection", 42, 42),
+            ("custom", 7, 7),
+        ];
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules");
+        for (name, declared, compiled) in expected {
+            let checker = OWASPCheck::from_directory(&root.join(name));
+            let summary = checker.load_summary();
+            assert!(
+                summary.source_errors.is_empty(),
+                "rules/{name}/: unreadable source(s): {:?}",
+                summary.source_errors
+            );
+            assert_eq!(summary.attempted, declared, "rules/{name}/: declared rule count");
+            assert_eq!(summary.compiled, compiled, "rules/{name}/: compiled rule count");
+        }
+
+        // `rules/geoip/` held two rules naming `geo_iso` / `geo_isp`, which are
+        // not fields this engine has (`Field::parse`), against an operator it
+        // does not implement (`in`), for a phase that cannot reach `ctx.geo` at
+        // all.  Zero of them could ever compile, so the file was removed rather
+        // than left looking like configuration; country blocking goes through
+        // the custom-rules engine.  Assert the directory holds no rule file, so
+        // a future one has to justify itself.
+        let geoip = root.join("geoip");
+        assert!(geoip.is_dir(), "rules/geoip/ keeps its README");
+        let yaml_files: Vec<_> = std::fs::read_dir(&geoip)
+            .expect("read rules/geoip/")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(OsStr::to_str) == Some("yaml"))
+            .collect();
+        assert!(
+            yaml_files.is_empty(),
+            "rules/geoip/ cannot hold enforceable rules — the OWASP phase has no geographic field: {yaml_files:?}"
+        );
+    }
+
+    /// The single measurement that decides `rules/advanced/`.
+    ///
+    /// `ADV-SSRF-001`..`004` are `field: all`, `severity: critical`,
+    /// `paranoia: 1`, `action: block` — and `all` covers every request *header
+    /// value* ([`Surfaces::ALL`]).  A private address anywhere in
+    /// `X-Forwarded-For` therefore reaches the inbound threshold on its own.
+    /// That header is not an attack signal; it is what every load balancer and
+    /// every ingress controller in front of this proxy appends, which makes
+    /// enabling the directory a site-wide outage rather than a tuning problem.
+    ///
+    /// Kept as a test rather than a paragraph because the paragraph in
+    /// `rules/advanced/README.md` is only worth reading if it is still true.
+    #[test]
+    fn advanced_rules_block_ordinary_internal_load_balancer_traffic() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/advanced");
+        let checker = OWASPCheck::from_directory(&dir).with_config(&OwaspConfig::default());
+
+        for forwarded in ["203.0.113.9, 10.0.1.7", "198.51.100.4, 192.168.1.20", "127.0.0.1"] {
+            let ctx = probe("GET", "/", "", &[("x-forwarded-for", forwarded)], "", 1);
+            let hit = checker.check(&ctx);
+            assert!(
+                hit.is_some(),
+                "rules/advanced/ no longer blocks `X-Forwarded-For: {forwarded}` — if the SSRF \
+                 rules were narrowed off the header surface, re-run the audit in rules/README.md \
+                 and update the verdict before enabling the directory"
+            );
+        }
+
+        // The same request without the proxy header is fine, so the header is
+        // the whole cause.
+        let clean = probe("GET", "/", "", &[], "", 1);
+        assert!(checker.check(&clean).is_none(), "the bare request is not the problem");
+    }
+
+    /// `action: log` blocks nothing *and records nothing*.
+    ///
+    /// [`Self::evaluate`] gives the `Log` arm a `debug!` and no
+    /// [`Contribution`], and [`Self::record_audit`] builds the audit rows from
+    /// the contributions — so a matching `log` rule leaves no audit-log row and
+    /// no `security_events` row either.  At the default log level it produces
+    /// nothing observable at all.
+    ///
+    /// This matters because `rules/README.md` tells rule authors to "start with
+    /// `action: log`, monitor before blocking", and because 104 rules across
+    /// the unloaded directories carry it.  Nothing in the shipped set takes
+    /// this branch — all 288 `rules/owasp-crs/` rules are `action: block` —
+    /// which is why the gap has never shown up in a conformance run.
+    #[test]
+    fn log_action_contributes_no_score_and_no_audit_record() {
+        const RULE: &str = r#"
+version: "1.0"
+rules:
+  - id: PROBE-001
+    name: Matches every request path
+    category: probe
+    severity: critical
+    paranoia: 1
+    field: path
+    operator: contains
+    value: "/"
+    action: ACTION
+"#;
+        let ctx = probe("GET", "/anything", "", &[], "", 1);
+
+        let logging = OWASPCheck::from_yaml(&RULE.replace("ACTION", "log")).with_config(&OwaspConfig::default());
+        assert_eq!(logging.rule_count(), 1, "the log rule is loaded and enforced");
+        assert!(
+            logging.check(&ctx).is_none(),
+            "a `critical` rule with action=log must not block — it contributes no score"
+        );
+
+        // The identical rule with `action: block` does reach the threshold, so
+        // the rule and the request are not the reason nothing happened.
+        let blocking = OWASPCheck::from_yaml(&RULE.replace("ACTION", "block")).with_config(&OwaspConfig::default());
+        assert!(
+            blocking.check(&ctx).is_some(),
+            "the same rule with action=block blocks, so `log` is what silenced it"
+        );
+    }
+
     /// `rules/modsecurity/response-checks.yaml` describes response bodies.  It
     /// is not on the load path today, but if it ever is, none of it may run
     /// against a request: MODSEC-RESP-006 alone would block every form POST
@@ -6425,6 +6564,79 @@ rules:
                 headers: &[
                     ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
                     ("range", "bytes=0-1023"),
+                    ("host", "shop.example.com"),
+                ],
+            },
+            // ── Deployment shapes, not encoding shapes ───────────────────────
+            //
+            // Everything above probes a `%` or a `+`.  These probe the traffic
+            // this proxy actually sits in front of: a load balancer that
+            // appends its own address, and the non-browser clients that make up
+            // most API traffic.  They are here because `rules/advanced/`'s SSRF
+            // rules block all four (see
+            // `advanced_rules_block_ordinary_internal_load_balancer_traffic`),
+            // and the shipped CRS set must keep not doing that.
+            Probe {
+                label: "forwarded by an internal load balancer (RFC1918)",
+                method: "GET",
+                path: "/products/shoes",
+                query: "",
+                body: "",
+                headers: &[
+                    ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+                    ("x-forwarded-for", "203.0.113.9, 10.0.1.7"),
+                    ("x-forwarded-proto", "https"),
+                    ("host", "shop.example.com"),
+                ],
+            },
+            Probe {
+                label: "forwarded by a k8s ingress (loopback)",
+                method: "GET",
+                path: "/api/v1/ping",
+                query: "",
+                body: "",
+                headers: &[
+                    ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0"),
+                    ("x-forwarded-for", "127.0.0.1"),
+                    ("x-real-ip", "192.168.1.20"),
+                    ("host", "shop.example.com"),
+                ],
+            },
+            Probe {
+                label: "API client (curl)",
+                method: "GET",
+                path: "/api/v1/health",
+                query: "",
+                body: "",
+                headers: &[
+                    ("user-agent", "curl/8.5.0"),
+                    ("accept", "*/*"),
+                    ("host", "shop.example.com"),
+                ],
+            },
+            Probe {
+                label: "API client (python-requests) posting JSON",
+                method: "POST",
+                path: "/api/v1/events",
+                query: "",
+                body: r#"{"event":"page_view","ts":1699999999}"#,
+                headers: &[
+                    ("user-agent", "python-requests/2.31.0"),
+                    ("content-type", "application/json"),
+                    ("host", "shop.example.com"),
+                ],
+            },
+            Probe {
+                label: "search-engine crawler",
+                method: "GET",
+                path: "/products/shoes",
+                query: "",
+                body: "",
+                headers: &[
+                    (
+                        "user-agent",
+                        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                    ),
                     ("host", "shop.example.com"),
                 ],
             },

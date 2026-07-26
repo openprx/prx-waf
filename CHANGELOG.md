@@ -9,6 +9,73 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`rules/` now says which of its directories the engine loads, and the answer
+  is one of seven.** `OWASPCheck::new()` reads `rules/owasp-crs/` from a
+  hardcoded path and nothing else; the 275 rules under `advanced/`,
+  `owasp-api/`, `modsecurity/`, `cve-patches/`, `bot-detection/` and `custom/`
+  have never been evaluated by the running proxy. `rules/README.md` claimed
+  the opposite ("loaded by the WAF engine at startup") and totalled the
+  inventory at 558 rules, which is the number a reader would quote for
+  coverage. The enforced number is 285.
+
+  Every one of the 275 was audited against the real loader and against a
+  benign-traffic corpus at the shipped defaults, and the finding is that most
+  of them must **not** be loaded — not that the loader should be pointed at
+  them. `rules/README.md` now carries the per-directory verdict with the
+  measured numbers, and each directory's own README opens with it. Highlights,
+  all reproduced against the engine rather than read off the YAML:
+
+  - `advanced/` blocks 7 of 52 ordinary business requests. `ADV-SSRF-001`..`004`
+    are `field: all` + `critical` + `paranoia: 1`, and `all` covers every
+    request **header value**, so any request carrying a private address in
+    `X-Forwarded-For` — i.e. every request behind a load balancer — is a 403.
+    70 of its 77 rules block on their own.
+  - `owasp-api/`'s `API-MASS-001/002/010` block `{"role":"admin"}`,
+    `{"role":"system"}` and any body carrying `role` next to `is_admin`: every
+    admin panel, every OpenAI-compatible request, every signup form that echoes
+    the user object back.
+  - 16 of `modsecurity/`'s 46 duplicate a CRS rule or a real subsystem
+    (`cc.rs`, `ip_feed.rs`, `sensitive.rs`), and all 12 rules in its
+    `data-leakage.yaml` are named "… in response" while reading `field: body`,
+    which is the request.
+  - `bot-detection/`'s `BOT-CRAWL-009` scores four crawlers that are on the
+    engine's own good-bot allowlist, which does not protect them because
+    `BotCheck` returning `None` does not short-circuit the pipeline.
+  - Several rules across all six can never match, for reasons the schema
+    documentation did not state: `field: headers` matches the name and the
+    value separately (so a literal `Content-Range:` never appears),
+    `field: cookies` yields values only, and `path`/`query`/`body` arrive
+    already percent-decoded.
+
+  `configs/default.toml` now states that `[rules]` is read by the CLI
+  subcommands and not by the daemon, so an operator does not go looking for the
+  switch that turns the other directories on. There isn't one.
+
+  Pinned by `rule_directory_load_status_is_pinned` and
+  `advanced_rules_block_ordinary_internal_load_balancer_traffic`. The shipped
+  request path is untouched: `rules/owasp-crs/` is byte-identical, every Rust
+  change is inside `#[cfg(test)]`, and the release binary rebuilds to the same
+  SHA-256.
+
+### Removed
+
+- **`rules/geoip/country-blocklist.yaml`** — its two rules could never have
+  loaded. `geo_iso` and `geo_isp` are not fields `Field::parse` knows, `in` is
+  not an operator the loader implements, and the OWASP phase cannot reach
+  `ctx.geo` at all. Country blocking goes through the custom-rules engine,
+  whose `ConditionField` does have the geographic variants and which is
+  reachable over `POST /api/custom-rules`; `rules/geoip/README.md` now says so
+  instead of documenting five YAML fields that do not exist.
+- **`rules/cve-patches/2024-xz-backdoor.yaml`** — CVE-2024-3094 is a pre-auth
+  backdoor in `sshd`'s RSA path via `liblzma` and is not reachable over HTTP,
+  so the file claimed coverage no HTTP WAF can provide. Its four rules matched,
+  respectively, the string `n3t` anywhere in the request, any base64 run of 200+
+  characters (every JWT), any URL containing `xz-utils` (every Debian mirror),
+  and a `User-Agent` of `xz-exploit`. The same repository already says as much
+  in `2024-recent.yaml`'s own comment on CVE-2024-6387.
+
 ### Fixed
 
 - **Request bodies are now routed by the same body-processor table upstream

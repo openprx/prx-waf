@@ -1,6 +1,46 @@
 # Custom Rules
 
-This directory is for your site-specific WAF rules.
+> ## NOT LOADED — this directory is documentation, not configuration
+>
+> The running proxy loads exactly one rule directory, `rules/owasp-crs/`, from a
+> hardcoded path (`crates/waf-engine/src/checks/owasp.rs:53`). **A YAML file
+> you drop here will never be evaluated**, and there is no setting that changes
+> that. `example.yaml` is an annotated illustration of the rule schema for a
+> hypothetical shop; it has no `enabled` key, so if the directory ever were
+> loaded, those seven example rules would be enforced on your traffic
+> (`CUSTOM-APP-002` is `critical` on any `.sh` under `/assets/`, and
+> `CUSTOM-APP-003` says "Log access to…" in its name while carrying
+> `action: block`).
+>
+> **The supported way to add your own rules is the custom-rules engine**
+> (`crates/waf-engine/src/rules/engine.rs`), which is a different format on a
+> different code path: conditions are stored in Postgres, combined with AND/OR,
+> matched with 13 operators including `cidr_match` and the geographic fields,
+> optionally gated by a Rhai script, scoped per host, and given a priority and
+> an `enabled` flag. Create them over the admin API and they take effect
+> immediately and replicate across the cluster:
+>
+> ```bash
+> curl -X POST http://localhost:16827/api/custom-rules \
+>   -H 'Content-Type: application/json' \
+>   -d '{
+>         "name": "Block the internal admin API from outside",
+>         "enabled": true,
+>         "priority": 100,
+>         "conditions": [
+>           {"field": "path", "operator": "regex", "value": "^/internal/"}
+>         ],
+>         "action": "block"
+>       }'
+> ```
+>
+> `GET /api/custom-rules` lists them, `DELETE /api/custom-rules/{id}` removes
+> one. Invalid regexes are rejected when the rule is loaded, not at request
+> time.
+>
+> Keep reading below for the YAML schema — it is accurate for
+> `rules/owasp-crs/`, and it is what `tools/validate.py` checks — but do not
+> expect a file in this directory to do anything.
 
 ## When to Write Custom Rules
 
@@ -57,7 +97,8 @@ rules:
 | `detect_sqli` | SQL injection detection via libinjection |
 | `detect_xss` | XSS detection via libinjection |
 | `pm_from_file` | Phrase match from external list file |
-| `pm` | Phrase match from inline value |
+| `contains_any` | Phrase match from an inline phrase set (`@pm`) |
+| `starts_with` / `ends_with` | Literal prefix / suffix match |
 
 ## Naming Convention
 
