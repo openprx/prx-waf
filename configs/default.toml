@@ -326,9 +326,13 @@ cors_origins = []
 # `enable_builtin_scanner`, `[[rules.sources]]`). It is deliberately absent
 # here, because setting it would not change what the daemon does.
 #
-# `RuleManager` — the only consumer of those keys — is constructed exclusively
-# by the `rules`, `sources` and `bot` CLI subcommands
-# (`crates/prx-waf/src/main.rs`). The serving process never builds one. What the
+# `RuleManager` — the only consumer of those keys — is constructed by exactly
+# four CLI subcommands: `rules validate`, `rules import`, `rules export` and
+# `rules update` (`crates/prx-waf/src/main.rs`). `sources list` reads
+# `[[rules.sources]]` straight off the config. Nothing else touches the section:
+# the serving process never builds a `RuleManager`, and the `rules` reads
+# (`list`, `info`, `search`, `stats`) report the enforced set instead — the CRS
+# rules this build compiled, with the database overrides layered on. What the
 # request path actually uses is:
 #
 #   * the OWASP CRS set, compiled at startup from `rules/owasp-crs/`, a
@@ -337,6 +341,12 @@ cors_origins = []
 #     off. Tune it with `[owasp]` below and with the per-host paranoia level.
 #   * every operator-managed rule — hosts, IP and URL lists, custom rules,
 #     sensitive-data patterns — from the database, over the admin API.
+#
+# `hot_reload` / `reload_debounce_ms` in particular reload nothing: the file
+# watcher they configure (`crates/waf-engine/src/rules/hot_reload.rs`) is never
+# started, and `prx-waf rules reload` is not implemented. Overrides are applied
+# to a running process with `POST /api/rules/reload`; an edited CRS file needs a
+# restart.
 #
 # The other directories under `rules/` (`advanced/`, `owasp-api/`,
 # `modsecurity/`, `cve-patches/`, `bot-detection/`, `custom/`) are not loaded by

@@ -17,7 +17,7 @@ use waf_common::config::{ApiConfig, AppConfig, ConfigError, SecurityConfig, appl
 use waf_engine::checks::ResponseCheckSet;
 use waf_engine::{
     BUILTIN_BAD_BOTS, BUILTIN_GOOD_BOTS, BotAction, BotCheck, CrowdSecClient, CrowdSecConfig, EnforcementMode,
-    ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource, MAX_USER_PATTERNS, OWASPCheck, RuleManager,
+    ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource, MAX_USER_PATTERNS, OWASPCheck, RuleDescriptor, RuleManager,
     RuleOverrideSpec, RuleState, RuntimeContentSecurityConfig, UserBotPattern, WafEngine, WafEngineConfig, XdbUpdater,
     cache_policy_from_str, init_community, init_crowdsec, spawn_auto_updater, spawn_ip_feed_sync,
     validate_user_pattern,
@@ -213,7 +213,8 @@ enum RulesCommands {
         #[arg(long)]
         log_only: bool,
     },
-    /// Hot-reload all rules from disk
+    /// Not implemented — prints how to make an override take effect and exits
+    /// non-zero
     Reload,
     /// Validate a rule file without loading it
     Validate {
@@ -233,13 +234,22 @@ enum RulesCommands {
     },
     /// Fetch latest rules from all configured remote sources
     Update,
-    /// Search rules by name, id, or description
+    /// Search the enforced rules by id, name, category, or source file
     Search {
-        /// Search query
+        /// Case-insensitive substring, matched against id, CRS id, name,
+        /// category and source file
         query: String,
+        /// Show the state in force for this host code instead of the global one
+        #[arg(long)]
+        host: Option<String>,
     },
-    /// Show rule statistics
-    Stats,
+    /// Summarise the rules this build enforces and the overrides on them
+    Stats {
+        /// Count the states in force for this host code instead of the global
+        /// ones
+        #[arg(long)]
+        host: Option<String>,
+    },
 }
 
 // ── Sources sub-commands ──────────────────────────────────────────────────────
@@ -538,49 +548,9 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
                 });
             }
 
-            println!(
-                "{:<16} {:<44} {:<10} {:<9} {:<3} {:<9} {:<9} State",
-                "ID", "Name", "Category", "Severity", "PL", "Phase", "Declared"
-            );
-            println!("{}", "-".repeat(120));
-            for rule in &rules {
-                println!(
-                    "{:<16} {:<44} {:<10} {:<9} {:<3} {:<9} {:<9} {}",
-                    truncate(&rule.id, 15),
-                    truncate(&rule.name, 43),
-                    truncate(&rule.category, 9),
-                    rule.severity,
-                    rule.paranoia,
-                    rule.phase,
-                    rule.declared_action,
-                    rule.state.as_str(),
-                );
-            }
-            let disabled = rules.iter().filter(|r| r.state == RuleState::Disabled).count();
-            let log_only = rules.iter().filter(|r| r.state == RuleState::LogOnly).count();
-            println!(
-                "\n{} rule(s) listed — {} active, {} disabled, {} log-only. Scope: {}.",
-                rules.len(),
-                rules.len().saturating_sub(disabled).saturating_sub(log_only),
-                disabled,
-                log_only,
-                host.as_deref()
-                    .map_or_else(|| "global".to_owned(), |h| format!("host {h}")),
-            );
-            let summary = checker.load_summary();
-            if summary.is_degraded() {
-                println!(
-                    "WARNING: {} of {} declared rule(s) are NOT enforced ({} unreadable source(s)){}.",
-                    summary.rejected.len(),
-                    summary.attempted,
-                    summary.source_errors.len(),
-                    if summary.used_embedded_fallback {
-                        "; the minimal embedded rule set was substituted"
-                    } else {
-                        ""
-                    }
-                );
-            }
+            print_rule_table(&rules);
+            print_rule_totals(&rules, host.as_deref(), "listed");
+            print_degraded_warning(&checker);
             if let Some(note) = db_note {
                 println!("{note}");
             }
@@ -653,9 +623,24 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
         }
 
         RulesCommands::Reload => {
-            let mut manager = RuleManager::new(&config.rules);
-            let report = manager.reload()?;
-            println!("{report}");
+            let api = admin_api_origin(&config.api.listen_addr);
+            anyhow::bail!(
+                "`rules reload` is not implemented — nothing was reloaded, and no running process \
+                 was contacted.\n\
+                 There is nothing here to reload. A serving `prx-waf run` compiles its OWASP CRS \
+                 set once at startup from `rules/owasp-crs/` and never re-reads those files, and \
+                 it keeps its operator overrides in its own memory, rebuilt from the database. \
+                 This command holds neither.\n\n\
+                 To apply `rules enable` / `rules disable` (or any out-of-band edit of \
+                 `rule_overrides`) to a running proxy:\n\
+                 \x20 curl -X POST {api}/api/rules/reload -H 'Authorization: Bearer <admin JWT>'\n\
+                 That endpoint rebuilds the override layer in place, with no dropped connections, \
+                 and reports how many rules ended up disabled or log-only. The Admin UI does the \
+                 same on every rule change.\n\n\
+                 To pick up an edited file under `rules/owasp-crs/`, restart the process: the CRS \
+                 automata are built at startup and are not rebuilt under live traffic.\n\n\
+                 {RULE_SOURCES_ARE_CLI_ONLY}"
+            );
         }
 
         RulesCommands::Validate { path } => {
@@ -716,45 +701,80 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
             }
         }
 
-        RulesCommands::Search { query } => {
-            let mut manager = RuleManager::new(&config.rules);
-            manager.load_all()?;
+        RulesCommands::Search { query, host } => {
+            let (checker, db_note) = live_rule_registry(config).await;
+            let needle = query.trim().to_ascii_lowercase();
+            let hits: Vec<RuleDescriptor> = checker
+                .registry(host.as_deref())
+                .into_iter()
+                .filter(|rule| rule_matches_query(rule, &needle))
+                .collect();
 
-            let results = manager.search(&query);
-            if results.is_empty() {
-                println!("No rules matched '{query}'");
+            if hits.is_empty() {
+                println!(
+                    "No enforced rule matches '{query}'. The search covers rule id, upstream CRS \
+                     id, name, category and source file; `prx-waf rules list` shows every rule \
+                     this build enforces."
+                );
             } else {
-                println!("{} result(s) for '{query}':", results.len());
-                for rule in &results {
-                    println!("  {} — {} [{}]", rule.id, rule.name, rule.category);
-                }
+                print_rule_table(&hits);
+                print_rule_totals(&hits, host.as_deref(), &format!("matched '{query}'"));
+            }
+            print_degraded_warning(&checker);
+            if let Some(note) = db_note {
+                println!("{note}");
             }
         }
 
-        RulesCommands::Stats => {
-            let mut manager = RuleManager::new(&config.rules);
-            manager.load_all()?;
-            let stats = manager.stats();
+        RulesCommands::Stats { host } => {
+            let (checker, db_note) = live_rule_registry(config).await;
+            let rules = checker.registry(host.as_deref());
+            let summary = checker.load_summary();
+            let (active, disabled, log_only) = state_counts(&rules);
 
-            println!("Rule Statistics");
-            println!("===============");
-            println!("  Total:    {}", stats.total);
-            println!("  Enabled:  {}", stats.enabled);
-            println!("  Disabled: {}", stats.disabled);
-            println!("  Version:  {}", stats.version);
+            println!("Rule statistics — scope: {}", scope_label(host.as_deref()));
+            println!("{}", "-".repeat(60));
+            println!(
+                "  Declared:  {:>5}  (rules read from rules/owasp-crs/)",
+                summary.attempted
+            );
+            println!(
+                "  Enforced:  {:>5}  (compiled into a matcher this WAF runs)",
+                rules.len()
+            );
+            println!(
+                "  Rejected:  {:>5}  (declared but not enforced){}",
+                summary.rejected.len(),
+                if summary.used_embedded_fallback {
+                    "; the minimal embedded rule set was substituted"
+                } else {
+                    ""
+                }
+            );
+            println!("  Request:   {:>5}", phase_count(&rules, "request"));
+            println!("  Response:  {:>5}", phase_count(&rules, "response"));
             println!();
-            println!("By Category:");
-            let mut cats: Vec<_> = stats.by_category.iter().collect();
-            cats.sort_by_key(|(k, _)| k.as_str());
-            for (cat, count) in cats {
-                println!("  {cat:<20} {count}");
+            println!("Effective state (of the {} enforced):", rules.len());
+            println!("  Active:    {active:>5}");
+            println!(
+                "  Disabled:  {disabled:>5}  (not evaluated — each one is a detection this WAF no \
+                 longer performs)"
+            );
+            println!("  Log-only:  {log_only:>5}  (evaluated and audited, contributing no score)");
+
+            print_grouped("By category", &rules, |rule| rule.category.as_str());
+            print_grouped("By severity", &rules, |rule| rule.severity);
+            print_grouped("By source file", &rules, |rule| rule.source.as_str());
+
+            if !summary.source_errors.is_empty() {
+                println!("\nUnreadable source(s):");
+                for err in &summary.source_errors {
+                    println!("  {}: {}", err.source, err.error);
+                }
             }
-            println!();
-            println!("By Source:");
-            let mut srcs: Vec<_> = stats.by_source.iter().collect();
-            srcs.sort_by_key(|(k, _)| k.as_str());
-            for (src, count) in srcs {
-                println!("  {src:<20} {count}");
+            print_degraded_warning(&checker);
+            if let Some(note) = db_note {
+                println!("{note}");
             }
         }
     }
@@ -835,8 +855,134 @@ const RULE_OVERRIDE_RELOAD_NOTE: &str = "A running proxy keeps its current overr
      through the Admin UI / `POST /api/rules/overrides` take effect immediately and need none of \
      this.";
 
-/// Build the rule set the daemon would build, so `rules list` / `rules info`
-/// answer "what is this WAF enforcing" and not "what is in some file".
+/// Which scope a `rules` read is reporting on, spelled the one way.
+fn scope_label(host: Option<&str>) -> String {
+    host.map_or_else(|| "global".to_owned(), |code| format!("host {code}"))
+}
+
+/// Active / disabled / log-only, counted once.
+///
+/// `rules list`, `rules search` and `rules stats` all print these three numbers
+/// and `GET /api/rules/registry` returns the last two. Deriving them in one
+/// place is what stops one question getting three answers.
+fn state_counts(rules: &[RuleDescriptor]) -> (usize, usize, usize) {
+    let disabled = rules.iter().filter(|r| r.state == RuleState::Disabled).count();
+    let log_only = rules.iter().filter(|r| r.state == RuleState::LogOnly).count();
+    let active = rules.len().saturating_sub(disabled).saturating_sub(log_only);
+    (active, disabled, log_only)
+}
+
+/// Rules evaluated in `phase` (`request` / `response`), matching the
+/// `request_rules` / `response_rules` fields of `GET /api/rules/registry`.
+fn phase_count(rules: &[RuleDescriptor], phase: &str) -> usize {
+    rules.iter().filter(|r| r.phase == phase).count()
+}
+
+/// Does this rule answer a `rules search` query?
+///
+/// Matched against the identifying fields the listing prints: the engine id,
+/// the upstream CRS number an operator reads off a log line, the rule name, its
+/// category, and the file it came from. A loaded rule carries no free-text
+/// description — there is nothing else to search.
+fn rule_matches_query(rule: &RuleDescriptor, needle: &str) -> bool {
+    rule.id.to_ascii_lowercase().contains(needle)
+        || rule.crs_id.is_some_and(|id| id.to_string().contains(needle))
+        || rule.name.to_ascii_lowercase().contains(needle)
+        || rule.category.to_ascii_lowercase().contains(needle)
+        || rule.source.to_ascii_lowercase().contains(needle)
+}
+
+/// The rule table `rules list` and `rules search` both print.
+fn print_rule_table(rules: &[RuleDescriptor]) {
+    println!(
+        "{:<16} {:<44} {:<10} {:<9} {:<3} {:<9} {:<9} State",
+        "ID", "Name", "Category", "Severity", "PL", "Phase", "Declared"
+    );
+    println!("{}", "-".repeat(120));
+    for rule in rules {
+        println!(
+            "{:<16} {:<44} {:<10} {:<9} {:<3} {:<9} {:<9} {}",
+            truncate(&rule.id, 15),
+            truncate(&rule.name, 43),
+            truncate(&rule.category, 9),
+            rule.severity,
+            rule.paranoia,
+            rule.phase,
+            rule.declared_action,
+            rule.state.as_str(),
+        );
+    }
+}
+
+/// The one-line total under that table. `verb` says what produced the rows
+/// ("listed", "matched 'sqli'").
+fn print_rule_totals(rules: &[RuleDescriptor], host: Option<&str>, verb: &str) {
+    let (active, disabled, log_only) = state_counts(rules);
+    println!(
+        "\n{} rule(s) {verb} — {active} active, {disabled} disabled, {log_only} log-only. Scope: {}.",
+        rules.len(),
+        scope_label(host),
+    );
+}
+
+/// Count the rules by one field and print the breakdown, largest bucket first.
+fn print_grouped<F>(title: &str, rules: &[RuleDescriptor], key: F)
+where
+    F: Fn(&RuleDescriptor) -> &str,
+{
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for rule in rules {
+        *counts.entry(key(rule)).or_default() += 1;
+    }
+    let mut rows: Vec<(&str, usize)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    println!("\n{title}:");
+    for (label, count) in rows {
+        println!("  {:<44} {count:>5}", truncate(label, 43));
+    }
+}
+
+/// Say so when part of the declared rule set is not being enforced.
+///
+/// Printed by every `rules` read: a listing that silently omits rules the load
+/// threw away reads as a complete inventory of a WAF that is smaller than the
+/// operator thinks it is.
+fn print_degraded_warning(checker: &OWASPCheck) {
+    let summary = checker.load_summary();
+    if !summary.is_degraded() {
+        return;
+    }
+    println!(
+        "WARNING: {} of {} declared rule(s) are NOT enforced ({} unreadable source(s)){}.",
+        summary.rejected.len(),
+        summary.attempted,
+        summary.source_errors.len(),
+        if summary.used_embedded_fallback {
+            "; the minimal embedded rule set was substituted"
+        } else {
+            ""
+        }
+    );
+}
+
+/// The origin an operator can actually `curl` the management API on.
+///
+/// `[api] listen_addr` is a bind address: `0.0.0.0:9527` is where the server
+/// listens, not an address a client connects to. Printing it verbatim in a
+/// copy-pasteable command would hand out one that fails on some platforms, so
+/// an unspecified bind is reported as loopback.
+fn admin_api_origin(listen_addr: &str) -> String {
+    match listen_addr.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() => format!("http://127.0.0.1:{}", addr.port()),
+        Ok(addr) => format!("http://{addr}"),
+        // Not a socket address: echo it back rather than invent one.
+        Err(_) => format!("http://{listen_addr}"),
+    }
+}
+
+/// Build the rule set the daemon would build, so every `rules` read — `list`,
+/// `info`, `search`, `stats` — answers "what is this WAF enforcing" and not
+/// "what is in some file".
 ///
 /// [`OWASPCheck::new`] reads `rules/owasp-crs/` relative to the working
 /// directory — the same hardcoded path the serving process uses — so running
@@ -997,13 +1143,16 @@ async fn write_rule_override(
 /// The one fact every `sources` / `rules` failure message has to carry.
 ///
 /// `[rules]` — `dir`, `sources`, `enable_builtin_*`, `hot_reload` — is read by
-/// these CLI subcommands and by nothing else: the daemon never constructs a
-/// [`RuleManager`]. Telling an operator to edit `[[rules.sources]]` without
-/// saying so would trade one false promise for another.
-const RULE_SOURCES_ARE_CLI_ONLY: &str = "Note: `[rules]` (dir / sources / builtin toggles) is consulted by the `rules` and `sources` \
-     CLI subcommands only. The running proxy compiles its OWASP CRS set from `rules/owasp-crs/` \
-     at startup and takes every operator-managed rule (hosts, IP/URL lists, custom Rhai rules, \
-     sensitive patterns, bot patterns) from the database.";
+/// `rules validate` / `import` / `export` / `update` (which build a
+/// [`RuleManager`]) and by `sources list` (which prints `[[rules.sources]]`
+/// back). Nothing else reads it: the daemon never constructs a `RuleManager`,
+/// and the `rules` reads (`list` / `info` / `search` / `stats`) go to the
+/// enforced set instead. Telling an operator to edit `[[rules.sources]]`
+/// without saying so would trade one false promise for another.
+const RULE_SOURCES_ARE_CLI_ONLY: &str = "Note: `[rules]` (dir / sources / builtin toggles) is consulted by the `rules validate/import/\
+     export/update` and `sources list` subcommands only. The running proxy compiles its OWASP CRS \
+     set from `rules/owasp-crs/` at startup and takes every operator-managed rule (hosts, IP/URL \
+     lists, custom Rhai rules, sensitive patterns, bot patterns) from the database.";
 
 // ── Bot commands ──────────────────────────────────────────────────────────────
 
@@ -3613,5 +3762,66 @@ mod tests {
             "unexpected appsec line: {}",
             line.text
         );
+    }
+
+    // ── `rules` read helpers ─────────────────────────────────────────────────
+
+    fn descriptor(id: &str, crs_id: Option<u32>, name: &str, category: &str, state: RuleState) -> RuleDescriptor {
+        RuleDescriptor {
+            id: id.to_owned(),
+            crs_id,
+            name: name.to_owned(),
+            category: category.to_owned(),
+            source: "rules/owasp-crs/sqli.yaml".to_owned(),
+            severity: "critical",
+            score: 5,
+            paranoia: 1,
+            phase: "request",
+            declared_action: "score",
+            state,
+        }
+    }
+
+    /// The three numbers `rules list`, `rules search` and `rules stats` print
+    /// are one computation, so the same rule set cannot produce three answers.
+    #[test]
+    fn state_counts_partition_the_rule_set() {
+        let rules = vec![
+            descriptor("CRS-942100", Some(942_100), "SQLi", "sqli", RuleState::Active),
+            descriptor("CRS-942110", Some(942_110), "SQLi", "sqli", RuleState::Disabled),
+            descriptor("CRS-941100", Some(941_100), "XSS", "xss", RuleState::LogOnly),
+            descriptor("CRS-941110", Some(941_110), "XSS", "xss", RuleState::Active),
+        ];
+        let (active, disabled, log_only) = state_counts(&rules);
+        assert_eq!((active, disabled, log_only), (2, 1, 1));
+        assert_eq!(active + disabled + log_only, rules.len(), "every rule is counted once");
+        assert_eq!(phase_count(&rules, "request"), 4);
+        assert_eq!(phase_count(&rules, "response"), 0);
+    }
+
+    /// A search hit is always a rule the listing shows: the query is matched
+    /// against the descriptor, never against a second copy of the rule files.
+    #[test]
+    fn search_matches_id_crs_number_name_category_and_source() {
+        let rule = descriptor("CRS-942100", Some(942_100), "SQL Injection", "sqli", RuleState::Active);
+        for needle in ["crs-942100", "942100", "sql injection", "sqli", "owasp-crs/sqli.yaml"] {
+            assert!(rule_matches_query(&rule, needle), "should match {needle:?}");
+        }
+        assert!(!rule_matches_query(&rule, "xss"));
+        // The severity/state columns are not search keys — matching them would
+        // make "critical" return most of the rule set.
+        assert!(!rule_matches_query(&rule, "critical"));
+    }
+
+    /// `rules reload` prints a command an operator can run. A bind address is
+    /// not always a connectable one, so the wildcard binds resolve to loopback.
+    #[test]
+    fn admin_api_origin_turns_a_bind_address_into_a_reachable_one() {
+        assert_eq!(admin_api_origin("0.0.0.0:9527"), "http://127.0.0.1:9527");
+        assert_eq!(admin_api_origin("[::]:9527"), "http://127.0.0.1:9527");
+        assert_eq!(admin_api_origin("127.0.0.1:19527"), "http://127.0.0.1:19527");
+        assert_eq!(admin_api_origin("[::1]:9527"), "http://[::1]:9527");
+        // Not a socket address: echoed back rather than replaced with a guess.
+        assert_eq!(admin_api_origin("waf.internal:9527"), "http://waf.internal:9527");
     }
 }

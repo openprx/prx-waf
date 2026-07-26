@@ -26,7 +26,7 @@ PRX-WAF is a production-ready Web Application Firewall proxy built on [Pingora](
 - **Rhai scripting engine** — write custom detection rules in a sandboxed scripting language
 - **OWASP CRS rule support** — load and manage OWASP Core Rule Set in YAML format
 - **ModSecurity rule parser** — import SecRule directives (basic subset: ARGS, REQUEST_HEADERS, REQUEST_URI, REQUEST_BODY)
-- **Rule hot-reload** — file watcher (notify) + SIGHUP handler; rules reload atomically without downtime
+- **Override reload without downtime** — `POST /api/rules/reload` rebuilds the per-rule override layer in the running process; the CRS rule files themselves are compiled once at startup and need a restart
 - **Sensitive word detection** — Aho-Corasick multi-pattern matching for PII / credential leakage
 - **Anti-hotlinking protection** — Referer-based validation per host
 - **CrowdSec integration** — Bouncer (decision cache from LAPI) + AppSec (remote HTTP inspection) + Log Pusher
@@ -124,28 +124,37 @@ prx-waf crowdsec setup              # Interactive setup wizard
 
 ### Rule Management Commands
 
+Reads report the rule set this build actually enforces (`rules/owasp-crs/`, with the operator
+overrides from the database layered on), so they answer "what is this WAF doing" rather than
+"what is in some file". Run them from the deployment root — the CRS path is relative to the
+working directory.
+
 ```bash
-# Rule operations
-prx-waf rules list                        # List all loaded rules
+# What is enforced, and in what state
+prx-waf rules list                        # Every enforced rule + its effective state
 prx-waf rules list --category sqli        # Filter by category
-prx-waf rules list --source owasp         # Filter by source
-prx-waf rules info <rule-id>              # Show rule details
-prx-waf rules enable <rule-id>            # Enable a rule
-prx-waf rules disable <rule-id>           # Disable a rule
-prx-waf rules reload                      # Hot-reload all rules from disk
-prx-waf rules validate <path>             # Validate a rule file
-prx-waf rules import <path|url>           # Import rules from file or URL
-prx-waf rules export [--format yaml]      # Export current rules
-prx-waf rules update                      # Fetch latest from remote sources
-prx-waf rules search <query>              # Search rules by name/description
-prx-waf rules stats                       # Rule statistics
+prx-waf rules list --source sqli          # Filter by source file
+prx-waf rules list --state disabled       # active | disabled | log_only | overridden
+prx-waf rules list --host <code>          # States in force for one host
+prx-waf rules info <rule-id>              # One rule in detail (CRS-942100 or 942100)
+prx-waf rules search <query>              # Same listing, filtered by id/name/category/source
+prx-waf rules stats                       # Enforced/declared/rejected + override totals
+
+# Changing a rule (writes an override row; see "Reloading" below)
+prx-waf rules enable <rule-id>            # Cancel an override
+prx-waf rules disable <rule-id>           # Stop evaluating the rule
+prx-waf rules disable <rule-id> --log-only  # Keep evaluating + auditing, stop scoring
+
+# Rule files (these read `[rules]` from the config, not the enforced set)
+prx-waf rules validate <path>             # Parse-check a rule file
+prx-waf rules export [--format yaml]      # Dump the files `[rules]` points at
+prx-waf rules import <path|url>           # Parse-check an import; nothing is persisted
+prx-waf rules update                      # Fetch every `[[rules.sources]]` URL; nothing is persisted
 
 # Source management
-prx-waf sources list                      # List configured rule sources
-prx-waf sources add <name> <url>          # Add a remote rule source
-prx-waf sources remove <name>             # Remove a rule source
-prx-waf sources update [name]             # Fetch latest from source
-prx-waf sources sync                      # Sync all sources
+prx-waf sources list                      # Print the configured `[[rules.sources]]`
+# add / remove / update / sync are not implemented: they exit non-zero and tell
+# you to edit the config file instead of pretending to have a writable store.
 
 # Bot detection
 prx-waf bot list                          # List known bot signatures
@@ -287,19 +296,20 @@ SecRule ARGS "@contains <script>" \
     "id:1002,phase:2,deny,status:403,msg:'XSS attempt'"
 ```
 
-### Hot-Reload
+### Reloading
 
-PRX-WAF watches the `rules/` directory for file changes and automatically reloads rules when a file is created, modified, or deleted. Changes take effect within the configured debounce window (default: 500ms).
+Two different things can change, and they reload differently.
 
-You can also trigger a reload manually:
+**Operator overrides** (`rules enable` / `rules disable`, the Admin UI, or a direct edit of the `rule_overrides` table) live in the database. A running process rebuilds that layer in place, with no dropped connections:
 
 ```bash
-# Via CLI
-prx-waf rules reload
-
-# Via SIGHUP (Unix only)
-kill -HUP <prx-waf-pid>
+curl -X POST http://127.0.0.1:9527/api/rules/reload \
+     -H "Authorization: Bearer <admin JWT>"
 ```
+
+The Admin UI and `POST /api/rules/overrides` already trigger this on every write, so the endpoint is only needed for changes made out of band — the CLI against a shared database, a migration, a `psql` session.
+
+**The CRS rule files** under `rules/owasp-crs/` are parsed and compiled into matchers once, at startup. They are not re-read while the process is serving: restart to pick up an edited rule file. There is no file watcher and no SIGHUP handler — `prx-waf rules reload` is not implemented and says so.
 
 ### Built-in Rules
 
