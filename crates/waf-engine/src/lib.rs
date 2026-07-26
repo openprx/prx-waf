@@ -35,7 +35,7 @@ pub use geoip_updater::{UpdateResult, XdbUpdater, spawn_auto_updater};
 pub use plugins::{PluginAction, PluginInfo, PluginManager, WasmPlugin};
 pub use rules::cluster_sync::{self, SyncedRuleStore};
 pub use rules::engine::{CustomRule, CustomRulesEngine};
-pub use rules::formats::{ExportFormat, RuleFormat, ValidationError};
+pub use rules::formats::{ExportFormat, RuleFormat, ValidationError, export_registry};
 pub use rules::ip_feed::{IpFeedFormat, IpFeedSource, spawn_ip_feed_sync};
 pub use rules::manager::RuleManager;
 pub use rules::registry::{Rule, RuleRegistry, RuleStats};

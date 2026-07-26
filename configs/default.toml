@@ -436,13 +436,13 @@ cors_origins = []
 # here, because setting it would not change what the daemon does.
 #
 # `RuleManager` — the only consumer of those keys — is constructed by exactly
-# four CLI subcommands: `rules validate`, `rules import`, `rules export` and
-# `rules update` (`crates/prx-waf/src/main.rs`). `sources list` reads
-# `[[rules.sources]]` straight off the config. Nothing else touches the section:
-# the serving process never builds a `RuleManager`, and the `rules` reads
-# (`list`, `info`, `search`, `stats`) report the enforced set instead — the CRS
-# rules this build compiled, with the database overrides layered on. What the
-# request path actually uses is:
+# one CLI subcommand, `rules validate`, which parses a single file and reports
+# its errors (`crates/prx-waf/src/main.rs`). `sources list` and the `rules
+# update` refusal print `[[rules.sources]]` straight off the config. Nothing
+# else touches the section: the serving process never builds a `RuleManager`,
+# and the `rules` reads (`list`, `info`, `search`, `stats`, `export`) report the
+# enforced set instead — the CRS rules this build compiled, with the database
+# overrides layered on. What the request path actually uses is:
 #
 #   * the OWASP CRS set, compiled at startup from `rules/owasp-crs/`, a
 #     hardcoded path (`crates/waf-engine/src/checks/owasp.rs:53`). `rules.dir`
@@ -456,6 +456,12 @@ cors_origins = []
 # started, and `prx-waf rules reload` is not implemented. Overrides are applied
 # to a running process with `POST /api/rules/reload`; an edited CRS file needs a
 # restart.
+#
+# `[[rules.sources]]` is likewise inert. `rules import` and `rules update` are
+# not implemented — both used to fetch or parse rules into a registry the
+# command then discarded, and both now refuse and say so. Nothing in this
+# codebase pulls a remote rule feed: a feed URL is a supply chain, and pinning,
+# signature verification and review-before-apply are not designed yet.
 #
 # The other directories under `rules/` (`advanced/`, `owasp-api/`,
 # `modsecurity/`, `cve-patches/`, `bot-detection/`, `custom/`) are not loaded by

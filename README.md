@@ -145,11 +145,13 @@ prx-waf rules enable <rule-id>            # Cancel an override
 prx-waf rules disable <rule-id>           # Stop evaluating the rule
 prx-waf rules disable <rule-id> --log-only  # Keep evaluating + auditing, stop scoring
 
-# Rule files (these read `[rules]` from the config, not the enforced set)
-prx-waf rules validate <path>             # Parse-check a rule file
-prx-waf rules export [--format yaml]      # Dump the files `[rules]` points at
-prx-waf rules import <path|url>           # Parse-check an import; nothing is persisted
-prx-waf rules update                      # Fetch every `[[rules.sources]]` URL; nothing is persisted
+# Rule files
+prx-waf rules validate <path>             # Parse-check a rule file (reads `[rules]`, not the enforced set)
+prx-waf rules export [--format yaml] [--host CODE]
+                                          # Dump the enforced set — same source as `list`/`stats`.
+                                          # Inventory on stdout, everything else on stderr.
+prx-waf rules import <path|url>           # Not implemented; exits non-zero
+prx-waf rules update                      # Withheld pending supply-chain review; exits non-zero
 
 # Source management
 prx-waf sources list                      # Print the configured `[[rules.sources]]`

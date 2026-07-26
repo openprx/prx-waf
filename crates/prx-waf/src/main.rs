@@ -19,7 +19,7 @@ use waf_engine::{
     BUILTIN_BAD_BOTS, BUILTIN_GOOD_BOTS, BotAction, BotCheck, CrowdSecClient, CrowdSecConfig, EnforcementMode,
     ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource, MAX_USER_PATTERNS, OWASPCheck, RuleDescriptor, RuleManager,
     RuleOverrideSpec, RuleState, RuntimeContentSecurityConfig, UserBotPattern, WafEngine, WafEngineConfig, XdbUpdater,
-    cache_policy_from_str, init_community, init_crowdsec, spawn_auto_updater, spawn_ip_feed_sync,
+    cache_policy_from_str, export_registry, init_community, init_crowdsec, spawn_auto_updater, spawn_ip_feed_sync,
     validate_user_pattern,
 };
 use waf_storage::Database;
@@ -47,7 +47,8 @@ enum Commands {
     /// `CrowdSec` integration management
     #[command(subcommand)]
     Crowdsec(CrowdSecCommands),
-    /// Rule management (list, validate, reload, import, export, …)
+    /// Inspect the enforced rule set and override it (list, info, search,
+    /// stats, export, enable, disable, validate)
     #[command(subcommand)]
     Rules(RulesCommands),
     /// Rule source management (add, remove, sync, …)
@@ -221,18 +222,25 @@ enum RulesCommands {
         /// Path to the rule file
         path: PathBuf,
     },
-    /// Import rules from a local file or remote URL
+    /// Not implemented — prints where a rule can actually be added and exits
+    /// non-zero
     Import {
         /// File path or HTTP(S) URL
         source: String,
     },
-    /// Export current rules to stdout
+    /// Write the enforced rule inventory to stdout as YAML or JSON — the same
+    /// set `rules list` prints, in a form a script or a diff can read
     Export {
         /// Output format: yaml (default) or json
         #[arg(long, default_value = "yaml")]
         format: String,
+        /// Export the states in force for this host code instead of the global
+        /// ones
+        #[arg(long)]
+        host: Option<String>,
     },
-    /// Fetch latest rules from all configured remote sources
+    /// Not implemented — prints why remote rule feeds are refused and exits
+    /// non-zero
     Update,
     /// Search the enforced rules by id, name, category, or source file
     Search {
@@ -345,15 +353,23 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("failed to install the ring rustls CryptoProvider: a default provider was already set");
     }
 
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(
-            EnvFilter::from_default_env()
-                .add_directive(tracing_subscriber::filter::Directive::from(tracing::Level::INFO)),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    let filter =
+        EnvFilter::from_default_env().add_directive(tracing_subscriber::filter::Directive::from(tracing::Level::INFO));
+    // `rules export` writes a machine-readable document to stdout. A log line
+    // interleaved into it would make `rules export > rules.json` produce a file
+    // that does not parse, so this one command's logs join its summary on
+    // stderr. Every other command keeps logging to stdout.
+    if matches!(&cli.command, Commands::Rules(RulesCommands::Export { .. })) {
+        tracing_subscriber::registry()
+            .with(fmt::layer().with_writer(std::io::stderr))
+            .with(filter)
+            .init();
+    } else {
+        tracing_subscriber::registry().with(fmt::layer()).with(filter).init();
+    }
+
     info!("PRX-WAF v{}", env!("CARGO_PKG_VERSION"));
 
     // Distinguish "no config file" (safe to default) from "config exists but is
@@ -658,47 +674,101 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
         }
 
         RulesCommands::Import { source } => {
-            let mut manager = RuleManager::new(&config.rules);
-            manager.load_all()?;
-
-            let count = if source.starts_with("http://") || source.starts_with("https://") {
-                manager.import_from_url(&source).await?
-            } else {
-                manager.import_from_file(std::path::Path::new(&source))?
-            };
-            println!("Imported {count} rules from {source}");
+            let api = admin_api_origin(&config.api.listen_addr);
+            anyhow::bail!(
+                "`rules import` is not implemented — nothing was imported, nothing was written to \
+                 disk or to the database, and no running process was contacted.\n\
+                 What it did was parse {source} into a rule registry this command owned, print a \
+                 count, and exit, discarding every rule it had just read. There is no store behind \
+                 it: `[rules]`, the section it read, is not consulted by the serving process at \
+                 all.\n\n\
+                 To check that a rule file parses — which is all this command ever really did:\n\
+                 \x20 prx-waf rules validate {source}\n\n\
+                 To add a detection this WAF actually enforces:\n\
+                 \x20 * an OWASP CRS rule: put the YAML file under `rules/owasp-crs/` on every \
+                 node and restart. That directory is a hardcoded path compiled once at startup — \
+                 there is no import step for it and no live reload.\n\
+                 \x20 * anything operator-managed (custom rules, IP/URL lists, bot patterns, \
+                 sensitive-data patterns): POST it to the admin API, which stores it and applies \
+                 it immediately, e.g.\n\
+                 \x20     curl -X POST {api}/api/custom-rules -H 'Authorization: Bearer <admin \
+                 JWT>' -H 'Content-Type: application/json' -d @rule.json\n\n\
+                 {RULE_SOURCES_ARE_CLI_ONLY}"
+            );
         }
 
-        RulesCommands::Export { format } => {
-            let mut manager = RuleManager::new(&config.rules);
-            manager.load_all()?;
-            let fmt = ExportFormat::parse_str(&format);
-            let output = manager.export(fmt)?;
-            print!("{output}");
+        RulesCommands::Export { format, host } => {
+            let Some(fmt) = ExportFormat::parse_flag(&format) else {
+                anyhow::bail!(
+                    "unknown export format {format:?} — nothing was written. Supported: \
+                     `yaml` (the default) and `json`."
+                );
+            };
+            let (checker, db_note) = live_rule_registry(config).await;
+            let rules = checker.registry(host.as_deref());
+            print!("{}", export_registry(&rules, fmt)?);
+
+            // Everything that is not the inventory goes to stderr, so
+            // `rules export > rules.json` stays a parseable document while the
+            // operator still sees the caveats.
+            let (active, disabled, log_only) = state_counts(&rules);
+            eprintln!(
+                "{} enforced rule(s) exported as {} — {active} active, {disabled} disabled, \
+                 {log_only} log-only. Scope: {}.",
+                rules.len(),
+                fmt.as_str(),
+                scope_label(host.as_deref()),
+            );
+            if let Some(warning) = degraded_warning(&checker) {
+                eprintln!("{warning}");
+            }
+            if let Some(note) = db_note {
+                eprintln!("{note}");
+            }
         }
 
         RulesCommands::Update => {
-            println!("Fetching remote rule sources...");
-            let mut manager = RuleManager::new(&config.rules);
-            let results = manager.load_remote_sources().await;
-            if results.is_empty() {
-                println!("No remote rule sources configured.");
+            let api = admin_api_origin(&config.api.listen_addr);
+            let configured = if config.rules.sources.is_empty() {
+                "There are no `[[rules.sources]]` entries in this config, so it had nothing to \
+                 fetch in any case."
+                    .to_owned()
             } else {
-                let mut had_error = false;
-                for (name, result) in &results {
-                    match result {
-                        Ok(n) => println!("  {name}: {n} rules loaded"),
-                        Err(e) => {
-                            eprintln!("  {name}: ERROR: {e}");
-                            had_error = true;
-                        }
-                    }
-                }
-                if had_error {
-                    anyhow::bail!("One or more remote sources failed to load");
-                }
-                println!("Done.");
-            }
+                let rows: Vec<String> = config
+                    .rules
+                    .sources
+                    .iter()
+                    .map(|src| {
+                        let location = src.url.as_deref().or(src.path.as_deref()).unwrap_or("(none)");
+                        format!("   {:<20} {location}", src.name)
+                    })
+                    .collect();
+                format!(
+                    "The entries it would have fetched (inert — nothing but this message and \
+                     `sources list` reads them):\n{}",
+                    rows.join("\n")
+                )
+            };
+            anyhow::bail!(
+                "`rules update` is not implemented — nothing was fetched, nothing was written, and \
+                 no running process was contacted.\n\
+                 What it did was download every `[[rules.sources]]` URL into a rule registry this \
+                 command owned, print a count per source, and exit, discarding all of it. \
+                 {configured}\n\n\
+                 It is withheld rather than merely unfinished. A remote rule feed is a supply \
+                 chain: whoever controls that URL controls what this WAF detects, and a single \
+                 fetched rule is enough to turn it into a deny-all (a `.*` pattern on every \
+                 request) or to quietly retire a detection class. Pinning, signature verification \
+                 and review-before-apply are not designed yet, so the fetch does not happen at all \
+                 rather than happening unchecked.\n\n\
+                 To change what this WAF enforces today:\n\
+                 \x20 * OWASP CRS: edit or add YAML under `rules/owasp-crs/` and restart.\n\
+                 \x20 * operator-managed rules: use the admin API at {api} (or the Admin UI) — \
+                 those take effect immediately.\n\
+                 \x20 * to switch one CRS rule off or down: `prx-waf rules disable <id>` \
+                 [--log-only], then `curl -X POST {api}/api/rules/reload`.\n\n\
+                 {RULE_SOURCES_ARE_CLI_ONLY}"
+            );
         }
 
         RulesCommands::Search { query, host } => {
@@ -827,16 +897,14 @@ fn run_sources_cmd(cmd: SourcesCommands, config: &AppConfig) -> anyhow::Result<(
             let which = name.as_deref().unwrap_or("all sources");
             anyhow::bail!(
                 "`sources update` is not implemented — '{which}' was not fetched.\n\
-                 Use `prx-waf rules update`, which really does fetch every configured remote \
-                 source.\n\n\
+                 {NO_REMOTE_RULE_FETCH}\n\n\
                  {RULE_SOURCES_ARE_CLI_ONLY}"
             );
         }
         SourcesCommands::Sync => {
             anyhow::bail!(
                 "`sources sync` is not implemented — nothing was fetched.\n\
-                 Use `prx-waf rules update`, which really does fetch every configured remote \
-                 source.\n\n\
+                 {NO_REMOTE_RULE_FETCH}\n\n\
                  {RULE_SOURCES_ARE_CLI_ONLY}"
             );
         }
@@ -944,15 +1012,15 @@ where
 
 /// Say so when part of the declared rule set is not being enforced.
 ///
-/// Printed by every `rules` read: a listing that silently omits rules the load
+/// Carried by every `rules` read: a listing that silently omits rules the load
 /// threw away reads as a complete inventory of a WAF that is smaller than the
-/// operator thinks it is.
-fn print_degraded_warning(checker: &OWASPCheck) {
+/// operator thinks it is. `None` when the whole declared set is enforced.
+fn degraded_warning(checker: &OWASPCheck) -> Option<String> {
     let summary = checker.load_summary();
     if !summary.is_degraded() {
-        return;
+        return None;
     }
-    println!(
+    Some(format!(
         "WARNING: {} of {} declared rule(s) are NOT enforced ({} unreadable source(s)){}.",
         summary.rejected.len(),
         summary.attempted,
@@ -962,7 +1030,17 @@ fn print_degraded_warning(checker: &OWASPCheck) {
         } else {
             ""
         }
-    );
+    ))
+}
+
+/// [`degraded_warning`] on stdout, for the reads that print a report there.
+///
+/// `rules export` writes the inventory to stdout and so prints its copy on
+/// stderr instead.
+fn print_degraded_warning(checker: &OWASPCheck) {
+    if let Some(warning) = degraded_warning(checker) {
+        println!("{warning}");
+    }
 }
 
 /// The origin an operator can actually `curl` the management API on.
@@ -1143,16 +1221,27 @@ async fn write_rule_override(
 /// The one fact every `sources` / `rules` failure message has to carry.
 ///
 /// `[rules]` — `dir`, `sources`, `enable_builtin_*`, `hot_reload` — is read by
-/// `rules validate` / `import` / `export` / `update` (which build a
-/// [`RuleManager`]) and by `sources list` (which prints `[[rules.sources]]`
+/// `rules validate` (which builds a [`RuleManager`] to parse one file) and by
+/// `sources list` / the `rules update` refusal (which print `[[rules.sources]]`
 /// back). Nothing else reads it: the daemon never constructs a `RuleManager`,
-/// and the `rules` reads (`list` / `info` / `search` / `stats`) go to the
-/// enforced set instead. Telling an operator to edit `[[rules.sources]]`
+/// and the `rules` reads (`list` / `info` / `search` / `stats` / `export`) go to
+/// the enforced set instead. Telling an operator to edit `[[rules.sources]]`
 /// without saying so would trade one false promise for another.
-const RULE_SOURCES_ARE_CLI_ONLY: &str = "Note: `[rules]` (dir / sources / builtin toggles) is consulted by the `rules validate/import/\
-     export/update` and `sources list` subcommands only. The running proxy compiles its OWASP CRS \
-     set from `rules/owasp-crs/` at startup and takes every operator-managed rule (hosts, IP/URL \
-     lists, custom Rhai rules, sensitive patterns, bot patterns) from the database.";
+const RULE_SOURCES_ARE_CLI_ONLY: &str = "Note: `[rules]` (dir / sources / builtin toggles) is consulted by `rules validate` and by \
+     `sources list` only, and changes nothing about what is enforced. The running proxy compiles \
+     its OWASP CRS set from `rules/owasp-crs/` at startup and takes every operator-managed rule \
+     (hosts, IP/URL lists, custom Rhai rules, sensitive patterns, bot patterns) from the database.";
+
+/// Why no `sources` / `rules` sub-command fetches a remote feed.
+///
+/// `sources update` / `sources sync` used to redirect to `rules update` as the
+/// one that "really does fetch"; it fetched into a registry it then threw away,
+/// and is now withheld outright. Three commands pointing at each other in a
+/// circle is how an operator concludes the feature exists somewhere.
+const NO_REMOTE_RULE_FETCH: &str = "No sub-command fetches a remote rule feed: `rules update` is withheld too. A feed URL is a \
+     supply chain — whoever controls it controls what this WAF detects — and pinning, signature \
+     verification and review-before-apply are not designed yet, so the fetch does not happen \
+     rather than happening unchecked.";
 
 // ── Bot commands ──────────────────────────────────────────────────────────────
 
