@@ -65,6 +65,7 @@
 
 use std::borrow::Cow;
 use std::convert::Infallible;
+use waf_common::metrics::{self, BudgetEvent};
 
 use async_graphql_value::{ConstValue, Value as GqlValue};
 use bytes::Bytes;
@@ -136,7 +137,13 @@ pub(super) const NOSQL_OP_LABEL: &str = "body.nosql.op";
 /// content-type whose first byte is not a structured opener returns empty.
 pub(super) fn extract_body_fields(body: &[u8], content_type: Option<&str>, max_fields: usize) -> Vec<Leaf> {
     let mut out = Vec::new();
-    if body.is_empty() || max_fields == 0 || body.len() > MAX_EXTRACT_INPUT_BYTES {
+    if body.len() > MAX_EXTRACT_INPUT_BYTES {
+        // The whole extraction is skipped: Lane 2 sees no structured field from
+        // this body at all, only whatever whole-body view survives.
+        metrics::record_budget_event(BudgetEvent::Lane2ExtractInputTooLarge);
+        return Vec::new();
+    }
+    if body.is_empty() || max_fields == 0 {
         return out;
     }
 
@@ -462,6 +469,7 @@ fn extract_graphql(body: &[u8], max_fields: usize, out: &mut Vec<Leaf>) {
     use async_graphql_parser::types::{Selection, SelectionSet};
 
     if graphql_max_depth(body) > MAX_PARSE_INPUT_DEPTH || graphql_raw_open_total(body) > MAX_GRAPHQL_RAW_OPENS {
+        metrics::record_budget_event(BudgetEvent::Lane2GraphqlDeclined);
         return;
     }
     let Ok(text) = std::str::from_utf8(body) else {

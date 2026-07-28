@@ -676,6 +676,7 @@ impl SemanticDetector for XssDomDetector {
         // Stack/DoS byte backstop BEFORE spending budget: decline oversized input
         // (fail-open, no signal — same posture as the AST depth guard).
         if text.len() > XSS_MAX_INPUT_BYTES {
+            waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::Lane2DetectorDegrade);
             return None;
         }
         // Per-request HTML-parse budget (attempt + cumulative bytes). Exhaustion

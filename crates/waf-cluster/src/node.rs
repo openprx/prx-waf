@@ -309,13 +309,19 @@ impl NodeState {
 
     /// Broadcast `msg` to all registered peer channels (non-blocking).
     ///
-    /// Full or closed channels are silently skipped.
+    /// A full or closed channel is skipped — but no longer silently.
+    /// `docs/dos-budget.md` §3 recorded this as the one hot-path drop that was
+    /// neither counted nor logged, which matters because heartbeats and
+    /// election messages share this 256-slot channel: a congested peer link can
+    /// contribute to a spurious election while leaving no trace at all. It now
+    /// leaves a counter.
     pub fn broadcast(&self, msg: &ClusterMessage) {
         let channels = self.peer_channels.lock();
         for tx in channels.iter() {
             match tx.try_send(msg.clone()) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
-                    // Back-pressure or disconnected: silently skip.
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
+                    waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::ClusterPeerDrop);
                 }
             }
         }

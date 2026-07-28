@@ -129,6 +129,10 @@ pub fn split_form_args(input: &str) -> Vec<RawArg<'_>> {
             // one member rather than dropping it. `name` stays empty so an
             // `ARGS_NAMES` rule — whose patterns are anchored parameter names —
             // is not run against a string that is not a parameter name.
+            // Values still reach `ARGS`; the names past the budget no longer
+            // reach `ARGS_NAMES`. That is a real, if narrow, coverage loss and
+            // docs/dos-budget.md §1.3 lists it as one.
+            crate::metrics::record_budget_event(crate::metrics::BudgetEvent::FormArgsFolded);
             out.push(RawArg { name: "", value: rest });
             return out;
         }

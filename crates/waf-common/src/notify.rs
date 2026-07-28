@@ -182,6 +182,7 @@ impl NotificationBus {
         if self.tx.try_send(event).is_ok() {
             self.published.fetch_add(1, Ordering::Relaxed);
         } else {
+            crate::metrics::record_budget_event(crate::metrics::BudgetEvent::NotificationDrop);
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }

@@ -16,6 +16,11 @@
 //! handled at the detector layer; this module is the deterministic *work-count*
 //! half. Exceeding any cap sets [`ContentInspectionState::degraded`].
 //!
+//! Every cap here also increments its own `prxwaf_budget_events_total` slot, so
+//! "which budget ran out" is answerable from a scrape rather than only from the
+//! per-request `degraded` column. That distinction matters: `degraded` is one
+//! flag for eleven different caps, and the remedy for each is a different key.
+//!
 //! This module only *records* exhaustion. `degraded` means **"part of this request
 //! was never inspected"** — an abstention over the remainder — and it is
 //! deliberately **not** a retraction of the signals already produced: since every
@@ -27,6 +32,7 @@
 //! ([`super::scoring::score`]).
 
 use waf_common::content_security_config::SemanticBudgetConfig;
+use waf_common::metrics::{self, BudgetEvent};
 
 /// Immutable work-budget caps for one request (compiled from
 /// [`SemanticBudgetConfig`]).
@@ -149,6 +155,11 @@ impl ContentInspectionState {
 
     /// Force the degraded flag (e.g. a soft time-deadline breach at the detector
     /// layer). Idempotent.
+    ///
+    /// Not counted here. Its two callers know more than this function does —
+    /// the Lane 1 body budget attributes its skip to `lane1_body`, and the
+    /// detector layer attributes its own input caps to `detector_limit` — and a
+    /// counter here would double-count both under a label meaning "something".
     pub const fn mark_degraded(&mut self) {
         self.degraded = true;
     }
@@ -177,8 +188,9 @@ impl ContentInspectionState {
     /// Try to admit one more field in the current phase. Returns `false` (and
     /// marks degraded) once `max_fields_per_phase` is reached.
     #[must_use]
-    pub const fn try_take_field(&mut self) -> bool {
+    pub fn try_take_field(&mut self) -> bool {
         if self.fields_used >= self.budget.max_fields_per_phase {
+            metrics::record_budget_event(BudgetEvent::Lane2FieldsPerPhase);
             self.degraded = true;
             return false;
         }
@@ -193,8 +205,9 @@ impl ContentInspectionState {
     /// size, not the request total. Marks degraded and returns `false` when the
     /// field exceeds `max_field_input_bytes`.
     #[must_use]
-    pub const fn try_admit_field_input(&mut self, n: usize) -> bool {
+    pub fn try_admit_field_input(&mut self, n: usize) -> bool {
         if n > self.budget.max_field_input_bytes {
+            metrics::record_budget_event(BudgetEvent::Lane2FieldInputBytes);
             self.degraded = true;
             return false;
         }
@@ -203,8 +216,9 @@ impl ContentInspectionState {
 
     /// Try to admit one more AST parse attempt for this request.
     #[must_use]
-    pub const fn try_take_ast_attempt(&mut self) -> bool {
+    pub fn try_take_ast_attempt(&mut self) -> bool {
         if self.ast_attempts_used >= self.budget.max_ast_attempts_per_request {
+            metrics::record_budget_event(BudgetEvent::Lane2AstAttempts);
             self.degraded = true;
             return false;
         }
@@ -214,13 +228,14 @@ impl ContentInspectionState {
 
     /// Try to reserve `n` bytes against the total AST input budget.
     #[must_use]
-    pub const fn try_take_ast_input_bytes(&mut self, n: usize) -> bool {
+    pub fn try_take_ast_input_bytes(&mut self, n: usize) -> bool {
         match self.ast_input_bytes_used.checked_add(n) {
             Some(next) if next <= self.budget.max_ast_input_bytes_total => {
                 self.ast_input_bytes_used = next;
                 true
             }
             _ => {
+                metrics::record_budget_event(BudgetEvent::Lane2AstInputBytes);
                 self.degraded = true;
                 false
             }
@@ -230,8 +245,9 @@ impl ContentInspectionState {
     /// Try to admit one more HTML5 fragment-parse attempt for this request
     /// (XSS DOM detector, P-XSS-1). Mirrors [`Self::try_take_ast_attempt`].
     #[must_use]
-    pub const fn try_take_html_parse_attempt(&mut self) -> bool {
+    pub fn try_take_html_parse_attempt(&mut self) -> bool {
         if self.html_parse_attempts_used >= self.budget.max_html_parse_attempts_per_request {
+            metrics::record_budget_event(BudgetEvent::Lane2HtmlParseAttempts);
             self.degraded = true;
             return false;
         }
@@ -241,13 +257,14 @@ impl ContentInspectionState {
 
     /// Try to reserve `n` bytes against the total HTML-parse input budget.
     #[must_use]
-    pub const fn try_take_html_parse_input_bytes(&mut self, n: usize) -> bool {
+    pub fn try_take_html_parse_input_bytes(&mut self, n: usize) -> bool {
         match self.html_parse_input_bytes_used.checked_add(n) {
             Some(next) if next <= self.budget.max_html_parse_input_bytes_total => {
                 self.html_parse_input_bytes_used = next;
                 true
             }
             _ => {
+                metrics::record_budget_event(BudgetEvent::Lane2HtmlParseInputBytes);
                 self.degraded = true;
                 false
             }
@@ -256,13 +273,14 @@ impl ContentInspectionState {
 
     /// Try to reserve `n` bytes against the total preprocessor-output budget.
     #[must_use]
-    pub const fn try_take_preprocess_bytes(&mut self, n: usize) -> bool {
+    pub fn try_take_preprocess_bytes(&mut self, n: usize) -> bool {
         match self.preprocess_output_bytes_used.checked_add(n) {
             Some(next) if next <= self.budget.max_preprocess_output_bytes_total => {
                 self.preprocess_output_bytes_used = next;
                 true
             }
             _ => {
+                metrics::record_budget_event(BudgetEvent::Lane2PreprocessOutputBytes);
                 self.degraded = true;
                 false
             }

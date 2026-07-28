@@ -158,6 +158,7 @@ impl CommunityReporter {
         };
 
         if self.tx.try_send(signal).is_err() {
+            waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::CommunityReportDrop);
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }

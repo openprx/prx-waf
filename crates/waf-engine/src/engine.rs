@@ -572,22 +572,30 @@ impl WafEngine {
                 AppSecResult::Allow => {}
                 // H-4: apply the configured failure_action instead of always
                 // failing open.
-                AppSecResult::Unavailable => match appsec.failure_action() {
-                    FallbackAction::Block => {
-                        let result = crate::crowdsec::appsec::appsec_unavailable_detection();
-                        return Some(self.record_block(ctx, result, false));
+                AppSecResult::Unavailable => {
+                    // The 500 ms AppSec deadline is awaited inline on every
+                    // request, so a wedged engine adds that to all traffic and
+                    // then — on the default `allow` posture — lets it through
+                    // unexamined. That is the most expensive fail-open on the
+                    // request path and it had no signal at all.
+                    metrics::record_budget_event(metrics::BudgetEvent::AppSecUnavailable);
+                    match appsec.failure_action() {
+                        FallbackAction::Block => {
+                            let result = crate::crowdsec::appsec::appsec_unavailable_detection();
+                            return Some(self.record_block(ctx, result, false));
+                        }
+                        FallbackAction::Log => {
+                            // Record the outage but let the request continue.
+                            let result = crate::crowdsec::appsec::appsec_unavailable_detection();
+                            let decision = WafDecision {
+                                action: WafAction::LogOnly,
+                                result: Some(result),
+                            };
+                            self.log_security_event(ctx, &decision);
+                        }
+                        FallbackAction::Allow => {}
                     }
-                    FallbackAction::Log => {
-                        // Record the outage but let the request continue.
-                        let result = crate::crowdsec::appsec::appsec_unavailable_detection();
-                        let decision = WafDecision {
-                            action: WafAction::LogOnly,
-                            result: Some(result),
-                        };
-                        self.log_security_event(ctx, &decision);
-                    }
-                    FallbackAction::Allow => {}
-                },
+                }
             }
         }
 
@@ -1044,6 +1052,12 @@ impl WafEngine {
             // currently has no decision set to have missed against, i.e. the
             // miss meant "I never got the list", not "this IP is clean".
             if let Some(action) = cs.fallback_for_miss() {
+                // Reached only when the decision cache is empty *and* LAPI is
+                // unreachable — "I never got the ban list", not "this IP is
+                // clean". With `fallback_action = "block"` this refuses every
+                // request, so the rate here is the difference between a
+                // CrowdSec outage and a site outage.
+                metrics::record_budget_event(metrics::BudgetEvent::CrowdSecFallback);
                 match action {
                     FallbackAction::Block => {
                         let result = crate::crowdsec::lapi_unavailable_detection();

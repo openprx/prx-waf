@@ -345,8 +345,15 @@ pub enum BudgetEvent {
     Lane2HtmlParseInputBytes,
     /// `max_preprocess_output_bytes_total`.
     Lane2PreprocessOutputBytes,
-    /// A detector-layer soft deadline or input cap marked the request degraded
-    /// without going through one of the counted work budgets above.
+    /// A Lane 2 detector declined a view because it exceeded that detector's
+    /// own input cap: the SQL AST's 256 bytes / 12 nesting levels, the shell
+    /// AST's 2 KiB / 20 levels, or the XSS DOM parser's 16 KiB.
+    ///
+    /// Deliberately **not** a `degraded` signal. These caps are per-view and the
+    /// lane still scores the view from its other detectors, so the request is
+    /// not blind — but the view was not seen by *that* detector, which is a
+    /// documented exceed behaviour (`docs/dos-budget.md` §1.3) that previously
+    /// had no signal of any kind.
     Lane2DetectorDegrade,
 
     // ── §1.3 Lane 2 structured extractor ─────────────────────────────────────
@@ -485,7 +492,7 @@ impl BudgetEvent {
             Self::Lane2HtmlParseAttempts => ("lane2_budget", "html_parse_attempts"),
             Self::Lane2HtmlParseInputBytes => ("lane2_budget", "html_parse_input_bytes"),
             Self::Lane2PreprocessOutputBytes => ("lane2_budget", "preprocess_output_bytes"),
-            Self::Lane2DetectorDegrade => ("lane2_budget", "detector_limit"),
+            Self::Lane2DetectorDegrade => ("lane2_detector", "input_cap"),
             Self::Lane2ExtractInputTooLarge => ("lane2_extract", "input_bytes"),
             Self::Lane2GraphqlDeclined => ("lane2_extract", "graphql_raw_opens"),
             Self::Lane1BodySkip => ("lane1_body", "max_body_bytes"),

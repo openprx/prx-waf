@@ -30,6 +30,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use waf_common::metrics::{self, BudgetEvent};
 use waf_storage::StorageError;
 use waf_storage::{
     Database,
@@ -140,6 +141,7 @@ impl SemanticObservationSink {
     /// counted.
     pub fn try_persist(&self, obs: CreateSemanticObservation) {
         if self.obs_tx.try_send(obs).is_err() {
+            metrics::record_budget_event(BudgetEvent::SemanticObservationDrop);
             self.obs_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -149,6 +151,7 @@ impl SemanticObservationSink {
     /// counted (codex A-1: the shadow log path must not spawn a task per hit).
     pub fn try_persist_event(&self, event: CreateSecurityEvent) {
         if self.event_tx.try_send(event).is_err() {
+            metrics::record_budget_event(BudgetEvent::SemanticEventDrop);
             self.event_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }

@@ -38,6 +38,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use waf_common::metrics::{self, BudgetEvent};
 use waf_common::{DetectionResult, RequestCtx, ResponseCtx};
 
 /// Trait implemented by every WAF checker module.
@@ -401,6 +402,12 @@ pub fn lane1_body_skips() -> u64 {
 /// common path never touches any of this.
 #[cold]
 fn record_lane1_body_skip(ctx: &RequestCtx, budget: Lane1BodyBudget) {
+    // docs/dos-budget.md §2.2 recorded this counter as "log-only, not exported
+    // as a metric", which meant the only way to read it was to grep for a WARN
+    // that is throttled to one per 30 s. The process counter stays — tests read
+    // it, and it is the number the WARN prints — and the metric is the same
+    // event, exported. Same unit: detector invocations, not requests.
+    metrics::record_budget_event(BudgetEvent::Lane1BodySkip);
     let total = LANE1_BODY_SKIPS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
 
     let now = PROCESS_EPOCH.elapsed().as_secs();

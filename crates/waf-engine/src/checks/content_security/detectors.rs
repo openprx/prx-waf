@@ -1923,6 +1923,11 @@ fn ast_structural_depth_ok(s: &str) -> bool {
     // Backstop: bound recursion by input length regardless of the driver scan
     // below (depth <= tokens <= bytes).
     if s.len() > AST_MAX_INPUT_BYTES {
+        // A declined parse is a view the SQL AST never saw. Not a `degraded`
+        // flag — these caps are per-view and the lane still scores the view
+        // from its other detectors — but it is a documented exceed behaviour
+        // (docs/dos-budget.md §1.3) that had no signal at all.
+        waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::Lane2DetectorDegrade);
         return false;
     }
 
@@ -2987,7 +2992,11 @@ impl SemanticDetector for RceAstDetector {
         // Parse the structure-preserving text, NOT `lower_trunc` (which collapses
         // the newlines a here-document needs).
         let s = view.text.as_ref();
-        if s.is_empty() || s.len() > SHELL_AST_MAX_INPUT_BYTES {
+        if s.is_empty() {
+            return None;
+        }
+        if s.len() > SHELL_AST_MAX_INPUT_BYTES {
+            waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::Lane2DetectorDegrade);
             return None;
         }
         // Cheap gate — clean traffic exits here without touching the AST budget.
@@ -3000,6 +3009,7 @@ impl SemanticDetector for RceAstDetector {
         // stack overflow aborts the process and cannot be caught, so this must be a
         // pre-parse reject; the structural detector still inspects the field.
         if max_nesting_depth(s) > SHELL_MAX_NESTING_DEPTH {
+            waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::Lane2DetectorDegrade);
             return None;
         }
         // DoS budget: one attempt + input bytes, shared with the SQL AST layer.

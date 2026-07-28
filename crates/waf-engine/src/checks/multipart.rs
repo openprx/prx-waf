@@ -48,6 +48,8 @@
 
 use std::borrow::Cow;
 
+use waf_common::metrics::{self, BudgetEvent};
+
 /// Longest `boundary=` value accepted, from RFC 2046 §5.1.1 (`1*70 bchars`).
 ///
 /// A longer boundary is not merely unusual, it cannot be produced by a
@@ -320,6 +322,7 @@ pub fn parse<'a>(body: &'a [u8], boundary: &str) -> Multipart<'a> {
     // report the envelope as malformed rather than scanning for a needle that
     // is not a boundary.
     if boundary.is_empty() || boundary.len() > MAX_BOUNDARY_LEN {
+        metrics::record_budget_event(BudgetEvent::MultipartBoundaryTooLong);
         return Multipart {
             parts: Vec::new(),
             malformed: true,
@@ -407,6 +410,7 @@ fn close_part<'a>(
     malformed: &mut bool,
 ) -> bool {
     if parts.len() >= MAX_PARTS {
+        metrics::record_budget_event(BudgetEvent::MultipartPartsExceeded);
         return false;
     }
     let end = strip_trailing_eol(body, delimiter_line);
@@ -470,6 +474,12 @@ fn strip_trailing_eol(body: &[u8], delimiter_line: usize) -> usize {
 fn parse_part(raw: &[u8]) -> Option<Part<'_>> {
     let (headers, payload) = split_header_block(raw)?;
     if headers.len() > MAX_PART_HEADER_BYTES {
+        // The part is dropped whole — name, filename and body never reach a
+        // detector — so an attacker who can attach an oversized header block to
+        // a part removes that part from inspection. The envelope is flagged
+        // malformed, but that is one bit for four different causes; this says
+        // which.
+        metrics::record_budget_event(BudgetEvent::MultipartPartHeaderBytesExceeded);
         return None;
     }
     let mut lines = 0usize;
@@ -481,6 +491,7 @@ fn parse_part(raw: &[u8]) -> Option<Part<'_>> {
         }
         lines = lines.saturating_add(1);
         if lines > MAX_PART_HEADER_LINES {
+            metrics::record_budget_event(BudgetEvent::MultipartPartHeaderLinesExceeded);
             return None;
         }
         if disposition.is_none() && header_name(line).is_some_and(|n| n.eq_ignore_ascii_case(b"content-disposition")) {

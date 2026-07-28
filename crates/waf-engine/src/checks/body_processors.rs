@@ -33,6 +33,7 @@
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
+use waf_common::metrics::{self, BudgetEvent};
 
 /// Pre-parse structural nesting guard. A body whose bracket / paren nesting
 /// exceeds this is declined **before** any recursive parser runs, so a
@@ -127,14 +128,29 @@ pub struct XmlBody {
 /// recursion is involved and nesting cannot overflow the stack.
 pub fn parse_xml(body: &[u8]) -> XmlBody {
     let mut out = XmlBody::default();
-    if body.is_empty() || body.len() > MAX_BODY_BYTES {
+    if body.is_empty() {
+        return out;
+    }
+    if body.len() > MAX_BODY_BYTES {
+        // No `XML:` target is produced at all past this size. Counted rather
+        // than silent because the gap between this 64 KiB cap and the 10 MiB
+        // body ceiling is the structured-inspection blind spot named in
+        // docs/dos-budget.md §1.3, and it is not configurable.
+        metrics::record_budget_event(BudgetEvent::CrsXmlBodyTooLarge);
         return out;
     }
     let mut reader = Reader::from_reader(body);
     let mut buf: Vec<u8> = Vec::new();
+    // Tracked so "the reader ran out of budget" can be told apart from "the
+    // reader reached the end of the document": both leave the loop, but only
+    // the first one means targets are missing.
+    let mut exhausted = true;
     for _ in 0..MAX_XML_EVENTS {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => {
+                exhausted = false;
+                break;
+            }
             Ok(Event::Start(e) | Event::Empty(e)) => collect_attrs(&e, &mut out.attrs),
             Ok(Event::Text(t)) => {
                 if let Ok(decoded) = t.decode() {
@@ -163,6 +179,9 @@ pub fn parse_xml(body: &[u8]) -> XmlBody {
         }
         buf.clear();
     }
+    if exhausted {
+        metrics::record_budget_event(BudgetEvent::CrsXmlEventsExceeded);
+    }
     out
 }
 
@@ -170,12 +189,14 @@ pub fn parse_xml(body: &[u8]) -> XmlBody {
 fn push_text(acc: &mut String, piece: &str) {
     let room = MAX_XML_TEXT_BYTES.saturating_sub(acc.len());
     if room == 0 {
+        metrics::record_budget_event(BudgetEvent::CrsXmlTextTruncated);
         return;
     }
     if piece.len() <= room {
         acc.push_str(piece);
         return;
     }
+    metrics::record_budget_event(BudgetEvent::CrsXmlTextTruncated);
     // Truncate on a character boundary; a split code point would not be a
     // payload either way.
     let cut = piece
@@ -191,6 +212,7 @@ fn push_text(acc: &mut String, piece: &str) {
 fn collect_attrs(e: &BytesStart<'_>, out: &mut Vec<String>) {
     for attr in e.attributes() {
         if out.len() >= MAX_XML_ATTRS {
+            metrics::record_budget_event(BudgetEvent::CrsXmlAttrsExceeded);
             return;
         }
         if let Ok(a) = attr
@@ -223,7 +245,18 @@ fn collect_attrs(e: &BytesStart<'_>, out: &mut Vec<String>) {
 /// caller's raw-body surface is unaffected either way.
 pub fn json_args(body: &[u8]) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    if body.is_empty() || body.len() > MAX_BODY_BYTES || nesting_depth(body) > MAX_PARSE_INPUT_DEPTH {
+    if body.is_empty() {
+        return out;
+    }
+    // Split apart so the two declines are distinguishable in the exposition:
+    // "your API posts bodies over 64 KiB" and "someone is sending 65-deep
+    // brackets" are different problems with different remedies.
+    if body.len() > MAX_BODY_BYTES {
+        metrics::record_budget_event(BudgetEvent::CrsJsonBodyTooLarge);
+        return out;
+    }
+    if nesting_depth(body) > MAX_PARSE_INPUT_DEPTH {
+        metrics::record_budget_event(BudgetEvent::CrsJsonInputTooDeep);
         return out;
     }
     let Ok(root) = serde_json::from_slice::<serde_json::Value>(body) else {
@@ -233,12 +266,14 @@ pub fn json_args(body: &[u8]) -> Vec<(String, String)> {
     let mut stack: Vec<(&serde_json::Value, String, usize)> = vec![(&root, String::new(), 0)];
     while let Some((node, path, depth)) = stack.pop() {
         if out.len() >= MAX_JSON_ARGS || visited >= MAX_JSON_NODES {
+            metrics::record_budget_event(BudgetEvent::CrsJsonArgsExceeded);
             break;
         }
         visited = visited.saturating_add(1);
         match node {
             serde_json::Value::Object(map) => {
                 if depth >= MAX_JSON_DEPTH {
+                    metrics::record_budget_event(BudgetEvent::CrsJsonDepthExceeded);
                     continue;
                 }
                 for (key, value) in map {
@@ -254,6 +289,7 @@ pub fn json_args(body: &[u8]) -> Vec<(String, String)> {
             // members of the key the array is bound to.
             serde_json::Value::Array(items) => {
                 if depth >= MAX_JSON_DEPTH {
+                    metrics::record_budget_event(BudgetEvent::CrsJsonDepthExceeded);
                     continue;
                 }
                 for value in items {
