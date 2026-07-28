@@ -373,6 +373,14 @@ pub enum BudgetEvent {
     // ── §3 queues and background sinks ───────────────────────────────────────
     /// Audit-log record dropped: the 4 096-slot channel was full.
     AuditLogDrop,
+    /// An `attack_logs` row for an enforced detection was dropped: the write
+    /// queue was full. **The request was still blocked** — what was lost is the
+    /// record of it, which is why this must never be read as "nothing was
+    /// detected".
+    AttackLogWriteDrop,
+    /// A `security_events` row for an enforced detection was dropped: the write
+    /// queue was full. Same distinction as [`Self::AttackLogWriteDrop`].
+    SecurityEventWriteDrop,
     /// Lane 2 observation dropped.
     SemanticObservationDrop,
     /// Lane 2 security event dropped.
@@ -411,7 +419,7 @@ impl BudgetEvent {
     /// Every variant, in declaration order. The exposition walks this, so a new
     /// variant appears in `/metrics` (at zero) the moment it is added — a
     /// counter an operator has never seen fire still has to be graphable.
-    const ALL: [Self; 44] = [
+    const ALL: [Self; 46] = [
         Self::HeaderValueCountExceeded,
         Self::HeaderFoldBytesExceeded,
         Self::DuplicateHost,
@@ -444,6 +452,8 @@ impl BudgetEvent {
         Self::Lane2GraphqlDeclined,
         Self::Lane1BodySkip,
         Self::AuditLogDrop,
+        Self::AttackLogWriteDrop,
+        Self::SecurityEventWriteDrop,
         Self::SemanticObservationDrop,
         Self::SemanticEventDrop,
         Self::NotificationDrop,
@@ -497,6 +507,8 @@ impl BudgetEvent {
             Self::Lane2GraphqlDeclined => ("lane2_extract", "graphql_raw_opens"),
             Self::Lane1BodySkip => ("lane1_body", "max_body_bytes"),
             Self::AuditLogDrop => ("queue", "audit_log"),
+            Self::AttackLogWriteDrop => ("queue", "attack_log"),
+            Self::SecurityEventWriteDrop => ("queue", "security_event"),
             Self::SemanticObservationDrop => ("queue", "semantic_observations"),
             Self::SemanticEventDrop => ("queue", "semantic_events"),
             Self::NotificationDrop => ("queue", "notifications"),

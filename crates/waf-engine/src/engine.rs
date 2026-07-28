@@ -23,6 +23,10 @@ use crate::checks::{
 };
 use crate::community::{CommunityChecker, CommunityReporter, RequestInfo};
 use crate::crowdsec::{AppSecClient, AppSecResult, CrowdSecChecker, FallbackAction, appsec_to_detection};
+use crate::detection_sink::{
+    ATTACK_LOG_CHANNEL_CAPACITY, DetectionLogSink, SECURITY_EVENT_CHANNEL_CAPACITY,
+    spawn_worker_if_runtime as spawn_detection_worker_if_runtime,
+};
 use crate::geoip::GeoIpService;
 use crate::rules::cluster_sync::SyncedRuleStore;
 use crate::rules::engine::{CustomRuleMatch, CustomRulesEngine, RuleAction, from_db_rule};
@@ -131,6 +135,18 @@ pub struct WafEngine {
     /// statement — see [`crate::semantic_sink`]). When the lane is off this is
     /// never fed, so it stays idle.
     semantic_sink: Arc<SemanticObservationSink>,
+    /// Bounded, back-pressured sink for the two tables an enforced detection
+    /// writes: `attack_logs` and `security_events`.
+    ///
+    /// This used to be a `tokio::spawn` per detection, which is bounded by
+    /// nothing at all — the hot path spawned as fast as the proxy could block
+    /// requests and the pool drained at whatever `storage.max_connections`
+    /// allowed. `tests/perf/results/soak/` records what that costs: half a
+    /// million rows in flight and 10.4 GiB/min of RSS growth under a flood one
+    /// unauthenticated client can generate. The queue is now bounded, its depth
+    /// is on `prxwaf_queue_depth`, and what it has to give up is counted on
+    /// `prxwaf_budget_events_total{subsystem="queue"}`.
+    detection_sink: Arc<DetectionLogSink>,
     /// Rule-hit audit log, or `None` when `audit_log.enabled = false` (the
     /// default). Held here as well as inside the OWASP check because the marker
     /// line has to be written once per *request*, not once per rule match.
@@ -217,6 +233,15 @@ impl WafEngine {
         ));
         let _ = spawn_worker_if_runtime(&semantic_sink, Arc::clone(&db));
 
+        // The detection write path. Unlike the semantic sink this one is fed by
+        // every posture that blocks anything, so it is always built and its
+        // worker always started.
+        let detection_sink = Arc::new(DetectionLogSink::new(
+            ATTACK_LOG_CHANNEL_CAPACITY,
+            SECURITY_EVENT_CHANNEL_CAPACITY,
+        ));
+        let _ = spawn_detection_worker_if_runtime(&detection_sink, Arc::clone(&db));
+
         Self {
             store,
             custom_rules,
@@ -238,6 +263,7 @@ impl WafEngine {
             synced_registry: OnceLock::new(),
             synced: ArcSwapOption::empty(),
             semantic_sink,
+            detection_sink,
             audit_log,
         }
     }
@@ -1196,7 +1222,12 @@ impl WafEngine {
 
     // ── Logging helpers ───────────────────────────────────────────────────────
 
-    /// Log a Phase 1/2 event to the `attack_logs` table (fire-and-forget).
+    /// Queue a Phase 1/2 event for the `attack_logs` table.
+    ///
+    /// Synchronous and non-blocking: one `try_send` into a bounded channel. It
+    /// does not spawn, does not await and does not touch the database — see
+    /// [`crate::detection_sink`] for why the previous spawn-per-detection was a
+    /// denial of service and what is given up instead.
     fn log_attack(&self, ctx: &RequestCtx, decision: &WafDecision) {
         let Some(result) = &decision.result else {
             return;
@@ -1241,17 +1272,13 @@ impl WafEngine {
             created_at: chrono::Utc::now(),
         };
 
-        let db = Arc::clone(&self.db);
-        metrics::queue_depth_inc(metrics::QueueGauge::AttackLog);
-        tokio::spawn(async move {
-            if let Err(e) = db.create_attack_log(log).await {
-                warn!("Failed to log attack event: {}", e);
-            }
-            metrics::queue_depth_dec(metrics::QueueGauge::AttackLog);
-        });
+        self.detection_sink.try_persist_attack_log(log);
     }
 
-    /// Log a Phase 2+ security event to the `security_events` table (fire-and-forget).
+    /// Queue a Phase 2+ event for the `security_events` table.
+    ///
+    /// Same discipline as [`Self::log_attack`]: bounded, synchronous, counted
+    /// when it has to drop.
     fn log_security_event(&self, ctx: &RequestCtx, decision: &WafDecision) {
         let Some(result) = &decision.result else {
             return;
@@ -1286,14 +1313,7 @@ impl WafEngine {
             }),
         };
 
-        let db = Arc::clone(&self.db);
-        metrics::queue_depth_inc(metrics::QueueGauge::SecurityEvent);
-        tokio::spawn(async move {
-            if let Err(e) = db.create_security_event(event).await {
-                warn!("Failed to log security event: {}", e);
-            }
-            metrics::queue_depth_dec(metrics::QueueGauge::SecurityEvent);
-        });
+        self.detection_sink.try_persist_security_event(event);
     }
 
     /// Push a detection signal to the community reporter via bounded channel.

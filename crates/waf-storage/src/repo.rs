@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use chrono::{DateTime, Utc};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -26,6 +28,14 @@ use waf_common::notify::{NotificationEvent, NotificationEventKind};
 /// to the same tables but describe traffic that was served, so alerting on them
 /// would flood an operator with non-events.
 const ACTION_BLOCK: &str = "block";
+
+/// Bind parameters per `attack_logs` row, for the batched insert's placeholder
+/// arithmetic. Kept next to the query it belongs to would be nicer; it lives
+/// here because a `const` after a statement is a lint.
+const ATTACK_LOG_COLS: usize = 15;
+
+/// Bind parameters per `security_events` row. Same reason.
+const SECURITY_EVENT_COLS: usize = 9;
 
 /// Longest request path echoed into a notification body.
 ///
@@ -545,6 +555,112 @@ impl Database {
         Ok(())
     }
 
+    /// Insert a batch of `attack_logs` rows as **one** multi-row statement.
+    ///
+    /// # Why a batch method exists at all
+    ///
+    /// The single-row [`Self::create_attack_log`] is the right shape for the
+    /// paths that write one row and want its notification. It is the wrong shape
+    /// for the drain worker behind
+    /// [`waf_engine::detection_sink`](../../waf_engine/detection_sink/index.html),
+    /// whose whole problem is arrival rate: under a flood the per-row round trip
+    /// to Postgres is the bottleneck that decides how many detections have to be
+    /// dropped, and one statement for 256 rows removes 255 of those round trips.
+    ///
+    /// # Same guarantees, per row
+    ///
+    /// Every `client_ip` is validated **before** any SQL is built, so one bad
+    /// address fails the batch as a named error rather than as a raw Postgres
+    /// `22P02` halfway through. The `$n::inet` casts are the same the single-row
+    /// path needs, for the same reason. Notifications are raised per blocked row
+    /// after the insert lands, so batching does not silently swallow alerts.
+    ///
+    /// An empty batch is a no-op rather than an error: the worker's drain loop
+    /// can legitimately produce one.
+    pub async fn create_attack_logs(&self, logs: Vec<AttackLog>) -> Result<(), StorageError> {
+        if logs.is_empty() {
+            return Ok(());
+        }
+        for log in &logs {
+            validate_ip("client_ip", &log.client_ip)?;
+        }
+
+        let mut sql = String::from(
+            "INSERT INTO attack_logs (
+                id, host_code, host, client_ip, method, path, query,
+                rule_id, rule_name, action, phase, detail,
+                request_headers, geo_info, created_at
+            ) VALUES ",
+        );
+        for row in 0..logs.len() {
+            if row > 0 {
+                sql.push(',');
+            }
+            let base = row * ATTACK_LOG_COLS;
+            // `client_ip` is `INET NOT NULL`; without the cast Postgres rejects
+            // the text parameter outright.
+            let _ = write!(
+                sql,
+                "(${},${},${},${}::inet,${},${},${},${},${},${},${},${},${},${},${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8,
+                base + 9,
+                base + 10,
+                base + 11,
+                base + 12,
+                base + 13,
+                base + 14,
+                base + 15,
+            );
+        }
+
+        // SQL-SAFETY: `sql` is assembled entirely from a compile-time literal
+        // and `$n` placeholders generated from `logs.len()`. No field of any
+        // `AttackLog` — every one of which is attacker-influenced — reaches the
+        // statement text; they are all bound below. The `AssertSqlSafe` wrapper
+        // is the same one the paginated readers in this file use for the same
+        // reason: sqlx cannot see that a runtime-built string contains no data.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for log in &logs {
+            query = query
+                .bind(log.id)
+                .bind(&log.host_code)
+                .bind(&log.host)
+                .bind(&log.client_ip)
+                .bind(&log.method)
+                .bind(&log.path)
+                .bind(&log.query)
+                .bind(&log.rule_id)
+                .bind(&log.rule_name)
+                .bind(&log.action)
+                .bind(&log.phase)
+                .bind(&log.detail)
+                .bind(&log.request_headers)
+                .bind(&log.geo_info)
+                .bind(log.created_at);
+        }
+        query.execute(&self.pool).await?;
+
+        for log in &logs {
+            if log.action == ACTION_BLOCK {
+                self.publish_notification(attack_event(
+                    &log.host_code,
+                    &log.client_ip,
+                    &log.method,
+                    &log.path,
+                    &log.rule_name,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn list_attack_logs(&self, query: &AttackLogQuery) -> Result<(Vec<AttackLog>, i64), StorageError> {
         let page = query.page.unwrap_or(1).max(1);
         let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
@@ -632,6 +748,84 @@ impl Database {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Insert a batch of `security_events` rows as **one** multi-row statement.
+    ///
+    /// The batch counterpart of [`Self::create_security_event`], and it exists
+    /// for the same reason [`Self::create_attack_logs`] does: the drain worker
+    /// behind the detection sink is round-trip bound under flood, and every
+    /// round trip it does not make is a detection it does not have to drop.
+    ///
+    /// The per-row side effects the single-row path performs are performed here
+    /// too, per row, after the insert lands — the WebSocket broadcast and the
+    /// `attack_detected` notification for real blocks. A batched write that
+    /// quietly stopped raising alerts would be a worse bug than the one this
+    /// method exists to fix.
+    ///
+    /// An empty batch is a no-op rather than an error.
+    pub async fn create_security_events(&self, events: Vec<CreateSecurityEvent>) -> Result<(), StorageError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut sql = String::from(
+            "INSERT INTO security_events
+               (host_code, client_ip, method, path, rule_id, rule_name, action, detail, geo_info)
+               VALUES ",
+        );
+        for row in 0..events.len() {
+            if row > 0 {
+                sql.push(',');
+            }
+            let base = row * SECURITY_EVENT_COLS;
+            let _ = write!(
+                sql,
+                "(${},${},${},${},${},${},${},${},${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8,
+                base + 9,
+            );
+        }
+
+        // SQL-SAFETY: as in `create_attack_logs` — the statement text is a
+        // literal plus generated `$n` placeholders, and every value is bound.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for req in &events {
+            query = query
+                .bind(&req.host_code)
+                .bind(&req.client_ip)
+                .bind(&req.method)
+                .bind(&req.path)
+                .bind(&req.rule_id)
+                .bind(&req.rule_name)
+                .bind(&req.action)
+                .bind(&req.detail)
+                .bind(&req.geo_info);
+        }
+        query.execute(&self.pool).await?;
+
+        for req in &events {
+            if let Ok(event_json) = serde_json::to_value(req) {
+                self.broadcast_event(event_json);
+            }
+            if req.action == ACTION_BLOCK {
+                self.publish_notification(attack_event(
+                    &req.host_code,
+                    &req.client_ip,
+                    &req.method,
+                    &req.path,
+                    &req.rule_name,
+                ));
+            }
+        }
         Ok(())
     }
 

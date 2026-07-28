@@ -410,6 +410,8 @@ means queue saturation is an *observability* incident, not an availability one.
 
 | Sink | Capacity | Overflow | Counted? | Tunable |
 |---|---|---|---|---|
+| **`attack_logs` writes** (`detection_sink.rs:76`) | 4 096 | drop | yes, metric + WARN every 30 s | no |
+| **`security_events` writes** (`detection_sink.rs:83`) | 4 096 | drop | yes, metric + WARN every 30 s | no |
 | audit log (`audit_log.rs:74`) | 4 096 | drop | yes, `AuditLogSink::dropped()`, WARN every 30 s | no |
 | semantic observations (`semantic_sink.rs:41`) | 4 096 | drop | yes | no |
 | semantic events (`semantic_sink.rs:45`) | 4 096 | drop | yes | no |
@@ -421,11 +423,15 @@ means queue saturation is an *observability* incident, not an availability one.
 
 Notes an operator needs:
 
-* **All drop counters are log-only.** None of the four hot-path counters is
-  exported as a metric. You can see saturation in the logs (a WARN every 30 s)
-  and nowhere else, so you cannot alert on it. If audit completeness matters to
-  you, this is the gap to close first. The Lane 1 body-skip counter (§2.2)
-  follows the same pattern and has the same limitation.
+* **The two detection-write queues are the ones that matter most.** They are
+  the only sinks whose overflow discards a record of an *enforced* block, so a
+  non-zero rate on
+  `prxwaf_budget_events_total{subsystem="queue", limit="attack_log"|"security_event"}`
+  means the WAF is protecting traffic it can no longer prove it protected. They
+  exist because the path used to be unbounded — one detached task per detection
+  — which `tests/perf/results/soak/` measured at 10.4 GiB of RSS growth per
+  minute under a flood, with the attacker choosing the slope. §8 lists every
+  queue's exported label pair.
 * **Cluster broadcast drops are silent and uncounted**
   (`crates/waf-cluster/src/node.rs:314-320`). Heartbeats and election messages
   are broadcast through the same 256-slot channel, so a congested peer link is
@@ -963,6 +969,8 @@ collecting its own targets). Read it as a rate signal.
 
 | Sink | `subsystem` | `limit` |
 |---|---|---|
+| `attack_logs` writes | `queue` | `attack_log` |
+| `security_events` writes | `queue` | `security_event` |
 | audit log | `queue` | `audit_log` |
 | semantic observations | `queue` | `semantic_observations` |
 | semantic events | `queue` | `semantic_events` |
@@ -973,7 +981,15 @@ collecting its own targets). Read it as a rate signal.
 §3 said "all drop counters are log-only… If audit completeness matters to you,
 this is the gap to close first", and the cluster peer channel was worse than
 that: neither counted nor logged, so a congested peer link could contribute to a
-spurious election without leaving a trace. All six are now exported.
+spurious election without leaving a trace. All eight are now exported.
+
+The first two rows are new, and they are the ones to alert on: they count
+**enforced detections whose record was not written**. The request was still
+blocked — an attacker gains nothing by filling this queue except the ability to
+erase the evidence, which is exactly why it must not be silent. Alongside them,
+`prxwaf_queue_depth{queue="attack_log"|"security_event"}` shows the backlog
+before any of it is given up, and `prxwaf_db_pool` says whether the connection
+pool is the reason.
 
 The DB event broadcast (`waf-storage/src/db.rs`) is **not** counted. It is a
 `tokio::sync::broadcast`, where loss is reported to the *receiver* as a lag

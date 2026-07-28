@@ -103,17 +103,29 @@ pin() {                                # $1 = cpu list, rest = command
   fi
 }
 
+# What state was the tree in when this was measured?
+#
+# Scoped to the paths that decide what the binary and its rule set are, and
+# deliberately NOT to the whole tree: this harness writes its own results back
+# into `tests/perf/results/`, so a whole-tree check reports "MODIFIED" on every
+# run after the first purely because the previous run's CSV is committed. That
+# reads as "the sources were dirty" and it is not what happened. The question the
+# reader needs answered is whether the SUBJECT matches the commit, so those are
+# the paths that get checked.
+INPUT_PATHS=(crates Cargo.toml Cargo.lock rules configs migrations)
+
 worktree_state() {
   local tracked untracked
   tracked=0
-  ( cd "$SRC" && git diff --quiet && git diff --cached --quiet ) 2>/dev/null || tracked=1
-  untracked="$( cd "$SRC" && git ls-files --others --exclude-standard 2>/dev/null | wc -l )"
+  ( cd "$SRC" && git diff --quiet -- "${INPUT_PATHS[@]}" \
+      && git diff --cached --quiet -- "${INPUT_PATHS[@]}" ) 2>/dev/null || tracked=1
+  untracked="$( cd "$SRC" && git ls-files --others --exclude-standard -- "${INPUT_PATHS[@]}" 2>/dev/null | wc -l )"
   if [ "$tracked" = "1" ]; then
-    echo "MODIFIED — tracked sources differ from the commit; this result is NOT reproducible from it"
+    echo "MODIFIED — tracked build inputs differ from the commit; this result is NOT reproducible from it"
   elif [ "${untracked:-0}" -gt 0 ]; then
-    echo "tracked sources clean; ${untracked} untracked file(s) present"
+    echo "build inputs clean; ${untracked} untracked file(s) under them"
   else
-    echo "clean"
+    echo "build inputs clean"
   fi
 }
 

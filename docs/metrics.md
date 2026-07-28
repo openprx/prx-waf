@@ -70,23 +70,23 @@ which the test suite asserts directly.
 | `prxwaf_detections_total` | 26 phases × 3 actions | 1 | 78 |
 | `prxwaf_degraded_requests_total` | — | 1 | 1 |
 | `prxwaf_inspection_duration_seconds` | 3 lanes | 21 (18 buckets + `+Inf` + sum + count) | 63 |
-| `prxwaf_budget_events_total` | 44 `(subsystem, limit)` pairs | 1 | 44 |
+| `prxwaf_budget_events_total` | 46 `(subsystem, limit)` pairs | 1 | 46 |
 | `prxwaf_queue_depth` | 5 queues | 1 | 5 |
 | `prxwaf_db_pool` | 2 states | 1 | 2 |
 
-Total = **`28H + 221`**, where `H` = `max_host_labels`.
+Total = **`28H + 223`**, where `H` = `max_host_labels`.
 
 | `max_host_labels` | Series |
 |--:|--:|
-| 0 (fold everything) | 221 |
-| 4 | 333 |
-| 16 | 669 |
-| **128 (default)** | **3 805** |
-| 4096 (the clamp) | 114 909 |
+| 0 (fold everything) | 223 |
+| 4 | 335 |
+| 16 | 671 |
+| **128 (default)** | **3 807** |
+| 4096 (the clamp) | 114 911 |
 
 The `4` row is measured, not calculated: a node configured with
 `max_host_labels = 4`, driven with six distinct hostnames plus its own, scrapes
-**exactly 333 series** — four host label values plus `__other__`, and the two
+**exactly 335 series** — four host label values plus `__other__`, and the two
 extra hostnames folded into it.
 
 A **100-host deployment at the default** produces about **3 000 series** — the
@@ -183,8 +183,8 @@ prxwaf_budget_events_total{subsystem, limit}
 ```
 
 `degraded` means part of a request was never inspected. `budget_events` says
-which bound was responsible. One family with 44 `(subsystem, limit)` pairs
-rather than 44 metric names, because the question is always the same shape.
+which bound was responsible. One family with 46 `(subsystem, limit)` pairs
+rather than 46 metric names, because the question is always the same shape.
 
 The full mapping — every bounded resource, its exceed behaviour and its counter
 — is in [`docs/dos-budget.md`](dos-budget.md), §8.
@@ -195,7 +195,8 @@ Three that are worth alerting on from day one:
 |---|---|
 | `{subsystem="lane1_body", limit="max_body_bytes"}` | bodies over 64 KiB are not scanned by `sqli`/`xss`/`rce`/`dir_traversal` **at all**. A steady rate means an application whose real traffic exceeds the budget |
 | `{subsystem="crs_body_processor", limit="json_body_bytes"}` | JSON over 64 KiB produces no `ARGS_POST` targets, so the CRS rules that read them are not protecting that endpoint |
-| `{subsystem="queue", ...}` | any non-zero rate means audit records, Lane 2 observations or notifications are being dropped. Detection is unaffected; your record of it is not |
+| `{subsystem="queue", limit="attack_log"}` and `{limit="security_event"}` | the WAF blocked a request and could not write the row proving it. Detection is unaffected; your evidence of it is not — this is the one drop an attacker benefits from |
+| `{subsystem="queue", ...}` (the rest) | audit records, Lane 2 observations or notifications are being dropped |
 
 ### The write path behind the detection
 
