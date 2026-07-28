@@ -137,17 +137,37 @@ pub struct WafEngine {
     audit_log: Option<Arc<AuditLogSink>>,
 }
 
-/// Map a decision onto the detection metric's `action` label.
+/// Count one detection against the phase that produced it.
 ///
-/// `None` for `Allow`: a whitelist hit short-circuits the pipeline but is not a
-/// detection, and counting it would make the block-rate ratio meaningless.
-const fn verdict_action_of(action: &WafAction) -> Option<metrics::VerdictAction> {
-    match action {
-        WafAction::Allow => None,
-        WafAction::Block { .. } => Some(metrics::VerdictAction::Block),
-        WafAction::LogOnly => Some(metrics::VerdictAction::LogOnly),
-        WafAction::Redirect { .. } => Some(metrics::VerdictAction::Redirect),
-    }
+/// # Why this is a free function called from three places
+///
+/// There is no single choke point, and assuming there was one is how the first
+/// attempt at this shipped a permanently-zero counter. The engine has **two**
+/// logging sinks covering disjoint sets of phases —
+/// [`WafEngine::log_attack`] for the IP and URL blocklists (including their
+/// cluster-synced twins) and [`WafEngine::log_security_event`] for everything
+/// that reaches the content pipeline — plus
+/// [`WafEngine::record_semantic_log`], which deliberately bypasses both so the
+/// shadow lane cannot change legacy logging behaviour. No request path reaches
+/// more than one of them, so calling this from each counts every detection
+/// exactly once.
+///
+/// `WafAction::Allow` is not counted: a whitelist hit short-circuits the
+/// pipeline but detects nothing, and counting it would make the block-rate
+/// ratio meaningless.
+///
+/// The rule id is deliberately not a label. 291 CRS rules times host times
+/// action is the cardinality explosion the metric store exists to prevent;
+/// per-rule attribution lives in `security_events` and the audit log, which are
+/// queryable and bounded by retention.
+fn record_detection_metric(decision: &WafDecision, result: &DetectionResult) {
+    let action = match &decision.action {
+        WafAction::Allow => return,
+        WafAction::Block { .. } => metrics::VerdictAction::Block,
+        WafAction::LogOnly => metrics::VerdictAction::LogOnly,
+        WafAction::Redirect { .. } => metrics::VerdictAction::Redirect,
+    };
+    metrics::record_detection(result.phase, action);
 }
 
 impl WafEngine {
@@ -1189,19 +1209,7 @@ impl WafEngine {
             WafAction::Redirect { .. } => "redirect",
         };
 
-        // Every legacy, custom-rule, CRS, CrowdSec and Lane-2-enforced detection
-        // reaches this function, and it is the only one that sees both the phase
-        // that produced the verdict and the action taken — which is the pair the
-        // detection metric is keyed on. `WafAction::Allow` is the whitelist
-        // short-circuit; it is not a detection and is not counted.
-        //
-        // The rule id is deliberately not a label. 291 CRS rules times host
-        // times action is the cardinality explosion this whole design exists to
-        // avoid; per-rule attribution lives in `security_events` and the audit
-        // log, which are queryable and bounded by retention.
-        if let Some(action) = verdict_action_of(&decision.action) {
-            metrics::record_detection(result.phase, action);
-        }
+        record_detection_metric(decision, result);
 
         let log = AttackLog {
             id: Uuid::new_v4(),
@@ -1253,6 +1261,8 @@ impl WafEngine {
             WafAction::LogOnly => "log_only",
             WafAction::Redirect { .. } => "redirect",
         };
+
+        record_detection_metric(decision, result);
 
         let event = CreateSecurityEvent {
             host_code: ctx.host_config.code.clone(),

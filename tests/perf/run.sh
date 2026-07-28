@@ -113,6 +113,14 @@ CONNECTIONS="${CONNECTIONS:-50}"
 WORKER_THREADS="${WORKER_THREADS:-}"
 LANE1_MAX_BODY_BYTES="${LANE1_MAX_BODY_BYTES:-}"
 
+#   METRICS                empty = the shipped default, i.e. `[metrics] enabled
+#                          = true`. 0 turns recording off entirely, which is the
+#                          only way to measure what the recording itself costs:
+#                          `full` against `full-nometrics` is the whole answer,
+#                          and no code path differs between them except the
+#                          `OnceLock` the record sites test.
+METRICS="${METRICS:-}"
+
 WORK="${WORK:-${TMPDIR:-/tmp}/prx-waf-perf}"
 OUT="${OUT:-$WORK/reports}"
 SRC="${SRC:-$REPO_ROOT}"
@@ -120,6 +128,10 @@ PRXWAF_BIN="${PRXWAF_BIN:-}"
 WAF_PORT="${WAF_PORT:-18801}"
 WAF_TLS_PORT="${WAF_TLS_PORT:-18844}"
 API_PORT="${API_PORT:-19811}"
+# Not 9090: the shipped default is the port a Prometheus server itself listens
+# on, and a harness that fights the machine's monitoring for a socket fails in a
+# way that looks like a WAF bug.
+METRICS_PORT="${METRICS_PORT:-19891}"
 BACKEND_PORT="${BACKEND_PORT:-18888}"
 PG_PORT="${PG_PORT:-15533}"
 PG_CONTAINER="${PG_CONTAINER:-prx-waf-perf-pg}"
@@ -147,6 +159,9 @@ esac
 case "$LANE1_MAX_BODY_BYTES" in ''|*[!0-9]*)
   [ -z "$LANE1_MAX_BODY_BYTES" ] ||
     die "LANE1_MAX_BODY_BYTES must be a non-negative integer or empty, got '$LANE1_MAX_BODY_BYTES'" ;;
+esac
+case "$METRICS" in ''|0|1) ;;
+  *) die "METRICS must be 0, 1 or empty, got '$METRICS'" ;;
 esac
 
 # What state was the tree in when this was measured?
@@ -232,7 +247,7 @@ mkdir -p "$WORK" "$OUT"
 # Pingora retries a busy listen socket forever instead of failing, so a
 # stranger on $WAF_PORT would be silently benchmarked instead of the WAF.
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
-PORTS_TO_CHECK=("$WAF_PORT" "$WAF_TLS_PORT" "$API_PORT" "$BACKEND_PORT")
+PORTS_TO_CHECK=("$WAF_PORT" "$WAF_TLS_PORT" "$API_PORT" "$BACKEND_PORT" "$METRICS_PORT")
 [ "$SKIP_POSTGRES" = "1" ] || PORTS_TO_CHECK+=("$PG_PORT")
 for p in "${PORTS_TO_CHECK[@]}"; do
   port_busy "$p" && die "port $p already in use — set WAF_PORT / API_PORT / BACKEND_PORT / PG_PORT"
@@ -422,7 +437,7 @@ curl -sf "http://127.0.0.1:$BACKEND_PORT/capabilities" >/dev/null 2>&1 \
 gen_config() {                         # $1 = posture, $2 = output path
   local posture="$1" dst="$2"
   local bot=false sqli=false xss=false scan=false rce=false sensitive=false
-  local traversal=false owasp=false cc=false pl=1 cs_enabled=false
+  local traversal=false owasp=false cc=false pl=1 cs_enabled=false metrics_enabled=true
 
   case "$posture" in
     passthrough) ;;
@@ -443,8 +458,19 @@ gen_config() {                         # $1 = posture, $2 = output path
     cc)    cc=true ;;
     full)  bot=true sqli=true xss=true scan=true rce=true sensitive=true traversal=true
            owasp=true pl=1 cc=true cs_enabled=true ;;
+    # The metrics A/B. Identical detection to the posture it names, with
+    # recording off — so the delta is the recording and nothing else.
+    passthrough-nometrics) metrics_enabled=false ;;
+    full-nometrics)
+           bot=true sqli=true xss=true scan=true rce=true sensitive=true traversal=true
+           owasp=true pl=1 cc=true cs_enabled=true metrics_enabled=false ;;
     *) die "unknown posture: $posture" ;;
   esac
+
+  # The global knob overrides the posture, so METRICS=0 measures every posture
+  # with recording off without needing a `-nometrics` twin for each one.
+  [ "$METRICS" = "0" ] && metrics_enabled=false
+  [ "$METRICS" = "1" ] && metrics_enabled=true
 
   {
     cat <<EOF
@@ -459,6 +485,13 @@ $([ -n "$WORKER_THREADS" ] && printf 'worker_threads = %s' "$WORKER_THREADS")
 
 [api]
 listen_addr = "127.0.0.1:$API_PORT"
+
+# Written explicitly in every posture, never left to the default, so the config
+# file left behind in \$WORK states which side of the metrics question the run
+# was on. \`enabled = false\` is what the \`*-nometrics\` postures select.
+[metrics]
+enabled = $metrics_enabled
+listen_addr = "127.0.0.1:$METRICS_PORT"
 
 [storage]
 database_url = "$DATABASE_URL"
