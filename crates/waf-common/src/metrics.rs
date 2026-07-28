@@ -379,6 +379,14 @@ pub enum BudgetEvent {
     /// documented exceed behaviour (`docs/dos-budget.md` §1.3) that previously
     /// had no signal of any kind.
     Lane2DetectorDegrade,
+    /// A third-party Lane 2 parser panicked on a request-controlled string and
+    /// the unwind was contained at the detector boundary: that view produced no
+    /// signal, the request carried on, the worker survived.
+    ///
+    /// Any non-zero value is an upstream parser bug reachable from the network
+    /// and worth an alert — it is not a tuning knob and no configuration change
+    /// makes it go away.
+    Lane2ParserPanic,
 
     // ── §1.3 Lane 2 structured extractor ─────────────────────────────────────
     /// Input over `MAX_EXTRACT_INPUT_BYTES` — the whole extraction is skipped.
@@ -443,7 +451,7 @@ impl BudgetEvent {
     /// Every variant, in declaration order. The exposition walks this, so a new
     /// variant appears in `/metrics` (at zero) the moment it is added — a
     /// counter an operator has never seen fire still has to be graphable.
-    const ALL: [Self; 48] = [
+    const ALL: [Self; 49] = [
         Self::HeaderValueCountExceeded,
         Self::HeaderFoldBytesExceeded,
         Self::DuplicateHost,
@@ -474,6 +482,7 @@ impl BudgetEvent {
         Self::Lane2TokensPerView,
         Self::Lane2PreprocessOutputBytes,
         Self::Lane2DetectorDegrade,
+        Self::Lane2ParserPanic,
         Self::Lane2ExtractInputTooLarge,
         Self::Lane2GraphqlDeclined,
         Self::Lane1BodySkip,
@@ -531,6 +540,7 @@ impl BudgetEvent {
             Self::Lane2TokensPerView => ("lane2_budget", "tokens_per_view"),
             Self::Lane2PreprocessOutputBytes => ("lane2_budget", "preprocess_output_bytes"),
             Self::Lane2DetectorDegrade => ("lane2_detector", "input_cap"),
+            Self::Lane2ParserPanic => ("lane2_detector", "parser_panic"),
             Self::Lane2ExtractInputTooLarge => ("lane2_extract", "input_bytes"),
             Self::Lane2GraphqlDeclined => ("lane2_extract", "graphql_raw_opens"),
             Self::Lane1BodySkip => ("lane1_body", "max_body_bytes"),

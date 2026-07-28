@@ -15,6 +15,7 @@
 //! log_only`, so a match is at most logged + persisted, never a Block.
 
 use std::borrow::Cow;
+use std::panic::AssertUnwindSafe;
 use std::sync::LazyLock;
 
 use brush_parser::ParserOptions;
@@ -2965,11 +2966,55 @@ impl RceAstDetector {
     }
 
     /// Parse `s` into a shell program, or `None` on a tokenize / parse failure.
-    /// Pure: no execution, no panic — an error simply yields no signal.
+    /// Pure: no execution — an error, or a contained parser panic, simply yields
+    /// no signal. See [`contain_parser_panic`] for why the guard is there.
     fn parse_program(&self, s: &str) -> Option<shell_ast::Program> {
-        let tokens = brush_parser::tokenize_str(s).ok()?;
-        brush_parser::parse_tokens(&tokens, &self.opts).ok()
+        let opts = &self.opts;
+        contain_parser_panic(|| {
+            let tokens = brush_parser::tokenize_str(s).ok()?;
+            brush_parser::parse_tokens(&tokens, opts).ok()
+        })
     }
+}
+
+/// Run a brush-parser entry point with the worker protected from a parser panic.
+///
+/// brush-parser 0.4.0 carries `.parse().unwrap()` sites that a request-controlled
+/// string reaches. `peg.rs:695` is the one the 2026-07-27 soak found: the
+/// `io_number` rule accepts any all-digit word sitting immediately before a `<` or
+/// `>` and unwraps it into `ast::IoFd`, an `i32`, so `x | 2147483648>&1` overflows
+/// and panics. `word.rs:909`/`:911` is a second one, in the tilde dir-stack index.
+/// 0.4.0 is the newest release, so there is no version to upgrade to, and the
+/// crate has upwards of a hundred further `unwrap` / `unreachable` sites — this
+/// is a class of bug, not one bug.
+///
+/// Rejecting the panicking *shapes* before the call was the alternative. It was
+/// rejected: it only covers the shapes already known, it has to model
+/// brush-parser's tokenisation to decide what counts as a word boundary, and it
+/// would have to be extended every time the fuzzer finds the next site. The
+/// containment below covers all of them at once and needs no upkeep. The narrower
+/// pre-parse guards that remain in `detect` are the ones containment genuinely
+/// cannot replace: a stack overflow aborts the process rather than unwinding, so
+/// `max_nesting_depth` still has to reject before the call.
+///
+/// A caught panic yields `None` — the same signal-free outcome as a parse error.
+/// That is fail-open for detection on that one view (Lane 1 and the structural
+/// detectors still inspect the field) and never fail-open for availability.
+/// `AssertUnwindSafe` is sound here because the closure only reads the input
+/// `&str` and the parser options and owns every value it builds; brush-parser
+/// keeps no statics or thread-locals, so an unwind can leave nothing torn behind
+/// for a later request to observe.
+///
+/// Residual, deliberately not addressed here: the default panic hook still writes
+/// the panic to stderr, so a flood of these payloads is a log-amplification
+/// nuisance. Silencing it means installing a process-wide hook, which is the
+/// binary's decision to make, not this detector's.
+fn contain_parser_panic<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
+    let Ok(parsed) = std::panic::catch_unwind(AssertUnwindSafe(f)) else {
+        waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::Lane2ParserPanic);
+        return None;
+    };
+    parsed
 }
 
 impl Default for RceAstDetector {
@@ -3428,7 +3473,8 @@ fn classify_word_cmdsubst(value: &str, walk: &mut ShellWalk<'_>) {
         return;
     }
     walk.word_parses += 1;
-    let Ok(pieces) = shell_word::parse(value, walk.opts) else {
+    let opts = walk.opts;
+    let Some(pieces) = contain_parser_panic(|| shell_word::parse(value, opts).ok()) else {
         return;
     };
     scan_word_pieces(&pieces, walk);
@@ -6176,27 +6222,31 @@ mod tests {
         assert!(rce_ast_fire(&big).is_none(), "oversized view is not AST-inspected");
     }
 
-    // ── P0: shell-AST I/O-number overflow DoS guard (brush-parser panic) ─────
+    // ── P0: brush-parser panic containment (shell AST) ───────────────────────
 
-    /// A redirection file descriptor wider than `i32` must be declined, never
-    /// parsed. brush-parser 0.4.0 `peg.rs:695` (`io_number`) does `w.parse().unwrap()`
+    /// A redirection file descriptor wider than `i32` must not take the worker
+    /// down. brush-parser 0.4.0 `peg.rs:695` (`io_number`) does `w.parse().unwrap()`
     /// into `ast::IoFd = i32`, so an all-digit word immediately followed by `<` or
-    /// `>` panics the worker on overflow. That this test *returns* is the proof the
-    /// input never reaches `tokenize_str`/`parse_tokens`.
+    /// `>` panics on overflow. `.ok()` at the call site covers the `Err` arm and
+    /// does nothing for a panic. That this test *returns* is the proof the panic is
+    /// contained; `is_none()` is the proof it degrades to "no signal" rather than
+    /// to a bogus finding.
+    ///
+    /// Minimised from the 2026-07-27 `content_security` soak crash. Each payload
+    /// carries a `shell_ast_prefilter` marker (`|` or `/etc/`), because without one
+    /// the view never reaches the parser and the reproducer would prove nothing.
     #[test]
-    fn rce_ast_oversized_io_number_declines_without_panic() {
-        // Minimised libFuzzer reproducer, both redirection directions and both
-        // overflow sides. The leading `|` is what admits the view past the
-        // prefilter, exactly as the fuzzer found it.
+    fn rce_ast_oversized_io_number_is_contained() {
         for payload in [
-            "|2147483648>x",
-            "|2147483648<x",
-            "|99999999999999999999>x",
-            "x | 4294967296>&1",
+            "x | 2147483648>&1",
+            "cat /etc/passwd | 2147483648>y",
+            "2147483648>/etc/passwd",
+            "id | 2147483648<x",
+            "x | 99999999999999999999>y",
         ] {
             assert!(
                 rce_ast_fire(payload).is_none(),
-                "{payload:?}: over-wide io number must be declined, not parsed"
+                "{payload:?}: over-wide io number must yield no signal"
             );
         }
     }
