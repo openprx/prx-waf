@@ -69,6 +69,13 @@ pub struct AppConfig {
     /// [`NotificationsConfig`].
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    /// Prometheus scrape endpoint.
+    ///
+    /// **On by default, bound to `127.0.0.1:9090`.** See
+    /// [`crate::metrics::MetricsConfig`] for why that combination and not
+    /// off-by-default.
+    #[serde(default)]
+    pub metrics: crate::metrics::MetricsConfig,
 }
 
 /// Runtime settings for operator-notification delivery.
@@ -1576,6 +1583,20 @@ where
     // baked-in TOML.
     if let Some(v) = get("PRXWAF_WORKER_THREADS") {
         config.proxy.worker_threads = Some(parse_env_usize("PRXWAF_WORKER_THREADS", &v)?);
+    }
+
+    // Where the scrape endpoint lives is a property of the deployment, not of
+    // the image: the same container is scraped over a pod-local port in
+    // Kubernetes and over loopback on a bare host. Same reasoning as the worker
+    // count above — keep it out of the baked-in TOML.
+    if let Some(v) = get("PRXWAF_METRICS_ENABLED") {
+        config.metrics.enabled = parse_env_bool("PRXWAF_METRICS_ENABLED", &v)?;
+    }
+    if let Some(v) = get("PRXWAF_METRICS_LISTEN_ADDR") {
+        config.metrics.listen_addr = v;
+    }
+    if let Some(v) = get("PRXWAF_METRICS_MAX_HOST_LABELS") {
+        config.metrics.max_host_labels = parse_env_usize("PRXWAF_METRICS_MAX_HOST_LABELS", &v)?;
     }
 
     // Cluster overrides only when a [cluster] section is present.

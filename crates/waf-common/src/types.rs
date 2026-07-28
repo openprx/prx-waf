@@ -392,6 +392,94 @@ pub enum Phase {
     ResponseBody = 26,
 }
 
+impl Phase {
+    /// Every phase, for exhaustive iteration.
+    ///
+    /// Written out rather than derived because the metrics exposition has to
+    /// name every `phase` series even at zero — a detection counter that only
+    /// appears once it has fired is a counter no dashboard can be built on
+    /// ahead of the incident. `phase_list_is_exhaustive` keeps this honest.
+    pub const ALL: [Self; 26] = [
+        Self::IpWhitelist,
+        Self::IpBlacklist,
+        Self::UrlWhitelist,
+        Self::UrlBlacklist,
+        Self::SqlInjection,
+        Self::Xss,
+        Self::Rce,
+        Self::Scanner,
+        Self::DirTraversal,
+        Self::Bot,
+        Self::RateLimit,
+        Self::CustomRule,
+        Self::Owasp,
+        Self::Sensitive,
+        Self::AntiHotlink,
+        Self::CrowdSec,
+        Self::GeoIp,
+        Self::Community,
+        Self::Xxe,
+        Self::NoSqlInjection,
+        Self::Ssti,
+        Self::LdapInjection,
+        Self::XpathInjection,
+        Self::Deserialization,
+        Self::ResponseHeaders,
+        Self::ResponseBody,
+    ];
+
+    /// Largest value [`Self::index`] can return. Discriminants start at 1, so a
+    /// table indexed by phase needs `MAX_INDEX + 1` slots.
+    pub const MAX_INDEX: usize = Self::ResponseBody as usize;
+
+    /// Dense index for table lookup. This is the discriminant, so it is stable
+    /// as long as the discriminants are — and they are already load-bearing
+    /// (they are persisted in `security_events.phase`).
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Label value for the `phase` metric label.
+    ///
+    /// Deliberately not [`std::fmt::Display`]: that is prose for an operator
+    /// reading a block page ("SQL Injection"), and it contains spaces and
+    /// capitals. This is a stable, lowercase, underscore-separated identifier —
+    /// changing one of these strings breaks somebody's alerting rule, so they
+    /// are written here once and never derived from the display name.
+    #[must_use]
+    pub const fn metric_label(self) -> &'static str {
+        match self {
+            Self::IpWhitelist => "ip_whitelist",
+            Self::IpBlacklist => "ip_blacklist",
+            Self::UrlWhitelist => "url_whitelist",
+            Self::UrlBlacklist => "url_blacklist",
+            Self::SqlInjection => "sql_injection",
+            Self::Xss => "xss",
+            Self::Rce => "rce",
+            Self::Scanner => "scanner",
+            Self::DirTraversal => "dir_traversal",
+            Self::Bot => "bot",
+            Self::RateLimit => "rate_limit",
+            Self::CustomRule => "custom_rule",
+            Self::Owasp => "owasp",
+            Self::Sensitive => "sensitive",
+            Self::AntiHotlink => "anti_hotlink",
+            Self::CrowdSec => "crowdsec",
+            Self::GeoIp => "geoip",
+            Self::Community => "community",
+            Self::Xxe => "xxe",
+            Self::NoSqlInjection => "nosql_injection",
+            Self::Ssti => "ssti",
+            Self::LdapInjection => "ldap_injection",
+            Self::XpathInjection => "xpath_injection",
+            Self::Deserialization => "deserialization",
+            Self::ResponseHeaders => "response_headers",
+            Self::ResponseBody => "response_body",
+        }
+    }
+}
+
 impl std::fmt::Display for Phase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -630,6 +718,53 @@ mod tests {
 
     fn pairs(input: &str) -> Vec<(&str, &str)> {
         split_form_args(input).into_iter().map(|a| (a.name, a.value)).collect()
+    }
+
+    /// A phase missing from `Phase::ALL` is a detection nobody can graph. The
+    /// only way to catch that is to check the list against the discriminants,
+    /// since Rust cannot enumerate a plain enum's variants.
+    #[test]
+    fn phase_list_is_exhaustive_and_densely_indexed() {
+        let mut seen = [false; Phase::MAX_INDEX + 1];
+        for phase in Phase::ALL {
+            let i = phase.index();
+            assert!(
+                (1..=Phase::MAX_INDEX).contains(&i),
+                "{phase:?} indexes out of range at {i}"
+            );
+            assert!(
+                !seen.get(i).copied().unwrap_or(true),
+                "{phase:?} shares index {i} with another phase"
+            );
+            if let Some(slot) = seen.get_mut(i) {
+                *slot = true;
+            }
+        }
+        // Index 0 is unused (discriminants start at 1); every other index must
+        // be claimed, which is what proves no variant was left out of `ALL`.
+        assert_eq!(seen.iter().filter(|s| **s).count(), Phase::ALL.len());
+        assert_eq!(Phase::ALL.len(), Phase::MAX_INDEX);
+    }
+
+    /// Metric label values end up in somebody's alerting rules, so they must be
+    /// unique and must stay in the character set Prometheus label values are
+    /// conventionally written in.
+    #[test]
+    fn phase_metric_labels_are_unique_and_well_formed() {
+        let mut labels: Vec<&str> = Phase::ALL.iter().map(|p| p.metric_label()).collect();
+        for label in &labels {
+            assert!(!label.is_empty());
+            assert!(
+                label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit()),
+                "{label} is not a lowercase snake_case identifier"
+            );
+        }
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(before, labels.len(), "two phases share a metric label");
     }
 
     #[test]

@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.70"
+version = "0.2.71"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -104,6 +104,24 @@ lz4_flex = "0.11"
 hmac = "0.13"
 time = { version = "0.3", default-features = false, features = ["std"] }
 parking_lot = "0.12"
+
+# Prometheus exposition. `prometheus-client` is the Prometheus project's own
+# Rust client; it is picked over the two alternatives for dependency weight,
+# which for a proxy that already links Pingora, sqlx, wasmtime and rustls is the
+# deciding factor:
+#
+#   * `prometheus` (tikv) drags in a whole `protobuf` 3.x runtime plus a second
+#     `thiserror` major, to serve a format this endpoint never emits;
+#   * `metrics` + `metrics-exporter-prometheus` adds `evmap`, `quanta`,
+#     `sketches-ddsketch` and a *second* hyper + rustls + hyper-rustls stack for
+#     a push gateway nothing here uses;
+#   * this adds `dtoa` and `itoa` — and reuses the `parking_lot`, `syn`, `quote`
+#     and `proc-macro2` already in the graph.
+#
+# Only its `Registry`/`Collector`/text-encoder half is used. The counters
+# themselves are the lock-free tables in `waf-common::metrics`, because the
+# library's `Family` takes a read lock and allocates a label set per increment.
+prometheus-client = "0.25"
 
 # Signature verification
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }

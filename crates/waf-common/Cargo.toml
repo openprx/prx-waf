@@ -18,6 +18,9 @@ aes-gcm = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 url = { workspace = true }
+# Prometheus registry + text exposition for `metrics`. Only the encoder half is
+# used; the counters are this crate's own lock-free tables.
+prometheus-client = { workspace = true }
 # Slow, salted KDF for encryption at rest (M-12)
 argon2 = { workspace = true }
 rand = { workspace = true }
