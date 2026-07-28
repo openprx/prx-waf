@@ -3711,10 +3711,15 @@ mod tests {
 
     /// The shipped default has to be the quiet one. If the factory config warns,
     /// operators learn to ignore the warning.
+    ///
+    /// The port is pinned here as well as in `MetricsConfig::default`, because
+    /// it is not a free choice: 9090 is Prometheus's own listen port and 9091 is
+    /// pushgateway, so either would collide with the node-local scraper this
+    /// default exists to be scraped by.
     #[test]
     fn shipped_metrics_bind_is_loopback_and_informational() {
         let cfg = MetricsConfig::default();
-        assert_eq!(cfg.listen_addr, "127.0.0.1:9090");
+        assert_eq!(cfg.listen_addr, "127.0.0.1:9127");
         assert!(cfg.enabled, "metrics must ship on");
         let lines = metrics_startup_broadcast(&cfg);
         let l = lines.first().expect("broadcast is never empty");
@@ -3726,7 +3731,7 @@ mod tests {
     /// exposure. It must warn, and it must say what reading it gets you.
     #[test]
     fn non_loopback_metrics_bind_warns_and_names_what_leaks() {
-        for addr in ["0.0.0.0:9090", "[::]:9090", "192.0.2.10:9090"] {
+        for addr in ["0.0.0.0:9127", "[::]:9127", "192.0.2.10:9127"] {
             let lines = metrics_startup_broadcast(&metrics_cfg(addr));
             let l = lines.first().expect("broadcast is never empty");
             assert_eq!(l.level, BroadcastLevel::Warn, "{addr}: {}", l.text);

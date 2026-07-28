@@ -84,8 +84,8 @@ PRXWAF_BIN="${PRXWAF_BIN:-}"
 WAF_PORT="${WAF_PORT:-18901}"
 WAF_TLS_PORT="${WAF_TLS_PORT:-18944}"
 API_PORT="${API_PORT:-19911}"
-# Not 9090. The shipped default is the port Prometheus itself listens on, and on
-# this host it is already taken by an unrelated service.
+# Not the shipped default (127.0.0.1:9127). That socket is host-global: a real
+# prx-waf, or run.sh, would be holding it while this soak runs.
 METRICS_PORT="${METRICS_PORT:-19991}"
 BACKEND_PORT="${BACKEND_PORT:-18988}"
 PG_PORT="${PG_PORT:-15633}"

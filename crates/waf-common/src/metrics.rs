@@ -62,9 +62,14 @@ use crate::types::Phase;
 /// overwhelming majority of deployments run blind, which is the problem this
 /// section exists to solve; binding to `0.0.0.0` by default would publish
 /// per-host request volumes and block rates to anyone who can route to the box.
-/// `127.0.0.1:9090` is the combination that is useful out of the box and
+/// `127.0.0.1:9127` is the combination that is useful out of the box and
 /// exposes nothing — an operator who wants a remote scraper has to say so, and
 /// gets a startup warning when they do.
+///
+/// The port is deliberately not 9090: that is Prometheus's own listen port, and
+/// a node-local Prometheus is the intended scraper, so 9090 would collide on
+/// exactly the deployment the default is for. 9091 is pushgateway and is out
+/// for the same reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MetricsConfig {
@@ -89,7 +94,7 @@ impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            listen_addr: "127.0.0.1:9090".to_string(),
+            listen_addr: "127.0.0.1:9127".to_string(),
             max_host_labels: 128,
         }
     }

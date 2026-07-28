@@ -461,16 +461,18 @@ This is deliberately **not** a CI gate — see
 
 ## Metrics
 
-Prometheus exposition on **`127.0.0.1:9090/metrics`**, on by default.
+Prometheus exposition on **`127.0.0.1:9127/metrics`**, on by default. (Not 9090:
+that is Prometheus's own port, and a node-local Prometheus is the intended
+scraper.)
 
 ```
-curl -s http://127.0.0.1:9090/metrics
+curl -s http://127.0.0.1:9127/metrics
 ```
 
 ```
 [metrics]
 enabled = true
-listen_addr = "127.0.0.1:9090"
+listen_addr = "127.0.0.1:9127"
 max_host_labels = 128
 ```
 

@@ -36,7 +36,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   it stops itself at an RSS ceiling rather than OOM-ing the host.
 
 - **Prometheus metrics on `/metrics`, on by default, bound to
-  `127.0.0.1:9090`.** The WAF previously exported nothing: request rate, block
+  `127.0.0.1:9127`.** (Not 9090 — that is the port a Prometheus server itself
+  listens on, and a node-local Prometheus is the scraper this default is written
+  for, so 9090 would collide on exactly the deployment it serves.) The WAF
+  previously exported nothing: request rate, block
   rate, detection mix, per-lane detection cost and every budget/degradation
   counter in `docs/dos-budget.md` were readable only by grepping logs, and
   several were not even logged. Seven metrics now cover RED by host and

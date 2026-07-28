@@ -133,9 +133,14 @@ listen_addr = "0.0.0.0:9527"
 # and replace certificates — puts a far more dangerous credential in the
 # monitoring system's config file. The bind address is the access control. Widen
 # it only behind a firewall you control; startup warns when you do.
+#
+# Deliberately NOT 9090: that is the port a Prometheus server itself listens on,
+# and a Prometheus scraping this WAF is very often the same box, so a 9090
+# default collides on exactly the deployment it was meant to serve. 9091 is
+# pushgateway, so it is out for the same reason. 9127 is unclaimed by both.
 [metrics]
 enabled = true
-listen_addr = "127.0.0.1:9090"
+listen_addr = "127.0.0.1:9127"
 
 # Upper bound on distinct `host` label values. This is the ONLY setting that
 # decides how many time series this process can produce: past the bound, hosts

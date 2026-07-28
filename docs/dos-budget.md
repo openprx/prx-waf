@@ -1118,7 +1118,7 @@ If you are deploying prx-waf, the short version:
    reading), `{subsystem="crs_body_processor", limit="json_body_bytes"}` (JSON
    your `ARGS_POST` rules are not protecting) and any `{subsystem="queue"}`
    (records you are losing). The endpoint is on by default on
-   `127.0.0.1:9090`; see [`docs/metrics.md`](metrics.md).
+   `127.0.0.1:9127`; see [`docs/metrics.md`](metrics.md).
 9. **Expect memory to grow under attack, and budget in gigabytes.** Ten seconds
    of blocked traffic took the shipping posture from 106 MiB to **4,065 MiB** in
    measurement, because every block writes to the database and the pool behind

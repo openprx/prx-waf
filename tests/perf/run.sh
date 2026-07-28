@@ -128,8 +128,8 @@ PRXWAF_BIN="${PRXWAF_BIN:-}"
 WAF_PORT="${WAF_PORT:-18801}"
 WAF_TLS_PORT="${WAF_TLS_PORT:-18844}"
 API_PORT="${API_PORT:-19811}"
-# Not 9090: the shipped default is the port a Prometheus server itself listens
-# on, and a harness that fights the machine's monitoring for a socket fails in a
+# Not the shipped default (127.0.0.1:9127): a harness that fights a real
+# prx-waf, or a second harness, for the machine's one metrics socket fails in a
 # way that looks like a WAF bug.
 METRICS_PORT="${METRICS_PORT:-19891}"
 BACKEND_PORT="${BACKEND_PORT:-18888}"

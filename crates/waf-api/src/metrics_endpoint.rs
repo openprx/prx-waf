@@ -13,7 +13,7 @@
 //!
 //! The endpoint is therefore **unauthenticated by design**, and its safety
 //! comes entirely from the bind address. `[metrics] listen_addr` defaults to
-//! `127.0.0.1:9090`; widening it publishes per-host request volumes, block
+//! `127.0.0.1:9127`; widening it publishes per-host request volumes, block
 //! rates and detection counts, which is a reconnaissance surface. The startup
 //! broadcast in `prx-waf` says so out loud when the bind is not loopback.
 //!

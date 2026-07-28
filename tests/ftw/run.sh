@@ -242,7 +242,7 @@ smuggling_detection = true
 listen_addr = "127.0.0.1:$API_PORT"
 
 # Off. These harnesses measure detection, and a scrape endpoint is a
-# host-global port (the default is 127.0.0.1:9090) that a second harness, or the
+# host-global port (the default is 127.0.0.1:9127) that a second harness, or the
 # machine's own Prometheus, would be fighting for. A failed bind is only logged,
 # so leaving it on would not break a run — it would just put an unexplained
 # ERROR in every waf log for the next person to read.

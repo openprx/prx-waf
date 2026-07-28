@@ -71,7 +71,7 @@ pub struct AppConfig {
     pub notifications: NotificationsConfig,
     /// Prometheus scrape endpoint.
     ///
-    /// **On by default, bound to `127.0.0.1:9090`.** See
+    /// **On by default, bound to `127.0.0.1:9127`.** See
     /// [`crate::metrics::MetricsConfig`] for why that combination and not
     /// off-by-default.
     #[serde(default)]

@@ -4,7 +4,7 @@ What prx-waf exports on `/metrics`, what each series answers, and — the part
 that decides whether you can run this in production — exactly how many series it
 can produce.
 
-The endpoint is **on by default** and bound to **`127.0.0.1:9090`**. It carries
+The endpoint is **on by default** and bound to **`127.0.0.1:9127`**. It carries
 no credential. Both of those are deliberate; see [Exposure](#exposure).
 
 ---
@@ -14,19 +14,26 @@ no credential. Both of those are deliberate; see [Exposure](#exposure).
 ```
 [metrics]
 enabled = true
-listen_addr = "127.0.0.1:9090"
+listen_addr = "127.0.0.1:9127"
 max_host_labels = 128
 ```
 
 | Key | Env override | Default |
 |---|---|---|
 | `enabled` | `PRXWAF_METRICS_ENABLED` | `true` |
-| `listen_addr` | `PRXWAF_METRICS_LISTEN_ADDR` | `127.0.0.1:9090` |
+| `listen_addr` | `PRXWAF_METRICS_LISTEN_ADDR` | `127.0.0.1:9127` |
 | `max_host_labels` | `PRXWAF_METRICS_MAX_HOST_LABELS` | `128` (clamped at 4096) |
 
 ```
-curl -s http://127.0.0.1:9090/metrics
+curl -s http://127.0.0.1:9127/metrics
 ```
+
+**Why 9127 and not 9090.** 9090 is the port a Prometheus server itself listens
+on, and the scraper this default is written for is a node-local Prometheus — so
+a 9090 default collides on exactly the deployment it was meant to serve, and
+whichever process starts second loses the bind. 9091 is pushgateway, so it is
+out for the same reason. If your site standard is 9090 anyway, set `listen_addr`
+explicitly; nothing else depends on the number.
 
 A scrape config that works out of the box on a node-local agent:
 
@@ -34,7 +41,7 @@ A scrape config that works out of the box on a node-local agent:
 scrape_configs:
   - job_name: prx-waf
     static_configs:
-      - targets: ['127.0.0.1:9090']
+      - targets: ['127.0.0.1:9127']
 ```
 
 Startup logs one line stating the bind scope and the cardinality bound, so
@@ -269,7 +276,7 @@ landing. That is reconnaissance. Widen `listen_addr` only behind a firewall you
 control — startup warns when you do, and names what leaks.
 
 In Docker, the bind and the port publish are separate decisions. A loopback bind
-inside the container plus `"0.0.0.0:9090:9090"` in the compose file is
+inside the container plus `"0.0.0.0:9127:9127"` in the compose file is
 network-wide exposure, and this process cannot see the second half.
 
 If you do not want the endpoint at all, `enabled = false` removes the listener
