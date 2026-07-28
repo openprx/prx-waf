@@ -86,6 +86,30 @@
 //! two families firing on the same field at the same score always resolve to the
 //! same primary — the security-event attack type is deterministic across
 //! processes (never seeded by `HashMap` iteration order).
+//!
+//! **Disposition and attribution are two different questions (T17).** The
+//! comparator above answers "which group carries the most corroborated evidence",
+//! which is the right question for *whether to act* and the wrong one for *what
+//! to call it*: group scores are not comparable across families, because
+//! `Σ weight = 1` is imposed **per family**. A single-detector family scores
+//! `1.0 · c`; a two-detector family with one detector firing scores `0.5 · c` on
+//! evidence of identical strength — and severity is compared before score, so the
+//! single-detector family can reach `Block` and outrank a `Log` outright. So
+//! `cat /etc/passwd` used to be reported as `DirTraversal`: `rce.sensitive_read`
+//! (70 · 0.5 = 35, under `Rce`'s log threshold) lost to `traversal.sensitive_abs`
+//! (68 · 1.0 = 68, `Log`).
+//!
+//! Renormalising the scores would fix the label by moving the thresholds, which
+//! are a separately calibrated contract, so the fix is on the evidence instead:
+//! some rules match a construct **several families share**
+//! ([`SHARED_CONSTRUCT_RULES`]) — matching one proves an attack, not which attack
+//! it is. Such a group still wins the disposition on its score exactly as before;
+//! it just does not get to *name* the event while a co-located family (same
+//! scope, same field) produced family-discriminating evidence. `recommendation`,
+//! `request_score` and `enforce_safe` are bit-for-bit unchanged by that step —
+//! only `primary_result` moves. Fixed by
+//! `shared_construct_cedes_naming_to_a_co_located_specific_family` and
+//! `attribution_never_moves_the_disposition`.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -147,6 +171,54 @@ impl RuntimeScoringConfig {
     }
 }
 
+/// Rule keys whose matched construct is **shared across attack families**:
+/// matching one proves an attack is under way, but not *which* attack it is.
+///
+/// The whole list today is the sensitive-absolute-path rules. The literal
+/// `/etc/passwd` is the payload of a path traversal (`../../../../etc/passwd`),
+/// of a command execution (`cat /etc/passwd`) and of a local-file include alike;
+/// the `Traversal` family owns these rules only because that is where the
+/// string-matching detector for absolute paths happens to live, not because a
+/// match discriminates the family. Every *other* traversal rule —
+/// `traversal.overlong`, `traversal.encoded_dotdot`, `traversal.plain_dotdot` —
+/// matches `../` itself, a construct no other family's grammar produces, and is
+/// deliberately NOT listed here.
+///
+/// **This list changes attribution only.** It selects which signal populates
+/// `primary_result`, i.e. what an operator sees the event *called*.
+/// `recommendation`, `request_score` and `enforce_safe` are all taken from the
+/// decision winner and are bit-for-bit unaffected by anything here (see step 3b
+/// in [`score`]). A group whose only evidence is a shared construct still wins
+/// the disposition on its score exactly as before — it just does not get to name
+/// the event while a co-located family produced family-discriminating evidence.
+///
+/// This is deliberately NOT an attempt to disambiguate genuinely ambiguous
+/// grammar. A quote-closed tautology (`' or '1'='1`) fires `ast.tautology` and
+/// `xpath.quote_tautology` on the same bytes, and a reverse proxy cannot know
+/// whether the backend hands that string to a SQL engine or an `XPath` evaluator.
+/// Each rule discriminates its family *within its own grammar*, so neither is
+/// listed and the existing deterministic tie-break still decides.
+///
+/// Kept in sync with the live rule tables by
+/// `detectors::tests::shared_construct_rules_all_name_a_live_rule`: a rename that
+/// silently turned an entry here into dead weight fails that test.
+pub(super) const SHARED_CONSTRUCT_RULES: &[&str] = &[
+    "traversal.sensitive_abs",
+    "traversal.sensitive_abs_brace",
+    "traversal.sensitive_abs_ops",
+];
+
+/// Whether `rule_key` names a cross-family shared construct
+/// ([`SHARED_CONSTRUCT_RULES`]).
+///
+/// A linear scan of a three-element `&'static` slice: once per admitted signal
+/// (to maintain [`Group::best_specific`]) plus at most one more per scored
+/// request. It allocates nothing and compares no more bytes than the roll-up
+/// tie-break already does.
+fn is_shared_construct(rule_key: &str) -> bool {
+    SHARED_CONSTRUCT_RULES.contains(&rule_key)
+}
+
 /// Clamp a floating score into a `0..=100` byte. Never panics.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn clamp_score_to_u8(x: f64) -> u8 {
@@ -170,7 +242,24 @@ struct Group<'a> {
     /// the E0 / A2 `enforce_safe` gate: a group whose Block is carried **only** by
     /// blind/synthetic views must not be enforced.
     has_capable: bool,
+    /// This group's strongest signal whose `rule_key` is **not** a cross-family
+    /// shared construct — i.e. the family's best *family-discriminating* evidence
+    /// — or `None` when everything it produced is a construct other families
+    /// share.
+    ///
+    /// Attribution-only: it never enters [`Group::score`], so it cannot move a
+    /// threshold. Ranked by [`specific_is_better`] — raw confidence, deliberately
+    /// **not** the weighted contribution that ranks [`Group::best`]. Weights are a
+    /// family-internal aggregation parameter with no cross-family meaning, and
+    /// comparing weighted numbers across families is the exact mistake this whole
+    /// step exists to undo. Confidence is the detector's own unscaled statement of
+    /// strength, on one scale for every family. Ties break structurally, so the
+    /// choice is `HashMap`-order-independent.
+    best_specific: Option<&'a DetectionSignal>,
 }
+
+/// The `(scope, field, attack)` → [`Group`] accumulation map built by [`score`].
+type GroupMap<'a> = HashMap<(InspectionScope, &'a str, AttackKind), Group<'a>>;
 
 /// Severity ranking so we can pick the strongest group recommendation.
 const fn severity(a: SemanticAction) -> u8 {
@@ -263,6 +352,79 @@ fn group_best_is_better(new_contrib: f64, new: &DetectionSignal, cur_contrib: f6
 /// ever compare equal, so the winner never depends on iteration order.
 type WinnerKey<'a> = (u8, u8, Reverse<(u8, u8, &'a str, &'a str)>);
 
+/// Ordering key for the attribution-only search in [`reattribute_shared_construct`].
+///
+/// Same shape as [`WinnerKey`] but with **raw confidence** in place of severity
+/// and weighted score, and deliberately so on both counts: a naming candidate is
+/// picked for the strength of its family-discriminating evidence, not for whether
+/// its own family happened to cross a threshold (a volume question) nor for a
+/// weighted number that only means something inside its own family. Greatest key
+/// wins; the [`Reverse`]d structural tuple is unique per group, so the order is
+/// total and the result never depends on `HashMap` iteration order.
+type AttributionKey<'a> = (u8, Reverse<(u8, u8, &'a str, &'a str)>);
+
+/// Whether a candidate should replace a group's current [`Group::best_specific`]
+/// under a total, `HashMap`-order-independent order: higher raw confidence wins;
+/// on a tie the smaller `(detector_ord, rule_key)` wins.
+fn specific_is_better(new: &DetectionSignal, cur: &DetectionSignal) -> bool {
+    match new.confidence.get().cmp(&cur.confidence.get()) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            (detector_ord(new.detector), new.rule_key) < (detector_ord(cur.detector), cur.rule_key)
+        }
+    }
+}
+
+/// Pick the signal that should *name* an event whose decision winner is
+/// represented by a cross-family shared construct ([`SHARED_CONSTRUCT_RULES`]).
+///
+/// Returns `None` to keep the decision winner's own signal — nothing better was
+/// co-located, so the shared construct is still the most honest label available.
+/// Search order:
+///
+/// 1. **Inside the winning group.** If the family that won the decision also
+///    produced family-discriminating evidence on this field, attribution stays
+///    in that family and only the rule sharpens — the smallest correction that
+///    fixes the label.
+/// 2. **A co-located group of another family** — same `scope` *and* same `field`,
+///    so it is provably the same bytes being described — that produced
+///    family-discriminating evidence, ranked by [`AttributionKey`].
+///
+/// Restricting step 2 to the same `(scope, field)` is what keeps this from being
+/// a global "prefer family X" rule: evidence about a different field describes a
+/// different part of the request and says nothing about what *this* construct is.
+///
+/// The winning group's severity, score, and provenance are untouched — this
+/// selects a `primary_result` and nothing else.
+fn reattribute_shared_construct<'a>(
+    groups: &GroupMap<'a>,
+    scope: InspectionScope,
+    field: &'a str,
+    attack: AttackKind,
+) -> Option<&'a DetectionSignal> {
+    if let Some(sig) = groups.get(&(scope, field, attack)).and_then(|g| g.best_specific) {
+        return Some(sig);
+    }
+    let mut best: Option<(AttributionKey<'a>, &'a DetectionSignal)> = None;
+    for (&(g_scope, g_field, g_attack), g) in groups {
+        if g_scope != scope || g_field != field || g_attack == attack {
+            continue;
+        }
+        let Some(sig) = g.best_specific else {
+            continue;
+        };
+        let key: AttributionKey<'a> = (
+            sig.confidence.get(),
+            Reverse((attack_ord(g_attack), scope_ord(g_scope), g_field, sig.rule_key)),
+        );
+        if best.as_ref().is_none_or(|(k, _)| key > *k) {
+            best = Some((key, sig));
+        }
+    }
+    best.map(|(_, sig)| sig)
+}
+
 /// Compute the closed Lane 2 verdict for a set of signals.
 ///
 /// Returns a [`SemanticVerdict`] whose `request_score` is guaranteed to be in
@@ -317,7 +479,7 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
     }
 
     // 2) Per-(scope, field, attack) weighted sum + arg-max contributor.
-    let mut groups: HashMap<(InspectionScope, &str, AttackKind), Group<'a>> = HashMap::new();
+    let mut groups: GroupMap<'a> = HashMap::new();
     // Hard-veto candidate is chosen deterministically (codex A-1): the highest
     // confidence wins, then the same stable structural tie-break as the roll-up,
     // so a multi-hit allowlisted request never records a `HashMap`-order-dependent
@@ -337,6 +499,7 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
             best: sig,
             best_contrib: -1.0,
             has_capable: false,
+            best_specific: None,
         });
         g.score += contrib;
         // A single directly-observable (non-blind, non-synthetic) signal makes
@@ -351,6 +514,13 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
         if group_best_is_better(contrib, sig, g.best_contrib, g.best) {
             g.best_contrib = contrib;
             g.best = sig;
+        }
+        // The attribution track (step 3b), restricted to this family's own
+        // discriminating evidence and ranked on raw confidence — it reads no
+        // weight and writes no score. Maintained here rather than recomputed later
+        // because `canonical` is consumed by this single pass.
+        if !is_shared_construct(sig.rule_key) && g.best_specific.is_none_or(|cur| specific_is_better(sig, cur)) {
+            g.best_specific = Some(sig);
         }
 
         // Hard-veto — un-forgeable triple gate (plan §6.3, codex A-1):
@@ -388,6 +558,9 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
     // the group that becomes primary so the enforce path can refuse to Block a
     // recommendation carried solely by blind/synthetic views.
     let mut winner_has_capable = false;
+    // The winning group's key, kept for the attribution step below. Never used
+    // for the decision itself.
+    let mut winner_group: Option<(InspectionScope, &'a str, AttackKind)> = None;
 
     for (&(scope, field, attack), g) in &groups {
         let Some(ac) = cfg.attacks.get(&attack) else { continue };
@@ -417,7 +590,44 @@ pub fn score<'a>(signals: &'a [DetectionSignal], cfg: &RuntimeScoringConfig, deg
             recommendation = group_rec;
             primary = Some(g.best);
             winner_has_capable = g.has_capable;
+            winner_group = Some((scope, field, attack));
         }
+    }
+
+    // 3b) Attribution correction (T17). The decision is already final above —
+    //     `recommendation`, `request_score` and `winner_has_capable` are fixed and
+    //     are NOT read or written here. What is still open is which signal *names*
+    //     the event.
+    //
+    //     Group scores are not comparable across families: `Σ weight = 1` is
+    //     imposed per family, so a single-detector family scores `1.0 · c` where a
+    //     two-detector family with one detector firing scores `0.5 · c` on
+    //     evidence of the same strength — and the roll-up compares severity first,
+    //     so the single-detector family can also outrank on severity alone. That
+    //     comparison is the right one for "should this be acted on" (it is a
+    //     volume question, and every family's thresholds are calibrated on its own
+    //     scale) and the wrong one for "what is this" (an identity question).
+    //     Renormalising to fix the label would move the thresholds, which are a
+    //     separately calibrated contract — so the label is fixed here instead, on
+    //     the evidence rather than on the arithmetic.
+    //
+    //     `/etc/passwd` says "someone is after a secret file"; `cat /etc/passwd`
+    //     says "…by executing a command". Only the second belongs in a responder's
+    //     runbook, and only the second is family-discriminating evidence.
+    //
+    //     One downstream consequence, stated rather than hidden: the engine reads
+    //     `primary_result.phase` back as the family key for
+    //     `enforcement_overrides` (`engine.rs`, `effective_enforcement_mode`). With
+    //     the shipped empty override map every family resolves to the global mode,
+    //     so a corrected label cannot move an action. With overrides configured it
+    //     can — and that is the intended reading: an override for `rce` should
+    //     apply to a request that is an RCE, which is precisely the judgement this
+    //     step exists to get right.
+    if let (Some(sig), Some((w_scope, w_field, w_attack))) = (primary, winner_group)
+        && is_shared_construct(sig.rule_key)
+        && let Some(better) = reattribute_shared_construct(&groups, w_scope, w_field, w_attack)
+    {
+        primary = Some(better);
     }
 
     // 4) Hard-veto overrides to Block regardless of the aggregate score. A
@@ -1325,6 +1535,272 @@ mod tests {
         let v = score(&signals, &shipped_rce_traversal_cfg(), false);
         assert_eq!(v.request_score, 68);
         assert_eq!(v.recommendation, SemanticAction::Log);
+    }
+
+    /// **T17 — the shared construct wins the decision but not the name.**
+    ///
+    /// The production shape of `cat /etc/passwd` on a field the shell AST layer
+    /// does not get to parse: `rce.sensitive_read` fires alone (70 · 0.5 = 35,
+    /// under `Rce`'s log threshold of 40) while `traversal.sensitive_abs` fires at
+    /// 68 · 1.0 = 68 and reaches `Log`. Before this fix the roll-up handed the
+    /// name to the higher-scoring group and the operator saw `DirTraversal` for a
+    /// command execution.
+    ///
+    /// The scores are not comparable — `Σ weight = 1` is per family, so the
+    /// two-detector family is halved for firing one detector on evidence of equal
+    /// strength. The decision still belongs to the traversal group (its threshold
+    /// is calibrated on its own scale); the *name* belongs to the only signal that
+    /// says which family this is. `/etc/passwd` is shared with traversal, LFI and
+    /// RCE alike; `cat /etc/passwd` is not.
+    #[test]
+    fn shared_construct_cedes_naming_to_a_co_located_specific_family() {
+        let signals = [
+            sig(
+                AttackKind::Rce,
+                DetectorId::Rce,
+                "body",
+                70,
+                "rce.sensitive_read",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Traversal,
+                DetectorId::Traversal,
+                "body",
+                68,
+                "traversal.sensitive_abs",
+                Provenance::Raw,
+            ),
+        ];
+        let v = score(&signals, &shipped_rce_traversal_cfg(), false);
+        // Disposition — identical to the pre-fix behaviour, byte for byte.
+        assert_eq!(v.request_score, 68, "the traversal group still sets the score");
+        assert_eq!(v.recommendation, SemanticAction::Log, "35 < log(40) ≤ 68");
+        // Attribution — the fix.
+        let primary = v.primary_result.as_ref().expect("a Log carries a primary");
+        assert_eq!(
+            primary.rule_id.as_deref(),
+            Some("rce.sensitive_read"),
+            "the family-discriminating rule names the event"
+        );
+        assert_eq!(primary.phase, AttackKind::Rce.to_phase(), "…and so does the phase");
+    }
+
+    /// **T17 reverse proof — a shared construct alone still names its own event.**
+    ///
+    /// `../../../../etc/passwd` with nothing else on the field: the traversal group
+    /// is the only evidence there is, so `traversal.sensitive_abs` remains the most
+    /// honest label available and keeps the name. The correction is conditional on a
+    /// co-located discriminating alternative existing, not a blanket demotion of the
+    /// `Traversal` family.
+    #[test]
+    fn shared_construct_keeps_naming_when_nothing_specific_is_co_located() {
+        let signals = [sig(
+            AttackKind::Traversal,
+            DetectorId::Traversal,
+            "body",
+            68,
+            "traversal.sensitive_abs",
+            Provenance::Raw,
+        )];
+        let v = score(&signals, &shipped_rce_traversal_cfg(), false);
+        assert_eq!(v.recommendation, SemanticAction::Log);
+        assert_eq!(
+            v.primary_result.as_ref().and_then(|r| r.rule_id.as_deref()),
+            Some("traversal.sensitive_abs"),
+        );
+    }
+
+    /// **T17 reverse proof — evidence about a *different* field never renames.**
+    ///
+    /// An RCE hit in a `cmd` parameter says nothing about what a `/etc/passwd` in
+    /// the `path` parameter is: they are different bytes. Restricting the handover
+    /// to the same `(scope, field)` is what stops this from becoming "RCE always
+    /// beats traversal".
+    #[test]
+    fn attribution_does_not_cross_fields() {
+        let signals = [
+            sig(
+                AttackKind::Rce,
+                DetectorId::Rce,
+                "cmd",
+                70,
+                "rce.sensitive_read",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Traversal,
+                DetectorId::Traversal,
+                "path",
+                68,
+                "traversal.sensitive_abs",
+                Provenance::Raw,
+            ),
+        ];
+        let v = score(&signals, &shipped_rce_traversal_cfg(), false);
+        assert_eq!(
+            v.primary_result.as_ref().and_then(|r| r.rule_id.as_deref()),
+            Some("traversal.sensitive_abs"),
+            "a co-located family means the SAME field, not merely the same request"
+        );
+    }
+
+    /// **T17 — a family that also produced its own discriminating evidence keeps
+    /// the name, and only the rule sharpens.**
+    ///
+    /// Handing the name to another family when the winner can speak for itself
+    /// would be a bigger correction than the label needs. Here the traversal group
+    /// carries both a shared construct at confidence 90 and a `../`-based rule at
+    /// 60 (a two-detector traversal family, so both survive canonicalisation): the
+    /// shared construct wins `best` on contribution, and attribution falls back
+    /// inside the family rather than to the co-located `Rce` group.
+    #[test]
+    fn attribution_prefers_the_winning_family_s_own_specific_evidence() {
+        let mut cfg = shipped_rce_traversal_cfg();
+        let mut trav_weights = HashMap::new();
+        trav_weights.insert(DetectorId::Traversal, 0.5);
+        trav_weights.insert(DetectorId::StructRule, 0.5);
+        if let Some(trav) = cfg.attacks.get_mut(&AttackKind::Traversal) {
+            trav.weights = trav_weights;
+        }
+        let signals = [
+            sig(
+                AttackKind::Traversal,
+                DetectorId::Traversal,
+                "body",
+                90,
+                "traversal.sensitive_abs",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Traversal,
+                DetectorId::StructRule,
+                "body",
+                60,
+                "traversal.encoded_dotdot",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Rce,
+                DetectorId::Rce,
+                "body",
+                70,
+                "rce.sensitive_read",
+                Provenance::Raw,
+            ),
+        ];
+        let v = score(&signals, &cfg, false);
+        assert_eq!(v.request_score, 75, "0.5·90 + 0.5·60 — attribution never moves a score");
+        assert_eq!(
+            v.primary_result.as_ref().and_then(|r| r.rule_id.as_deref()),
+            Some("traversal.encoded_dotdot"),
+            "the winner's own `../` evidence keeps the name in the family"
+        );
+    }
+
+    /// **T17 — attribution is inert on the decision.**
+    ///
+    /// The load-bearing invariant of the whole change: for the payload that moved,
+    /// `recommendation`, `request_score` and `enforce_safe` are identical to what
+    /// the same signals produce with the shared-construct signal deleted from the
+    /// winning group's competition — i.e. the naming step reads the decision and
+    /// never writes it. Blocking behaviour cannot move because of a label.
+    #[test]
+    fn attribution_never_moves_the_disposition() {
+        let cfg = shipped_rce_traversal_cfg();
+        let shared = sig(
+            AttackKind::Traversal,
+            DetectorId::Traversal,
+            "body",
+            68,
+            "traversal.sensitive_abs",
+            Provenance::Raw,
+        );
+        let specific = sig(
+            AttackKind::Rce,
+            DetectorId::Rce,
+            "body",
+            70,
+            "rce.sensitive_read",
+            Provenance::Raw,
+        );
+        let both = score(&[shared.clone(), specific], &cfg, false);
+        let shared_alone = score(std::slice::from_ref(&shared), &cfg, false);
+
+        assert_eq!(both.recommendation, shared_alone.recommendation);
+        assert_eq!(both.request_score, shared_alone.request_score);
+        assert_eq!(both.enforce_safe, shared_alone.enforce_safe);
+        assert_ne!(
+            both.primary_result.as_ref().and_then(|r| r.rule_id.as_deref()),
+            shared_alone.primary_result.as_ref().and_then(|r| r.rule_id.as_deref()),
+            "only the name moved"
+        );
+    }
+
+    /// **T17 — the handover is deterministic across `HashMap` seeds.**
+    ///
+    /// Two co-located families both carry discriminating evidence at exactly the
+    /// same contribution, so the choice of who names the event rests entirely on
+    /// the structural tie-break in [`AttributionKey`]. Scoring the same signals in
+    /// every permutation must produce one answer; if the tie-break were ever
+    /// dropped this would flake rather than fail cleanly, which is why the
+    /// permutations are enumerated instead of trusted.
+    #[test]
+    fn attribution_tie_break_is_order_independent() {
+        let mut cfg = shipped_rce_traversal_cfg();
+        let mut xss_weights = HashMap::new();
+        xss_weights.insert(DetectorId::XssDom, 1.0);
+        cfg.attacks.insert(
+            AttackKind::Xss,
+            RuntimeAttackConfig {
+                enabled: true,
+                weights: xss_weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: HashSet::new(),
+            },
+        );
+        let signals = [
+            // Wins the disposition at 1.0 · 90 = 90, on a shared construct.
+            sig(
+                AttackKind::Traversal,
+                DetectorId::Traversal,
+                "body",
+                90,
+                "traversal.sensitive_abs",
+                Provenance::Raw,
+            ),
+            // Both discriminating signals sit at confidence 70 — and note the Rce
+            // one is worth half as much *score* (0.5 weight) as the Xss one, which
+            // is exactly the incomparable number the attribution key refuses to
+            // read. Only `attack_ord` separates them.
+            sig(
+                AttackKind::Rce,
+                DetectorId::Rce,
+                "body",
+                70,
+                "rce.sensitive_read",
+                Provenance::Raw,
+            ),
+            sig(
+                AttackKind::Xss,
+                DetectorId::XssDom,
+                "body",
+                70,
+                "xss.script_tag",
+                Provenance::Raw,
+            ),
+        ];
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let permuted: Vec<DetectionSignal> = order.iter().filter_map(|&i| signals.get(i).cloned()).collect();
+            assert_eq!(permuted.len(), signals.len(), "permutation must keep every signal");
+            let v = score(&permuted, &cfg, false);
+            assert_eq!(
+                v.primary_result.as_ref().and_then(|r| r.rule_id.as_deref()),
+                Some("rce.sensitive_read"),
+                "attack_ord(Rce)=1 < attack_ord(Xss)=2 decides, for every input order {order:?}"
+            );
+        }
     }
 
     /// The confidence budget the new AST rules were chosen against: in the shipped

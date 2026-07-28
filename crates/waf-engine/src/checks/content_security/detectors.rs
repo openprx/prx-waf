@@ -3475,7 +3475,50 @@ mod tests {
 
     use super::*;
     use crate::checks::content_security::budget::ContentInspectionState;
+    use crate::checks::content_security::scoring::SHARED_CONSTRUCT_RULES;
     use crate::checks::content_security::types::{InspectionScope, Provenance};
+
+    /// Every regex rule table in this module, for the whole-module invariants
+    /// below. Not the shell-AST table — its keys are a different type and none of
+    /// the invariants here apply to them.
+    const ALL_RULE_TABLES: &[&[RuleRow]] = &[
+        RULES,
+        RCE_RULES,
+        TRAVERSAL_RULES,
+        XXE_RULES,
+        NOSQL_RULES,
+        SSTI_RULES,
+        LDAP_RULES,
+        XPATH_RULES,
+        DESER_RULES,
+    ];
+
+    /// The scoring module's cross-family shared-construct list names rules by a
+    /// string key, and a string key is exactly the kind of reference that rots
+    /// silently: rename `traversal.sensitive_abs` and the entry stops matching
+    /// anything, attribution quietly reverts, and every test that checks a
+    /// *behaviour* still passes because the rule that used to be listed simply is
+    /// not listed any more.
+    ///
+    /// So assert the reference itself. Each entry must name a rule that still
+    /// exists in a live table; the list must also stay free of duplicates, which
+    /// are the other way a hand-maintained table goes wrong.
+    #[test]
+    fn shared_construct_rules_all_name_a_live_rule() {
+        let live: std::collections::HashSet<&str> = ALL_RULE_TABLES
+            .iter()
+            .flat_map(|t| t.iter().map(|&(key, ..)| key))
+            .collect();
+        for key in SHARED_CONSTRUCT_RULES {
+            assert!(
+                live.contains(key),
+                "SHARED_CONSTRUCT_RULES names '{key}', which no rule table defines any more — \
+                 a rename turned a cross-family attribution rule into dead weight"
+            );
+        }
+        let unique: std::collections::HashSet<&&str> = SHARED_CONSTRUCT_RULES.iter().collect();
+        assert_eq!(unique.len(), SHARED_CONSTRUCT_RULES.len(), "duplicate entry");
+    }
 
     fn view(text: &str) -> View<'static> {
         // Mirror the preprocessor's normalisation so tests exercise the real
