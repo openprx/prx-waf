@@ -3057,6 +3057,14 @@ impl SemanticDetector for RceAstDetector {
             waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::Lane2DetectorDegrade);
             return None;
         }
+        // Known-panic guard: `contain_parser_panic` keeps this off the worker, but
+        // only in production — under libFuzzer a panic aborts from the harness's
+        // hook before it can unwind, so the soak stays red until the input stops
+        // reaching the parser. See [`has_unparsable_io_number`].
+        if has_unparsable_io_number(s) {
+            waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::Lane2DetectorDegrade);
+            return None;
+        }
         // DoS budget: one attempt + input bytes, shared with the SQL AST layer.
         if !state.try_take_ast_attempt() {
             return None;
@@ -3177,6 +3185,50 @@ fn max_nesting_depth(s: &str) -> usize {
         }
     }
     max_depth
+}
+
+/// Cheap single-pass scan for a redirection file descriptor brush-parser cannot
+/// hold — the shape the 2026-07-27 soak crashed on.
+///
+/// `peg.rs:695` accepts any word made entirely of ASCII digits that sits
+/// *immediately* before a `<` or `>` operator and unwraps it into `ast::IoFd`,
+/// an `i32`. `2147483647>x` is a legal redirection; `2147483648>x` overflows and
+/// panics. This returns true for the second and false for the first.
+///
+/// The three conditions mirror what the parser actually requires, because a
+/// looser scan would decline ordinary traffic and a tighter one would miss a
+/// crash:
+/// - the digits must start a word, so `abc2147483648>x` is left alone (the token
+///   is `abc2147483648`, not a number, and the rule never matches it);
+/// - the operator must touch the digits, so `2147483648 >x` is left alone
+///   (brush's `locations_are_contiguous` rejects it);
+/// - the digits must not fit an `i32`.
+///
+/// A word boundary is taken to be the start of the input or one of the POSIX
+/// shell metacharacters, which is what brush's tokenizer splits on. Over-counting
+/// is safe and under-counting is not, so anything ambiguous declines: a decline
+/// costs this one detector's view of this one field, and the structural detector
+/// and Lane 1 still inspect it.
+fn has_unparsable_io_number(s: &str) -> bool {
+    // Start of input is a word boundary.
+    let mut at_boundary = true;
+    let mut digits_from: Option<usize> = None;
+    for (i, b) in s.bytes().enumerate() {
+        if b.is_ascii_digit() {
+            if digits_from.is_none() && at_boundary {
+                digits_from = Some(i);
+            }
+            continue;
+        }
+        if let Some(from) = digits_from.take()
+            && (b == b'<' || b == b'>')
+            && s.get(from..i).is_none_or(|d| d.parse::<i32>().is_err())
+        {
+            return true;
+        }
+        at_boundary = matches!(b, b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b'(' | b')' | b'<' | b'>');
+    }
+    false
 }
 
 /// Walk every complete command of a parsed program.
@@ -6249,6 +6301,51 @@ mod tests {
                 "{payload:?}: over-wide io number must yield no signal"
             );
         }
+    }
+
+    /// The guard must key on the shape brush-parser panics on and nothing wider.
+    /// Each `true` case below is a verified panic in brush-parser 0.4.0 and each
+    /// `false` case is a verified clean parse, so a change to either column is a
+    /// change to what the detector can still see.
+    #[test]
+    fn unparsable_io_number_matches_the_parser_rule() {
+        for panics in [
+            "2147483648>x",    // one past i32::MAX
+            "2147483648<x",    // the other redirection direction
+            "2147483648>>x",   // append
+            "2147483648<&0",   // fd duplication
+            "0002147483648>x", // leading zeros do not rescue the value
+            "x;2147483648>y",  // `;` is a word boundary
+            "x&&2147483648>y", // so is `&`
+            "(2147483648>x)",  // and `(`
+            "99999999999999999999>x",
+        ] {
+            assert!(has_unparsable_io_number(panics), "{panics:?} must be declined");
+        }
+        for fine in [
+            "2147483647>x",     // i32::MAX itself is a legal fd
+            "1>x",              // the everyday case
+            "2>&1",             // the most common redirection in any payload
+            "abc2147483648>x",  // not a number token — the word is `abc2147483648`
+            "2147483648 >x",    // not contiguous, so the io_number rule never fires
+            "\"2147483648\">x", // quoted, so the word carries the quotes
+            "2147483648",       // no redirection at all
+            "2147483648;x",     // followed by a separator, not a redirection
+        ] {
+            assert!(!has_unparsable_io_number(fine), "{fine:?} must still be parsed");
+        }
+    }
+
+    /// The libFuzzer unit from run 30246890138, reduced to its payload: a long
+    /// digit run, a `>`, and a `|` to get past the prefilter. It must be declined
+    /// before the parser, not merely survived by the panic guard — under libFuzzer
+    /// a panic aborts from the harness's hook and never reaches `catch_unwind`, so
+    /// containment alone would leave the soak red.
+    #[test]
+    fn rce_ast_declines_the_soak_reproducer_before_parsing() {
+        let payload = format!("{0}>{0}|{0}>{0} 1", "6".repeat(25));
+        assert!(has_unparsable_io_number(&payload), "reproducer declined pre-parse");
+        assert!(rce_ast_fire(&payload).is_none(), "reproducer yields no signal");
     }
 
     // ── P0: shell-AST stack-overflow DoS guard (nested substitution) ─────────
