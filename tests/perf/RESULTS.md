@@ -255,10 +255,13 @@ nothing, write nothing, and stay at 113 MiB; `lane2` is in its shipping shadow
 posture, observes without blocking, and stays at 120 MiB. **The growth is the
 persistence path, not the detection.**
 
-The harness does not run long enough to say where this settles — **whether it
-plateaus or continues is not established by this measurement, and it should be,
-because "attacker controls your memory growth" is the shape of a DoS, and the
-number is now measured in gigabytes rather than hundreds of megabytes.**
+The harness does not run long enough to say where this settles. **§8 answers
+that with a time series, and the answer is that it does not settle**: on this
+same tree the curve is a straight line at 10.4 GiB/min with an R² of 1.000, the
+attacker sets the slope, and the end of it is the OOM killer. The table above is
+therefore not a peak — it is a reading taken while the number was still going
+up, at whatever moment the ten seconds happened to end. §8 also records the fix
+and re-measures the same flood against it.
 
 ### 7. The proxy hop itself is not free either
 
@@ -271,6 +274,150 @@ origin row as "far above the WAF", not as an exact number.
 
 The gap narrowed from −85.5% to −66% purely because the WAF got its cores back;
 the origin barely moved (171,856 → 169,700 rps).
+
+### 8. §6 does not plateau — and it is now bounded
+
+Recorded **2026-07-28** by [`soak.sh`](soak.sh), which is a different instrument
+from the one that produced everything above: it samples a time series instead of
+a peak, runs for minutes instead of seconds, and reads queue depth and pool
+occupancy alongside RSS so a curve can be attributed rather than just observed.
+Raw series in [`results/soak/`](results/soak/); the classification rule it
+applies is written out in [`soak_shape.py`](soak_shape.py). **Nothing in §1–§7
+was re-run and no figure above changed.**
+
+§6 measured ten seconds of a curve and said it could not tell whether it settled.
+Three shapes fit those ten seconds — a working set, a bound, and an unbounded
+climb — and they have completely different operational meanings.
+
+#### The answer, before: a straight line
+
+| | shipped tree (`488e44ee`) |
+|---|---|
+| RSS | 1,025 MiB at t=1 s → **6,183 MiB at t=30.6 s** |
+| slope, 1st half / 2nd half | **+10,592 / +10,348 MiB/min**, R² **1.000** on both |
+| run ended | **aborted at the 6 GiB ceiling**, 30.6 s into a planned 600 s |
+| `queue_depth{security_event}` | 85,666 → **556,935**, rising ~16,000/s |
+| `db_pool` | **20 connections, 0 idle**, the entire run |
+| drops, all queues | **0** — there was no bound to hit |
+| blocked | 691,619 (22,600/s) |
+
+Both halves of the series agree on the slope to within 2% and fit a line with an
+R² of 1.000. **That is not a curve flattening out.** Extrapolated, 30 GiB of RAM
+is about three minutes of one unauthenticated client sending the same query
+string over and over.
+
+The mechanism is in the two new gauges rather than in guesswork. Every enforced
+detection wrote its row through one detached task; the pool drained at
+`storage.max_connections` and nothing connected the two, so the queue grew at
+arrival minus drain — ~16,000 rows a second at ~11 KiB a row, which is the RSS
+slope. **The attacker chose it.**
+
+A control run pins that to the rate rather than to the traffic: the same binary
+under **500 rps** of the identical payload holds **711 MiB flat** (+0.00 MiB/min
+over the second half) with the queue draining to zero and 19–20 of 20
+connections idle. The write path is not slow in absolute terms. It is slow
+relative to how fast the proxy can block.
+
+#### The answer, after: flat at 121 MiB for twenty minutes
+
+Same flood, same host, same pinning, against a bounded and batched write path
+(`detection_sink`, tree `254226b3`), run for **twenty minutes** rather than
+until a ceiling stopped it:
+
+| | before (`488e44ee`) | after (`254226b3`) |
+|---|--:|--:|
+| observed | 30.6 s (aborted) | **1,207 s (completed)** |
+| RSS, start → end | 1,025 → **6,183 MiB** | 103 → **121 MiB** |
+| slope, 2nd half | **+10,348 MiB/min** | **+0.05 MiB/min** |
+| `queue_depth{security_event}`, max | **556,935** | **4,352** |
+| `db_pool` connections / idle | 20 / 0 | **3 / 2** |
+| requests blocked | 691,619 | **27,107,747** |
+| rows written | ~137,000 | **24,119,415** |
+| records dropped (counted) | 0 | **2,988,332** |
+
+**RSS is flat.** +0.05 MiB/min over the second half is below this harness's
+resolution — it samples at 1 Hz on a host with other processes on it — and the
+first half's +1.04 MiB/min is allocator arenas filling. Peak RSS under twenty
+minutes of full-rate attack is **121 MiB against the 106 MiB §6 records for the
+same posture on benign traffic**: attack traffic now costs about 15 MiB, not
+6 GiB and climbing.
+
+The queue depth ceiling is 4,352, which is the 4,096-slot channel plus the up-to
+256 rows the worker has taken out of it and not yet inserted. That is the
+definition of `queue_depth` — rows *owed a write* — so exceeding the channel
+capacity by one batch is correct rather than a leak.
+
+#### What it costs, stated plainly
+
+**Eleven percent of the security record was lost.** 24,119,415 rows written plus
+2,988,332 counted drops is exactly 27,107,747 blocked requests, with no
+remainder — every enforced detection is either a row in the database or a number
+on `/metrics`, and that reconciliation is asserted by the harness on every run.
+But 11% is 11%, and the honest framing is that the fix converts an availability
+failure into a bounded, measured, visible loss of evidence. It does not make the
+loss zero.
+
+The loss is also **not immediate and not constant**. The first drop lands at
+**t = 488.7 s**, after 10.9 million requests. For the first five minutes the
+write path keeps up completely — 22,178 rows a second, zero drops — and it
+degrades to 18,729 a second over the last five as the table it is writing into
+passes twenty million rows and its indexes get more expensive. So the binding
+constraint has moved: it used to be the twenty-connection pool, and it is now
+the database's own sustained write rate, with the pool sitting at three
+connections and two of them idle. `storage.attack_log_retention_days` and its
+`security_events` twin are the knobs that decide how far that degradation goes,
+and neither of them was in this picture before.
+
+#### The bound holds when the database does not
+
+Freezing Postgres for forty seconds in the middle of the same flood is the
+scenario an operator actually meets, and it separates "the queue is bounded"
+from "the queue is bounded while the thing behind it is healthy":
+
+| | during a 40 s database freeze |
+|---|---|
+| RSS | 101 → **114 MiB** (the unbounded path reached 6.2 GiB in less time, with a *working* database) |
+| `queue_depth{security_event}` | pinned at its ceiling, **4,132** |
+| drops, counted | **945,507** |
+| reconciliation | 2,808,798 blocked = 1,863,291 written + 945,507 dropped, **exact** |
+
+The scrape taken while the database was still frozen is committed verbatim at
+[`results/soak/after-full-dbstall.scrape.txt`](results/soak/after-full-dbstall.scrape.txt).
+It is what an operator would see:
+
+```
+prxwaf_budget_events_total{subsystem="queue",limit="attack_log"} 0
+prxwaf_budget_events_total{subsystem="queue",limit="security_event"} 953795
+prxwaf_budget_events_total{subsystem="queue",limit="audit_log"} 0
+prxwaf_budget_events_total{subsystem="queue",limit="semantic_observations"} 0
+prxwaf_queue_depth{queue="attack_log"} 0
+prxwaf_queue_depth{queue="security_event"} 3886
+prxwaf_db_pool{state="connections"} 3
+prxwaf_db_pool{state="idle"} 2
+```
+
+The loss is attributed to one writer, not to "something is dropping things", and
+the depth next to it says the queue was full rather than the traffic absent.
+**This distinction is the whole reason the drop is counted**: without it, "we are
+not detecting anything" and "we are detecting and cannot write it down" are the
+same picture downstream.
+
+#### Caveats
+
+* **The `attack_log` queue was never exercised by this workload.** It reads zero
+  in every run above, correctly: `log_attack` serves the IP and URL blocklists,
+  and a SQLi query string reaches neither. Its bound, its drop counter and its
+  batched insert are covered by unit tests and by a live-Postgres integration
+  test, not by these measurements.
+* **The 500 rps control ran for two minutes, not longer.** It is enough to show
+  the queue draining to zero against an idle pool, which is the mechanism; it is
+  not a long-run claim.
+* **The crossover rate was not bisected.** Somewhere between 500 rps and 22,400
+  rps the unbounded path stops keeping up; the runs here bracket it rather than
+  locate it, and the number would in any case be a property of this host's
+  Postgres rather than of the WAF.
+* **One host, one database, one payload.** The `security_events` write rate that
+  sets the drop share is a property of the storage this ran against.
 
 ---
 
