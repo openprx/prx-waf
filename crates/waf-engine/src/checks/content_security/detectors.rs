@@ -6176,6 +6176,31 @@ mod tests {
         assert!(rce_ast_fire(&big).is_none(), "oversized view is not AST-inspected");
     }
 
+    // ── P0: shell-AST I/O-number overflow DoS guard (brush-parser panic) ─────
+
+    /// A redirection file descriptor wider than `i32` must be declined, never
+    /// parsed. brush-parser 0.4.0 `peg.rs:695` (`io_number`) does `w.parse().unwrap()`
+    /// into `ast::IoFd = i32`, so an all-digit word immediately followed by `<` or
+    /// `>` panics the worker on overflow. That this test *returns* is the proof the
+    /// input never reaches `tokenize_str`/`parse_tokens`.
+    #[test]
+    fn rce_ast_oversized_io_number_declines_without_panic() {
+        // Minimised libFuzzer reproducer, both redirection directions and both
+        // overflow sides. The leading `|` is what admits the view past the
+        // prefilter, exactly as the fuzzer found it.
+        for payload in [
+            "|2147483648>x",
+            "|2147483648<x",
+            "|99999999999999999999>x",
+            "x | 4294967296>&1",
+        ] {
+            assert!(
+                rce_ast_fire(payload).is_none(),
+                "{payload:?}: over-wide io number must be declined, not parsed"
+            );
+        }
+    }
+
     // ── P0: shell-AST stack-overflow DoS guard (nested substitution) ─────────
 
     /// A deeply nested `$( … )` payload must be **declined before** the tokenizer,
