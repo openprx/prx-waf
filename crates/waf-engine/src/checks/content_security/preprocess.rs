@@ -1257,12 +1257,23 @@ pub fn semantic_preprocessor<'a>(
             frontier.push((plus_seed, false, 1));
         }
         while let Some((text, tainted, depth)) = frontier.pop() {
-            // Not a recorded miss. A frontier text that is never scanned may hold
-            // no decodable payload at all — most do not — so counting this as
-            // lost coverage would put `degraded` on requests whose inspection was
-            // complete. The loss is recorded one level down, where a decoder has
-            // actually produced a view and the cap refuses it.
-            if views_for_field >= max_views || depth > MAX_TRANSFORM_DEPTH {
+            // Depth first, and separately: the composition depth is a structural
+            // bound, not the configured budget, so a text skipped for depth must
+            // not be billed to `max_views_per_field`.
+            if depth > MAX_TRANSFORM_DEPTH {
+                continue;
+            }
+            // A pending text the cap refuses to scan at all. Recorded even though
+            // the scan might have produced nothing: it is the same standard the
+            // eight `try_take_*` budgets already hold — a refused AST parse or a
+            // refused field is degradation whether or not it would have found
+            // anything, because what is being reported is inspection that did not
+            // happen. Requiring proof of loss here reads as restraint and is
+            // actually a silent false negative: the cap can fill on a successful
+            // push and every remaining frontier text then vanishes through this
+            // arm without any single view being visibly refused.
+            if views_for_field >= max_views {
+                state.record_view_cap_miss();
                 continue;
             }
             // One proxy charge for scanning this text (codex A-4.6.3): a length
@@ -1509,22 +1520,47 @@ mod tests {
         assert!(st.is_degraded(), "the refused round is a view the detectors never got");
     }
 
-    #[test]
-    fn view_cap_reached_with_nothing_left_to_decode_does_not_degrade() {
-        // Same one-view budget, but the field decodes to itself and synthesises no
-        // transform. The cap is reached and costs nothing — reporting it would make
-        // `degraded` a per-request constant for any tight budget, which is the same
-        // as reporting nothing at all.
+    /// A field engineered to fan out: two comment sites (a join view and a space
+    /// view), an HTML entity run, a base64 token, a hex token and shell
+    /// metacharacters, each of which the depth-2 transform composition re-explores.
+    /// It wants exactly 16 views.
+    const FANOUT_FIELD: &[u8] = concat!(
+        "id=un/**/ion sel/**/ect 1,2,3 from users where a=b",
+        " ${IFS}cat${IFS}/etc/passwd",
+        " 73656c656374202a2066726f6d2075736572737768657265",
+        " c2VsZWN0ICogZnJvbSB1c2VycyB3aGVyZSBpZD0xIG9yIDE9MQ==",
+        " &lt;script&gt;alert(1)&lt;/script&gt;"
+    )
+    .as_bytes();
+
+    fn fanout_views(max_views: u32) -> (usize, bool) {
         let budget = Budget {
-            max_views_per_field: 1,
+            max_views_per_field: max_views,
             ..Budget::default()
         };
-        let req = req_with("/a", "q=hello", b"");
+        let req = req_with("/a", "", FANOUT_FIELD);
         let mut st = ContentInspectionState::new(budget);
         st.begin_phase();
-        let views = semantic_preprocessor(InspectionScope::Header, &req, &mut st);
-        assert!(!views.is_empty(), "the raw views are still produced");
-        assert!(!st.is_degraded(), "nothing was lost, so nothing may be claimed");
+        let views = semantic_preprocessor(InspectionScope::Body, &req, &mut st);
+        (views.len(), st.is_degraded())
+    }
+
+    #[test]
+    fn the_view_cap_flag_turns_on_exactly_where_the_cap_starts_costing_views() {
+        // The boundary, from both sides, on one field. This is the test that
+        // matters: an earlier revision of this reporting only fired when a
+        // decoded view was visibly refused, which looked like restraint and was a
+        // silent false negative — the cap fills on a *successful* push and the
+        // remaining transform frontier then disappears without any one view being
+        // turned away. At 12 it costs four views and says so.
+        assert_eq!(fanout_views(16), (16, false), "16 is exactly what the field wants");
+        assert_eq!(fanout_views(17), (16, false), "a cap above the demand costs nothing");
+        assert_eq!(fanout_views(15), (15, true), "one short is one view never inspected");
+        assert_eq!(
+            fanout_views(12),
+            (12, true),
+            "the shipped default costs this field four views"
+        );
     }
 
     #[test]

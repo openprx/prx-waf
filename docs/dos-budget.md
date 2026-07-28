@@ -235,21 +235,34 @@ is not visible to the per-request budget state; they report through
 `v0.2.91` they reported nothing at all, and hitting them narrowed what the lane
 looked at with no flag and no counter.
 
-Those two are reported **only on a demonstrated loss**, which is narrower than
-"the cap was reached":
+Both report **work the budget refused**, which is the standard the other eight
+already hold — a refused AST parse is degradation whether or not that parse
+would have found anything. What neither reports is a cap that merely *equals*
+the demand:
 
-* `max_views_per_field` degrades when a decode round already proved distinct
-  from the round before it is refused (`preprocess.rs:1197`), and when a
-  transform child that has already been decoded is thrown away
-  (`preprocess.rs:1278`, `preprocess.rs:551`). It does **not** degrade when a
-  pending transform frontier goes unscanned (`preprocess.rs:1265`) — most such
-  texts yield no view at all, and flagging them would report coverage loss that
-  may not exist.
+* `max_views_per_field` degrades when it refuses a decode round already proved
+  distinct from the round before it (`preprocess.rs:1197`), a transform child
+  already decoded and in hand (`preprocess.rs:1289`, `preprocess.rs:551`), or a
+  pending transform text it will not let the preprocessor scan
+  (`preprocess.rs:1276`). It does **not** degrade a field that produced exactly
+  `max_views_per_field` views and had nothing further to offer. The unit test
+  `the_view_cap_flag_turns_on_exactly_where_the_cap_starts_costing_views` pins
+  that boundary from both sides on one field: 16 wanted, cap 17 and cap 16
+  clean, cap 15 and cap 12 degraded.
 * `max_tokens_per_view` degrades when a view's normalised walk stopped with
   tokens still unread (`preprocess.rs:938`). It does **not** degrade when the
   whole-view byte ceiling (§1.3, `MAX_NORMALISED_VIEW_BYTES`) stopped the walk
   first: that is a separate limit with a separate exceed behaviour, and billing
   the token cap for its cut would flag requests the budget never narrowed.
+
+A note on how the first of those was nearly got wrong, because the shape
+recurs. The rule was first written as "only report a view you can see being
+thrown away", which reads as restraint and was a silent false negative: the cap
+fills on a **successful** push, and every remaining transform text then
+disappears down the not-reported arm without any one view visibly being turned
+away. A field losing four of its sixteen views reported nothing. "I could not
+prove the loss" is not the same claim as "there was no loss", and only one of
+them is safe to encode as `degraded = false`.
 
 **`max_list_items` bounds nothing.** It is parsed, validated non-zero and
 compiled into `Budget` (`budget.rs:68`), and no code path reads it. The list
@@ -985,13 +998,14 @@ coverage boundary, not a threshold, so there is no moment at which it "binds".
 | `max_preprocess_output_bytes_total` | `lane2_budget` | `preprocess_output_bytes` |
 | `[content_security.lane1] max_body_bytes` | `lane1_body` | `max_body_bytes` |
 
-The last two `lane2_budget` rows count **views**, not requests: a field whose
-four views each lose tokens raises `tokens_per_view` four times. Both were added
-in `v0.2.91`; before that they were the hole this table's earlier revision
-described — enforced in the preprocessor's loops rather than through
-`try_take_*`, so they narrowed inspection without setting `degraded` and without
-a counter. They are raised only on a demonstrated loss, and §2.1 lists the
-cases each one deliberately stays quiet about.
+The two new `lane2_budget` rows count **events**, not requests: `tokens_per_view`
+counts views truncated, so a field whose four views each lose tokens raises it
+four times, and `views_per_field` counts refusals, so one field can raise it
+several times. Both were added in `v0.2.91`; before that they were the hole this
+table's earlier revision described — enforced in the preprocessor's loops rather
+than through `try_take_*`, so they narrowed inspection without setting `degraded`
+and without a counter. §2.1 states what each one deliberately stays quiet
+about.
 
 **`max_list_items` is still not counted, and cannot be: it bounds nothing.** No
 code path reads it (§2.1). A metric cannot be added to a limit that does not

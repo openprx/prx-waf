@@ -348,14 +348,15 @@ pub enum BudgetEvent {
     Lane2HtmlParseAttempts,
     /// `max_html_parse_input_bytes_total`.
     Lane2HtmlParseInputBytes,
-    /// `max_views_per_field` discarded a decode/transform view that had already
-    /// been produced, or refused a decode round that was known to differ from
-    /// the one before it. **Unit: views dropped**, not requests.
+    /// `max_views_per_field` refused a unit of view-producing work: a decoded
+    /// view already in hand, a decode round already known to differ from the one
+    /// before it, or a pending transform text the cap will not let the
+    /// preprocessor scan. **Unit: refusals**, not requests — one field can raise
+    /// it several times.
     ///
-    /// Only raised on a *demonstrated* loss. The preprocessor also stops
-    /// scanning pending transform frontiers once the cap is reached; that is not
-    /// counted, because a frontier text often yields no view at all and counting
-    /// it would report coverage loss that may not exist.
+    /// Not raised when the cap merely equals what the field wanted: a field that
+    /// produces exactly `max_views_per_field` views and has nothing further to
+    /// offer lost nothing.
     Lane2ViewsPerField,
     /// `max_tokens_per_view` cut a view's normalised text short while tokens
     /// remained. **Unit: views truncated** — a field with four views can raise

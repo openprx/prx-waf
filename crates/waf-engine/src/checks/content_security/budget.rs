@@ -195,8 +195,14 @@ impl ContentInspectionState {
     /// per *field* while this state is per *request*, and the preprocessor is
     /// the only place that knows which field it is on.
     ///
-    /// Call sites must be certain of the loss. "The cap is reached and there
-    /// might have been more to see" is not a miss; a discarded view is.
+    /// The bar for calling this is the same one the `try_take_*` methods above
+    /// hold themselves to: **work the budget refused**. A refused AST parse is
+    /// degradation whether or not that parse would have found anything, and a
+    /// refused view is no different. What must not be called a miss is a cap
+    /// that merely *equals* the demand — a field that produced every view it had
+    /// and stopped lost nothing, and marking it would make `degraded` a constant
+    /// for any tight budget, which carries the same information as never marking
+    /// it at all.
     pub fn record_view_cap_miss(&mut self) {
         metrics::record_budget_event(BudgetEvent::Lane2ViewsPerField);
         self.degraded = true;
