@@ -271,16 +271,38 @@ jobs:
           PRX_WAF_FUZZ_RULES_DIR: ${{ github.workspace }}/rules/owasp-crs
         run: cargo fuzz cmin "${TARGET}" "corpus/${TARGET}"
 
-      # Only runs when the Fuzz step failed, i.e. libFuzzer wrote a reproducer.
+      # `always()`, not `failure()`.
+      #
+      # A crash reproducer is the only artefact of a fuzz run that cannot be
+      # regenerated: libFuzzer found that input by chance and the next run will
+      # not find it again. So the upload must survive every way this job can
+      # end, and `failure()` does not — it is false while the job is being
+      # cancelled, which is exactly what a `timeout-minutes: 60` overrun and a
+      # `cancel-in-progress` concurrency cancel both are. Those two are the runs
+      # most likely to be holding a reproducer nobody has seen: a target that
+      # crashes late in a 1800s soak, or one that has already written
+      # `crash-*` and then hung on the next input until the clock ran out.
+      # Only `always()` (or an explicit `cancelled()`) runs a step during
+      # cancellation.
+      #
+      # On a clean run this step still executes and finds nothing; the existing
+      # `if-no-files-found: ignore` makes that a no-op rather than a red X, so
+      # the cost of the wider condition is one skipped upload per green run.
+      #
+      # 90 days rather than 30 because 30 nearly lost the 2026-07-27 soak crash:
+      # a scheduled run reports to no pull request, and that one sat unread for
+      # over a day before anyone looked. A reproducer for a remotely reachable
+      # panic has to outlive a holiday, not a weekend. 90 is GitHub's ceiling
+      # for public repositories; a repository configured lower simply clamps.
       - name: Upload crash reproducers
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts-${{ matrix.target }}-${{ github.run_id }}
           path: |
             fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
-          retention-days: 30
+          retention-days: 90
 
       # The corpus the soak grew (already minimized above) is worth a
       # human-inspectable copy alongside the cache: an artifact can be
@@ -343,7 +365,7 @@ jobs:
           question is answered: the fuzz targets drive the production request
           path, so an input that kills the target is an input a request can
           carry. The crash reproducer is attached to the run as
-          \`fuzz-artifacts-<target>-<run id>\` and expires in 30 days; download
+          \`fuzz-artifacts-<target>-<run id>\` and expires in 90 days; download
           it before then and reproduce with
           \`cargo +nightly fuzz run <target> <file>\`."
 
