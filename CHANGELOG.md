@@ -63,6 +63,12 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   system's configuration. The bind address is the access control; a
   non-loopback bind logs a startup warning naming what a reader learns.
 
+  A bind that fails is never fatal — losing observability is bad, losing the
+  firewall is worse. It logs one ERROR naming the address, the stage that
+  failed, the two settings that move the listener (`[metrics] listen_addr`,
+  `PRXWAF_METRICS_LISTEN_ADDR`) and the fact that traffic filtering is
+  unaffected, so the line is actionable without reading the source.
+
   Recording is lock-free — a flat `[AtomicU64]` indexed by the label
   enumeration, one relaxed `fetch_add` per event, with the `host` label resolved
   to an integer once per request through a lock-free interner. With
