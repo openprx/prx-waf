@@ -9,6 +9,53 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Prometheus metrics on `/metrics`, on by default, bound to
+  `127.0.0.1:9090`.** The WAF previously exported nothing: request rate, block
+  rate, detection mix, per-lane detection cost and every budget/degradation
+  counter in `docs/dos-budget.md` were readable only by grepping logs, and
+  several were not even logged. Seven metrics now cover RED by host and
+  decision, detections by phase and action, per-lane inspection cost as a
+  histogram, and one counter for every bounded resource that skips, truncates,
+  degrades or drops. See [`docs/metrics.md`](docs/metrics.md) and
+  `docs/dos-budget.md` §8 for the limit-to-counter mapping.
+
+  **Cardinality is bounded by construction.** Every label except `host` is a
+  compile-time enumeration — there is no API that accepts a caller-supplied
+  label string — and `host` is capped by `[metrics] max_host_labels` (default
+  128), folding into a single `__other__` series past the cap. Client IP, rule
+  id, path and user agent are never labels. Total series is
+  `28 × max_host_labels + 214`, about 3 800 at the default, and does not move
+  with request rate, attack volume or rule-set size.
+
+  The endpoint is **unauthenticated by design** and runs on its own listener
+  rather than as a route on the management API: Prometheus has no good way to
+  carry a JWT, and reusing the admin token would place a credential that can
+  rewrite rules, upload plugins and replace certificates into the monitoring
+  system's configuration. The bind address is the access control; a
+  non-loopback bind logs a startup warning naming what a reader learns.
+
+  Recording is lock-free — a flat `[AtomicU64]` indexed by the label
+  enumeration, one relaxed `fetch_add` per event, with the `host` label resolved
+  to an integer once per request through a lock-free interner. With
+  `[metrics] enabled = false` nothing is allocated, every record site is one
+  `OnceLock` load, and no timing clock is read.
+
+  New dependency: `prometheus-client` (the Prometheus project's own Rust
+  client), used only for its registry and text encoder. It adds `dtoa` and
+  `itoa` and reuses the `parking_lot`, `syn`, `quote` and `proc-macro2` already
+  in the graph.
+
+- **Counters for limits that previously had none.** `docs/dos-budget.md`
+  recorded four places as having no metric and, in one case, no log line at all;
+  all are now exported: the fail-open body-overflow path
+  (`PRXWAF_BODY_INSPECT_OVERFLOW=log`, which forwards everything past 10 MiB
+  uninspected), the Lane 1 body-budget skip, all six background-queue drops
+  including the cluster peer channel — which was neither counted nor logged,
+  despite carrying heartbeats and election messages — and the CrowdSec
+  `AppSec` timeout, the most consequential fail-open on the request path.
+
 ### Changed
 
 - **`[content_security.lane1] max_body_bytes` now defaults to `65536` instead of

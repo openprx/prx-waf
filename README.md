@@ -450,10 +450,48 @@ Three things an operator should know before deploying:
   Give the process a memory limit.
 
 Resource limits, queue capacities, timeouts and what happens when each is
-exceeded are documented separately in [`docs/dos-budget.md`](docs/dos-budget.md).
+exceeded are documented separately in [`docs/dos-budget.md`](docs/dos-budget.md),
+and every one of them now has a counter on `/metrics` — see
+[`docs/metrics.md`](docs/metrics.md).
 
 This is deliberately **not** a CI gate — see
 [`tests/perf/README.md`](tests/perf/README.md#why-this-is-not-a-ci-gate).
+
+---
+
+## Metrics
+
+Prometheus exposition on **`127.0.0.1:9090/metrics`**, on by default.
+
+```
+curl -s http://127.0.0.1:9090/metrics
+```
+
+```
+[metrics]
+enabled = true
+listen_addr = "127.0.0.1:9090"
+max_host_labels = 128
+```
+
+Seven metrics: RED by host and decision, the detection mix by phase, per-lane
+detection cost (Lane 1 / CRS / Lane 2 are timed separately, because they share
+no work and their cost ordering inverts with body size), and a counter for every
+bounded resource in [`docs/dos-budget.md`](docs/dos-budget.md) — so "how much
+inspection am I losing" is a query rather than a log grep.
+
+**Cardinality is a property of the config, not of the traffic.** Every label
+except `host` is a compile-time enumeration; `host` is bounded by
+`max_host_labels` and folds into `__other__` past it. Client IP, rule id, path
+and user agent are never labels. Total series is `28 × max_host_labels + 214` —
+about 3 800 at the default, whatever the traffic does.
+
+The endpoint is **unauthenticated by design** and its own listener, not a route
+on the management API: Prometheus cannot carry a JWT well, and reusing the admin
+token would put a credential that can rewrite rules and replace certificates
+into the monitoring system's config file. The bind address is the access
+control, which is why it defaults to loopback and warns at startup when it does
+not. Full reference: [`docs/metrics.md`](docs/metrics.md).
 
 ---
 

@@ -834,10 +834,196 @@ are recorded here as findings; none has been changed by this document.
 14. **`cluster.sync.events_queue_size` (default 10 000) is a dead knob** —
     declared at `crates/waf-common/src/config.rs:1499`, never read. The
     documented "drop oldest past this bound" behaviour does not exist.
-15. **Queue drop counters are log-only, never exported as metrics** (§3).
+15. ~~**Queue drop counters are log-only, never exported as metrics** (§3).~~
+    **Fixed.** Every drop in §3 now increments
+    `prxwaf_budget_events_total{subsystem="queue"}`, including the cluster peer
+    channel, which was neither counted nor logged. See §8 for the full mapping.
 16. **`SpentTokenRegistry` capacity is unverified** — no non-test caller of
     `SpentTokenRegistry::new` (`waf-cluster/src/crypto/token.rs:181`) was found,
     so its live capacity could not be established from source.
+
+---
+
+## 8. Every limit, and the counter that says it bound
+
+The tables above answer "what happens when an attacker reaches this". This one
+answers the operator's next question: **how do I know it happened?**
+
+All of these are the same metric family. The label pair identifies the limit:
+
+```
+prxwaf_budget_events_total{subsystem="...", limit="..."}
+```
+
+The mapping is deliberately **total** — the enum that drives the exposition is
+this table, so a limit that grows an exceed behaviour and gains no counter is
+visible in a diff. See [`docs/metrics.md`](metrics.md) for the endpoint, the
+cardinality budget and the rest of what is exported.
+
+### The limits that reject (§1.1)
+
+| Limit | Behaviour | `subsystem` | `limit` |
+|---|---|---|---|
+| `MAX_HEADER_VALUES_PER_NAME` (431) | reject | `request_headers` | `values_per_name` |
+| `MAX_FOLDED_HEADER_BYTES` (431) | reject | `request_headers` | `folded_bytes` |
+| Duplicate `Host` (400) | reject | `request_headers` | `duplicate_host` |
+| `MAX_INSPECTED_BODY_BYTES`, `OVERFLOW=reject` (413) | reject | `request_body` | `inspect_ceiling_reject` |
+| `MAX_INSPECTED_BODY_BYTES`, `OVERFLOW=log` | **skip** | `request_body` | `inspect_ceiling_forward` |
+| `MAX_H3_REQUEST_BODY` (413) | reject | `http3_body` | `buffer_ceiling` |
+
+The `OVERFLOW=log` row is the one this section existed to complain about: §1.1
+recorded it as emitting a `warn!` and **no counter**, so an operator who had
+chosen the fail-open posture could not alert on how much traffic was being
+forwarded unscanned. They can now.
+
+### Inspection windows (§1.2)
+
+| Limit | Behaviour | `subsystem` | `limit` |
+|---|---|---|---|
+| `MAX_INSPECTED_RESPONSE_BYTES` | truncate | `response_body` | `inspect_ceiling` |
+
+Latched, so one oversized response contributes one, not one per chunk.
+
+`BODY_PREVIEW_LIMIT` / `BODY_WINDOW_OVERLAP` / `RESPONSE_WINDOW_*` have no
+counters and need none: they bound peak memory, not coverage, and cannot be
+"exceeded" in a way that loses inspection.
+
+### Parsers (§1.3)
+
+| Limit | Behaviour | `subsystem` | `limit` |
+|---|---|---|---|
+| `MAX_BOUNDARY_LEN` | envelope not parsed | `multipart` | `boundary_len` |
+| `MAX_PARTS` | remainder → whole-body | `multipart` | `parts` |
+| `MAX_PART_HEADER_BYTES` | part dropped whole | `multipart` | `part_header_bytes` |
+| `MAX_PART_HEADER_LINES` | part dropped whole | `multipart` | `part_header_lines` |
+| `MAX_BODY_BYTES` (JSON) | processor skipped | `crs_body_processor` | `json_body_bytes` |
+| `MAX_BODY_BYTES` (XML) | processor skipped | `crs_body_processor` | `xml_body_bytes` |
+| `MAX_PARSE_INPUT_DEPTH` | parse declined | `crs_body_processor` | `json_parse_input_depth` |
+| `MAX_JSON_DEPTH` | subtree not descended | `crs_body_processor` | `json_depth` |
+| `MAX_JSON_ARGS` / `MAX_JSON_NODES` | walk breaks | `crs_body_processor` | `json_args` |
+| `MAX_XML_EVENTS` | reader stops | `crs_body_processor` | `xml_events` |
+| `MAX_XML_TEXT_BYTES` | truncate | `crs_body_processor` | `xml_text_bytes` |
+| `MAX_XML_ATTRS` | attributes dropped | `crs_body_processor` | `xml_attrs` |
+| `MAX_FORM_ARGS` | remainder folded anonymous | `crs_body_processor` | `form_args` |
+| `MAX_EXTRACT_INPUT_BYTES` | extraction skipped | `lane2_extract` | `input_bytes` |
+| `MAX_GRAPHQL_RAW_OPENS` | parse declined | `lane2_extract` | `graphql_raw_opens` |
+| `AST_MAX_INPUT_BYTES`, `MAX_AST_NESTING`, `SHELL_AST_MAX_INPUT_BYTES`, `SHELL_MAX_NESTING_DEPTH`, `XSS_MAX_INPUT_BYTES` | detector declines the view | `lane2_detector` | `input_cap` |
+
+Two notes on the two rows that share a counter with something else.
+
+`MAX_JSON_ARGS` and `MAX_JSON_NODES` are one condition in the source and one
+counter here. They are the same event from an operator's point of view — the
+JSON walk stopped early and members are missing — and the remedy is the same.
+
+The five Lane 2 detector caps share `lane2_detector/input_cap` and are
+deliberately **not** counted as `degraded`. They are per-view: the lane still
+scores that view from its other detectors, so the request is not blind. It is
+still a view one detector never saw, which previously had no signal of any kind.
+
+`MAX_DECODE_PASSES` (§1.3, decode loops) has **no counter**. Exhausting it does
+not skip anything — the value is inspected with a residual encoded layer still
+present — so there is no coverage event to count, only a weaker one. Stated
+here rather than left as an apparent gap.
+
+`SCANNED_HEADERS` (§1.4) has no counter and cannot have one: it is a permanent
+coverage boundary, not a threshold, so there is no moment at which it "binds".
+
+### The configurable budgets (§2)
+
+| Key | `subsystem` | `limit` |
+|---|---|---|
+| `max_fields_per_phase` | `lane2_budget` | `fields_per_phase` |
+| `max_field_input_bytes` | `lane2_budget` | `field_input_bytes` |
+| `max_ast_attempts_per_request` | `lane2_budget` | `ast_attempts` |
+| `max_ast_input_bytes_total` | `lane2_budget` | `ast_input_bytes` |
+| `max_html_parse_attempts_per_request` | `lane2_budget` | `html_parse_attempts` |
+| `max_html_parse_input_bytes_total` | `lane2_budget` | `html_parse_input_bytes` |
+| `max_preprocess_output_bytes_total` | `lane2_budget` | `preprocess_output_bytes` |
+| `[content_security.lane1] max_body_bytes` | `lane1_body` | `max_body_bytes` |
+
+**`max_views_per_field`, `max_tokens_per_view` and `max_list_items` are not
+counted, and — checked while writing this table — they do not set `degraded`
+either.** They are enforced inside the preprocessor's own loops
+(`push_extra_view` returns early at `preprocess.rs:545`; `normalise` truncates)
+rather than through the budget's `try_take_*` accounting, which is the only
+place `degraded` is set. So §2.1's blanket "exceed behaviour is **degrade**" is
+true of the other eight keys and not of these three: hitting them silently
+narrows what the lane looked at, with no per-request flag and no counter. That
+is the one remaining hole in §2, and it predates this table.
+
+Every row above also raises `prxwaf_degraded_requests_total`, which counts
+**requests** while the rows above count **events**. Read the first for "how many
+requests were partly uninspected" and the second for "which bound did it".
+
+`lane1_body/max_body_bytes` counts **detector invocations**, not requests: one
+oversized request contributes up to four per body window (four detectors, each
+collecting its own targets). Read it as a rate signal.
+
+### Queues and background sinks (§3)
+
+| Sink | `subsystem` | `limit` |
+|---|---|---|
+| audit log | `queue` | `audit_log` |
+| semantic observations | `queue` | `semantic_observations` |
+| semantic events | `queue` | `semantic_events` |
+| notification bus | `queue` | `notifications` |
+| community reporter | `queue` | `community_reporter` |
+| cluster peer channel | `queue` | `cluster_peer` |
+
+§3 said "all drop counters are log-only… If audit completeness matters to you,
+this is the gap to close first", and the cluster peer channel was worse than
+that: neither counted nor logged, so a congested peer link could contribute to a
+spurious election without leaving a trace. All six are now exported.
+
+The DB event broadcast (`waf-storage/src/db.rs`) is **not** counted. It is a
+`tokio::sync::broadcast`, where loss is reported to the *receiver* as a lag
+error rather than to the sender at send time; counting it correctly means
+counting it in each subscriber, which is a different change.
+
+The rules hot-reload channel is unbounded and has nothing to count.
+
+### Caches (§4)
+
+| Limit | `subsystem` | `limit` |
+|---|---|---|
+| per-entry admission cap (`CACHE_BODY_LIMIT`, `MAX_ENTRY_FRACTION`) | `response_cache` | `entry_bytes` |
+| size-pressure eviction | `response_cache` | `total_bytes` |
+
+The CrowdSec decision cache (§4.2) and the per-IP rate-limit maps (§4.3) have no
+counters, because they have no bound to exceed — that is the finding, and it is
+§6 entries 6 and 7. A metric cannot be added to a limit that does not exist.
+
+### Timeouts and fail-open (§5)
+
+| Event | `subsystem` | `limit` |
+|---|---|---|
+| upstream connect timeout | `upstream_timeout` | `connect` |
+| upstream read timeout | `upstream_timeout` | `read` |
+| upstream write timeout | `upstream_timeout` | `write` |
+| `CrowdSec` `AppSec` did not answer in `appsec_timeout_ms` | `crowdsec` | `appsec_timeout` |
+| `CrowdSec` bouncer blind → `fallback_action` applied | `crowdsec` | `decision_cache_blind` |
+
+The `AppSec` row is the most consequential fail-open on the request path — the
+500 ms deadline is awaited inline on every request, and the default `allow`
+posture then forwards the request unexamined — and it previously had no signal
+at all.
+
+The remaining §5.2 timeouts (LAPI polls, health checks, rule downloads, IP feed
+fetches, ACME polls, cluster elections) are background work whose failure does
+not cost request-path coverage. They are not counted here.
+
+### Not counted, and why
+
+| §6 entry | Why there is no counter |
+|---|---|
+| 3, 4 — single-threaded proxy, no concurrency limit | fixed / no limit to exceed |
+| 6 — unbounded CrowdSec cache | no bound |
+| 7 — per-IP maps capped once a minute | the cap is an average, not an event |
+| 8 — no regex compile-size or match timeout | no limit exists |
+| 9 — no cap on distinct header names | no limit exists |
+| 10, 11, 12 — no URI, query or multipart payload length caps | no limit exists |
+| 14 — `cluster.sync.events_queue_size` is a dead knob | the behaviour does not exist |
+| 16 — `SpentTokenRegistry` capacity unverified | no live caller |
 
 ---
 
@@ -908,8 +1094,15 @@ If you are deploying prx-waf, the short version:
    oversized bodies. (That those two detectors were 94% of Lane 1's cost was
    measured on the unbounded, single-threaded tree and has not been re-measured;
    see `tests/perf/RESULTS.md` under what was not measured.)
-8. **Watch the logs for queue-drop WARNs**, since there is no metric. Grep for
-   `channel full` and `dropped`.
+8. **Alert on `prxwaf_budget_events_total`, not on log greps.** Every limit in
+   this document that skips, truncates, degrades or drops now has a counter on
+   `/metrics` (§8), including the queue drops that used to be visible only as a
+   WARN every 30 seconds. The three worth a rule on day one are
+   `{subsystem="lane1_body"}` (bodies your four native detectors are not
+   reading), `{subsystem="crs_body_processor", limit="json_body_bytes"}` (JSON
+   your `ARGS_POST` rules are not protecting) and any `{subsystem="queue"}`
+   (records you are losing). The endpoint is on by default on
+   `127.0.0.1:9090`; see [`docs/metrics.md`](metrics.md).
 9. **Expect memory to grow under attack, and budget in gigabytes.** Ten seconds
    of blocked traffic took the shipping posture from 106 MiB to **4,065 MiB** in
    measurement, because every block writes to the database and the pool behind
