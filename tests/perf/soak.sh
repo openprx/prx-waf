@@ -59,6 +59,18 @@ CONNECTIONS="${CONNECTIONS:-50}"
 SAMPLE_SECS="${SAMPLE_SECS:-1}"
 WARMUP="${WARMUP:-3}"
 RSS_ABORT_MIB="${RSS_ABORT_MIB:-12288}"
+# Freeze the Postgres container this many seconds into the run, for this many
+# seconds. The drain worker then cannot make progress, the queue fills, and the
+# overflow policy is exercised for real instead of being reasoned about.
+#
+# This is the scenario an operator actually meets — "the database went away in
+# the middle of an attack" — and the only way to see the drop counters move
+# without waiting for a flood large enough to outrun a working database. What it
+# must show is two things at once: the drops are COUNTED on /metrics, and RSS
+# stays flat anyway. A bound that only holds while the thing behind it is
+# healthy is not a bound.
+STALL_DB_AT="${STALL_DB_AT:-}"
+STALL_DB_FOR="${STALL_DB_FOR:-30}"
 LABEL="${LABEL:-$POSTURE-$([ -n "$RATE" ] && echo "${RATE}rps" || echo saturating)-${MINUTES}min}"
 
 OHA_VERSION="${OHA_VERSION:-1.11.0}"
@@ -93,6 +105,10 @@ die() { printf '\033[1;31m[soak] %s\033[0m\n' "$*" >&2; exit 1; }
 
 case "$MINUTES" in ''|*[!0-9.]*) die "MINUTES must be a number, got '$MINUTES'" ;; esac
 case "$RATE" in ''|*[!0-9]*) [ -z "$RATE" ] || die "RATE must be an integer, got '$RATE'" ;; esac
+case "$STALL_DB_AT" in ''|*[!0-9]*) [ -z "$STALL_DB_AT" ] || die "STALL_DB_AT must be an integer, got '$STALL_DB_AT'" ;; esac
+case "$STALL_DB_FOR" in ''|*[!0-9]*) die "STALL_DB_FOR must be an integer, got '$STALL_DB_FOR'" ;; esac
+[ -z "$STALL_DB_AT" ] || [ "$SKIP_POSTGRES" = "0" ] || die "STALL_DB_AT needs the Postgres this harness started"
+
 
 pin() {                                # $1 = cpu list, rest = command
   local cpus="$1"; shift
@@ -167,6 +183,9 @@ teardown() {
   local rc=$?
   stop_load
   stop_waf
+  # A frozen container survives the script that froze it and would poison the
+  # next run's `pg_isready` in a way that looks like a broken image.
+  [ "$SKIP_POSTGRES" = "1" ] || "$CONTAINER_CLI" unpause "$PG_CONTAINER" >/dev/null 2>&1 || true
   [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
   sleep 0.3
   [ -n "$BACKEND_PID" ] && kill -9 "$BACKEND_PID" 2>/dev/null || true
@@ -507,6 +526,8 @@ prev_ticks="$start_ticks"
 prev_epoch="$start_epoch"
 ABORTED=""
 PEAK_RSS_KB=0
+STALL_STATE=before
+STALL_ENDS_AT=0
 t=0
 
 while :; do
@@ -526,6 +547,24 @@ while :; do
   echo "$t,$rss_kb,$cores,$threads,$m" >>"$CSV"
 
   [ "${rss_kb:-0}" -gt "$PEAK_RSS_KB" ] && PEAK_RSS_KB="$rss_kb"
+
+  if [ -n "$STALL_DB_AT" ]; then
+    t_int="$(awk -v t="$t" 'BEGIN{printf "%d", t}')"
+    if [ "$STALL_STATE" = "before" ] && [ "$t_int" -ge "$STALL_DB_AT" ]; then
+      log "  >> freezing $PG_CONTAINER at t=${t}s for ${STALL_DB_FOR}s"
+      "$CONTAINER_CLI" pause "$PG_CONTAINER" >/dev/null 2>&1 || log "  !! pause failed"
+      STALL_STATE=during
+      STALL_ENDS_AT="$((STALL_DB_AT + STALL_DB_FOR))"
+    elif [ "$STALL_STATE" = "during" ] && [ "$t_int" -ge "$STALL_ENDS_AT" ]; then
+      log "  >> thawing $PG_CONTAINER at t=${t}s"
+      "$CONTAINER_CLI" unpause "$PG_CONTAINER" >/dev/null 2>&1 || log "  !! unpause failed"
+      STALL_STATE=after
+      # Capture the exposition while the evidence is fresh. A drop counter is
+      # only worth having if it can be read off the endpoint an operator scrapes.
+      curl -s --max-time 5 "http://127.0.0.1:$METRICS_PORT/metrics" >"$OUT/$LABEL.scrape.txt" 2>/dev/null || true
+      log "  >> scrape saved to $OUT/$LABEL.scrape.txt"
+    fi
+  fi
 
   if [ "$((rss_kb / 1024))" -ge "$RSS_ABORT_MIB" ]; then
     ABORTED="RSS reached ${RSS_ABORT_MIB} MiB"
@@ -552,6 +591,20 @@ SETTLED_KB=0
 kill -0 "$WAF_PID" 2>/dev/null && SETTLED_KB="$(rss_kb_of "$WAF_PID")"
 echo "settled_after_load_stopped,$SETTLED_KB,,,,,,,,,,,,,,,," >>"$CSV"
 
+# Count what actually landed. A bounded queue that drops and a batched insert
+# that silently writes nothing produce the same flat RSS curve, and only one of
+# them is a fix — so the rows are counted from the database rather than inferred
+# from the fact that no error was logged.
+ROWS_SECURITY_EVENTS=0
+ROWS_ATTACK_LOGS=0
+if [ "$SKIP_POSTGRES" != "1" ]; then
+  ROWS_SECURITY_EVENTS="$("$CONTAINER_CLI" exec "$PG_CONTAINER" psql -U prx_waf -d prx_waf -tAc \
+    'SELECT count(*) FROM security_events' 2>/dev/null | tr -dc '0-9')"
+  ROWS_ATTACK_LOGS="$("$CONTAINER_CLI" exec "$PG_CONTAINER" psql -U prx_waf -d prx_waf -tAc \
+    'SELECT count(*) FROM attack_logs' 2>/dev/null | tr -dc '0-9')"
+  log "rows written: security_events=${ROWS_SECURITY_EVENTS:-?} attack_logs=${ROWS_ATTACK_LOGS:-?}"
+fi
+
 jq -n \
   --arg label "$LABEL" --arg posture "$POSTURE" --arg rate "${RATE:-unthrottled}" \
   --argjson minutes "$MINUTES" --argjson connections "$CONNECTIONS" \
@@ -562,10 +615,16 @@ jq -n \
   --arg tree "$(cd "$SRC" && git rev-parse HEAD 2>/dev/null || echo unknown)" \
   --arg dirty "$(worktree_state)" \
   --arg binary "$PRXWAF_BIN" \
+  --argjson rows_security_events "${ROWS_SECURITY_EVENTS:-0}" \
+  --argjson rows_attack_logs "${ROWS_ATTACK_LOGS:-0}" \
+  --arg stall_db_at "${STALL_DB_AT:-}" --argjson stall_db_for "$STALL_DB_FOR" \
   '{label:$label, posture:$posture, rate:$rate, minutes:$minutes,
     connections:$connections, sample_secs:$sample_secs, rss_abort_mib:$abort_mib,
+    stall_db_at:$stall_db_at, stall_db_for:$stall_db_for,
     aborted:$aborted, peak_rss_kb:$peak_rss_kb, settled_rss_kb:$settled_rss_kb,
-    observed_s:$observed_s, load_before:$load_before, load_after:$load_after,
+    observed_s:$observed_s, rows_security_events:$rows_security_events,
+    rows_attack_logs:$rows_attack_logs,
+    load_before:$load_before, load_after:$load_after,
     tree:$tree, worktree:$dirty, binary:$binary}' >"$META"
 
 log "series: $CSV"

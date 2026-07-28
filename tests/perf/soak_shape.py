@@ -147,6 +147,15 @@ def main() -> int:
     print(f"  pool conns/idle  {rows[-1]['pool_connections']}/{rows[-1]['pool_idle']}")
     print(f"  drops            {drops}")
     print(f"  blocked/allowed  {rows[-1]['requests_blocked']}/{rows[-1]['requests_allowed']}")
+    # A queue that drops everything and a batched insert that silently writes
+    # nothing produce the same flat RSS curve, and only one of them is a fix. So
+    # the rows are counted out of the database rather than inferred from the
+    # absence of an error in the log.
+    blocked = int(rows[-1]["requests_blocked"])
+    written = int(meta.get("rows_security_events", 0)) + int(meta.get("rows_attack_logs", 0))
+    if written or blocked:
+        share = (written / blocked * 100.0) if blocked else 0.0
+        print(f"  rows in DB       {written} of {blocked} blocked ({share:.1f}% recorded)")
     print(f"  load avg         {meta.get('load_before')} -> {meta.get('load_after')}")
     print(f"  tree             {meta.get('tree')} ({meta.get('worktree')})")
     print()

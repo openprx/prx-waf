@@ -1,0 +1,18 @@
+{
+  "label": "after-full-saturating",
+  "posture": "full",
+  "rate": "unthrottled",
+  "minutes": 10,
+  "connections": 50,
+  "sample_secs": 1,
+  "rss_abort_mib": 6144,
+  "aborted": "",
+  "peak_rss_kb": 123376,
+  "settled_rss_kb": 123376,
+  "observed_s": 602.8,
+  "load_before": "0.75",
+  "load_after": "8.02",
+  "tree": "3f2ac6672d8197bff4decc509e5ffbb220f6da0e",
+  "worktree": "build inputs clean",
+  "binary": "/tmp/claude-1000/-opt-worker/2f6d1048-1606-4b0e-b41a-e7f160c317c9/scratchpad/bin/prx-waf-fixed"
+}

@@ -1,0 +1,22 @@
+{
+  "label": "after-full-dbstall",
+  "posture": "full",
+  "rate": "unthrottled",
+  "minutes": 2,
+  "connections": 50,
+  "sample_secs": 1,
+  "rss_abort_mib": 6144,
+  "stall_db_at": "20",
+  "stall_db_for": 40,
+  "aborted": "",
+  "peak_rss_kb": 116912,
+  "settled_rss_kb": 116912,
+  "observed_s": 120.5,
+  "rows_security_events": 1863291,
+  "rows_attack_logs": 0,
+  "load_before": "1.89",
+  "load_after": "6.86",
+  "tree": "3f2ac6672d8197bff4decc509e5ffbb220f6da0e",
+  "worktree": "build inputs clean",
+  "binary": "/tmp/claude-1000/-opt-worker/2f6d1048-1606-4b0e-b41a-e7f160c317c9/scratchpad/bin/prx-waf-fixed"
+}
