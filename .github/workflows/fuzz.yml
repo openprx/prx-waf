@@ -36,9 +36,10 @@ concurrency:
   group: fuzz-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-# Read-only: this workflow never writes to the repository. Crash reproducers
-# leave as build artifacts, not commits, because a committed reproducer for an
-# unfixed parser bug is a published exploit.
+# Read-only by default: this workflow never writes to the repository. Crash
+# reproducers leave as build artifacts, not commits, because a committed
+# reproducer for an unfixed parser bug is a published exploit. The one job that
+# needs more (`notify-soak-failure`) asks for `issues: write` itself.
 permissions:
   contents: read
 
@@ -296,6 +297,70 @@ jobs:
           path: fuzz/corpus/${{ matrix.target }}/
           if-no-files-found: ignore
           retention-days: 14
+
+  # ===========================================================================
+  # Who finds out when the Monday soak crashes?
+  #
+  # Until this job existed, nobody did. The 2026-07-27 soak found a remotely
+  # reachable panic in the shell-AST detector's parser and the only trace was a
+  # red X on the Actions tab: a scheduled run is attached to no pull request, so
+  # no required check reports it, and GitHub's own failure mail goes to whoever
+  # last touched the workflow file rather than to anyone who owns the code. The
+  # crash sat unread for over a day.
+  #
+  # A soak failure is a remote DoS until proven otherwise, so it gets an issue.
+  # One issue, reused: a bug that survives a fix attempt should extend the
+  # existing thread rather than open a second one every Monday, so this comments
+  # on the open `fuzz-soak` issue when there is one and files a new issue only
+  # when there is not.
+  #
+  # `needs: fuzz` with `if: failure()` covers any of the seven targets failing,
+  # because `fail-fast: false` lets them all run and `needs` reports the worst
+  # outcome. Restricted to `schedule`: a push or pull_request failure is already
+  # in front of the person who caused it.
+  # ===========================================================================
+  notify-soak-failure:
+    name: Report soak failure
+    needs: fuzz
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: File or update the soak-failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          body="The scheduled fuzz soak failed: ${RUN_URL}
+
+          Treat a soak crash as a remote denial of service until the reachability
+          question is answered: the fuzz targets drive the production request
+          path, so an input that kills the target is an input a request can
+          carry. The crash reproducer is attached to the run as
+          \`fuzz-artifacts-<target>-<run id>\` and expires in 30 days; download
+          it before then and reproduce with
+          \`cargo +nightly fuzz run <target> <file>\`."
+
+          existing=$(gh issue list --repo "$REPO" --state open --label fuzz-soak \
+            --limit 1 --json number --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+            echo "commented on #${existing}"
+          else
+            # The label may not exist yet on a fresh repository; creating it is
+            # idempotent and failing to create it must not swallow the report.
+            gh label create fuzz-soak --repo "$REPO" \
+              --description "A scheduled fuzz soak crashed" --color B60205 || true
+            gh issue create --repo "$REPO" --label fuzz-soak \
+              --title "Fuzz soak crashed" --body "$body"
+          fi
 
   # ===========================================================================
   # Is the FUZZ_NIGHTLY pin still needed?
