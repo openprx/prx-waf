@@ -17,6 +17,7 @@ use waf_common::config::{
     ApiConfig, AppConfig, ConfigError, SecurityConfig, WorkerThreadPlan, WorkerThreadSource, apply_env_overrides,
     load_config,
 };
+use waf_common::metrics::MetricsConfig;
 use waf_engine::checks::ResponseCheckSet;
 use waf_engine::{
     BUILTIN_BAD_BOTS, BUILTIN_GOOD_BOTS, BotAction, BotCheck, CrowdSecClient, CrowdSecConfig, EnforcementMode,
@@ -1842,6 +1843,13 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     // operator reads is the count the data plane is actually built with.
     let worker_threads = config.proxy.worker_thread_plan();
 
+    // Metrics come up before anything else records, so that a counter can never
+    // miss the first request. `init` allocates the whole table up front — the
+    // size is a function of `max_host_labels`, not of traffic — and returns
+    // `false` when the operator turned metrics off, in which case every record
+    // site downstream stays a `OnceLock` load and a branch.
+    let metrics_active = waf_common::metrics::init(&config.metrics);
+
     // Report the admin-API reachable surface before anything else binds, so
     // the very first thing an operator sees is whether the management API is
     // exposed and what to do about it.
@@ -1860,6 +1868,10 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
         // listeners come up, because it is the one capacity figure an operator
         // cannot read back off a default config file.
         .chain(worker_thread_startup_broadcast(worker_threads))
+        // Whether this process can be watched at all, and who can watch it.
+        // Grouped with the other exposure lines because it is the same class of
+        // question: a listener, its scope, and what reading it gets you.
+        .chain(metrics_startup_broadcast(&config.metrics))
     {
         match line.level {
             BroadcastLevel::Info => info!("{}", line.text),
@@ -1892,6 +1904,34 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
             }
         });
     });
+
+    // The scrape endpoint gets its own thread and its own runtime for the same
+    // reason the admin API does: neither may share the Pingora worker threads,
+    // which exist to serve traffic. Its own *listener* rather than a route on
+    // the admin API is a separate decision, argued in
+    // `waf_api::metrics_endpoint`.
+    //
+    // A failure here is logged and dropped, never fatal. A metrics port that is
+    // already in use must not stop a WAF from filtering traffic — losing
+    // observability is bad, losing the firewall is worse — and the startup
+    // broadcast above has already told the operator where to look.
+    if metrics_active {
+        let metrics_listen = config.metrics.listen_addr.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to build metrics runtime: {e}");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                if let Err(e) = waf_api::metrics_endpoint::serve(&metrics_listen).await {
+                    tracing::error!("Metrics endpoint error (metrics are still being recorded): {e}");
+                }
+            });
+        });
+    }
 
     // Category ③ (external dependency): HTTP/3 needs a TLS cert + key, so it is
     // off for a zero-config single node. Rather than hard-enabling it (which
@@ -2443,6 +2483,82 @@ fn admin_exposure_startup_broadcast(api: &ApiConfig, security: &SecurityConfig) 
                     "Admin API exposure: [api] listen_addr={addr} binds to {scope_desc}, but [security] admin_ip_allowlist restricts application-level access to {allowlist_desc}. Requests from any other source are rejected with 403 before reaching business logic, so the WAF-rule/plugin/cluster-token/certificate surface is gated. The TCP port itself is still open network-wide though (health checks, port scans, and the rate limiter's per-IP bucket can still be probed by anyone who can route to this host) — if those allowlist entries are not a hard perimeter (e.g. broad CIDRs, a shared NAT gateway), also consider binding [api] listen_addr to 127.0.0.1 or a specific admin-only interface."
                 ))]
             }
+        }
+    }
+}
+
+/// Build the metrics-endpoint startup broadcast.
+///
+/// Reuses [`classify_admin_bind_scope`] deliberately: the exposure question is
+/// the same question the admin API answers, and a second classifier would be a
+/// second place for "is this loopback" to be got wrong. What differs is the
+/// consequence. The scrape endpoint carries **no credential at all** — see
+/// `waf_api::metrics_endpoint` for why adding one is worse than not having one
+/// — so its bind address is its entire access control, and a non-loopback bind
+/// is stated as a warning rather than as information.
+///
+/// What leaks if it is reachable is worth naming rather than implying: per-host
+/// request volume, block rate and detection counts by phase. That is a map of
+/// which sites this WAF fronts, how busy each is, and which attacks against them
+/// are currently getting through.
+fn metrics_startup_broadcast(metrics: &MetricsConfig) -> Vec<BroadcastLine> {
+    if !metrics.enabled {
+        return vec![BroadcastLine::warn(
+            "Metrics DISABLED ([metrics] enabled = false): no /metrics endpoint is bound and nothing is recorded. \
+             This process is unobservable — request rate, block rate, detection mix, per-lane cost and every \
+             budget/degradation counter in docs/dos-budget.md are unavailable to a scraper, and the only remaining \
+             signal is the log. Set [metrics] enabled = true (or PRXWAF_METRICS_ENABLED=1) to restore it.",
+        )];
+    }
+
+    let addr = &metrics.listen_addr;
+    let hosts = metrics.effective_max_hosts();
+    let clamped = if hosts == metrics.max_host_labels {
+        String::new()
+    } else {
+        format!(
+            " ([metrics] max_host_labels = {} was clamped to the {hosts} ceiling.)",
+            metrics.max_host_labels
+        )
+    };
+    let cardinality = format!(
+        "Cardinality is bounded: at most {hosts} distinct host label values plus one __other__ fold, so the series \
+         count is a property of this setting and not of the traffic.{clamped}"
+    );
+
+    let Some(scope) = classify_admin_bind_scope(addr) else {
+        return vec![BroadcastLine::warn(format!(
+            "Metrics exposure UNKNOWN: [metrics] listen_addr={addr:?} does not parse as host:port, so its bind scope \
+             cannot be assessed here and the listener will fail to bind. Metrics are still being recorded; nothing \
+             can scrape them. {cardinality}"
+        ))];
+    };
+
+    match scope {
+        AdminBindScope::Loopback => vec![BroadcastLine::info(format!(
+            "Metrics endpoint: http://{addr}/metrics is loopback-only — reachable only from processes on this host \
+             (this container, if containerized). The endpoint is unauthenticated by design, so this bind is what \
+             protects it; scrape it via a node-local Prometheus agent, or publish the port deliberately. {cardinality}"
+        ))],
+        AdminBindScope::Interface => vec![BroadcastLine::warn(format!(
+            "Metrics exposure: [metrics] listen_addr={addr} binds a non-loopback interface and the endpoint is \
+             UNAUTHENTICATED — every host that can route to that network can read per-host request volume, block \
+             rate and detection counts by phase, which is a map of the sites this WAF fronts and which attacks \
+             against them are landing. Restrict it at the firewall, or bind 127.0.0.1 and let a local agent forward \
+             it. {cardinality}"
+        ))],
+        AdminBindScope::WildcardV4 | AdminBindScope::WildcardV6 => {
+            let scope_desc = if scope == AdminBindScope::WildcardV4 {
+                "every IPv4 interface of this host/container"
+            } else {
+                "every interface of this host/container (IPv4 and IPv6 alike on most kernels)"
+            };
+            vec![BroadcastLine::warn(format!(
+                "Metrics exposure: CRITICAL — [metrics] listen_addr={addr} binds {scope_desc} and the endpoint is \
+                 UNAUTHENTICATED, so ANY host that can reach this port can read per-host request volume, block rate \
+                 and detection counts by phase. Bind 127.0.0.1 (the default) and scrape from a node-local agent, or \
+                 put the port behind a firewall you control. {cardinality}"
+            ))]
         }
     }
 }
@@ -3574,6 +3690,90 @@ mod tests {
         let l = lines.first().expect("broadcast is never empty");
         assert_eq!(l.level, BroadcastLevel::Warn, "{}", l.text);
         assert!(l.text.contains("UNKNOWN"), "{}", l.text);
+    }
+
+    // ── Metrics exposure broadcast ───────────────────────────────────────────
+
+    fn metrics_cfg(listen: &str) -> MetricsConfig {
+        MetricsConfig {
+            listen_addr: listen.to_string(),
+            ..MetricsConfig::default()
+        }
+    }
+
+    /// The shipped default has to be the quiet one. If the factory config warns,
+    /// operators learn to ignore the warning.
+    #[test]
+    fn shipped_metrics_bind_is_loopback_and_informational() {
+        let cfg = MetricsConfig::default();
+        assert_eq!(cfg.listen_addr, "127.0.0.1:9090");
+        assert!(cfg.enabled, "metrics must ship on");
+        let lines = metrics_startup_broadcast(&cfg);
+        let l = lines.first().expect("broadcast is never empty");
+        assert_eq!(l.level, BroadcastLevel::Info, "{}", l.text);
+        assert!(l.text.contains("loopback-only"), "{}", l.text);
+    }
+
+    /// The endpoint carries no credential, so a non-loopback bind is the whole
+    /// exposure. It must warn, and it must say what reading it gets you.
+    #[test]
+    fn non_loopback_metrics_bind_warns_and_names_what_leaks() {
+        for addr in ["0.0.0.0:9090", "[::]:9090", "192.0.2.10:9090"] {
+            let lines = metrics_startup_broadcast(&metrics_cfg(addr));
+            let l = lines.first().expect("broadcast is never empty");
+            assert_eq!(l.level, BroadcastLevel::Warn, "{addr}: {}", l.text);
+            assert!(l.text.contains("UNAUTHENTICATED"), "{addr}: {}", l.text);
+            assert!(l.text.contains("block rate"), "{addr}: {}", l.text);
+        }
+    }
+
+    /// Turning metrics off is a legitimate choice, but it is a choice with a
+    /// consequence, and the log is the only place left to state it.
+    #[test]
+    fn disabled_metrics_say_the_process_is_unobservable() {
+        let cfg = MetricsConfig {
+            enabled: false,
+            ..MetricsConfig::default()
+        };
+        let lines = metrics_startup_broadcast(&cfg);
+        let l = lines.first().expect("broadcast is never empty");
+        assert_eq!(l.level, BroadcastLevel::Warn, "{}", l.text);
+        assert!(l.text.contains("unobservable"), "{}", l.text);
+    }
+
+    /// A clamped `max_host_labels` must be reported, otherwise an operator who
+    /// asked for a million host labels believes they got them.
+    #[test]
+    fn clamped_host_label_bound_is_reported() {
+        let cfg = MetricsConfig {
+            max_host_labels: 1_000_000,
+            ..MetricsConfig::default()
+        };
+        let lines = metrics_startup_broadcast(&cfg);
+        let text = &lines.first().expect("broadcast is never empty").text;
+        assert!(text.contains("was clamped"), "{text}");
+        assert!(
+            text.contains(&waf_common::metrics::MAX_HOST_LABELS_CEILING.to_string()),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unparseable_metrics_addr_warns_rather_than_assuming() {
+        let lines = metrics_startup_broadcast(&metrics_cfg("not-an-addr"));
+        let l = lines.first().expect("broadcast is never empty");
+        assert_eq!(l.level, BroadcastLevel::Warn, "{}", l.text);
+        assert!(l.text.contains("UNKNOWN"), "{}", l.text);
+    }
+
+    /// The shipped TOML and the struct default must agree. They are two
+    /// separate sources of the same decision, and a drift between them means
+    /// the documented default is not the one a config-less install gets.
+    #[test]
+    fn shipped_toml_metrics_section_matches_the_struct_default() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/default.toml");
+        let shipped = load_config(path).expect("shipped default.toml must load").metrics;
+        assert_eq!(shipped, MetricsConfig::default());
     }
 
     // ── IPv4-mapped config broadcast ─────────────────────────────────────────

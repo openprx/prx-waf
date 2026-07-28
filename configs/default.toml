@@ -119,6 +119,33 @@ listen_addr_tls = "0.0.0.0:443"
 [api]
 listen_addr = "0.0.0.0:9527"
 
+# ── Prometheus metrics ────────────────────────────────────────────────────────
+# On by default, and bound to loopback. Off by default would mean most
+# deployments run blind — no request rate, no block rate, no per-lane detection
+# cost, and none of the budget/degradation counters that tell you how much
+# inspection you are losing (see docs/dos-budget.md). A wildcard bind by default
+# would publish per-host request volume, block rate and detection counts by
+# phase to anyone who can route to the box, which is a map of the sites this WAF
+# fronts and which attacks against them are landing.
+#
+# The endpoint is UNAUTHENTICATED by design: Prometheus has no good way to carry
+# a JWT, and the alternative — reusing the admin token, which can rewrite rules
+# and replace certificates — puts a far more dangerous credential in the
+# monitoring system's config file. The bind address is the access control. Widen
+# it only behind a firewall you control; startup warns when you do.
+[metrics]
+enabled = true
+listen_addr = "127.0.0.1:9090"
+
+# Upper bound on distinct `host` label values. This is the ONLY setting that
+# decides how many time series this process can produce: past the bound, hosts
+# are folded into a single `__other__` series, so series count is a property of
+# this number and not of the traffic. No other label is dynamic — client IP,
+# rule id, path and user agent are never labels, by construction. Roughly
+# 26 series per host plus a fixed ~230; 128 hosts is about 3.6k series.
+max_host_labels = 128
+
+
 [storage]
 database_url = "postgresql://prx_waf:prx_waf@postgres:5432/prx_waf"
 max_connections = 20
