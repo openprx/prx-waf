@@ -9,6 +9,15 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [0.2.119] — 2026-07-28
+
+The first release since 0.2.31. Eighty-eight versions of work land together, so
+the sections below are long; the four that decide whether this is deployable are
+the metrics endpoint, the bounded write path, the graceful upgrade, and the
+shell-parser guard.
+
 ### Added
 
 - **`run --upgrade`: change the configuration or the binary without dropping
