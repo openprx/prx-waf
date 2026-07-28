@@ -328,7 +328,12 @@ const RCE_RULES: &[RuleRow] = &[
         true,
     ),
     // Reading a sensitive file via a reader command — the shape a de-obfuscated
-    // `cat$IFS/etc/passwd` collapses to after shell normalisation.
+    // `cat$IFS/etc/passwd` or `cat${IFS}/etc/passwd` collapses to after shell
+    // normalisation. Both spellings, and that is load-bearing: the braced one is
+    // the form that needs no separator behind it, so it is the form actually
+    // sent, and `preprocess::shell_normalize`'s fast-path guard used to decline
+    // it (`${IFS}` does not contain the substring `$IFS`) — which made this
+    // comment a claim about a payload the rule never saw.
     (
         "rce.sensitive_read",
         70,

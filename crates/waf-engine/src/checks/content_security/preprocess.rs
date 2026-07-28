@@ -763,7 +763,16 @@ fn transform_children(text: &str, parent_tainted: bool) -> Vec<TransformChild> {
 /// it is scored but can never single-signal Block (plan §6.3, same rule as blind
 /// decode).
 fn shell_normalize(s: &str) -> Option<String> {
-    if !(s.contains('\'') || s.contains('"') || s.contains('\\') || s.contains("$IFS")) {
+    // The `IFS` arm is the bare name, NOT `$IFS`, and that is the whole point:
+    // `${IFS}` does not contain the substring `$IFS` — the brace sits between the
+    // sigil and the name — so a guard written as `contains("$IFS")` declined
+    // `cat${IFS}/etc/passwd` before the replacement below ever ran, and the
+    // braced form (the one an attacker reaches for, because it needs no
+    // separator after it) produced no normalised view at all. Gating on the name
+    // is also one scan rather than two, and over-admitting costs nothing: a field
+    // that merely mentions IFS is unchanged by the replacements and falls out at
+    // the `out == s` check.
+    if !(s.contains('\'') || s.contains('"') || s.contains('\\') || s.contains("IFS")) {
         return None;
     }
     // Collapse the `$IFS` idiom (longest forms first), then strip shell quotes
@@ -1523,7 +1532,14 @@ mod tests {
     /// A field engineered to fan out: two comment sites (a join view and a space
     /// view), an HTML entity run, a base64 token, a hex token and shell
     /// metacharacters, each of which the depth-2 transform composition re-explores.
-    /// It wants exactly 16 views.
+    /// It wants exactly 25 views.
+    ///
+    /// It wanted 16 until the `shell_normalize` fast-path guard learned to admit
+    /// `${IFS}`. The nine it gained are the shell-normalised child and the
+    /// depth-2 transforms of it, and they are not new work invented here — they
+    /// are exactly the views this field always produced when the same idiom was
+    /// spelled `$IFS`, which is what
+    /// [`the_two_ifs_spellings_cost_the_same_fanout`] pins.
     const FANOUT_FIELD: &[u8] = concat!(
         "id=un/**/ion sel/**/ect 1,2,3 from users where a=b",
         " ${IFS}cat${IFS}/etc/passwd",
@@ -1552,14 +1568,48 @@ mod tests {
         // decoded view was visibly refused, which looked like restraint and was a
         // silent false negative — the cap fills on a *successful* push and the
         // remaining transform frontier then disappears without any one view being
-        // turned away. At 12 it costs four views and says so.
-        assert_eq!(fanout_views(16), (16, false), "16 is exactly what the field wants");
-        assert_eq!(fanout_views(17), (16, false), "a cap above the demand costs nothing");
-        assert_eq!(fanout_views(15), (15, true), "one short is one view never inspected");
+        // turned away. At 12 it costs thirteen views and says so.
+        assert_eq!(fanout_views(25), (25, false), "25 is exactly what the field wants");
+        assert_eq!(fanout_views(26), (25, false), "a cap above the demand costs nothing");
+        assert_eq!(fanout_views(24), (24, true), "one short is one view never inspected");
         assert_eq!(
             fanout_views(12),
             (12, true),
-            "the shipped default costs this field four views"
+            "the shipped default costs this field thirteen views"
+        );
+    }
+
+    /// The braced and bare spellings of the `$IFS` idiom are the same idiom, so
+    /// they must cost the same and decode to the same thing. This is the whole
+    /// claim behind the guard fix: it does not widen what the preprocessor does,
+    /// it stops one spelling of an admitted idiom from being declined at the
+    /// door. The view *count* is the budget half of that claim — a fanout the
+    /// bare form always paid for is not new work — and the view *text* is the
+    /// detection half.
+    #[test]
+    fn the_two_ifs_spellings_cost_the_same_fanout() {
+        let bare: Vec<u8> = String::from_utf8_lossy(FANOUT_FIELD)
+            .replace("${IFS}", "$IFS")
+            .into_bytes();
+        let count = |body: &[u8]| {
+            let budget = Budget {
+                max_views_per_field: 64,
+                ..Budget::default()
+            };
+            let req = req_with("/a", "", body);
+            let mut st = ContentInspectionState::new(budget);
+            st.begin_phase();
+            semantic_preprocessor(InspectionScope::Body, &req, &mut st).len()
+        };
+        assert_eq!(
+            count(FANOUT_FIELD),
+            count(&bare),
+            "the two spellings fan out identically"
+        );
+        assert_eq!(
+            shell_normalize("cat${IFS}/etc/passwd"),
+            shell_normalize("cat$IFS/etc/passwd"),
+            "…and normalise to the same command"
         );
     }
 
@@ -2170,6 +2220,53 @@ mod tests {
             v.lower_trunc.contains("cat /etc/passwd"),
             "shell normalisation must restore the command: {:?}",
             v.lower_trunc
+        );
+    }
+
+    #[test]
+    fn braced_ifs_is_normalised_like_the_bare_form() {
+        // `${IFS}` is the form that needs no separator after it, so it is the one
+        // an attacker reaches for — and the one the old fast-path guard declined,
+        // because `${IFS}` does not contain the substring `$IFS`. With no quote
+        // and no backslash anywhere in the payload the guard was the only thing
+        // between this field and its normalised view.
+        for (payload, want) in [
+            ("cat${IFS}/etc/passwd", "cat /etc/passwd"),
+            ("head${IFS}/proc/self/environ", "head /proc/self/environ"),
+            ("cat${IFS}$IFS/etc/passwd", "cat  /etc/passwd"),
+        ] {
+            let out = shell_normalize(payload).unwrap_or_else(|| panic!("must normalise: {payload}"));
+            assert_eq!(out, want, "payload {payload}");
+        }
+        // …and end to end, on the view the detectors actually receive.
+        let views = body_views(b"cmd=cat${IFS}/etc/passwd");
+        let v = views
+            .iter()
+            .find(|v| v.provenance == Provenance::BlindDecoded)
+            .expect("a shell-normalised view must be produced");
+        assert!(
+            v.lower_trunc.contains("cat /etc/passwd"),
+            "shell normalisation must restore the command: {:?}",
+            v.lower_trunc
+        );
+    }
+
+    #[test]
+    fn a_bare_mention_of_ifs_synthesises_no_view() {
+        // The guard now admits the bare name, so the no-change check is what keeps
+        // prose out. Nothing here is a shell idiom and nothing may be synthesised.
+        for benign in [
+            "set IFS to a comma before the loop",
+            "IFS=$'\\n'",     // an assignment, not the ${IFS} substitution idiom
+            "notifsomething", // the name as a substring of a word
+        ] {
+            assert!(shell_normalize(benign).is_none(), "must synthesise nothing: {benign}");
+        }
+        let views = body_views(b"msg=set IFS to a comma before the loop");
+        assert!(
+            views.iter().all(|v| v.provenance == Provenance::Raw),
+            "a prose mention of IFS must not synthesise a view: {:?}",
+            views.iter().map(|v| v.provenance).collect::<Vec<_>>()
         );
     }
 
