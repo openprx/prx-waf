@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1820,7 +1820,7 @@ dependencies = [
  "pingora-http",
  "pingora-proxy",
  "quinn",
- "rand 0.8.7",
+ "rand 0.10.2",
  "rcgen",
  "reqwest",
  "rustls",
@@ -3744,7 +3744,7 @@ checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "prx-waf"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5690,7 +5690,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waf-api"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5708,7 +5708,7 @@ dependencies = [
  "jsonwebtoken",
  "lettre",
  "parking_lot",
- "rand 0.8.7",
+ "rand 0.10.2",
  "reqwest",
  "rust-embed",
  "rustls",
@@ -5731,7 +5731,7 @@ dependencies = [
 
 [[package]]
 name = "waf-cluster"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5744,7 +5744,7 @@ dependencies = [
  "lz4_flex",
  "parking_lot",
  "quinn",
- "rand 0.8.7",
+ "rand 0.10.2",
  "rcgen",
  "ring",
  "rustls",
@@ -5762,7 +5762,7 @@ dependencies = [
 
 [[package]]
 name = "waf-common"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5770,7 +5770,7 @@ dependencies = [
  "base64 0.23.0",
  "bytes",
  "prometheus-client",
- "rand 0.8.7",
+ "rand 0.10.2",
  "serde",
  "sha2 0.11.0",
  "thiserror 2.0.19",
@@ -5781,7 +5781,7 @@ dependencies = [
 
 [[package]]
 name = "waf-engine"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5805,7 +5805,7 @@ dependencies = [
  "parking_lot",
  "pollster",
  "quick-xml",
- "rand 0.8.7",
+ "rand 0.10.2",
  "regex",
  "reqwest",
  "rhai",
@@ -5826,7 +5826,7 @@ dependencies = [
 
 [[package]]
 name = "waf-storage"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "chrono",
  "parking_lot",
