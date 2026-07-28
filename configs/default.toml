@@ -747,9 +747,6 @@ max_ast_input_bytes_total = 262144
 max_html_parse_attempts_per_request = 6    # XSS DOM detector HTML5 fragment-parse cap (P-XSS-1)
 max_html_parse_input_bytes_total = 262144  # total bytes handed to the HTML parser per request
 max_tokens_per_view = 512
-max_list_items = 1024                 # NO-OP: read by nothing. List expansion is bounded by
-                                      # the extractor's hardcoded 256-node ceiling instead
-                                      # (docs/dos-budget.md §2.1). Tuning this changes nothing.
 max_preprocess_output_bytes_total = 524288
 max_field_input_bytes = 16384         # per-field input cap, checked before any decode/alloc
 max_decode_rounds = 3

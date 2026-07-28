@@ -101,6 +101,15 @@ pub struct SemanticAttackConfig {
 
 /// Deterministic work-budget caps with conservative factory defaults
 /// (plan §12.2). Every value must be non-zero.
+///
+/// Every key here is read by something. `max_list_items` used to be here and
+/// was not: it was parsed, validated and compiled into `Budget`, and no code
+/// path ever consulted it. It was removed rather than pointed at a limit,
+/// because the only candidate — the structured extractor's `MAX_VALUE_NODES` —
+/// bounds GraphQL argument value nodes, not list items, and adopting the key's
+/// 1 024 there would have quadrupled an attacker-reachable walk to make a name
+/// come true. A config file still carrying the key parses; it is ignored, which
+/// is what it always was.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SemanticBudgetConfig {
@@ -116,7 +125,6 @@ pub struct SemanticBudgetConfig {
     /// request. A second, cumulative cap on top of the per-parse byte backstop.
     pub max_html_parse_input_bytes_total: usize,
     pub max_tokens_per_view: u32,
-    pub max_list_items: u32,
     pub max_preprocess_output_bytes_total: usize,
     /// Per-field **input** admission cap in bytes (plan §12.2, codex A-2). A
     /// single field longer than this is rejected on a borrowed view **before**
@@ -138,7 +146,6 @@ impl Default for SemanticBudgetConfig {
             max_html_parse_attempts_per_request: 6,
             max_html_parse_input_bytes_total: 256 * 1024,
             max_tokens_per_view: 512,
-            max_list_items: 1024,
             max_preprocess_output_bytes_total: 512 * 1024,
             max_field_input_bytes: 16 * 1024,
             max_decode_rounds: 3,
@@ -316,7 +323,7 @@ impl ContentSecurityConfig {
 
 impl SemanticBudgetConfig {
     fn validate(&self) -> Result<(), String> {
-        let checks: [(&str, u64); 11] = [
+        let checks: [(&str, u64); 10] = [
             ("max_fields_per_phase", u64::from(self.max_fields_per_phase)),
             ("max_views_per_field", u64::from(self.max_views_per_field)),
             (
@@ -333,7 +340,6 @@ impl SemanticBudgetConfig {
                 self.max_html_parse_input_bytes_total as u64,
             ),
             ("max_tokens_per_view", u64::from(self.max_tokens_per_view)),
-            ("max_list_items", u64::from(self.max_list_items)),
             (
                 "max_preprocess_output_bytes_total",
                 self.max_preprocess_output_bytes_total as u64,

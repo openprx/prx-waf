@@ -226,7 +226,6 @@ max_views_per_field = 12
 max_ast_attempts_per_request = 6
 max_ast_input_bytes_total = 262144
 max_tokens_per_view = 512
-max_list_items = 1024
 max_preprocess_output_bytes_total = 524288
 max_field_input_bytes = 16384         # per-field input cap, checked before any decode/alloc
 max_decode_rounds = 3

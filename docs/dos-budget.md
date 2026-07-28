@@ -215,12 +215,11 @@ invisible in the metrics.
 | `max_html_parse_attempts_per_request` | 6 | HTML5 fragment parses |
 | `max_html_parse_input_bytes_total` | 262 144 | total bytes handed to the HTML parser |
 | `max_tokens_per_view` | 512 | tokens per view |
-| `max_list_items` | 1 024 | **nothing — see below** |
 | `max_preprocess_output_bytes_total` | 524 288 | **total normalised bytes per request** |
 | `max_field_input_bytes` | 16 384 | per field, checked before any decode/alloc |
 | `max_decode_rounds` | 3 | decode passes |
 
-Exceed behaviour is **degrade** for nine of the eleven keys: the unit of work is
+Exceed behaviour is **degrade** for nine of the ten keys: the unit of work is
 skipped and `SemanticVerdict::degraded` is set. Crucially, exhaustion does
 **not** retract signals already found — the comment at `budget.rs:33-42`
 explains why: letting exhaustion clear the verdict would hand an attacker a
@@ -235,10 +234,10 @@ state; they report through `ContentInspectionState::record_view_cap_miss` /
 `v0.2.91` they reported nothing at all, and hitting them narrowed what the lane
 looked at with no flag and no counter.
 
-The two keys that do **not** degrade are `max_list_items`, which bounds nothing
-at all, and `max_decode_rounds`, which bounds the URL-decode chain and stops it
-without a flag or a counter. Both are described below. Earlier revisions of this
-section counted `max_decode_rounds` among the degrading keys; it never was.
+The one key that does **not** degrade is `max_decode_rounds`, which bounds the
+URL-decode chain and stops it without a flag or a counter. It is described
+below. Earlier revisions of this section counted it among the degrading keys; it
+never was.
 
 Both report **work the budget refused**, which is the standard the other eight
 already hold — a refused AST parse is degradation whether or not that parse
@@ -269,15 +268,16 @@ field losing four of its sixteen views reported nothing. "I could not prove the
 loss" is not the same claim as "there was no loss", and only one of them is safe
 to encode as `degraded = false`.
 
-**`max_list_items` bounds nothing.** It is parsed, validated non-zero and
-compiled into `Budget` (`budget.rs:68`), and no code path reads it. The list
-expansion it names is bounded by the structured extractor's hardcoded
-`MAX_VALUE_NODES = 256` (`struct_extract.rs:108`) and by `max_fields_per_phase`,
-neither of which consults this key. Tuning it has no effect in either direction.
-It is left wired to nothing rather than pointed at `MAX_VALUE_NODES`, because
-that would move the bound from 256 to the configured 1 024 and change what the
-lane extracts — a detection change, not a budget one. Treat the row as a
-documented no-op until someone decides which of the two numbers is right.
+**`max_list_items` is gone.** Up to `v0.2.121` the table above carried an
+eleventh row for it: parsed, validated non-zero, compiled into `Budget`, and read
+by nothing. The key was deleted rather than wired up. The only limit it could
+plausibly have driven is the structured extractor's `MAX_VALUE_NODES = 256`
+(`struct_extract.rs:108`), and that bounds nodes visited while walking a single
+GraphQL argument value — not list items, and nothing in the JSON or XML paths
+consults it. Adopting the key's 1 024 there would have quadrupled the worst-case
+walk on attacker-supplied input to make a name come true, with no evidence of
+anything gained. A config file still carrying `max_list_items` continues to load;
+the key is ignored, which is what it always was.
 
 **`max_decode_rounds` is the one budget key that still narrows silently.** The
 URL-decode loop stops at `round <= max_rounds` (`preprocess.rs:1191`); when the
@@ -1023,13 +1023,13 @@ than through `try_take_*`, so they narrowed inspection without setting `degraded
 and without a counter. §2.1 states what each one deliberately stays quiet
 about.
 
-**Two keys are still uncounted.** `max_list_items` cannot be counted: it bounds
-nothing, no code path reads it (§2.1), and a metric cannot be added to a limit
-that does not exist — the same finding §4 records for the CrowdSec decision
-cache. `max_decode_rounds` could be, and is not: exhausting it leaves the field
-inspected with a residual encoded layer rather than uninspected, which is the
-argument this section already makes for `MAX_DECODE_PASSES` above. §2.1 states
-the case for revisiting that.
+**One key is still uncounted.** `max_decode_rounds` could be counted, and is
+not: exhausting it leaves the field inspected with a residual encoded layer
+rather than uninspected, which is the argument this section already makes for
+`MAX_DECODE_PASSES` above. §2.1 states the case for revisiting that. The other
+uncounted key this paragraph used to name, `max_list_items`, has been removed
+from the config entirely (§2.1) — a metric could never be added to a limit that
+did not exist.
 
 Every row above also raises `prxwaf_degraded_requests_total`, which counts
 **requests** while the rows above count **events**. Read the first for "how many

@@ -27,8 +27,12 @@
 //! per-request state can see. They report through
 //! [`ContentInspectionState::record_view_cap_miss`] /
 //! [`ContentInspectionState::record_token_cap_miss`] instead, and only when the
-//! loss is demonstrated. The eleventh key, `max_list_items`, is accepted from
-//! the config and enforced nowhere — see [`Budget::max_list_items`].
+//! loss is demonstrated.
+//!
+//! There used to be an eleventh key, `max_list_items`, which was accepted from
+//! the config and enforced nowhere. It is gone; see
+//! [`waf_common::content_security_config::SemanticBudgetConfig`]. Every field of
+//! [`Budget`] is now something a code path reads.
 //!
 //! This module only *records* exhaustion. `degraded` means **"part of this request
 //! was never inspected"** — an abstention over the remainder — and it is
@@ -54,18 +58,6 @@ pub struct Budget {
     pub max_html_parse_attempts_per_request: u32,
     pub max_html_parse_input_bytes_total: usize,
     pub max_tokens_per_view: u32,
-    /// **Enforced nowhere.** Carried from the config so the compiled budget is a
-    /// faithful copy of what the operator wrote, but no code path reads it: the
-    /// list expansion it names is bounded by the structured extractor's own
-    /// hardcoded `MAX_VALUE_NODES` (256) and by `max_fields_per_phase`, neither
-    /// of which consults this key. Raising or lowering it changes nothing.
-    ///
-    /// Left in place rather than wired up because pointing it at
-    /// `MAX_VALUE_NODES` would move that bound from 256 to the configured 1 024
-    /// and change what the lane extracts — a detection change, not the
-    /// observability fix this comment belongs to. Recorded in
-    /// `docs/dos-budget.md` §2.1 so an operator does not tune a dead knob.
-    pub max_list_items: u32,
     pub max_preprocess_output_bytes_total: usize,
     pub max_field_input_bytes: usize,
     pub max_decode_rounds: u8,
@@ -89,7 +81,6 @@ impl Budget {
             max_html_parse_attempts_per_request: cfg.max_html_parse_attempts_per_request,
             max_html_parse_input_bytes_total: cfg.max_html_parse_input_bytes_total,
             max_tokens_per_view: cfg.max_tokens_per_view,
-            max_list_items: cfg.max_list_items,
             max_preprocess_output_bytes_total: cfg.max_preprocess_output_bytes_total,
             max_field_input_bytes: cfg.max_field_input_bytes,
             max_decode_rounds: cfg.max_decode_rounds,
@@ -354,7 +345,6 @@ mod tests {
             max_html_parse_attempts_per_request: 1,
             max_html_parse_input_bytes_total: 8,
             max_tokens_per_view: 4,
-            max_list_items: 4,
             max_preprocess_output_bytes_total: 8,
             max_field_input_bytes: 8,
             max_decode_rounds: 2,
