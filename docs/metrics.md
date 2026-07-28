@@ -150,6 +150,31 @@ The duration histogram starts before host routing, so it covers ACME probes,
 upstream. `host="__other__"` therefore also collects requests refused before a
 host was resolved at all (an over-long header fold, a duplicate `Host`).
 
+**HTTP/3 is in these series too, on the same labels.** The QUIC forwarder does
+not run under Pingora and has no `logging` callback, so it records from a
+wrapper around its request handler — the one place all of its return paths pass
+through — but everything downstream of that is shared: the same
+decision-to-`action` mapping, the same `resolve_host` and therefore the same
+`max_host_labels` bound, the same "status actually written" rule. An HTTP/3 404
+for an unrouted authority is `action="block"` with a 4xx exactly as the
+HTTP/1.1 one is, and a site reached over both protocols on the same port lands
+on one series. HTTP/3 refusals that fire before an authority is settled on — a
+duplicate `Host`, an over-long fold, an `:authority` its `Host` line
+contradicts — join the `__other__` fold alongside their HTTP/1.1 equivalents.
+`tests/e2e-http3-red-metrics.sh` reconciles a scrape against a real QUIC client
+request by request.
+
+**There is no `proto` label, and no HTTP/3-specific metric names.** A protocol
+dimension would double the `28H` above — about 3 800 series at the default — to
+answer a question the per-host SLO dashboards do not ask, and would halve the
+sample count behind every per-host quantile. The protocol-specific failure
+modes that do need separating have their own unlabelled counters:
+`prxwaf_budget_events_total{subsystem="http3_body", limit="buffer_ceiling"}`,
+and the `waf.upstream_timeout` log target, which the HTTP/3 forwarder shares
+with the Pingora path. If you need per-protocol RED, run separate listeners in
+separate processes rather than paying the cardinality on every deployment that
+does not.
+
 Block rate: `sum(rate(prxwaf_requests_total{action="block"}[5m])) / sum(rate(prxwaf_requests_total[5m]))`
 
 ### Detections

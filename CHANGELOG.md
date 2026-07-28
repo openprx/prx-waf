@@ -181,6 +181,23 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **HTTP/3 requests appear on `/metrics`.** The RED series were recorded from
+  Pingora's `logging` callback, which the QUIC forwarder never reaches — it does
+  not run under Pingora — so every HTTP/3 request was invisible except for one
+  413 body counter. A node serving both protocols reported a request rate and a
+  block rate that silently omitted one of them. The H3 handler now records from
+  a wrapper that all of its return paths pass through, using the HTTP/1.1
+  sources for every label: the same decision-to-`action` mapping, so a refusal
+  is a `block` on both; the same `resolve_host`, so `max_host_labels` bounds
+  HTTP/3 without a second cap and a site reached over both protocols on one port
+  lands on one series; the same "status actually written" rule, so an upstream
+  502 stays distinguishable from a WAF 403. Refusals that fire before an
+  authority is settled on join the `__other__` fold, where their HTTP/1.1
+  equivalents already are. No new label and no new metric name: a `proto`
+  dimension would double the series count to answer a question the per-host
+  dashboards do not ask. `tests/e2e-http3-red-metrics.sh` reconciles a scrape
+  against a real QUIC client, outcome by outcome.
+
 - **Sustained attack traffic no longer lets the attacker choose how much memory
   the process uses.** Every enforced detection wrote an `attack_logs` and/or a
   `security_events` row through one `tokio::spawn` per detection. Nothing
