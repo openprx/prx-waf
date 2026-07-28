@@ -5,9 +5,13 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::broadcast;
 use tracing::info;
+use waf_common::metrics;
 use waf_common::notify::{NotificationBus, NotificationEvent};
 
 use crate::StorageError;
+
+/// How often [`Database::spawn_pool_gauge_sampler`] republishes pool occupancy.
+const POOL_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Database connection wrapper with real-time event broadcast
 #[derive(Clone)]
@@ -55,6 +59,49 @@ impl Database {
     /// Get a reference to the connection pool
     pub const fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Publish the pool's occupancy into `prxwaf_db_pool` once.
+    ///
+    /// Separate from the sampler loop so a test can drive one observation
+    /// without a timer, and so the shape of what is published lives next to the
+    /// pool it is read from.
+    pub fn sample_pool_gauges(&self) {
+        // `size()` and `num_idle()` are `u32`/`usize`; both are bounded by
+        // `storage.max_connections`, so the conversion cannot lose anything —
+        // but it is done saturating rather than with a cast, because a metric
+        // that silently wraps is worse than one that is pinned at its maximum.
+        metrics::set_pool_gauge(metrics::PoolGauge::Connections, i64::from(self.pool.size()));
+        metrics::set_pool_gauge(
+            metrics::PoolGauge::Idle,
+            i64::try_from(self.pool.num_idle()).unwrap_or(i64::MAX),
+        );
+    }
+
+    /// Spawn the background sampler that keeps `prxwaf_db_pool` current.
+    ///
+    /// Pool occupancy is a level, not an event: there is no record site to hang
+    /// it off, so something has to read it on a clock. One second is chosen
+    /// against the scrape interval — fast enough that a 15 s Prometheus scrape
+    /// never reads a value older than it, slow enough to be free (two atomic
+    /// loads and two atomic stores per second).
+    ///
+    /// Returns the join handle; the caller decides its lifetime. The task holds
+    /// a `Weak`, so it stops on its own once the last `Arc<Database>` is gone
+    /// rather than keeping the pool alive for the life of the process.
+    pub fn spawn_pool_gauge_sampler(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(POOL_SAMPLE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(db) = weak.upgrade() else {
+                    return;
+                };
+                db.sample_pool_gauges();
+            }
+        })
     }
 
     /// Subscribe to real-time security events (for WebSocket streaming)

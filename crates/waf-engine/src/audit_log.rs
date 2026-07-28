@@ -67,7 +67,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use waf_common::metrics::{self, BudgetEvent};
+use waf_common::metrics::{self, BudgetEvent, QueueGauge};
 use waf_common::{AuditLogConfig, RequestCtx};
 
 /// Bounded channel capacity, in per-request blocks. A sustained flood beyond
@@ -341,6 +341,8 @@ impl AuditLogSink {
         if self.tx.try_send(block).is_err() {
             metrics::record_budget_event(BudgetEvent::AuditLogDrop);
             self.dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            metrics::queue_depth_inc(QueueGauge::AuditLog);
         }
     }
 }
@@ -386,6 +388,7 @@ impl AuditLogWorker {
                     }
                     for block in batch {
                         self.write_block(&block).await;
+                        metrics::queue_depth_dec(QueueGauge::AuditLog);
                     }
                     self.flush().await;
                 }

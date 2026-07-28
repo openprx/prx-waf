@@ -41,7 +41,7 @@
 //! read.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use prometheus_client::collector::Collector;
@@ -513,6 +513,91 @@ impl BudgetEvent {
     }
 }
 
+/// A background write path whose **current occupancy** an operator needs to see,
+/// not just its drop count.
+///
+/// [`BudgetEvent`]'s `queue` rows are counters: they fire the moment a queue is
+/// already full, which is *after* the interesting part. A queue that is filling
+/// but has not yet overflowed produces no signal from them at all, and that is
+/// exactly the state a memory-growth investigation is looking for — the depth is
+/// the leading indicator, the drop is the trailing one.
+///
+/// The unit is **items presently owed a write**: incremented when the hot path
+/// hands work to a background writer and decremented when that writer is done
+/// with it. For a bounded channel that is the queue length; for a path that
+/// spawns a task per item it is the number of tasks in flight, which is the same
+/// quantity measured on the only structure that path has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueGauge {
+    /// `attack_logs` rows owed a write.
+    AttackLog,
+    /// `security_events` rows owed a write, on the Lane 1 / CRS path.
+    SecurityEvent,
+    /// Lane 2 observations queued in the semantic sink.
+    SemanticObservation,
+    /// Lane 2 shadow security events queued in the semantic sink.
+    SemanticEvent,
+    /// Per-request rule-hit blocks queued for the audit-log file writer.
+    AuditLog,
+}
+
+impl QueueGauge {
+    /// Every variant, in declaration order — the exposition walks this, so a
+    /// queue appears in `/metrics` at zero before it has ever been used.
+    const ALL: [Self; 5] = [
+        Self::AttackLog,
+        Self::SecurityEvent,
+        Self::SemanticObservation,
+        Self::SemanticEvent,
+        Self::AuditLog,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AttackLog => "attack_log",
+            Self::SecurityEvent => "security_event",
+            Self::SemanticObservation => "semantic_observations",
+            Self::SemanticEvent => "semantic_events",
+            Self::AuditLog => "audit_log",
+        }
+    }
+}
+
+/// The two numbers that say whether the database pool is the bottleneck.
+///
+/// Both are sampled from the live `sqlx` pool rather than counted at a record
+/// site, because neither is an event: `Connections` is how many the pool has
+/// opened (it grows to `storage.max_connections` under load and stops), and
+/// `Idle` is how many of those nobody is holding. `Connections` at the
+/// configured maximum with `Idle` at zero is pool saturation, and it is the
+/// state that turns a background writer's queue into a growing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolGauge {
+    /// Connections the pool currently owns, open or connecting.
+    Connections,
+    /// Connections currently idle — owned by the pool and held by nobody.
+    Idle,
+}
+
+impl PoolGauge {
+    const ALL: [Self; 2] = [Self::Connections, Self::Idle];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Connections => "connections",
+            Self::Idle => "idle",
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Histogram bucket layouts — explicit, not the library defaults
 // ─────────────────────────────────────────────────────────────────────────────
@@ -845,6 +930,16 @@ pub struct MetricsState {
     lane_duration: Box<[AtomicHistogram]>,
     /// One slot per [`BudgetEvent`].
     budget: Box<[AtomicU64]>,
+    /// One slot per [`QueueGauge`]. Signed because the increment and the
+    /// decrement happen on different threads: a scrape that lands between a
+    /// writer's decrement and its producer's increment can legitimately observe
+    /// a transient −1, and clamping that to zero inside an unsigned type would
+    /// hide a *real* pairing bug behind a plausible number. It is published
+    /// clamped and stored honestly.
+    queue_depth: Box<[AtomicI64]>,
+    /// One slot per [`PoolGauge`], written by the sampler rather than by a
+    /// record site.
+    pool: Box<[AtomicI64]>,
     /// Requests whose Lane 2 verdict came back `degraded` — part of the request
     /// was never inspected.
     degraded: AtomicU64,
@@ -873,6 +968,8 @@ impl MetricsState {
                 .map(|_| AtomicHistogram::new(&LANE_BUCKETS_NANOS))
                 .collect(),
             budget: BudgetEvent::ALL.iter().map(|_| AtomicU64::new(0)).collect(),
+            queue_depth: QueueGauge::ALL.iter().map(|_| AtomicI64::new(0)).collect(),
+            pool: PoolGauge::ALL.iter().map(|_| AtomicI64::new(0)).collect(),
             degraded: AtomicU64::new(0),
             hosts,
         }
@@ -903,6 +1000,7 @@ impl Collector for MetricsState {
         self.encode_detections(&mut encoder)?;
         self.encode_lanes(&mut encoder)?;
         self.encode_budget(&mut encoder)?;
+        self.encode_queues(&mut encoder)?;
         Ok(())
     }
 }
@@ -1022,6 +1120,41 @@ impl MetricsState {
             let labels = [("subsystem", subsystem), ("limit", limit)];
             let mut family = budget.encode_family(&labels)?;
             family.encode_counter::<NoLabelSet, u64, u64>(&value, None)?;
+        }
+        Ok(())
+    }
+
+    fn encode_queues(&self, encoder: &mut DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let mut depth = encoder.encode_descriptor(
+            "prxwaf_queue_depth",
+            "Items handed to a background writer and not yet written — the queue in front of \
+             the database, before anything is dropped",
+            None,
+            MetricType::Gauge,
+        )?;
+        for queue in QueueGauge::ALL {
+            // Clamped at the boundary, not in storage: see `queue_depth`.
+            let value = self
+                .queue_depth
+                .get(queue.index())
+                .map_or(0, |g| g.load(Ordering::Relaxed))
+                .max(0);
+            let labels = [("queue", queue.label())];
+            let mut family = depth.encode_family(&labels)?;
+            family.encode_gauge(&value)?;
+        }
+
+        let mut pool = encoder.encode_descriptor(
+            "prxwaf_db_pool",
+            "Database connection pool occupancy, sampled: connections owned, and of those, idle",
+            None,
+            MetricType::Gauge,
+        )?;
+        for gauge in PoolGauge::ALL {
+            let value = self.pool.get(gauge.index()).map_or(0, |g| g.load(Ordering::Relaxed));
+            let labels = [("state", gauge.label())];
+            let mut family = pool.encode_family(&labels)?;
+            family.encode_gauge(&value)?;
         }
         Ok(())
     }
@@ -1167,6 +1300,54 @@ pub fn record_budget_event(event: BudgetEvent) {
     if let Some(m) = metrics() {
         MetricsState::bump(&m.state.budget, event.index());
     }
+}
+
+/// One more item is owed a write by a background writer.
+///
+/// Must be paired with exactly one [`queue_depth_dec`] on every path the item
+/// can leave by, the error and drop paths included — an unpaired increment
+/// makes the gauge climb forever and look like the leak it is meant to detect.
+#[inline]
+pub fn queue_depth_inc(queue: QueueGauge) {
+    if let Some(m) = metrics()
+        && let Some(slot) = m.state.queue_depth.get(queue.index())
+    {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One item a background writer owed has left the queue — written, dropped or
+/// failed. See [`queue_depth_inc`] for the pairing rule.
+#[inline]
+pub fn queue_depth_dec(queue: QueueGauge) {
+    if let Some(m) = metrics()
+        && let Some(slot) = m.state.queue_depth.get(queue.index())
+    {
+        slot.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Publish a sampled connection-pool occupancy. Absolute, not a delta: the
+/// caller reads the live pool and states what it saw.
+#[inline]
+pub fn set_pool_gauge(gauge: PoolGauge, value: i64) {
+    if let Some(m) = metrics()
+        && let Some(slot) = m.state.pool.get(gauge.index())
+    {
+        slot.store(value, Ordering::Relaxed);
+    }
+}
+
+/// Current depth of one queue. For tests and for the shutdown log; the
+/// exposition reads the same slot.
+#[must_use]
+pub fn queue_depth(queue: QueueGauge) -> i64 {
+    metrics().map_or(0, |m| {
+        m.state
+            .queue_depth
+            .get(queue.index())
+            .map_or(0, |g| g.load(Ordering::Relaxed))
+    })
 }
 
 /// A request finished with part of it never inspected.
@@ -1328,8 +1509,84 @@ mod tests {
         assert!(text.contains("prxwaf_inspection_duration_seconds_bucket"), "{text}");
         assert!(text.contains(r#"lane="crs""#), "{text}");
         assert!(text.contains("prxwaf_degraded_requests_total"), "{text}");
+        assert!(text.contains("prxwaf_queue_depth"), "{text}");
+        assert!(text.contains(r#"queue="attack_log""#), "{text}");
+        assert!(text.contains(r#"queue="security_event""#), "{text}");
+        assert!(text.contains("prxwaf_db_pool"), "{text}");
+        assert!(text.contains(r#"state="idle""#), "{text}");
         // No host has been resolved, so only the `__other__` series exists.
         assert!(text.contains(r#"host="__other__""#), "{text}");
+    }
+
+    #[test]
+    fn queue_gauges_index_uniquely_and_label_uniquely() {
+        for (i, queue) in QueueGauge::ALL.iter().enumerate() {
+            assert_eq!(queue.index(), i, "QueueGauge::ALL is out of declaration order at {i}");
+        }
+        let mut labels: Vec<_> = QueueGauge::ALL.iter().map(|q| q.label()).collect();
+        let before = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(before, labels.len(), "two QueueGauges share a label");
+
+        for (i, gauge) in PoolGauge::ALL.iter().enumerate() {
+            assert_eq!(gauge.index(), i, "PoolGauge::ALL is out of declaration order at {i}");
+        }
+    }
+
+    /// A gauge is a level, not a count: what reaches the exposition has to be
+    /// the difference between the increments and the decrements, and a queue
+    /// that drained back to empty has to read zero rather than "how busy it
+    /// once was".
+    #[test]
+    fn queue_depth_is_a_level_and_returns_to_zero() {
+        let m = Metrics::new(4);
+        let slot = m
+            .state
+            .queue_depth
+            .get(QueueGauge::AttackLog.index())
+            .expect("attack_log slot");
+        slot.fetch_add(3, Ordering::Relaxed);
+        slot.fetch_sub(1, Ordering::Relaxed);
+        let text = m.encode().expect("encode");
+        assert!(text.contains("prxwaf_queue_depth{queue=\"attack_log\"} 2"), "{text}");
+
+        slot.fetch_sub(2, Ordering::Relaxed);
+        let text = m.encode().expect("encode");
+        assert!(text.contains("prxwaf_queue_depth{queue=\"attack_log\"} 0"), "{text}");
+    }
+
+    /// The storage is signed so a pairing bug stays visible in `queue_depth()`,
+    /// but a transient negative must never be published — `-1` on a gauge whose
+    /// unit is "items" is not a reading any dashboard can use.
+    #[test]
+    fn a_transient_negative_depth_is_published_as_zero() {
+        let m = Metrics::new(4);
+        let slot = m
+            .state
+            .queue_depth
+            .get(QueueGauge::SecurityEvent.index())
+            .expect("security_event slot");
+        slot.fetch_sub(1, Ordering::Relaxed);
+        let text = m.encode().expect("encode");
+        assert!(
+            text.contains("prxwaf_queue_depth{queue=\"security_event\"} 0"),
+            "{text}"
+        );
+        assert_eq!(slot.load(Ordering::Relaxed), -1, "storage keeps the honest value");
+    }
+
+    #[test]
+    fn pool_gauge_publishes_what_the_sampler_stored() {
+        let m = Metrics::new(4);
+        m.state
+            .pool
+            .get(PoolGauge::Connections.index())
+            .expect("connections slot")
+            .store(20, Ordering::Relaxed);
+        let text = m.encode().expect("encode");
+        assert!(text.contains("prxwaf_db_pool{state=\"connections\"} 20"), "{text}");
+        assert!(text.contains("prxwaf_db_pool{state=\"idle\"} 0"), "{text}");
     }
 
     #[test]
@@ -1569,5 +1826,8 @@ mod tests {
         record_request_duration(HostSlot::OTHER, Duration::from_millis(1));
         record_detection(Phase::Xss, VerdictAction::Block);
         record_response(HostSlot::OTHER, 200);
+        queue_depth_inc(QueueGauge::AttackLog);
+        queue_depth_dec(QueueGauge::AttackLog);
+        set_pool_gauge(PoolGauge::Idle, 4);
     }
 }

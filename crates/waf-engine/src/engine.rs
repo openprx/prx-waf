@@ -1242,10 +1242,12 @@ impl WafEngine {
         };
 
         let db = Arc::clone(&self.db);
+        metrics::queue_depth_inc(metrics::QueueGauge::AttackLog);
         tokio::spawn(async move {
             if let Err(e) = db.create_attack_log(log).await {
                 warn!("Failed to log attack event: {}", e);
             }
+            metrics::queue_depth_dec(metrics::QueueGauge::AttackLog);
         });
     }
 
@@ -1285,10 +1287,12 @@ impl WafEngine {
         };
 
         let db = Arc::clone(&self.db);
+        metrics::queue_depth_inc(metrics::QueueGauge::SecurityEvent);
         tokio::spawn(async move {
             if let Err(e) = db.create_security_event(event).await {
                 warn!("Failed to log security event: {}", e);
             }
+            metrics::queue_depth_dec(metrics::QueueGauge::SecurityEvent);
         });
     }
 

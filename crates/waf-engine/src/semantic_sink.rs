@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use waf_common::metrics::{self, BudgetEvent};
+use waf_common::metrics::{self, BudgetEvent, QueueGauge};
 use waf_storage::StorageError;
 use waf_storage::{
     Database,
@@ -143,6 +143,8 @@ impl SemanticObservationSink {
         if self.obs_tx.try_send(obs).is_err() {
             metrics::record_budget_event(BudgetEvent::SemanticObservationDrop);
             self.obs_dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            metrics::queue_depth_inc(QueueGauge::SemanticObservation);
         }
     }
 
@@ -153,6 +155,8 @@ impl SemanticObservationSink {
         if self.event_tx.try_send(event).is_err() {
             metrics::record_budget_event(BudgetEvent::SemanticEventDrop);
             self.event_dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            metrics::queue_depth_inc(QueueGauge::SemanticEvent);
         }
     }
 
@@ -205,6 +209,7 @@ impl SemanticObservationWorker {
                         if let Err(e) = writer.write_observation(obs).await {
                             warn!("Failed to persist semantic observation: {e}");
                         }
+                        metrics::queue_depth_dec(QueueGauge::SemanticObservation);
                     }
                 }
                 maybe = self.event_rx.recv() => {
@@ -226,6 +231,7 @@ impl SemanticObservationWorker {
                         if let Err(e) = writer.write_event(event).await {
                             warn!("Failed to persist shadow security event: {e}");
                         }
+                        metrics::queue_depth_dec(QueueGauge::SemanticEvent);
                     }
                 }
             }
@@ -238,6 +244,7 @@ impl SemanticObservationWorker {
             if let Err(e) = writer.write_observation(obs).await {
                 warn!("Failed to persist semantic observation: {e}");
             }
+            metrics::queue_depth_dec(QueueGauge::SemanticObservation);
         }
     }
 
@@ -248,6 +255,7 @@ impl SemanticObservationWorker {
             if let Err(e) = writer.write_event(event).await {
                 warn!("Failed to persist shadow security event: {e}");
             }
+            metrics::queue_depth_dec(QueueGauge::SemanticEvent);
         }
     }
 

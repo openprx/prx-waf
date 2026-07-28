@@ -71,20 +71,22 @@ which the test suite asserts directly.
 | `prxwaf_degraded_requests_total` | — | 1 | 1 |
 | `prxwaf_inspection_duration_seconds` | 3 lanes | 21 (18 buckets + `+Inf` + sum + count) | 63 |
 | `prxwaf_budget_events_total` | 44 `(subsystem, limit)` pairs | 1 | 44 |
+| `prxwaf_queue_depth` | 5 queues | 1 | 5 |
+| `prxwaf_db_pool` | 2 states | 1 | 2 |
 
-Total = **`28H + 214`**, where `H` = `max_host_labels`.
+Total = **`28H + 221`**, where `H` = `max_host_labels`.
 
 | `max_host_labels` | Series |
 |--:|--:|
-| 0 (fold everything) | 214 |
-| 4 | 326 |
-| 16 | 662 |
-| **128 (default)** | **3 798** |
-| 4096 (the clamp) | 114 902 |
+| 0 (fold everything) | 221 |
+| 4 | 333 |
+| 16 | 669 |
+| **128 (default)** | **3 805** |
+| 4096 (the clamp) | 114 909 |
 
 The `4` row is measured, not calculated: a node configured with
 `max_host_labels = 4`, driven with six distinct hostnames plus its own, scrapes
-**exactly 326 series** — four host label values plus `__other__`, and the two
+**exactly 333 series** — four host label values plus `__other__`, and the two
 extra hostnames folded into it.
 
 A **100-host deployment at the default** produces about **3 000 series** — the
@@ -194,6 +196,38 @@ Three that are worth alerting on from day one:
 | `{subsystem="lane1_body", limit="max_body_bytes"}` | bodies over 64 KiB are not scanned by `sqli`/`xss`/`rce`/`dir_traversal` **at all**. A steady rate means an application whose real traffic exceeds the budget |
 | `{subsystem="crs_body_processor", limit="json_body_bytes"}` | JSON over 64 KiB produces no `ARGS_POST` targets, so the CRS rules that read them are not protecting that endpoint |
 | `{subsystem="queue", ...}` | any non-zero rate means audit records, Lane 2 observations or notifications are being dropped. Detection is unaffected; your record of it is not |
+
+### The write path behind the detection
+
+```
+prxwaf_queue_depth{queue}   queue = attack_log | security_event
+                                  | semantic_observations | semantic_events
+                                  | audit_log
+prxwaf_db_pool{state}       state = connections | idle
+```
+
+Both are **gauges**, and they exist because the `subsystem="queue"` counters
+above are trailing indicators: they fire only once a queue is already full, so a
+queue that is filling — which is what memory growth under attack looks like from
+the inside — produces no signal from them at all.
+
+`queue_depth` counts **items handed to a background writer and not yet written**.
+Every detection this WAF blocks costs two database rows, and those rows are
+written off the request path; the depth is how far behind that write path has
+fallen. `db_pool` says whether the pool is why:
+`connections` pinned at `storage.max_connections` with `idle` at zero is
+saturation, and a `queue_depth` rising against a saturated pool is the whole
+diagnosis in two series.
+
+The pair an operator should graph together is `prxwaf_queue_depth{queue="attack_log"}`
+against `prxwaf_budget_events_total{subsystem="queue", limit="attack_log"}`: the
+first is how much is waiting, the second is how much was given up on. Neither
+number alone distinguishes "the WAF is not detecting anything" from "the WAF is
+detecting and cannot write it down", and those two states must never look alike.
+
+`db_pool` is sampled once a second by a background task rather than recorded at
+a call site, because occupancy is a level and not an event. A scrape therefore
+reads a value at most one second old.
 
 ---
 

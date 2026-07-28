@@ -2878,6 +2878,14 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
     info!("Running database migrations...");
     db.migrate().await?;
 
+    // Pool occupancy has no record site — it is a level, not an event — so it
+    // needs a clock. Started here rather than lazily: the question it answers
+    // ("is the write path bottlenecked on connections?") is one an operator asks
+    // during an incident, and a gauge that only starts on demand is not there
+    // when the incident is. The task holds a `Weak` and exits when the pool
+    // does, so the handle is deliberately dropped.
+    drop(db.spawn_pool_gauge_sampler());
+
     // Compile the (already-validated) Lane 2 semantic config into the immutable
     // runtime form. `load_config` already ran strict validation; this resolves
     // detector-id strings and is a hard failure if it somehow fails.
