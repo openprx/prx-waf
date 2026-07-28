@@ -9,6 +9,47 @@
 listen_addr = "0.0.0.0:80"
 listen_addr_tls = "0.0.0.0:443"
 
+# ── Stopping, and replacing a running process ─────────────────────────────────
+# How long this process keeps serving requests it has already accepted after it
+# is told to stop — by SIGTERM, or by handing its listening sockets to a
+# replacement started with `prx-waf run --upgrade`.
+#
+# It is a FIXED WAIT, NOT A DRAIN DETECTOR. The whole period is slept whether or
+# not anything is still in flight, and then the runtimes get five more seconds
+# before they are cut. So this is the cost of every stop, not a worst case: 30
+# means `systemctl stop` takes 35 seconds on an idle box, and an in-place
+# upgrade holds two processes, two database pools and no management API for that
+# long. Pingora's own default here is 300 seconds, which is what prx-waf used
+# to inherit.
+#
+# Size it above the longest request this proxy should be allowed to finish and
+# below your supervisor's kill timeout (systemd TimeoutStopSec, Kubernetes
+# terminationGracePeriodSeconds) — past that the supervisor SIGKILLs the
+# process and severs exactly the connections this wait exists to protect.
+# WebSocket and SSE connections are not "requests that finish": they are cut at
+# the end of the drain whatever it is set to. 0 skips the wait entirely.
+#
+# PRXWAF_DRAIN_TIMEOUT_SECS overrides it. See docs/graceful-upgrade.md.
+drain_timeout_secs = 30
+
+# ── Zero-downtime upgrade handover socket ─────────────────────────────────────
+# Where the two processes of an in-place upgrade meet. Left unset (the shipped
+# default) the path is DERIVED from the effective uid — /run/prx-waf/upgrade.sock
+# for root, /tmp/prx-waf-<uid>/upgrade.sock otherwise — so both halves agree on
+# it with nothing configured, and it is announced at startup.
+#
+# Whatever it points at, the PARENT DIRECTORY is the security boundary: Pingora
+# chmods the socket itself to 0666, and whoever can create a socket at this path
+# while an upgrade is in flight receives the listening file descriptors of the
+# port this WAF fronts. prx-waf creates the directory 0700 and refuses one that
+# is a symlink, is owned by another user, or grants anything to group or other —
+# which is why Pingora's shipped /tmp/pingora_upgrade.sock is not used.
+#
+# Set this only to move the socket somewhere a supervisor manages, and set it
+# identically in the config both processes read.
+#
+# upgrade_sock = "/run/prx-waf/upgrade.sock"
+
 # ── Worker threads — the size of the proxy data plane ─────────────────────────
 # How many threads accept, inspect and relay requests. This is the one knob that
 # decides whether the WAF can use the machine it is on.

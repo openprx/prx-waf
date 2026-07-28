@@ -1921,7 +1921,11 @@ fn run_server(config: &AppConfig, taking_over: bool) -> anyhow::Result<()> {
         // and on which path the replacement will reach it. Both halves of a
         // handover have to name the same socket, and this line is where an
         // operator reads back the one this process derived.
-        .chain(handover_startup_broadcast(handover_sock.as_ref(), taking_over))
+        .chain(handover_startup_broadcast(
+            handover_sock.as_ref(),
+            taking_over,
+            config.proxy.drain_timeout_secs,
+        ))
     {
         match line.level {
             BroadcastLevel::Info => info!("{}", line.text),
@@ -1948,7 +1952,8 @@ fn run_server(config: &AppConfig, taking_over: bool) -> anyhow::Result<()> {
     // are gone by the time the ports free up. So on a handover launch, and only
     // then, each of the three keeps retrying for as long as the contention can
     // plausibly last.
-    let handover_window = taking_over.then_some(upgrade::HANDOVER_BIND_WINDOW);
+    let handover_window = taking_over
+        .then(|| upgrade::handover_bind_window(std::time::Duration::from_secs(config.proxy.drain_timeout_secs)));
 
     // Start the management API in a background thread
     let api_listen = config.api.listen_addr.clone();
@@ -2161,7 +2166,11 @@ fn run_server(config: &AppConfig, taking_over: bool) -> anyhow::Result<()> {
             upgrade: taking_over,
             ..Opt::default()
         },
-        proxy_server_conf(worker_threads.threads, handover_sock.as_ref())?,
+        proxy_server_conf(
+            worker_threads.threads,
+            handover_sock.as_ref(),
+            config.proxy.drain_timeout_secs,
+        )?,
     );
     if taking_over {
         info!(
@@ -2484,11 +2493,27 @@ fn render_admin_allowlist(allowlist: &[String]) -> String {
 /// derived path is a function of the effective uid, so printing it is how an
 /// operator confirms from the outgoing process's log what the incoming one will
 /// look for.
-fn handover_startup_broadcast(sock: Option<&upgrade::UpgradeSock>, taking_over: bool) -> Vec<BroadcastLine> {
+fn handover_startup_broadcast(
+    sock: Option<&upgrade::UpgradeSock>,
+    taking_over: bool,
+    drain_secs: u64,
+) -> Vec<BroadcastLine> {
+    // Said whether or not a handover is possible, because it is also the cost
+    // of an ordinary `systemctl stop`, and because the value it replaces was
+    // Pingora's unconditional five minutes.
+    let drain = BroadcastLine::info(format!(
+        "Stop drain: {drain_secs}s — after SIGTERM, or after handing its listeners to a replacement, this process \
+         keeps serving already-accepted requests for {drain_secs}s and then gives its runtimes 5s more before \
+         cutting them. It is a fixed wait, not a drain detector: the full {drain_secs}s is spent even when nothing \
+         is in flight, so it is the cost of every stop. Set [proxy] drain_timeout_secs (or \
+         PRXWAF_DRAIN_TIMEOUT_SECS) above the longest request this proxy should be allowed to finish, and below \
+         your supervisor's kill timeout."
+    ));
+
     let Some(sock) = sock else {
         // The refusal was already logged in full, with its reason, where it was
         // decided; repeating it here would only say it twice.
-        return Vec::new();
+        return vec![drain];
     };
     let path = sock.path.display();
     let origin = match sock.source {
@@ -2498,20 +2523,26 @@ fn handover_startup_broadcast(sock: Option<&upgrade::UpgradeSock>, taking_over: 
     };
 
     if taking_over {
-        return vec![BroadcastLine::info(format!(
-            "Graceful upgrade: this process is TAKING OVER. It will wait on {path} ({origin}) for the running \
-             prx-waf to hand its listening sockets across. Send that process SIGQUIT now. Until then this process \
-             holds no listener, and if it gives up waiting it exits without having disturbed anything."
-        ))];
+        return vec![
+            BroadcastLine::info(format!(
+                "Graceful upgrade: this process is TAKING OVER. It will wait on {path} ({origin}) for the running \
+                 prx-waf to hand its listening sockets across. Send that process SIGQUIT now. Until then this \
+                 process holds no listener, and if it gives up waiting it exits without having disturbed anything."
+            )),
+            drain,
+        ];
     }
 
-    vec![BroadcastLine::info(format!(
-        "Graceful upgrade: available on {path} ({origin}). To change the configuration or the binary without \
-         dropping connections, start the new process with `prx-waf run --upgrade` FIRST and only then send this one \
-         SIGQUIT. Sending SIGQUIT with no process waiting on that socket is a shutdown, not an upgrade: this process \
-         will spend its retry budget looking for a successor that is not there and then exit, leaving the port \
-         unserved."
-    ))]
+    vec![
+        BroadcastLine::info(format!(
+            "Graceful upgrade: available on {path} ({origin}). To change the configuration or the binary without \
+             dropping connections, start the new process with `prx-waf run --upgrade` FIRST and only then send this \
+             one SIGQUIT. Sending SIGQUIT with no process waiting on that socket is a shutdown, not an upgrade: this \
+             process will spend its retry budget looking for a successor that is not there and then exit, leaving \
+             the port unserved."
+        )),
+        drain,
+    ]
 }
 
 /// Build the Pingora server configuration the proxy data plane runs under.
@@ -2530,15 +2561,24 @@ fn handover_startup_broadcast(sock: Option<&upgrade::UpgradeSock>, taking_over: 
 /// handover in a world-writable directory. `None` leaves the default in place
 /// but nothing ever asks for the handover, since the flag that arms the
 /// receiving side is refused in the same breath.
+/// `drain_secs` is the third. Left unset, Pingora sleeps its own
+/// `EXIT_TIMEOUT` — 300 seconds (`server/mod.rs:56`, applied at `:775`) — after
+/// every graceful stop, unconditionally, whether or not a single connection is
+/// still open. That is five minutes of two live processes holding two database
+/// pools and two sets of management ports after a handover whose data plane
+/// finished in two seconds, and five minutes of a `systemctl stop` that
+/// systemd will `SIGKILL` at ninety.
 fn proxy_server_conf(
     threads: usize,
     handover_sock: Option<&upgrade::UpgradeSock>,
+    drain_secs: u64,
 ) -> anyhow::Result<pingora_core::server::configuration::ServerConf> {
     use pingora_core::server::configuration::ServerConf;
 
     let mut conf =
         ServerConf::new().ok_or_else(|| anyhow::anyhow!("failed to build the default Pingora server configuration"))?;
     conf.threads = threads;
+    conf.grace_period_seconds = Some(drain_secs);
     if let Some(sock) = handover_sock {
         conf.upgrade_sock = sock.path.to_string_lossy().into_owned();
         conf.upgrade_sock_connect_accept_max_retries = Some(upgrade::HANDOVER_SOCK_RETRIES);
@@ -4719,7 +4759,7 @@ mod tests {
     /// (`pingora-core-0.8.1/src/server/mod.rs:705`).
     #[test]
     fn proxy_server_conf_carries_the_worker_thread_count() {
-        let conf = proxy_server_conf(12, None).expect("default Pingora conf must build");
+        let conf = proxy_server_conf(12, None, 30).expect("default Pingora conf must build");
         assert_eq!(conf.threads, 12);
         // Pingora's own default is the value this whole change exists to stop
         // inheriting; assert it is what we would have got, so the test fails if
@@ -4742,7 +4782,7 @@ mod tests {
             path: PathBuf::from("/run/prx-waf/upgrade.sock"),
             source: upgrade::SockSource::Configured,
         };
-        let conf = proxy_server_conf(4, Some(&sock)).expect("default Pingora conf must build");
+        let conf = proxy_server_conf(4, Some(&sock), 30).expect("default Pingora conf must build");
         assert_eq!(conf.upgrade_sock, "/run/prx-waf/upgrade.sock");
         assert_eq!(
             conf.upgrade_sock_connect_accept_max_retries,
@@ -4756,6 +4796,23 @@ mod tests {
         );
     }
 
+    /// The drain budget has to displace Pingora's `None`, which is not "no
+    /// wait" but a five-minute unconditional sleep (`server/mod.rs:56`, applied
+    /// at `:775`) that holds the management ports and the database pool open
+    /// long after the handover is done.
+    #[test]
+    fn proxy_server_conf_replaces_pingoras_five_minute_stop() {
+        let conf = proxy_server_conf(1, None, 45).expect("default Pingora conf must build");
+        assert_eq!(conf.grace_period_seconds, Some(45));
+        assert_eq!(
+            pingora_core::server::configuration::ServerConf::new()
+                .expect("default conf")
+                .grace_period_seconds,
+            None,
+            "upstream still leaves this unset, so the wiring is still needed"
+        );
+    }
+
     /// The startup line is the only place an operator reads back the derived
     /// path, so it must name it, and it must say which order the two commands
     /// go in — the reverse order is a shutdown.
@@ -4765,19 +4822,37 @@ mod tests {
             path: PathBuf::from("/tmp/prx-waf-1000/upgrade.sock"),
             source: upgrade::SockSource::UserTemp,
         };
-        let lines = handover_startup_broadcast(Some(&sock), false);
+        let lines = handover_startup_broadcast(Some(&sock), false, 30);
         let line = lines.first().expect("an available handover is announced");
         assert!(line.text.contains("/tmp/prx-waf-1000/upgrade.sock"), "{}", line.text);
         assert!(line.text.contains("run --upgrade"), "{}", line.text);
         assert!(line.text.contains("SIGQUIT"), "{}", line.text);
 
-        let taking_over = handover_startup_broadcast(Some(&sock), true);
+        let taking_over = handover_startup_broadcast(Some(&sock), true, 30);
         let line = taking_over.first().expect("a handover launch is announced");
         assert!(line.text.contains("TAKING OVER"), "{}", line.text);
+    }
 
-        // An unavailable handover was already explained in full where it was
-        // refused; the broadcast does not repeat it.
-        assert!(handover_startup_broadcast(None, false).is_empty());
+    /// The stop drain is announced even when no handover is possible: it is
+    /// what an ordinary `systemctl stop` costs, and the value it replaced was
+    /// five minutes.
+    #[test]
+    fn the_drain_is_announced_whether_or_not_a_handover_is_possible() {
+        for sock in [
+            None,
+            Some(upgrade::UpgradeSock {
+                path: PathBuf::from("/run/prx-waf/upgrade.sock"),
+                source: upgrade::SockSource::SystemRuntime,
+            }),
+        ] {
+            let lines = handover_startup_broadcast(sock.as_ref(), false, 45);
+            let drain = lines
+                .iter()
+                .find(|l| l.text.starts_with("Stop drain"))
+                .expect("the drain is always announced");
+            assert!(drain.text.contains("45s"), "{}", drain.text);
+            assert!(drain.text.contains("drain_timeout_secs"), "{}", drain.text);
+        }
     }
 
     /// A default install must be told the count, since it appears in no config

@@ -792,6 +792,30 @@ pub struct ProxyConfig {
     /// another user, or grants any access to group or other.
     #[serde(default)]
     pub upgrade_sock: Option<String>,
+    /// Seconds a process keeps serving requests it has already accepted after
+    /// it has been told to stop — by `SIGTERM`, or by handing its listeners to
+    /// a replacement.
+    ///
+    /// It is a **fixed wait, not a drain detector**. Pingora sleeps the whole
+    /// period whether or not anything is still in flight
+    /// (`pingora-core-0.8.1/src/server/mod.rs:777`) and then gives the runtimes
+    /// five more seconds before cutting them, so this is the exact cost of
+    /// every stop and every upgrade, not a worst case. Pingora's own default —
+    /// applied when this is left unset, which is what prx-waf used to do — is
+    /// **300 seconds** (`server/mod.rs:56`): five minutes of two processes, two
+    /// database pools, and no management API, after a handover that finished in
+    /// two seconds.
+    ///
+    /// Size it to the longest request this proxy should be allowed to finish.
+    /// `0` cuts straight to the five-second runtime shutdown, which severs
+    /// anything still running.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+}
+
+/// See [`ProxyConfig::drain_timeout_secs`].
+const fn default_drain_timeout_secs() -> u64 {
+    30
 }
 
 impl Default for ProxyConfig {
@@ -805,6 +829,7 @@ impl Default for ProxyConfig {
             smuggling_detection: true,
             upstream_timeouts: UpstreamTimeoutConfig::default(),
             upgrade_sock: None,
+            drain_timeout_secs: default_drain_timeout_secs(),
         }
     }
 }
@@ -1533,6 +1558,13 @@ fn parse_env_usize(key: &str, raw: &str) -> anyhow::Result<usize> {
         .map_err(|e| anyhow::anyhow!("environment variable {key} has invalid integer value '{raw}': {e}"))
 }
 
+/// Parse an unsigned-64 environment override, naming the key on failure.
+fn parse_env_u64(key: &str, raw: &str) -> anyhow::Result<u64> {
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("environment variable {key} has invalid integer value '{raw}': {e}"))
+}
+
 /// Split a comma-separated environment value into trimmed, non-empty entries.
 fn parse_env_list(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -1611,6 +1643,14 @@ where
     // does not.
     if let Some(v) = get("PRXWAF_UPGRADE_SOCK") {
         config.proxy.upgrade_sock = Some(v);
+    }
+
+    // How long a stop is allowed to take is a property of the platform doing
+    // the stopping — a supervisor's kill timeout, an orchestrator's
+    // terminationGracePeriodSeconds — and those live beside the deployment, not
+    // in the image's TOML.
+    if let Some(v) = get("PRXWAF_DRAIN_TIMEOUT_SECS") {
+        config.proxy.drain_timeout_secs = parse_env_u64("PRXWAF_DRAIN_TIMEOUT_SECS", &v)?;
     }
 
     // Where the scrape endpoint lives is a property of the deployment, not of

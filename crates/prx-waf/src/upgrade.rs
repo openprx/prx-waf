@@ -43,19 +43,33 @@ const SYSTEM_RUNTIME_DIR: &str = "/run/prx-waf";
 /// command, and it only ever elapses on a handover that has already failed.
 pub const HANDOVER_SOCK_RETRIES: usize = 60;
 
-/// How long a listener Pingora does not carry over keeps retrying its bind
-/// while the outgoing process still holds the port.
-///
-/// The outgoing process releases the admin API, metrics and HTTP/3 ports only
-/// when it exits, which is Pingora's five-second close timeout plus the
-/// configured grace period plus however long the last in-flight request takes.
-/// This window has to outlast that or the incoming process comes up with no
-/// management plane; it is deliberately generous because the cost of waiting is
-/// a log line and the cost of giving up early is a WAF that cannot be
-/// administered until someone restarts it.
-pub const HANDOVER_BIND_WINDOW: Duration = Duration::from_mins(2);
+/// Floor and margin on the window a listener Pingora does not carry over keeps
+/// retrying its bind for. See [`handover_bind_window`].
+const HANDOVER_BIND_MARGIN: Duration = Duration::from_mins(1);
+const HANDOVER_BIND_FLOOR: Duration = Duration::from_mins(2);
 
-/// Interval between bind attempts inside [`HANDOVER_BIND_WINDOW`].
+/// How long the admin API, metrics and HTTP/3 listeners keep retrying their
+/// bind while the outgoing process still holds their ports.
+///
+/// Derived from the drain budget rather than fixed, because the two numbers are
+/// the same fact seen from either end. The outgoing process releases those
+/// ports only when it exits, and that is Pingora's five-second close timeout,
+/// plus the whole of `[proxy] drain_timeout_secs` — slept unconditionally, not
+/// until the connections are gone — plus five seconds of runtime shutdown. A
+/// window that did not follow the drain would silently stop covering it the
+/// first time someone raised the drain for long-lived requests, and the symptom
+/// would be a WAF with no management plane after every upgrade.
+///
+/// The margin exists because the two processes read two different config files
+/// — the whole point of an upgrade is often that the file changed — so the
+/// incoming process is computing this from its own drain setting, not from the
+/// one the outgoing process is actually sleeping. The floor keeps a deployment
+/// that drains in zero seconds from giving up before a slow start finishes.
+pub fn handover_bind_window(drain: Duration) -> Duration {
+    (drain + Duration::from_secs(10) + HANDOVER_BIND_MARGIN).max(HANDOVER_BIND_FLOOR)
+}
+
+/// Interval between bind attempts inside [`handover_bind_window`].
 const HANDOVER_BIND_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Where the resolved socket path came from, for the startup line.
@@ -369,6 +383,22 @@ mod tests {
         assert_ne!(auto_sock_dirs(1000), auto_sock_dirs(1001));
         assert_eq!(auto_sock_dirs(0).first(), Some(&PathBuf::from("/run/prx-waf")));
         assert_eq!(auto_sock_dirs(1000).get(1), Some(&PathBuf::from("/tmp/prx-waf-1000")));
+    }
+
+    /// The window must always outlast the drain it is waiting on, or the
+    /// listeners Pingora does not carry give up before the outgoing process
+    /// releases their ports and the new process comes up unmanageable.
+    #[test]
+    fn the_bind_window_always_outlasts_the_drain() {
+        for drain_secs in [0, 5, 30, 120, 600, 3600] {
+            let drain = Duration::from_secs(drain_secs);
+            let window = handover_bind_window(drain);
+            assert!(
+                window > drain + Duration::from_secs(10),
+                "drain {drain_secs}s leaves no room for the close timeout and runtime shutdown: {window:?}"
+            );
+            assert!(window >= HANDOVER_BIND_FLOOR, "drain {drain_secs}s: {window:?}");
+        }
     }
 
     /// The retry hinges on recognising the kind through however many layers of
