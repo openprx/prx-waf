@@ -331,6 +331,9 @@ cors_origins = []
 # # the request is proxied through anyway. ModSecurity's `SecRuleEngine
 # # DetectionOnly`. Default false (enforce).
 # log_only_mode = false
+# # Administrative on/off. false answers every request for this host with 503
+# # Service Unavailable and never contacts the upstream. Default true (serving).
+# start_status = true
 
 # ── Cluster Configuration (disabled by default — opt-in) ──────────────────────
 # Remove the leading '#' characters from the [cluster] section to enable.

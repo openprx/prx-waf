@@ -3196,6 +3196,12 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
             defense_config: entry.defense_config.clone(),
             // Detect-only posture from the config file (defaults to enforce).
             log_only_mode: entry.log_only_mode,
+            // Administrative on/off from the config file (defaults to serving).
+            // Without this line the `..HostConfig::default()` below would force
+            // `start_status = true` and a config-file `start_status = false`
+            // would be a no-op — the site would keep serving while the operator
+            // believed they had closed it.
+            start_status: entry.start_status,
             ..HostConfig::default()
         });
         router.register(&cfg);

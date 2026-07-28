@@ -1254,6 +1254,22 @@ pub struct HostEntry {
     /// previously unreachable without the API.
     #[serde(default)]
     pub log_only_mode: bool,
+    /// Administrative on/off switch for the site. `false` makes the gateway
+    /// answer every request for this host with `503 Service Unavailable`
+    /// (`gateway::proxy` and `gateway::http3`) instead of proxying it upstream.
+    ///
+    /// Defaults to `true` — a config file that never mentions the key serves the
+    /// site, which is what it has always done.
+    ///
+    /// This field exists because its absence was worse than a missing feature.
+    /// The database row and the admin API have carried `start_status` since the
+    /// first migration, but `HostEntry` did not have the field, and serde
+    /// silently drops unknown keys: an operator who wrote `start_status = false`
+    /// into the config file to take a site down got a parse that succeeded and a
+    /// site that kept serving. A knob that reads as "off" while the thing is on
+    /// is more dangerous than no knob at all.
+    #[serde(default = "default_true")]
+    pub start_status: bool,
 }
 
 /// Response caching configuration
@@ -2061,6 +2077,43 @@ mod load_config_tests {
             !cfg.content_security.enabled,
             "semantic lane off in the compiled default"
         );
+    }
+
+    /// `start_status = false` on a `[[hosts]]` entry must survive
+    /// deserialization. It did not for the whole life of the config-file host
+    /// path: `HostEntry` had no such field, serde dropped the key without a
+    /// word, and an operator who wrote it got a site that kept serving. The
+    /// assert is on the parsed value rather than on a proxy response because
+    /// this is the exact step that used to lose it.
+    #[test]
+    fn host_start_status_false_survives_parsing() {
+        let dir = std::env::temp_dir();
+        let path = format!("{}/prx-waf-start-status-{}.toml", dir.display(), std::process::id());
+        // The serialized default already carries an empty `hosts = []`; a second
+        // `[[hosts]]` array would be a duplicate key, so fill that one in.
+        let serialized = toml::to_string(&AppConfig::default()).expect("serialize default");
+        let toml_text = serialized.replace(
+            "hosts = []",
+            "hosts = [\n\
+             { host = \"closed.example\", port = 80, remote_host = \"127.0.0.1\", \
+             remote_port = 8080, start_status = false },\n\
+             { host = \"open.example\", port = 80, remote_host = \"127.0.0.1\", \
+             remote_port = 8080 },\n]",
+        );
+        assert_ne!(
+            toml_text, serialized,
+            "serialized default no longer carries `hosts = []`"
+        );
+        std::fs::write(&path, toml_text).expect("write temp config");
+        let result = load_config(&path);
+        let _ = std::fs::remove_file(&path);
+        let cfg = result.expect("valid config must load");
+        let closed = cfg.hosts.first().expect("first host entry");
+        let open = cfg.hosts.get(1).expect("second host entry");
+        assert_eq!(closed.host, "closed.example");
+        assert!(!closed.start_status, "start_status = false must reach HostEntry");
+        // Omitting the key keeps the historical behaviour: the site serves.
+        assert!(open.start_status, "an absent start_status must default to serving");
     }
 }
 
