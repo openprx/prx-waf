@@ -1927,7 +1927,20 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
             };
             rt.block_on(async move {
                 if let Err(e) = waf_api::metrics_endpoint::serve(&metrics_listen).await {
-                    tracing::error!("Metrics endpoint error (metrics are still being recorded): {e}");
+                    // `{e:#}` so the context chain from `serve` — which stage
+                    // failed, and the OS error under it — reaches the log. The
+                    // rest of this line exists because the previous version
+                    // printed only the cause: an operator who reads "address in
+                    // use" still has to find out which knob moves the port, and
+                    // whether their WAF is now down.
+                    tracing::error!(
+                        "Metrics endpoint is NOT serving on {metrics_listen}: {e:#}. Nothing can scrape this \
+                         process; recording continues in memory and traffic filtering is UNAFFECTED, so this is \
+                         not fatal. If the port is taken, find the holder with `ss -ltnp | grep {metrics_listen}` \
+                         and move this listener with [metrics] listen_addr in the config file or \
+                         PRXWAF_METRICS_LISTEN_ADDR in the environment; set [metrics] enabled = false to stop \
+                         binding at all."
+                    );
                 }
             });
         });

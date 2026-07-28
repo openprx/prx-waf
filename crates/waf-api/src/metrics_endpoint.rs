@@ -25,6 +25,7 @@
 
 use std::net::SocketAddr;
 
+use anyhow::Context as _;
 use axum::Router;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -71,11 +72,22 @@ pub fn build_router() -> Router {
 /// Returns an error rather than exiting the process if the bind fails: a
 /// metrics port that is already taken must not stop a WAF from filtering
 /// traffic. The caller logs it.
+///
+/// The three failures are given separate context because they need separate
+/// fixes and the bare `io::Error` does not distinguish them: a malformed
+/// `listen_addr` is a config typo, a refused bind is almost always another
+/// process on the port, and a failure after that is the accept loop dying.
 pub async fn serve(listen_addr: &str) -> anyhow::Result<()> {
-    let addr: SocketAddr = listen_addr.parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr: SocketAddr = listen_addr
+        .parse()
+        .with_context(|| format!("[metrics] listen_addr = {listen_addr:?} is not an ip:port address"))?;
+    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
+        format!("cannot bind the metrics listener on {addr} — the port is most likely already taken")
+    })?;
     info!("Metrics endpoint listening on http://{addr}/metrics");
-    axum::serve(listener, build_router()).await?;
+    axum::serve(listener, build_router())
+        .await
+        .with_context(|| format!("the metrics listener on {addr} stopped serving"))?;
     Ok(())
 }
 
@@ -101,6 +113,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A typo in `listen_addr` must name the setting it came from. `AddrParseError`
+    /// renders as "invalid socket address syntax" and says nothing else.
+    #[tokio::test]
+    async fn unparseable_listen_addr_names_the_setting() {
+        let err = serve("127.0.0.1")
+            .await
+            .expect_err("a bare IP is not an ip:port address");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("[metrics] listen_addr"), "{rendered}");
+    }
+
+    /// The failure operators actually hit. The OS says "address in use"; the log
+    /// has to say which listener could not start.
+    #[tokio::test]
+    async fn taken_port_says_it_is_the_metrics_listener() {
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port is always available");
+        let addr = squatter.local_addr().expect("a bound listener has an address");
+        let err = serve(&addr.to_string())
+            .await
+            .expect_err("the port is held by this test");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("cannot bind the metrics listener"), "{rendered}");
+        assert!(rendered.contains(&addr.to_string()), "{rendered}");
     }
 
     #[tokio::test]
