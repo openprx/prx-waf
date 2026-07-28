@@ -2988,14 +2988,19 @@ impl RceAstDetector {
 /// crate has upwards of a hundred further `unwrap` / `unreachable` sites — this
 /// is a class of bug, not one bug.
 ///
-/// Rejecting the panicking *shapes* before the call was the alternative. It was
-/// rejected: it only covers the shapes already known, it has to model
-/// brush-parser's tokenisation to decide what counts as a word boundary, and it
-/// would have to be extended every time the fuzzer finds the next site. The
-/// containment below covers all of them at once and needs no upkeep. The narrower
-/// pre-parse guards that remain in `detect` are the ones containment genuinely
-/// cannot replace: a stack overflow aborts the process rather than unwinding, so
-/// `max_nesting_depth` still has to reject before the call.
+/// This is the general guard, and it is deliberately the only one that scales:
+/// a per-shape input filter covers what is already known, has to model
+/// brush-parser's tokenisation to decide what a word boundary is, and needs
+/// extending every time the fuzzer finds the next site.
+///
+/// It does not replace the pre-parse guards in `detect`, which exist for the two
+/// things it cannot do. A stack overflow aborts the process rather than
+/// unwinding, so `max_nesting_depth` has to reject first. And a panic under
+/// libFuzzer aborts from the harness's own hook before any unwind, so a shape the
+/// fuzzer has already found has to be rejected first too, or the soak stays red
+/// on an input production would have survived — that is what
+/// `has_unparsable_io_number` is for. The division of labour is: known shapes are
+/// declined, everything else is contained here.
 ///
 /// A caught panic yields `None` — the same signal-free outcome as a parse error.
 /// That is fail-open for detection on that one view (Lane 1 and the structural
