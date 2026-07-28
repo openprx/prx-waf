@@ -47,6 +47,7 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 
+use waf_common::metrics;
 use waf_common::{DetectionResult, RequestCtx};
 
 use crate::checks::{Check, DirTraversalCheck, RceCheck, SqlInjectionCheck, XssCheck};
@@ -296,7 +297,16 @@ impl ContentSecuritySubsystem {
         // `evaluate_scoped`) therefore exercise the identical Lane 1 code — a
         // future change to the loop can no longer pass the parity gate while
         // silently diverging on the production path (codex A-3).
-        if let ContentVerdict::LegacyVeto { result } = self.evaluate(ctx) {
+        // Timed here rather than inside `evaluate` so the parity suite, which
+        // calls `evaluate` directly, does not record production metrics from a
+        // test harness. `enabled()` gates the clock read: with metrics off this
+        // is a `OnceLock` load, not two `clock_gettime` calls per request phase.
+        let lane1_started = metrics::enabled().then(Instant::now);
+        let lane1 = self.evaluate(ctx);
+        if let Some(started) = lane1_started {
+            metrics::record_lane_duration(metrics::Lane::Lane1, started.elapsed());
+        }
+        if let ContentVerdict::LegacyVeto { result } = lane1 {
             return ContentVerdict::LegacyVeto { result };
         }
 
@@ -336,6 +346,7 @@ impl ContentSecuritySubsystem {
             return ContentVerdict::None;
         }
 
+        let lane2_started = metrics::enabled().then(Instant::now);
         state.begin_phase();
         let views = semantic_preprocessor(scope, ctx, state);
         let pctx = PreprocessCtx { scope, req: ctx };
@@ -353,6 +364,13 @@ impl ContentSecuritySubsystem {
         }
 
         let verdict = score(&signals, &self.config.scoring, state.is_degraded());
+        if let Some(started) = lane2_started {
+            // Covers preprocess + every detector + scoring, which is the whole
+            // of what turning the lane off would remove. Measured per request
+            // phase, so a request with a body contributes two observations —
+            // the same shape the header/body split has everywhere else here.
+            metrics::record_lane_duration(metrics::Lane::Lane2, started.elapsed());
+        }
         ContentVerdict::Semantic(verdict)
     }
 

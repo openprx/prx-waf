@@ -6,6 +6,7 @@ use parking_lot::RwLock as ParkingRwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use waf_common::metrics;
 use waf_common::{AuditLogConfig, DetectionResult, OwaspConfig, RequestCtx, WafAction, WafDecision};
 use waf_storage::{
     Database,
@@ -134,6 +135,19 @@ pub struct WafEngine {
     /// default). Held here as well as inside the OWASP check because the marker
     /// line has to be written once per *request*, not once per rule match.
     audit_log: Option<Arc<AuditLogSink>>,
+}
+
+/// Map a decision onto the detection metric's `action` label.
+///
+/// `None` for `Allow`: a whitelist hit short-circuits the pipeline but is not a
+/// detection, and counting it would make the block-rate ratio meaningless.
+const fn verdict_action_of(action: &WafAction) -> Option<metrics::VerdictAction> {
+    match action {
+        WafAction::Allow => None,
+        WafAction::Block { .. } => Some(metrics::VerdictAction::Block),
+        WafAction::LogOnly => Some(metrics::VerdictAction::LogOnly),
+        WafAction::Redirect { .. } => Some(metrics::VerdictAction::Redirect),
+    }
 }
 
 impl WafEngine {
@@ -597,7 +611,18 @@ impl WafEngine {
         }
 
         // ── Phase 13: OWASP CRS ────────────────────────────────────────────────
-        if let Some(result) = self.owasp.check(ctx) {
+        // Timed separately from Lane 1 and Lane 2 because the three chains share
+        // no work and their cost ordering inverts with body size — CRS is the
+        // cheapest layer on a 64 KiB upload (its body processors stop at 64 KiB)
+        // and the most expensive on a 1 MiB body (its raw-body scan does not).
+        // An operator deciding which layer to turn off needs the individual
+        // number, and `tests/perf/RESULTS.md` can only be re-measured offline.
+        let crs_started = metrics::enabled().then(Instant::now);
+        let crs_result = self.owasp.check(ctx);
+        if let Some(started) = crs_started {
+            metrics::record_lane_duration(metrics::Lane::Crs, started.elapsed());
+        }
+        if let Some(result) = crs_result {
             return Some(self.record_block(ctx, result, true));
         }
 
@@ -647,6 +672,17 @@ impl WafEngine {
         // resolved action (a real Block is persisted too).
         if !verdict.signals.is_empty() {
             self.persist_semantic_observation(ctx, scope, &verdict);
+        }
+
+        // A degraded verdict means part of this request was never inspected —
+        // either a Lane 2 work budget ran out or the Lane 1 body budget withheld
+        // the body. `docs/dos-budget.md` calls this the `degrade` exceed
+        // behaviour, and until now it existed only as a column in
+        // `semantic_observations`, which is not something anyone alerts on.
+        // Counted per verdict, i.e. once per request phase that ran the lane;
+        // `prxwaf_budget_events_total` says which budget was responsible.
+        if verdict.degraded {
+            metrics::record_degraded();
         }
 
         // Resolve the effective action. `request_key = client_ip` gives a stable
@@ -788,6 +824,13 @@ impl WafEngine {
     /// [`Self::log_security_event`] so the legacy/custom logging behaviour stays
     /// byte-for-byte unchanged.
     fn record_semantic_log(&self, ctx: &RequestCtx, result: DetectionResult) {
+        // The shadow lane does not go through `log_security_event` (that would
+        // change the legacy logging behaviour), so it counts its own detections
+        // here. Same metric, same labels: an operator comparing Lane 2's
+        // log_only volume against Lane 1's block volume — which is the whole
+        // point of running a shadow lane — must be able to read both off one
+        // series.
+        metrics::record_detection(result.phase, metrics::VerdictAction::LogOnly);
         let event = CreateSecurityEvent {
             host_code: ctx.host_config.code.clone(),
             client_ip: ctx.client_ip.to_string(),
@@ -1131,6 +1174,20 @@ impl WafEngine {
             WafAction::LogOnly => "log_only",
             WafAction::Redirect { .. } => "redirect",
         };
+
+        // Every legacy, custom-rule, CRS, CrowdSec and Lane-2-enforced detection
+        // reaches this function, and it is the only one that sees both the phase
+        // that produced the verdict and the action taken — which is the pair the
+        // detection metric is keyed on. `WafAction::Allow` is the whitelist
+        // short-circuit; it is not a detection and is not counted.
+        //
+        // The rule id is deliberately not a label. 291 CRS rules times host
+        // times action is the cardinality explosion this whole design exists to
+        // avoid; per-rule attribution lives in `security_events` and the audit
+        // log, which are queryable and bounded by retention.
+        if let Some(action) = verdict_action_of(&decision.action) {
+            metrics::record_detection(result.phase, action);
+        }
 
         let log = AttackLog {
             id: Uuid::new_v4(),
