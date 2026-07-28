@@ -363,6 +363,40 @@ const RCE_RULES: &[RuleRow] = &[
         RuleKind::Presence,
         true,
     ),
+    // The same brace expansion used on the **command** side rather than the path
+    // side: `{cat,/etc/passwd}` is one word to a parser and two words to a shell,
+    // and the two words are the reader and its target. The sibling rule above
+    // wants `cat /etc/{…}` and cannot see this, because here the reader is inside
+    // the group and there is no space in the request at all — which is the point
+    // of the form.
+    //
+    // Where the line is drawn, and why there. Brace expansion produces separate
+    // WORDS, never a concatenated string, so the only spellings that assemble a
+    // working `reader + sensitive path` invocation are the word-level ones: the
+    // reader first (`{/etc/passwd,cat}` runs `/etc/passwd`, not `cat`), the group
+    // flat and closed, at most 64 bytes of other alternatives on either side of
+    // the path. The character-splitting shapes that look like they belong here do
+    // not work and are deliberately absent: `{c,a,t}` expands to three words
+    // `c a t`, not to `cat`, and `{c,a,t}/etc/passwd` to `c/etc/passwd
+    // a/etc/passwd t/etc/passwd`, none of which is a command. Splitting a
+    // keyword is what quoting and backslashes are for, and
+    // `preprocess::shell_normalize` already collapses those.
+    //
+    // Left uncovered, knowingly: a nested group (`{cat,/etc/{passwd,shadow}}`).
+    // `[^{}]` refuses it, matching the sibling rule's bound, and the alternative
+    // is a regex that must count braces. It is not a hole in the request's
+    // visibility — `traversal.sensitive_abs_brace` still fires on the inner
+    // group — only in its attribution, which is the same trade the sibling makes.
+    (
+        "rce.sensitive_read_brace_cmd",
+        70,
+        concat!(
+            r"\{\s*(cat|less|more|head|tail|nl|od|xxd|strings)\s*,",
+            r"[^{}]{0,64}/?(etc/passwd|etc/shadow|proc/self|proc/version)[^{}]{0,64}\}",
+        ),
+        RuleKind::Presence,
+        true,
+    ),
     // DEFAULT-OFF (codex A-4, joint structure): a FIFO reverse shell — `mkfifo`
     // followed (within a short window) by a shell / netcat reader, e.g.
     // `mkfifo /tmp/f; cat /tmp/f | /bin/sh -i … | nc …`. Requiring the joint
@@ -3896,6 +3930,7 @@ mod tests {
             "rce.fetch_exec",
             "rce.sensitive_read",
             "rce.sensitive_read_brace",
+            "rce.sensitive_read_brace_cmd",
         ] {
             assert!(on.contains(onk), "{onk} must be default-on");
         }
@@ -3927,6 +3962,69 @@ mod tests {
         ] {
             assert!(rce_fire(benign).is_none(), "benign brace payload fired: {benign}");
         }
+    }
+
+    #[test]
+    fn rce_command_side_brace_expansion_fires() {
+        // One word to a parser, two words to a shell — and the two words are the
+        // reader and the file it opens. No space appears anywhere in the request.
+        for payload in [
+            "{cat,/etc/passwd}",
+            "{head,/etc/shadow}",
+            "{strings,/proc/self/environ}",
+            "{cat,-n,/etc/passwd}",
+            "{cat,/etc/passwd,/etc/shadow}",
+        ] {
+            let f = rce_fire(payload).unwrap_or_else(|| panic!("command-side brace must fire: {payload}"));
+            assert_eq!(f.rule_key, "rce.sensitive_read_brace_cmd", "payload {payload}");
+            assert_eq!(f.confidence, 70);
+        }
+        // The reader has to come first: brace expansion is ordered, and
+        // `{/etc/passwd,cat}` asks the shell to execute /etc/passwd.
+        assert!(
+            rce_fire("{/etc/passwd,cat}").is_none(),
+            "path-first expansion runs no reader"
+        );
+        // A comma-less group is not an expansion at all — bash leaves it literal.
+        assert!(rce_fire("{cat}/etc/passwd").is_none(), "no comma, no expansion");
+        // Benign shapes that share the punctuation.
+        for benign in [
+            r#"{"cat":"/etc/passwd"}"#,
+            "{cat,dog,rabbit}",
+            "{name,age}",
+            "report-{2024,2025}.csv",
+            "{{ user.name }},{{ site }}",
+            "cp /etc/{hosts,resolv.conf} /tmp/",
+        ] {
+            assert!(rce_fire(benign).is_none(), "benign brace payload fired: {benign}");
+        }
+    }
+
+    /// The boundary this rule deliberately does not cross, stated as a test so it
+    /// is a decision on the record rather than an oversight. Neither shape is a
+    /// working invocation, and pretending otherwise is what turns a rule table
+    /// into noise.
+    #[test]
+    fn character_splitting_braces_are_out_of_scope_because_they_do_not_run() {
+        for not_a_command in ["{c,a,t} /etc/passwd", "{c,a,t}/etc/passwd", "{c,at}/etc/passwd"] {
+            assert!(
+                rce_fire(not_a_command).is_none_or(|f| f.rule_key != "rce.sensitive_read_brace_cmd"),
+                "the command-side brace rule must not claim {not_a_command}"
+            );
+        }
+        // Nesting is out of scope for this rule, and stays visible through the
+        // traversal family rather than becoming a false negative.
+        let nested = "{cat,/etc/{passwd,shadow}}";
+        assert!(
+            rce_fire(nested).is_none(),
+            "nested groups are outside the flat-group bound"
+        );
+        assert_eq!(
+            run(&TraversalStructuralDetector::new(), nested)
+                .expect("the inner group is still a sensitive path")
+                .rule_key,
+            "traversal.sensitive_abs_brace"
+        );
     }
 
     #[test]
