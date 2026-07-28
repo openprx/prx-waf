@@ -1220,7 +1220,31 @@ impl Default for StorageConfig {
     }
 }
 
-/// Static host entry from configuration file
+/// Static host entry from configuration file.
+///
+/// This is a *subset* of [`crate::types::HostConfig`], not a mirror of it, and
+/// the difference is deliberate. `HostConfig` is the runtime shape shared with
+/// the database row, so it carries columns that only the admin API writes and,
+/// in one case, a column nothing reads at all. Adding a key here that the data
+/// plane never consults would produce exactly the failure `start_status` used to
+/// have — a config file that parses cleanly and changes nothing — so the three
+/// remaining `HostConfig` fields are absent on purpose:
+///
+/// * `remote_ip` — an `INET` column on the `hosts` table with no reader in
+///   `gateway` or `waf-engine`. The upstream is dialled from
+///   `remote_host`/`remote_port` (`gateway::proxy::upstream_peer`,
+///   `gateway::http3::upstream_target`); an IP goes in `remote_host` if that is
+///   what you want. Exposing it here would be a second inert knob.
+/// * `remarks` — free-text description for the admin UI's host list, which
+///   reads the database and never sees a config-file host. In a TOML file a `#`
+///   comment does the same job and is visible in the same place.
+/// * `exclude_url_log` — no reader anywhere: not in the request path, not in
+///   the attack-log writer, not even in the API's own `Host` → `HostConfig`
+///   projection. The feature does not exist yet, and a config key is not the
+///   place to imply that it does.
+///
+/// `cert_file`/`key_file` are likewise carried but unconsumed today; they
+/// predate this note and are left alone rather than removed under it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostEntry {
     pub host: String,
@@ -1270,6 +1294,18 @@ pub struct HostEntry {
     /// is more dangerous than no knob at all.
     #[serde(default = "default_true")]
     pub start_status: bool,
+    /// Custom HTML body for this host's block page, replacing the built-in
+    /// template. Three placeholders are substituted, each HTML-escaped:
+    /// `{{req_id}}`, `{{rule_name}}`, `{{client_ip}}`. See
+    /// `waf_engine::block_page::render_block_page`, which is the sole reader and
+    /// which serves the default template when this is `None`.
+    ///
+    /// Absent from a config file until now, though `HostConfig` has carried it
+    /// and the renderer has honoured it since block pages were added — the
+    /// admin API does not surface it either, so the field was reachable only by
+    /// writing the `hosts` row by hand.
+    #[serde(default)]
+    pub block_page_template: Option<String>,
 }
 
 /// Response caching configuration
@@ -2127,6 +2163,44 @@ mod load_config_tests {
         assert!(!closed.start_status, "start_status = false must reach HostEntry");
         // Omitting the key keeps the historical behaviour: the site serves.
         assert!(open.start_status, "an absent start_status must default to serving");
+    }
+
+    /// `block_page_template` on a `[[hosts]]` entry must survive
+    /// deserialization. Same failure mode as `start_status`: `HostEntry` had no
+    /// field, serde discarded the key silently, and the operator got the
+    /// built-in 403 page they had written a replacement for.
+    #[test]
+    fn host_block_page_template_survives_parsing() {
+        let dir = std::env::temp_dir();
+        let path = format!("{}/prx-waf-block-page-{}.toml", dir.display(), std::process::id());
+        let serialized = toml::to_string(&AppConfig::default()).expect("serialize default");
+        let toml_text = serialized.replace(
+            "hosts = []",
+            "hosts = [\n\
+             { host = \"custom.example\", port = 80, remote_host = \"127.0.0.1\", \
+             remote_port = 8080, block_page_template = \"denied: {{rule_name}}\" },\n\
+             { host = \"plain.example\", port = 80, remote_host = \"127.0.0.1\", \
+             remote_port = 8080 },\n]",
+        );
+        assert_ne!(
+            toml_text, serialized,
+            "serialized default no longer carries `hosts = []`"
+        );
+        std::fs::write(&path, toml_text).expect("write temp config");
+        let result = load_config(&path);
+        let _ = std::fs::remove_file(&path);
+        let cfg = result.expect("valid config must load");
+        let custom = cfg.hosts.first().expect("first host entry");
+        let plain = cfg.hosts.get(1).expect("second host entry");
+        assert_eq!(
+            custom.block_page_template.as_deref(),
+            Some("denied: {{rule_name}}"),
+            "block_page_template must reach HostEntry"
+        );
+        assert!(
+            plain.block_page_template.is_none(),
+            "an absent block_page_template must leave the built-in template in place"
+        );
     }
 }
 

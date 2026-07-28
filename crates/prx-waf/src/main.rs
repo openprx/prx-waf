@@ -3202,6 +3202,9 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
             // would be a no-op — the site would keep serving while the operator
             // believed they had closed it.
             start_status: entry.start_status,
+            // Custom block page from the config file. `None` keeps the built-in
+            // template, which is what every config file has rendered so far.
+            block_page_template: entry.block_page_template.clone(),
             ..HostConfig::default()
         });
         router.register(&cfg);

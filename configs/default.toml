@@ -360,6 +360,17 @@ cors_origins = []
 # # Administrative on/off. false answers every request for this host with 503
 # # Service Unavailable and never contacts the upstream. Default true (serving).
 # start_status = true
+# # Custom block-page body, replacing the built-in 403 page for this host.
+# # Placeholders {{req_id}}, {{rule_name}} and {{client_ip}} are substituted and
+# # HTML-escaped. Unset (default) serves the built-in template.
+# block_page_template = "<h1>Blocked</h1><p>{{rule_name}} — ref {{req_id}}</p>"
+#
+# Not settable here, and deliberately so — each is a `hosts` table column with
+# no reader in the request path, and a key that parses but does nothing is worse
+# than no key:
+#   remote_ip        nothing dials it; the upstream comes from remote_host/port
+#   remarks          admin-UI description for database hosts; use a # comment
+#   exclude_url_log  unimplemented — no code reads it, in any crate
 
 # ── Cluster Configuration (disabled by default — opt-in) ──────────────────────
 # Remove the leading '#' characters from the [cluster] section to enable.
