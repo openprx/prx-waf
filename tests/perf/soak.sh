@@ -175,6 +175,14 @@ done
 command -v jq >/dev/null 2>&1 || die "jq is required"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
+# A generator left over from an earlier run is the one contaminant a free port
+# check cannot see: it holds no listener, it just keeps sending. Refuse rather
+# than measure two attackers and attribute the sum to one.
+if pgrep -x oha >/dev/null 2>&1; then
+  pgrep -ax oha >&2
+  die "an 'oha' process is already running — a leftover generator would be measured as this run's traffic"
+fi
+
 # ── Tools ────────────────────────────────────────────────────────────────────
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 OHA_BIN="${OHA_BIN:-}"
@@ -453,10 +461,33 @@ log "abort if RSS exceeds ${RSS_ABORT_MIB} MiB"
 RATE_ARGS=()
 [ -n "$RATE" ] && RATE_ARGS=(-q "$RATE")
 
-pin "$LOAD_CPUS" "$OHA_BIN" --no-tui --output-format json -c "$CONNECTIONS" \
-  "${RATE_ARGS[@]}" -z "${DURATION_S}s" -H "User-Agent: $UA" \
-  "http://127.0.0.1:$WAF_PORT$ATTACK_PATH" >"$WORK/oha-$LABEL.json" 2>"$WORK/oha-$LABEL.err" &
+# `exec` inside an explicit subshell, NOT the `pin` helper. Backgrounding a
+# shell FUNCTION makes `$!` the subshell's pid, so `stop_load` would kill the
+# wrapper and leave the generator running — which is not a tidiness problem, it
+# is a correctness one: an orphaned generator from a finished run keeps loading
+# the next run's WAF on the same port, and the second run then measures its own
+# traffic plus a ghost. This harness produced exactly that once (a `RATE=2000`
+# run that recorded 20,000 rps because the previous saturating run's generator
+# was still alive), which is why the invariant is spelled out here rather than
+# assumed. run.sh makes the same note about albedo.
+(
+  if [ "$PIN" = "1" ] && command -v taskset >/dev/null 2>&1; then
+    exec taskset -c "$LOAD_CPUS" "$OHA_BIN" --no-tui --output-format json \
+      -c "$CONNECTIONS" "${RATE_ARGS[@]}" -z "${DURATION_S}s" \
+      -H "User-Agent: $UA" "http://127.0.0.1:$WAF_PORT$ATTACK_PATH"
+  else
+    exec "$OHA_BIN" --no-tui --output-format json \
+      -c "$CONNECTIONS" "${RATE_ARGS[@]}" -z "${DURATION_S}s" \
+      -H "User-Agent: $UA" "http://127.0.0.1:$WAF_PORT$ATTACK_PATH"
+  fi
+) >"$WORK/oha-$LABEL.json" 2>"$WORK/oha-$LABEL.err" &
 LOAD_PID=$!
+# Verify the claim rather than trust it: if `$!` is not the generator, every
+# figure this run produces is contaminated and the run must not proceed.
+sleep 1
+LOAD_COMM="$(cat "/proc/$LOAD_PID/comm" 2>/dev/null || echo "gone")"
+[ "$LOAD_COMM" = "oha" ] \
+  || die "load generator pid $LOAD_PID is '$LOAD_COMM', not oha — stop_load would orphan it"
 
 start_ticks="$(cpu_ticks "$WAF_PID")"
 start_epoch="$(date +%s.%N)"

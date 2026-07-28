@@ -1,0 +1,19 @@
+{
+  "label": "before-full-500rps",
+  "posture": "full",
+  "rate": "500",
+  "minutes": 2,
+  "connections": 50,
+  "sample_secs": 1,
+  "rss_abort_mib": 6144,
+  "aborted": "",
+  "peak_rss_kb": 728104,
+  "settled_rss_kb": 728104,
+  "observed_s": 119.9,
+  "load_before": "3.94",
+  "load_after": "1.56",
+  "tree": "16ee616b47acd2d098e95c518327e238a0784640",
+  "worktree": "MODIFIED \u2014 tracked sources differ from the commit; this result is NOT reproducible from it",
+  "binary": "/tmp/claude-1000/-opt-worker/2f6d1048-1606-4b0e-b41a-e7f160c317c9/scratchpad/bin/prx-waf-baseline",
+  "note": "first run on the corrected harness; the tree was MODIFIED only by that correction (tests/perf/soak.sh), which is not compiled into the binary under test -- PRXWAF_BIN is the stashed build of 488e44ee"
+}
