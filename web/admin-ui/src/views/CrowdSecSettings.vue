@@ -168,12 +168,9 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import axios from 'axios'
 import Layout from '../components/Layout.vue'
-import { useAuthStore } from '../stores/auth'
+import { crowdsecApi, type CrowdSecConfigReq, type CrowdSecTestReq } from '../api'
 import { ShieldCheck, AlertTriangle } from 'lucide-vue-next'
-
-const auth = useAuthStore()
 
 const status = ref<any>({ enabled: false })
 const config = ref<any>({ api_key_set: false, appsec_key_set: false })
@@ -195,20 +192,16 @@ const testResult = ref<any>(null)
 const saveMsg = ref('')
 const saveError = ref('')
 
-function headers() {
-  return { Authorization: `Bearer ${auth.token}` }
-}
-
 async function loadStatus() {
   try {
-    const r = await axios.get('/api/crowdsec/status', { headers: headers() })
+    const r = await crowdsecApi.status()
     status.value = r.data
   } catch {}
 }
 
 async function loadConfig() {
   try {
-    const r = await axios.get('/api/crowdsec/config', { headers: headers() })
+    const r = await crowdsecApi.getConfig()
     config.value = r.data
     form.value.enabled = r.data.enabled ?? false
     form.value.mode = r.data.mode ?? 'bouncer'
@@ -224,7 +217,7 @@ async function saveConfig() {
   saveMsg.value = ''
   saveError.value = ''
   try {
-    const payload: any = {
+    const payload: CrowdSecConfigReq = {
       enabled: form.value.enabled,
       mode: form.value.mode,
       lapi_url: form.value.lapi_url,
@@ -235,7 +228,7 @@ async function saveConfig() {
     if (form.value.appsec_endpoint) payload.appsec_endpoint = form.value.appsec_endpoint
     if (form.value.appsec_key) payload.appsec_key = form.value.appsec_key
 
-    await axios.put('/api/crowdsec/config', payload, { headers: headers() })
+    await crowdsecApi.updateConfig(payload)
     saveMsg.value = 'Configuration saved. Restart prx-waf to apply changes.'
     await loadConfig()
     await loadStatus()
@@ -250,9 +243,9 @@ async function testConnection() {
   testing.value = true
   testResult.value = null
   try {
-    const payload: any = { lapi_url: form.value.lapi_url }
+    const payload: CrowdSecTestReq = { lapi_url: form.value.lapi_url }
     if (form.value.api_key) payload.api_key = form.value.api_key
-    const r = await axios.post('/api/crowdsec/test', payload, { headers: headers() })
+    const r = await crowdsecApi.test(payload)
     testResult.value = r.data
   } catch (e: any) {
     testResult.value = { success: false, message: e.response?.data?.error ?? e.message }

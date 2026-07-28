@@ -101,19 +101,12 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import axios from 'axios'
 import Layout from '../components/Layout.vue'
-import { useAuthStore } from '../stores/auth'
-
-const auth = useAuthStore()
+import { crowdsecApi } from '../api'
 
 const stats = ref<any>({})
 const loading = ref(false)
 const lastRefresh = ref('-')
-
-function headers() {
-  return { Authorization: `Bearer ${auth.token}` }
-}
 
 const maxTypeCount = computed(() => {
   if (!stats.value.by_type) return 0
@@ -130,7 +123,7 @@ const topScenarios = computed(() => {
 async function load() {
   loading.value = true
   try {
-    const r = await axios.get('/api/crowdsec/stats', { headers: headers() })
+    const r = await crowdsecApi.stats()
     stats.value = r.data
     lastRefresh.value = new Date().toLocaleTimeString()
   } catch {

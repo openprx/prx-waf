@@ -93,25 +93,13 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import axios from 'axios'
 import Layout from '../components/Layout.vue'
-import { useAuthStore } from '../stores/auth'
+import { crowdsecApi, type CrowdSecDecision } from '../api'
 import { useI18n } from 'vue-i18n'
 
-const auth = useAuthStore()
 const { t } = useI18n()
 
-interface Decision {
-  id: number
-  origin: string
-  scope: string
-  value: string
-  type_: string
-  scenario: string
-  duration?: string
-}
-
-const decisions = ref<Decision[]>([])
+const decisions = ref<CrowdSecDecision[]>([])
 const total = ref(0)
 const loading = ref(false)
 const error = ref('')
@@ -120,10 +108,6 @@ const isEnabled = ref(false)
 const filter = ref({ value: '', type: '', scenario: '' })
 
 let refreshTimer: ReturnType<typeof setInterval> | null = null
-
-function headers() {
-  return { Authorization: `Bearer ${auth.token}` }
-}
 
 const filteredDecisions = computed(() => {
   return decisions.value.filter(d => {
@@ -139,8 +123,8 @@ async function load() {
   error.value = ''
   try {
     const [decResp, statusResp] = await Promise.all([
-      axios.get('/api/crowdsec/decisions', { headers: headers() }),
-      axios.get('/api/crowdsec/status', { headers: headers() }),
+      crowdsecApi.listDecisions(),
+      crowdsecApi.status(),
     ])
     decisions.value = decResp.data.decisions ?? []
     total.value = decResp.data.total ?? 0
@@ -156,7 +140,7 @@ async function deleteDecision(id: number) {
   if (!confirm(t('crowdsec.decisions.confirmDelete', { id }))) return
   error.value = ''
   try {
-    await axios.delete(`/api/crowdsec/decisions/${id}`, { headers: headers() })
+    await crowdsecApi.deleteDecision(id)
     await load()
   } catch (e: any) {
     error.value = e.response?.data?.error ?? e.message

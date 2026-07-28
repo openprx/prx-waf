@@ -336,6 +336,42 @@ export const systemApi = {
   reload: () => api.post('/api/reload'),
 }
 
+// ─── CrowdSec ─────────────────────────────────────────────────────────────────
+// Reads are login-gated, mutations are admin-only; both need the JWT, so every
+// call goes through `api` and picks up the auth interceptor.
+export interface CrowdSecDecision {
+  id: number
+  origin: string
+  scope: string
+  value: string
+  type_: string
+  scenario: string
+  duration?: string
+}
+export interface CrowdSecTestReq {
+  lapi_url: string
+  api_key?: string
+}
+export interface CrowdSecConfigReq {
+  enabled: boolean
+  mode: string
+  lapi_url: string
+  update_frequency_secs: number
+  fallback_action: string
+  api_key?: string
+  appsec_endpoint?: string
+  appsec_key?: string
+}
+export const crowdsecApi = {
+  status: () => api.get('/api/crowdsec/status'),
+  stats: () => api.get('/api/crowdsec/stats'),
+  getConfig: () => api.get('/api/crowdsec/config'),
+  updateConfig: (data: CrowdSecConfigReq) => api.put('/api/crowdsec/config', data),
+  listDecisions: () => api.get('/api/crowdsec/decisions'),
+  deleteDecision: (id: number) => api.delete(`/api/crowdsec/decisions/${id}`),
+  test: (data: CrowdSecTestReq) => api.post('/api/crowdsec/test', data),
+}
+
 // ─── Cluster ──────────────────────────────────────────────────────────────────
 export const clusterApi = {
   status: () => api.get('/api/cluster/status'),
