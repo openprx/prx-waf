@@ -344,7 +344,11 @@ listener_of() {  # $1=port -> the ss line, whitespace-squeezed
     ss -Htlnep "sport = :$1" 2>/dev/null | tr -s ' '
 }
 field_of() {     # $1=pattern $2=line
-    printf '%s' "$2" | grep -oE "$1" | head -1
+    # `|| true` because the interesting case is the one where there is nothing
+    # to match: when a run fails so badly that no listener exists at all, a
+    # non-zero grep here would abort the script under `set -e` and swallow the
+    # very summary that says what went wrong.
+    printf '%s' "$2" | grep -oE "$1" | head -1 || true
 }
 
 gen_config "$WORK/waf.toml" "$PROXY_PORT" "$PROXY_TLS_PORT" "$H3_PORT" "$API_PORT" "$METRICS_PORT"
@@ -414,6 +418,12 @@ if [ "$DEPARTED" = "1" ]; then
 else
     fail "the outgoing process was still alive 120s after SIGQUIT — it had to be killed"
     OLD_STATUS=-1
+    # Recorded as a failure and then killed, so the remaining phases still run
+    # and still report. A process that has not drained is holding every port the
+    # rest of this script needs, and stopping here would replace a full account
+    # of what broke with a single line.
+    kill -9 "$OLD_PID" 2>/dev/null || true
+    wait "$OLD_PID" 2>/dev/null || true
 fi
 
 # Close timeout (5s, Pingora's own) + the drain + 5s of runtime shutdown. The
@@ -484,7 +494,8 @@ grep -v '^#' "$WORK/verdict.txt" | while IFS=$'\t' read -r l s o f; do
 done
 grep '^#' "$WORK/verdict.txt" | sed 's/^#\t/    failure: /' || true
 
-read_row() { grep "^$1	" "$WORK/verdict.txt" | cut -f"$2"; }
+# Same reasoning as `field_of`: a missing row is a result, not a reason to stop.
+read_row() { grep "^$1	" "$WORK/verdict.txt" | cut -f"$2" || true; }
 
 TOTAL="$(read_row whole-run 2)";       TOTAL_BAD="$(read_row whole-run 4)"
 WIN="$(read_row upgrade-window 2)";    WIN_BAD="$(read_row upgrade-window 4)"
