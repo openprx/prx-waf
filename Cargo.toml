@@ -94,7 +94,7 @@ rustls-pki-types = { version = "1", features = ["std"] }
 futures-util = "0.3"
 
 # Phase 7 additions
-notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 # URL validation
 url = "2"
