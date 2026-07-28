@@ -1,0 +1,448 @@
+{
+  "_comment": [
+    "prx-waf runtime performance measurement. NOT a CI gate \u2014 see README.md.",
+    "",
+    "Numbers are only comparable against numbers produced by the same",
+    "generator version, on the same hardware, at the same connection",
+    "count and duration. Restate all four whenever a figure is quoted.",
+    "",
+    "`recorded_from.tree` is the commit that was BUILT AND MEASURED, and",
+    "`recorded_from.worktree_state` says whether that tree had uncommitted",
+    "changes. A number measured on a dirty tree is not reproducible and",
+    "says so here rather than in a footnote nobody reads."
+  ],
+  "recorded_from": {
+    "tree": "a7e8b075eaf42ba40a2ac66c550b88ec0695ed33",
+    "worktree_state": "clean"
+  },
+  "environment": {
+    "cpu": "AMD Ryzen 9 5900HX with Radeon Graphics",
+    "cpus": 16,
+    "memory_gib": 30.8,
+    "kernel": "6.12.48+deb13-amd64",
+    "os": "Linux #1 SMP PREEMPT_DYNAMIC Debian 6.12.48-1 (2025-09-20)",
+    "loadavg_1min_at_start": "0.29",
+    "loadavg_1min_at_end": "7.08"
+  },
+  "method": {
+    "generator": "oha 1.11.0",
+    "origin": "albedo v0.3.0 (200, empty body \u2014 a near-zero-work origin, so the measurement is dominated by the subject and not by the backend)",
+    "connections": 50,
+    "duration_s": 10,
+    "rounds_per_cell": 3,
+    "reduction": "median round by RPS; latency taken from that same round",
+    "cpu_pinning": "on (waf 0-3, origin 4-9, generator 10-15)",
+    "proxy_worker_threads": "shipped default (unset \u2014 follows the CPUs the process may use)",
+    "lane1_max_body_bytes": "shipped default (65536)",
+    "held_constant": [
+      "response cache OFF in every posture (a hit skips the upstream and would make the WAF measure faster than its own origin)",
+      "geoip OFF (no xdb shipped; leaving it on measures a no-op)",
+      "audit log OFF",
+      "rate limiter, where enabled, is configured never to trigger \u2014 the cost measured is the bucket lookup, not the 429 path"
+    ]
+  },
+  "results": {
+    "passthrough": {
+      "get-small": {
+        "rps": 60200.2,
+        "p50_ms": 0.823,
+        "p95_ms": 1.175,
+        "p99_ms": 1.319,
+        "p999_ms": 1.488,
+        "max_ms": 5.14,
+        "cpu_cores": 3.898,
+        "cpu_us_per_req": 64.75,
+        "cpu_us_per_req_spread_pct": 2.7,
+        "rss_mib": 62.2,
+        "threads": 17,
+        "success_rate": 1.0,
+        "status": {
+          "200": 602099
+        },
+        "errors": {
+          "aborted due to deadline": 48
+        },
+        "requests": 602099,
+        "rounds": 3,
+        "rps_spread_pct": 2.7
+      },
+      "json-post": {
+        "rps": 47941.8,
+        "p50_ms": 1.034,
+        "p95_ms": 1.475,
+        "p99_ms": 1.657,
+        "p999_ms": 1.864,
+        "max_ms": 2.964,
+        "cpu_cores": 3.91,
+        "cpu_us_per_req": 81.56,
+        "cpu_us_per_req_spread_pct": 0.6,
+        "rss_mib": 65.9,
+        "threads": 17,
+        "success_rate": 1.0,
+        "status": {
+          "200": 479493
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 479493,
+        "rounds": 3,
+        "rps_spread_pct": 0.6
+      },
+      "attack": {
+        "rps": 57805.6,
+        "p50_ms": 0.849,
+        "p95_ms": 1.247,
+        "p99_ms": 1.526,
+        "p999_ms": 2.038,
+        "max_ms": 5.395,
+        "cpu_cores": 3.897,
+        "cpu_us_per_req": 67.42,
+        "cpu_us_per_req_spread_pct": 0.5,
+        "rss_mib": 66.5,
+        "threads": 17,
+        "success_rate": 1.0,
+        "status": {
+          "200": 578072,
+          "502": 79
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 578151,
+        "rounds": 3,
+        "rps_spread_pct": 0.5
+      }
+    },
+    "full": {
+      "get-small": {
+        "rps": 9730.0,
+        "p50_ms": 5.09,
+        "p95_ms": 7.456,
+        "p99_ms": 8.481,
+        "p999_ms": 9.655,
+        "max_ms": 11.718,
+        "cpu_cores": 3.973,
+        "cpu_us_per_req": 408.33,
+        "cpu_us_per_req_spread_pct": 0.3,
+        "rss_mib": 106.5,
+        "threads": 17,
+        "success_rate": 1.0,
+        "status": {
+          "200": 97262
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 97262,
+        "rounds": 3,
+        "rps_spread_pct": 0.3
+      },
+      "json-post": {
+        "rps": 1862.6,
+        "p50_ms": 26.592,
+        "p95_ms": 39.011,
+        "p99_ms": 44.439,
+        "p999_ms": 49.91,
+        "max_ms": 57.123,
+        "cpu_cores": 3.993,
+        "cpu_us_per_req": 2143.83,
+        "cpu_us_per_req_spread_pct": 1.3,
+        "rss_mib": 116.3,
+        "threads": 17,
+        "success_rate": 1.0,
+        "status": {
+          "200": 18578
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 18578,
+        "rounds": 3,
+        "rps_spread_pct": 1.2
+      },
+      "attack": {
+        "rps": 19384.6,
+        "p50_ms": 2.571,
+        "p95_ms": 3.802,
+        "p99_ms": 4.313,
+        "p999_ms": 4.871,
+        "max_ms": 7.216,
+        "cpu_cores": 3.928,
+        "cpu_us_per_req": 202.63,
+        "cpu_us_per_req_spread_pct": 1.7,
+        "rss_mib": 4071.3,
+        "threads": 17,
+        "success_rate": 1.0,
+        "status": {
+          "403": 193848
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 193848,
+        "rounds": 3,
+        "rps_spread_pct": 1.8
+      }
+    },
+    "full-nometrics": {
+      "get-small": {
+        "rps": 9809.9,
+        "p50_ms": 5.044,
+        "p95_ms": 7.368,
+        "p99_ms": 8.38,
+        "p999_ms": 9.462,
+        "max_ms": 11.742,
+        "cpu_cores": 3.972,
+        "cpu_us_per_req": 404.9,
+        "cpu_us_per_req_spread_pct": 1.1,
+        "rss_mib": 106.1,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 98064
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 98064,
+        "rounds": 3,
+        "rps_spread_pct": 1.0
+      },
+      "json-post": {
+        "rps": 1896.2,
+        "p50_ms": 26.102,
+        "p95_ms": 38.213,
+        "p99_ms": 43.703,
+        "p999_ms": 49.929,
+        "max_ms": 55.318,
+        "cpu_cores": 3.994,
+        "cpu_us_per_req": 2106.37,
+        "cpu_us_per_req_spread_pct": 1.0,
+        "rss_mib": 116.2,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 18915
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 18915,
+        "rounds": 3,
+        "rps_spread_pct": 0.8
+      },
+      "attack": {
+        "rps": 19451.2,
+        "p50_ms": 2.564,
+        "p95_ms": 3.782,
+        "p99_ms": 4.293,
+        "p999_ms": 4.802,
+        "max_ms": 6.802,
+        "cpu_cores": 3.919,
+        "cpu_us_per_req": 201.48,
+        "cpu_us_per_req_spread_pct": 1.8,
+        "rss_mib": 4107.5,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "403": 194498
+        },
+        "errors": {
+          "aborted due to deadline": 49
+        },
+        "requests": 194498,
+        "rounds": 3,
+        "rps_spread_pct": 2.0
+      }
+    },
+    "passthrough-nometrics": {
+      "get-small": {
+        "rps": 59593.2,
+        "p50_ms": 0.831,
+        "p95_ms": 1.185,
+        "p99_ms": 1.332,
+        "p999_ms": 1.507,
+        "max_ms": 6.057,
+        "cpu_cores": 3.896,
+        "cpu_us_per_req": 65.38,
+        "cpu_us_per_req_spread_pct": 0.4,
+        "rss_mib": 62.0,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 596035
+        },
+        "errors": {
+          "aborted due to deadline": 48
+        },
+        "requests": 596035,
+        "rounds": 3,
+        "rps_spread_pct": 0.4
+      },
+      "json-post": {
+        "rps": 47646.4,
+        "p50_ms": 1.04,
+        "p95_ms": 1.486,
+        "p99_ms": 1.673,
+        "p999_ms": 1.886,
+        "max_ms": 2.9,
+        "cpu_cores": 3.907,
+        "cpu_us_per_req": 82.0,
+        "cpu_us_per_req_spread_pct": 0.6,
+        "rss_mib": 65.7,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 476514
+        },
+        "errors": {
+          "aborted due to deadline": 47
+        },
+        "requests": 476514,
+        "rounds": 3,
+        "rps_spread_pct": 0.7
+      },
+      "attack": {
+        "rps": 57609.5,
+        "p50_ms": 0.853,
+        "p95_ms": 1.25,
+        "p99_ms": 1.524,
+        "p999_ms": 2.028,
+        "max_ms": 3.842,
+        "cpu_cores": 3.896,
+        "cpu_us_per_req": 67.63,
+        "cpu_us_per_req_spread_pct": 0.5,
+        "rss_mib": 67.3,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 576130,
+          "502": 89
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 576219,
+        "rounds": 3,
+        "rps_spread_pct": 0.5
+      }
+    }
+  },
+  "attribution": {
+    "get-small": {
+      "passthrough": {
+        "rps": 60200.2,
+        "p99_ms": 1.319,
+        "p999_ms": 1.488,
+        "cpu_us_per_req": 64.75
+      },
+      "full": {
+        "rps": 9730.0,
+        "p99_ms": 8.481,
+        "p999_ms": 9.655,
+        "cpu_us_per_req": 408.33,
+        "rps_vs_passthrough_pct": -83.8,
+        "p99_vs_passthrough_ms": 7.162,
+        "cpu_us_vs_passthrough": 343.58,
+        "cpu_pct_vs_passthrough": 530.6
+      },
+      "full-nometrics": {
+        "rps": 9809.9,
+        "p99_ms": 8.38,
+        "p999_ms": 9.462,
+        "cpu_us_per_req": 404.9,
+        "rps_vs_passthrough_pct": -83.7,
+        "p99_vs_passthrough_ms": 7.061,
+        "cpu_us_vs_passthrough": 340.15,
+        "cpu_pct_vs_passthrough": 525.3
+      },
+      "passthrough-nometrics": {
+        "rps": 59593.2,
+        "p99_ms": 1.332,
+        "p999_ms": 1.507,
+        "cpu_us_per_req": 65.38,
+        "rps_vs_passthrough_pct": -1.0,
+        "p99_vs_passthrough_ms": 0.013,
+        "cpu_us_vs_passthrough": 0.63,
+        "cpu_pct_vs_passthrough": 1.0
+      }
+    },
+    "json-post": {
+      "passthrough": {
+        "rps": 47941.8,
+        "p99_ms": 1.657,
+        "p999_ms": 1.864,
+        "cpu_us_per_req": 81.56
+      },
+      "full": {
+        "rps": 1862.6,
+        "p99_ms": 44.439,
+        "p999_ms": 49.91,
+        "cpu_us_per_req": 2143.83,
+        "rps_vs_passthrough_pct": -96.1,
+        "p99_vs_passthrough_ms": 42.782,
+        "cpu_us_vs_passthrough": 2062.27,
+        "cpu_pct_vs_passthrough": 2528.5
+      },
+      "full-nometrics": {
+        "rps": 1896.2,
+        "p99_ms": 43.703,
+        "p999_ms": 49.929,
+        "cpu_us_per_req": 2106.37,
+        "rps_vs_passthrough_pct": -96.0,
+        "p99_vs_passthrough_ms": 42.046,
+        "cpu_us_vs_passthrough": 2024.81,
+        "cpu_pct_vs_passthrough": 2482.6
+      },
+      "passthrough-nometrics": {
+        "rps": 47646.4,
+        "p99_ms": 1.673,
+        "p999_ms": 1.886,
+        "cpu_us_per_req": 82.0,
+        "rps_vs_passthrough_pct": -0.6,
+        "p99_vs_passthrough_ms": 0.016,
+        "cpu_us_vs_passthrough": 0.44,
+        "cpu_pct_vs_passthrough": 0.5
+      }
+    },
+    "attack": {
+      "passthrough": {
+        "rps": 57805.6,
+        "p99_ms": 1.526,
+        "p999_ms": 2.038,
+        "cpu_us_per_req": 67.42
+      },
+      "full": {
+        "rps": 19384.6,
+        "p99_ms": 4.313,
+        "p999_ms": 4.871,
+        "cpu_us_per_req": 202.63,
+        "rps_vs_passthrough_pct": -66.5,
+        "p99_vs_passthrough_ms": 2.787,
+        "cpu_us_vs_passthrough": 135.21,
+        "cpu_pct_vs_passthrough": 200.5
+      },
+      "full-nometrics": {
+        "rps": 19451.2,
+        "p99_ms": 4.293,
+        "p999_ms": 4.802,
+        "cpu_us_per_req": 201.48,
+        "rps_vs_passthrough_pct": -66.4,
+        "p99_vs_passthrough_ms": 2.767,
+        "cpu_us_vs_passthrough": 134.06,
+        "cpu_pct_vs_passthrough": 198.8
+      },
+      "passthrough-nometrics": {
+        "rps": 57609.5,
+        "p99_ms": 1.524,
+        "p999_ms": 2.028,
+        "cpu_us_per_req": 67.63,
+        "rps_vs_passthrough_pct": -0.3,
+        "p99_vs_passthrough_ms": -0.002,
+        "cpu_us_vs_passthrough": 0.21,
+        "cpu_pct_vs_passthrough": 0.3
+      }
+    }
+  }
+}

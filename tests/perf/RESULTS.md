@@ -506,6 +506,91 @@ Latency in ms. **CPU µs/req** is subject-process CPU time divided by requests s
 
 ---
 
+## Metrics recording overhead (`*-nometrics`)
+
+**A separate recording from every table above, and not comparable to them.**
+Taken later, on the same host but a different tree (`a7e8b075`, which adds the
+`/metrics` endpoint), with a narrower workload set. Read it only for the
+`full` ↔ `full-nometrics` and `passthrough` ↔ `passthrough-nometrics`
+differences it exists to measure; do not compare its absolute numbers against
+§1–§5. Machine-readable:
+[`results/metrics-overhead.json`](results/metrics-overhead.json) and
+[`results/metrics-overhead-bodies.json`](results/metrics-overhead-bodies.json).
+
+The two postures differ in exactly one config key, `[metrics] enabled`. No code
+path differs between them — every record site is present in both binaries and
+tests the same `OnceLock`, which is set in one and never set in the other. So
+the delta is the recording and nothing else.
+
+Host loadavg 0.29 → 7.08 for the first run, 0.27 → 4.46 for the body workloads;
+tree clean at `a7e8b075` in both.
+
+### The deltas
+
+Metrics on minus metrics off. Positive means recording costs.
+
+| workload | posture | CPU µs/req, on | off | delta | RPS on | off | delta |
+|---|---|--:|--:|--:|--:|--:|--:|
+| get-small | passthrough | 65.82 | 66.45 | **−0.95%** | 60,200 | 59,593 | +1.02% |
+| get-small | full | 409.92 | 406.39 | **+0.87%** | 9,730 | 9,810 | −0.81% |
+| json-post | passthrough | 82.66 | 83.15 | **−0.58%** | 47,942 | 47,646 | +0.62% |
+| json-post | full | 2152.65 | 2114.93 | **+1.78%** | 1,863 | 1,896 | −1.77% |
+| attack | passthrough | 68.55 | 68.71 | **−0.24%** | 57,806 | 57,610 | +0.34% |
+| attack | full | 203.92 | 202.76 | **+0.57%** | 19,385 | 19,451 | −0.34% |
+| multipart | full | 836.83 | 861.01 | **−2.81%** | 4,762 | 4,630 | +2.85% |
+| body-1mb | full | 11443.08 | 11647.16 | **−1.75%** | 350 | 343 | +2.04% |
+
+**Every measured overhead is under 2%**, and four of the eight rows come out
+*negative* — which a real cost cannot be. Those rows are the useful ones: they
+say the recording is below what this rig can resolve on that workload, and they
+put a bound on how much the positive rows can be trusted.
+
+### Which rows actually resolve
+
+Two of the positive rows separate cleanly at the round level, meaning the
+slowest metrics-on round still beat the fastest metrics-off round:
+
+| workload | rounds, on | rounds, off | separated? |
+|---|---|---|---|
+| get-small `full` | 410.7 / 409.9 / 409.3 | 408.3 / 406.4 / 403.9 | **yes**, min(on) > max(off) |
+| json-post `full` | 2161.5 / 2152.6 / 2133.3 | 2127.7 / 2114.9 / 2106.8 | **yes**, min(on) > max(off) |
+| attack `full` | 202.6 / 203.9 / 206.1 | 201.4 / 202.8 / 205.1 | no, overlapping |
+| get-small `passthrough` | 66.6 / 65.8 / 64.8 | 66.3 / 66.5 / 66.5 | no, and the delta is negative |
+
+So the honest reading is: **0.87% on a small GET and 1.78% on a 1 KiB JSON POST,
+both resolved; everything else is below the noise floor.**
+
+### Why the JSON POST is twice the GET
+
+Because it runs every measured phase twice. A request with a body goes through
+the header phase and then the body phase, and both record the same six clock
+reads (three lanes × start/end) and the same per-phase budget accounting. Double
+the phases, double the recording — 2 × 0.87% ≈ 1.78%, which is the number.
+
+That predicts a *lower* proportional cost, not a higher one, on the two body
+workloads: their per-request detection cost is 4× (multipart) and 28×
+(`body-1mb`) that of a JSON POST, while the recording per body window stays the
+same size. The measurements agree in the only way they can — the cost vanishes
+into the noise, and the sign comes out backwards.
+
+### What was not measured here
+
+* **The `body-1mb` window count.** A 1 MiB body is scanned window by window, and
+  each window is its own body phase, so the lane-timing cost is paid once per
+  window rather than once per request. The proportional overhead still came out
+  negative, so this did not bind — but it is the shape that would make it bind,
+  and it was inferred from the design rather than counted.
+* **Scrape cost.** Every figure here is the *recording* side. Encoding the
+  exposition walks every series and allocates a string; at the default
+  `max_host_labels = 128` that is ~3 800 series, on the metrics thread, at
+  whatever interval the scraper uses. It does not touch a worker thread, so it
+  cannot show up in these columns, and it was not separately timed.
+* **`cc` and `lane2` postures.** Only `passthrough` and `full` carry a
+  `-nometrics` twin. `full` includes both, so the aggregate is covered; the
+  per-layer split of the recording cost is not.
+
+---
+
 ## What was not measured
 
 Three of these are gaps this edition opened and intends to close; the rest are

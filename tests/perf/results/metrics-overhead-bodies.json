@@ -1,0 +1,172 @@
+{
+  "_comment": [
+    "prx-waf runtime performance measurement. NOT a CI gate \u2014 see README.md.",
+    "",
+    "Numbers are only comparable against numbers produced by the same",
+    "generator version, on the same hardware, at the same connection",
+    "count and duration. Restate all four whenever a figure is quoted.",
+    "",
+    "`recorded_from.tree` is the commit that was BUILT AND MEASURED, and",
+    "`recorded_from.worktree_state` says whether that tree had uncommitted",
+    "changes. A number measured on a dirty tree is not reproducible and",
+    "says so here rather than in a footnote nobody reads."
+  ],
+  "recorded_from": {
+    "tree": "a7e8b075eaf42ba40a2ac66c550b88ec0695ed33",
+    "worktree_state": "clean"
+  },
+  "environment": {
+    "cpu": "AMD Ryzen 9 5900HX with Radeon Graphics",
+    "cpus": 16,
+    "memory_gib": 30.8,
+    "kernel": "6.12.48+deb13-amd64",
+    "os": "Linux #1 SMP PREEMPT_DYNAMIC Debian 6.12.48-1 (2025-09-20)",
+    "loadavg_1min_at_start": "0.27",
+    "loadavg_1min_at_end": "4.46"
+  },
+  "method": {
+    "generator": "oha 1.11.0",
+    "origin": "albedo v0.3.0 (200, empty body \u2014 a near-zero-work origin, so the measurement is dominated by the subject and not by the backend)",
+    "connections": 50,
+    "duration_s": 10,
+    "rounds_per_cell": 3,
+    "reduction": "median round by RPS; latency taken from that same round",
+    "cpu_pinning": "on (waf 0-3, origin 4-9, generator 10-15)",
+    "proxy_worker_threads": "shipped default (unset \u2014 follows the CPUs the process may use)",
+    "lane1_max_body_bytes": "shipped default (65536)",
+    "held_constant": [
+      "response cache OFF in every posture (a hit skips the upstream and would make the WAF measure faster than its own origin)",
+      "geoip OFF (no xdb shipped; leaving it on measures a no-op)",
+      "audit log OFF",
+      "rate limiter, where enabled, is configured never to trigger \u2014 the cost measured is the bucket lookup, not the 429 path"
+    ]
+  },
+  "results": {
+    "full": {
+      "multipart": {
+        "rps": 4762.0,
+        "p50_ms": 10.361,
+        "p95_ms": 15.312,
+        "p99_ms": 17.493,
+        "p999_ms": 19.896,
+        "max_ms": 23.699,
+        "cpu_cores": 3.985,
+        "cpu_us_per_req": 836.83,
+        "cpu_us_per_req_spread_pct": 1.6,
+        "rss_mib": 120.5,
+        "threads": 17,
+        "success_rate": 1.0,
+        "status": {
+          "200": 47582
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 47582,
+        "rounds": 3,
+        "rps_spread_pct": 1.5
+      },
+      "body-1mb": {
+        "rps": 349.6,
+        "p50_ms": 144.296,
+        "p95_ms": 195.172,
+        "p99_ms": 218.846,
+        "p999_ms": 235.103,
+        "max_ms": 244.067,
+        "cpu_cores": 4.0,
+        "cpu_us_per_req": 11443.08,
+        "cpu_us_per_req_spread_pct": 0.1,
+        "rss_mib": 188.6,
+        "threads": 17,
+        "success_rate": 1.0,
+        "status": {
+          "200": 3446
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 3446,
+        "rounds": 3,
+        "rps_spread_pct": 0.1
+      }
+    },
+    "full-nometrics": {
+      "multipart": {
+        "rps": 4629.5,
+        "p50_ms": 10.656,
+        "p95_ms": 15.711,
+        "p99_ms": 17.836,
+        "p999_ms": 20.208,
+        "max_ms": 22.799,
+        "cpu_cores": 3.986,
+        "cpu_us_per_req": 861.01,
+        "cpu_us_per_req_spread_pct": 1.1,
+        "rss_mib": 121.0,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 46254
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 46254,
+        "rounds": 3,
+        "rps_spread_pct": 1.1
+      },
+      "body-1mb": {
+        "rps": 343.2,
+        "p50_ms": 146.64,
+        "p95_ms": 202.486,
+        "p99_ms": 225.117,
+        "p999_ms": 254.646,
+        "max_ms": 259.212,
+        "cpu_cores": 3.997,
+        "cpu_us_per_req": 11647.16,
+        "cpu_us_per_req_spread_pct": 0.3,
+        "rss_mib": 193.5,
+        "threads": 16,
+        "success_rate": 1.0,
+        "status": {
+          "200": 3382
+        },
+        "errors": {
+          "aborted due to deadline": 50
+        },
+        "requests": 3382,
+        "rounds": 3,
+        "rps_spread_pct": 0.4
+      }
+    }
+  },
+  "attribution": {
+    "multipart": {
+      "full": {
+        "rps": 4762.0,
+        "p99_ms": 17.493,
+        "p999_ms": 19.896,
+        "cpu_us_per_req": 836.83
+      },
+      "full-nometrics": {
+        "rps": 4629.5,
+        "p99_ms": 17.836,
+        "p999_ms": 20.208,
+        "cpu_us_per_req": 861.01
+      }
+    },
+    "body-1mb": {
+      "full": {
+        "rps": 349.6,
+        "p99_ms": 218.846,
+        "p999_ms": 235.103,
+        "cpu_us_per_req": 11443.08
+      },
+      "full-nometrics": {
+        "rps": 343.2,
+        "p99_ms": 225.117,
+        "p999_ms": 254.646,
+        "cpu_us_per_req": 11647.16
+      }
+    }
+  }
+}
