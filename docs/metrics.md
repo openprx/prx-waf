@@ -48,6 +48,13 @@ Startup logs one line stating the bind scope and the cardinality bound, so
 "where is it and how big is it" is answerable from the log rather than from the
 config file. A non-loopback bind logs it as a **warning**.
 
+If the listener cannot bind — the usual cause being another process on the port
+— the WAF logs one ERROR naming the address, the two settings that move the
+listener and the fact that traffic filtering is unaffected, and **keeps
+running**. Losing observability is bad; losing the firewall is worse. Recording
+continues in memory, so the counters are correct the moment something can scrape
+them again; only the scrape path is missing.
+
 ---
 
 ## Cardinality
