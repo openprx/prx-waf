@@ -30,7 +30,7 @@
   "enforce — enforcement_mode = enforce, rollout_bps = 10000, i.e. the far end",
   "          of the rollout dial. Verdicts come from HTTP status codes. This is",
   "          what actually happens to traffic, and the two numbers are very far",
-  "          apart: 73.53% of the attack corpus is DETECTED, 43.53% would be",
+  "          apart: 74.71% of the attack corpus is DETECTED, 43.53% would be",
   "          BLOCKED. The gap is the two-detector corroboration requirement",
   "          (block_threshold = 80 with two 0.5 weights needs both detectors to",
   "          agree) plus the A2 blind guard. It is not a defect; it is the",
@@ -63,8 +63,8 @@
   "the single most likely way to move the FP column — which is exactly the",
   "trade this harness exists to price."
  ],
- "recorded_at": "2026-07-26",
- "recorded_from": "c644606 — the commit that adds tests/lane2/. Measured on that tree with configs/default.toml unmodified; replace this string with the real sha when the change lands.",
+ "recorded_at": "2026-07-28",
+ "recorded_from": "eee23d61 — the two RCE obfuscation fixes: fdd4da34 admits ${IFS} to shell de-obfuscation, eee23d61 reads a command-side brace expansion. Measured on that tree with configs/default.toml unmodified. First recorded at c644606; the only rows that moved are rce-011 and rce-013, wrong-family to detected in shadow, and every enforce number is unchanged.",
  "corpus": {
   "attack": 170,
   "benign": 220,
@@ -80,19 +80,19 @@
    "_comment": "Shipped log_only posture; verdicts from semantic_observations joined by client_ip.",
    "attack": {
     "n": 170,
-    "detected": 125,
-    "detection_rate": 73.53,
+    "detected": 127,
+    "detection_rate": 74.71,
     "buckets": {
-     "detected": 123,
+     "detected": 125,
      "misattributed": 2,
      "sub-threshold": 1,
-     "wrong-family": 4,
+     "wrong-family": 2,
      "blind": 40,
      "harness": 0
     },
     "by_family": {
      "sql_injection": {"n": 20, "detected": 15},
-     "rce": {"n": 20, "detected": 14},
+     "rce": {"n": 20, "detected": 16},
      "traversal": {"n": 20, "detected": 18},
      "xss": {"n": 20, "detected": 18},
      "xxe": {"n": 15, "detected": 12},
