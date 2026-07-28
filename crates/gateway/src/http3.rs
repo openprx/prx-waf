@@ -8,8 +8,12 @@
 //! them through the WAF engine (header **and** body phases, identical to the
 //! HTTP/1.1 path), and forwards allowed requests to the **per-host** upstream
 //! selected by the same [`HostRouter`] that Pingora uses.  Requests whose
-//! `Host` header matches no configured route are rejected (404) and never
+//! authority matches no configured route are rejected (404) and never
 //! forwarded — closing the H3 detection-bypass / SSRF surface (audit H-7).
+//!
+//! "Authority" is deliberate: HTTP/3 has no `Host` *header*, it has an
+//! `:authority` pseudo-header, and a compliant client sends only that.  See
+//! [`route_authority`] for how the two are reconciled.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -84,6 +88,63 @@ fn is_hop_by_hop(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+// ─── Routing authority ────────────────────────────────────────────────────────
+
+/// Outcome of deciding which authority a request must be routed on.
+enum RouteAuthority<'a> {
+    /// The authority to route on, borrowed verbatim from the request.
+    Found(&'a str),
+    /// An `:authority` and a `Host` were both present and disagreed.
+    Contradicted,
+    /// Neither carried a usable value; nothing can be routed.
+    Missing,
+}
+
+/// Decide the authority an HTTP/3 request is routed on.
+///
+/// HTTP/3 does not carry a `Host` header. RFC 9114 §4.3.1 defines the
+/// `:authority` pseudo-header and says a client that sends `:authority`
+/// **SHOULD NOT** also send `Host`; `curl --http3`, Chrome and quiche-based
+/// clients all send `:authority` alone. Reading `headers["host"]` therefore
+/// found nothing on every compliant request, and the empty string routed to
+/// `None` — a 404 for all HTTP/3 traffic.
+///
+/// `h3` hands the authority up in [`http::Uri`], not in the header map: its
+/// `Header::into_request_parts` folds `:authority` (or, absent that, a `Host`
+/// field) into `Uri::authority` and leaves the field map untouched. So the URI
+/// is the authoritative source here, with the header map as the fallback for
+/// callers that build a request the other way round.
+///
+/// The disagreement case is refused rather than resolved. `h3` 0.0.8 already
+/// rejects it at decode time (`HeaderError::ContradictedAuthority`), so on
+/// today's dependency this branch is belt-and-braces — but that check is an
+/// internal detail of a 0.0.x crate, not a contract, and the consequence of
+/// silently picking one side is a desync primitive: this WAF would apply the
+/// policy of authority A while the origin resolves its vhost from the `Host`
+/// line carrying B. One `!=` is a cheap price for making the choice a property
+/// of this function instead of an assumption about a dependency.
+fn route_authority<'a>(uri: &'a http::Uri, headers: &'a http::HeaderMap) -> RouteAuthority<'a> {
+    let authority = uri
+        .authority()
+        .map(http::uri::Authority::as_str)
+        .filter(|a| !a.is_empty());
+    // First line only, which is all `h3` compares too. A request carrying more
+    // than one `Host` is refused before this point (`FoldedHeaders::duplicate_host`).
+    let host = headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .filter(|h| !h.is_empty());
+
+    match (authority, host) {
+        // Byte-exact, matching the decoder's own comparison: `a.com` and
+        // `a.com:443` are different authorities and may hold different policy.
+        (Some(a), Some(h)) if a != h => RouteAuthority::Contradicted,
+        (Some(a), _) => RouteAuthority::Found(a),
+        (None, Some(h)) => RouteAuthority::Found(h),
+        (None, None) => RouteAuthority::Missing,
+    }
 }
 
 // ─── Upstream clients ─────────────────────────────────────────────────────────
@@ -304,8 +365,9 @@ where
 /// Handle one HTTP/3 request: route → WAF (header + body) → forward → relay.
 ///
 /// Mirrors the HTTP/1.1 pipeline in `proxy.rs`:
-///   1. Resolve the `Host` header via the router; unknown host → 404 (no
-///      forward).  Administratively closed host → 503.
+///   1. Resolve the request authority ([`route_authority`]) via the router;
+///      unknown authority → 404 (no forward).  Administratively closed host →
+///      503.
 ///   2. WAF header-phase inspection ([`WafEngine::inspect`]).
 ///   3. Read the request body (bounded) and run body-phase inspection
 ///      ([`WafEngine::inspect_body`]).
@@ -344,6 +406,8 @@ where
     // represent faithfully are refused outright.
     let folded = fold_request_headers(&parts.headers);
     if folded.duplicate_host {
+        // Refused before `route_authority`, which compares `:authority` with
+        // the first `Host` line only — as does the `h3` decoder.
         warn!("Rejecting H3 request with duplicate Host headers: ip={}", client_ip);
         return respond_simple(
             &mut stream,
@@ -366,21 +430,47 @@ where
         )
         .await;
     }
-    let headers = folded.headers;
+    let mut headers = folded.headers;
 
-    // Extract Host header for route resolution.
-    let host_header = parts
-        .headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+    // ── Routing authority (`:authority`, not a `Host` header) ────────────────
+    let authority = match route_authority(&parts.uri, &parts.headers) {
+        RouteAuthority::Found(a) => a,
+        RouteAuthority::Contradicted => {
+            warn!(
+                "Rejecting H3 request whose Host disagrees with :authority: ip={}",
+                client_ip
+            );
+            return respond_simple(
+                &mut stream,
+                http::StatusCode::BAD_REQUEST,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"Bad Request"),
+            )
+            .await;
+        }
+        // Unroutable. Fall through to the router with an empty authority so
+        // this lands on exactly the same 404 as an unknown host — never a
+        // default config, never a forward.
+        RouteAuthority::Missing => "",
+    };
+
+    // The detectors must not see a different request depending on the wire
+    // protocol: a rule that matches on the `Host` header has to fire on HTTP/3
+    // too, where the same value arrives as `:authority`. `entry` rather than
+    // `insert` so a client-sent `Host` — already proven byte-equal to
+    // `:authority` above — is preserved exactly as it was received.
+    if !authority.is_empty() {
+        headers
+            .entry("host".to_string())
+            .or_insert_with(|| authority.to_string());
+    }
 
     // ── Host routing (matches proxy.rs; no default-config fall-through) ──────
-    let Some(host_config) = router.resolve(host_header) else {
-        // Unknown host: previously this path built a default HostConfig and
-        // forwarded anyway (audit H-7). Now unrouted traffic is refused and
+    let Some(host_config) = router.resolve(authority) else {
+        // Unknown authority: previously this path built a default HostConfig
+        // and forwarded anyway (audit H-7). Now unrouted traffic is refused and
         // never reaches an upstream.
-        warn!("No H3 route found for host: {host_header}");
+        warn!("No H3 route found for authority: {authority}");
         return respond_simple(
             &mut stream,
             http::StatusCode::NOT_FOUND,
@@ -401,13 +491,13 @@ where
     if smuggling_detection {
         let findings = crate::smuggling::detect(&parts.headers);
         if !findings.is_empty() {
-            crate::smuggling::log_findings(&findings, client_ip, host_header, &path);
+            crate::smuggling::log_findings(&findings, client_ip, authority, &path);
         }
     }
 
     // Administratively closed site → 503.
     if !host_config.start_status {
-        warn!("H3 site closed for host: {host_header}");
+        warn!("H3 site closed for authority: {authority}");
         return respond_simple(
             &mut stream,
             http::StatusCode::SERVICE_UNAVAILABLE,
@@ -743,6 +833,105 @@ mod tests {
         let b = router.resolve("b.com").expect("b route");
         assert_eq!(upstream_target(&a, "/"), "http://10.0.0.1:1111/");
         assert_eq!(upstream_target(&b, "/"), "http://10.0.0.2:2222/");
+    }
+
+    // ── Routing authority ───────────────────────────────────────────────────
+
+    /// Build the `(uri, headers)` pair a request with these two fields
+    /// produces, so each case names only what the client actually sent.
+    fn authority_of(pseudo_authority: Option<&str>, host_field: Option<&str>) -> Option<String> {
+        // `h3` builds exactly this shape: scheme + authority + path, with the
+        // authority coming from `:authority` (or, absent that, from `Host`).
+        let uri: http::Uri = pseudo_authority.map_or_else(
+            || http::Uri::from_static("/x"),
+            |a| format!("https://{a}/x").parse().expect("valid uri"),
+        );
+
+        let mut map = http::HeaderMap::new();
+        if let Some(h) = host_field {
+            let value = http::HeaderValue::from_str(h).expect("valid header value");
+            map.insert(http::header::HOST, value);
+        }
+
+        match route_authority(&uri, &map) {
+            RouteAuthority::Found(a) => Some(a.to_string()),
+            RouteAuthority::Contradicted => Some("<contradicted>".to_string()),
+            RouteAuthority::Missing => None,
+        }
+    }
+
+    /// The regression this whole path exists for: a compliant HTTP/3 client
+    /// sends `:authority` and no `Host` at all. Reading the header map found
+    /// nothing and every such request 404'd.
+    #[test]
+    fn authority_pseudo_header_alone_is_routable() {
+        assert_eq!(authority_of(Some("a.com"), None).as_deref(), Some("a.com"));
+    }
+
+    /// A `Host` with no `:authority` still routes — `h3` folds it into the URI
+    /// on the way in, and a caller that does not gets the header-map fallback.
+    #[test]
+    fn host_header_alone_is_routable() {
+        assert_eq!(authority_of(None, Some("a.com")).as_deref(), Some("a.com"));
+    }
+
+    /// Both present and equal: route on it, once.
+    #[test]
+    fn agreeing_authority_and_host_route_on_that_value() {
+        assert_eq!(authority_of(Some("a.com"), Some("a.com")).as_deref(), Some("a.com"));
+    }
+
+    /// Both present and different is a desync primitive, not a preference:
+    /// refuse rather than pick a side. Byte-exact, so a port that appears on
+    /// only one of the two counts as a disagreement.
+    #[test]
+    fn contradicting_authority_and_host_are_refused() {
+        assert_eq!(
+            authority_of(Some("a.com"), Some("evil.com")).as_deref(),
+            Some("<contradicted>")
+        );
+        assert_eq!(
+            authority_of(Some("a.com"), Some("a.com:443")).as_deref(),
+            Some("<contradicted>")
+        );
+    }
+
+    /// Neither present: nothing to route on. The handler turns this into the
+    /// unknown-authority 404 rather than a default config.
+    #[test]
+    fn missing_authority_and_host_yields_nothing() {
+        assert!(authority_of(None, None).is_none());
+        // And the empty authority the handler then routes with resolves to no
+        // host, so the request is never forwarded.
+        let router = HostRouter::new();
+        router.register(&host_cfg("known.com", "10.0.0.1", 8080, false));
+        assert!(router.resolve("").is_none());
+    }
+
+    /// An empty `Host` line is "no host", not an empty authority to route on.
+    #[test]
+    fn empty_host_field_falls_back_to_the_pseudo_header() {
+        assert_eq!(authority_of(Some("a.com"), Some("")).as_deref(), Some("a.com"));
+        assert!(authority_of(None, Some("")).is_none());
+    }
+
+    /// The authority is routed verbatim, so the router's port rules (and its
+    /// refusal to fall through on a non-default port) apply to HTTP/3 exactly
+    /// as they do to HTTP/1.1.
+    #[test]
+    fn authority_with_a_port_routes_through_the_same_rules() {
+        let router = HostRouter::new();
+        router.register(&host_cfg("a.com", "10.0.0.1", 8080, false));
+
+        let resolves = |pseudo: &str| {
+            authority_of(Some(pseudo), None)
+                .and_then(|a| router.resolve(&a))
+                .is_some()
+        };
+        assert!(resolves("a.com"));
+        assert!(resolves("a.com:443"));
+        assert!(!resolves("a.com:31337"));
+        assert!(!resolves("evil.com"));
     }
 
     // ── Upstream client selection ───────────────────────────────────────────
