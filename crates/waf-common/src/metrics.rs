@@ -348,6 +348,24 @@ pub enum BudgetEvent {
     Lane2HtmlParseAttempts,
     /// `max_html_parse_input_bytes_total`.
     Lane2HtmlParseInputBytes,
+    /// `max_views_per_field` discarded a decode/transform view that had already
+    /// been produced, or refused a decode round that was known to differ from
+    /// the one before it. **Unit: views dropped**, not requests.
+    ///
+    /// Only raised on a *demonstrated* loss. The preprocessor also stops
+    /// scanning pending transform frontiers once the cap is reached; that is not
+    /// counted, because a frontier text often yields no view at all and counting
+    /// it would report coverage loss that may not exist.
+    Lane2ViewsPerField,
+    /// `max_tokens_per_view` cut a view's normalised text short while tokens
+    /// remained. **Unit: views truncated** — a field with four views can raise
+    /// it four times.
+    ///
+    /// Not raised when the whole-view byte ceiling (`NormaliseLimits`, §1.3)
+    /// stopped the walk first: that is a different limit with its own exceed
+    /// behaviour, and attributing it here would blame the token cap for a cut it
+    /// did not make.
+    Lane2TokensPerView,
     /// `max_preprocess_output_bytes_total`.
     Lane2PreprocessOutputBytes,
     /// A Lane 2 detector declined a view because it exceeded that detector's
@@ -424,7 +442,7 @@ impl BudgetEvent {
     /// Every variant, in declaration order. The exposition walks this, so a new
     /// variant appears in `/metrics` (at zero) the moment it is added — a
     /// counter an operator has never seen fire still has to be graphable.
-    const ALL: [Self; 46] = [
+    const ALL: [Self; 48] = [
         Self::HeaderValueCountExceeded,
         Self::HeaderFoldBytesExceeded,
         Self::DuplicateHost,
@@ -451,6 +469,8 @@ impl BudgetEvent {
         Self::Lane2AstInputBytes,
         Self::Lane2HtmlParseAttempts,
         Self::Lane2HtmlParseInputBytes,
+        Self::Lane2ViewsPerField,
+        Self::Lane2TokensPerView,
         Self::Lane2PreprocessOutputBytes,
         Self::Lane2DetectorDegrade,
         Self::Lane2ExtractInputTooLarge,
@@ -506,6 +526,8 @@ impl BudgetEvent {
             Self::Lane2AstInputBytes => ("lane2_budget", "ast_input_bytes"),
             Self::Lane2HtmlParseAttempts => ("lane2_budget", "html_parse_attempts"),
             Self::Lane2HtmlParseInputBytes => ("lane2_budget", "html_parse_input_bytes"),
+            Self::Lane2ViewsPerField => ("lane2_budget", "views_per_field"),
+            Self::Lane2TokensPerView => ("lane2_budget", "tokens_per_view"),
             Self::Lane2PreprocessOutputBytes => ("lane2_budget", "preprocess_output_bytes"),
             Self::Lane2DetectorDegrade => ("lane2_detector", "input_cap"),
             Self::Lane2ExtractInputTooLarge => ("lane2_extract", "input_bytes"),

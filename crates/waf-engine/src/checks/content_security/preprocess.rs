@@ -527,6 +527,11 @@ fn best_hex_candidate(s: &str) -> Option<String> {
 /// Push one additional decode/transform view, metered against the preprocess
 /// output budget and the per-field view cap. Shared by the base64 / hex /
 /// html-entity / comment-strip decoders (plan §7.1).
+///
+/// `text` is a view the decoders have already produced, so every early return
+/// here is a decoded payload the detectors will not see. The view cap reports
+/// that through [`ContentInspectionState::record_view_cap_miss`]; the two byte
+/// checks are already reported by `try_take_preprocess_bytes`.
 // `location` stays `&Cow` (not `&str`) so a `Cow::Borrowed` label is cloned
 // cheaply without re-allocating; `ptr_arg` would push us to `&str` + `to_string`.
 #[allow(clippy::too_many_arguments, clippy::ptr_arg)]
@@ -543,12 +548,13 @@ fn push_extra_view(
     provenance: Provenance,
 ) {
     if *views_for_field >= max_views {
+        state.record_view_cap_miss();
         return;
     }
     if !state.try_take_preprocess_bytes(text.len()) {
         return;
     }
-    let lower_trunc = normalise(&text, max_tokens, limits);
+    let (lower_trunc, token_cap_cut) = normalise(&text, max_tokens, limits);
     if !state.try_take_preprocess_bytes(lower_trunc.len()) {
         return;
     }
@@ -560,6 +566,13 @@ fn push_extra_view(
         provenance,
     });
     *views_for_field += 1;
+    // Recorded after the push, not before: a view the byte budget then refuses is
+    // lost whole, and that loss is already attributed to
+    // `max_preprocess_output_bytes_total`. Counting the token cut as well would
+    // bill two keys for one miss.
+    if token_cap_cut {
+        state.record_token_cap_miss();
+    }
 }
 
 /// Curated headers scanned by Lane 2 in the header scope. Kept independent of
@@ -878,10 +891,29 @@ impl NormaliseLimits {
 /// panics: every slice goes through `get`, and the remaining-space arithmetic
 /// cannot underflow because the loop breaks before `out.len()` can pass
 /// `max_total_len`.
-fn normalise(text: &str, max_tokens: u32, limits: NormaliseLimits) -> String {
+///
+/// Returns the normalised text together with **whether the token cap is what cut
+/// it short**: true only when `max_tokens` tokens were consumed *and* the input
+/// still had another token to give. The whole-view byte ceiling stopping the
+/// walk first returns false — that ceiling is a separate limit with a separate
+/// exceed behaviour (`docs/dos-budget.md` §1.3), and blaming the budget key for
+/// its cut would put a `degraded` flag on a request the budget did not narrow.
+fn normalise(text: &str, max_tokens: u32, limits: NormaliseLimits) -> (String, bool) {
     let mut out = String::with_capacity(text.len().min(1024));
-    for (i, token) in text.split_whitespace().take(max_tokens as usize).enumerate() {
+    let mut tokens = text.split_whitespace();
+    let max_tokens = max_tokens as usize;
+    // Tokens pulled off `tokens`, so the leftover check below can distinguish
+    // "the cap stopped us" from "the input ran out" / "the byte ceiling stopped
+    // us". Hand-rolled rather than `take().enumerate()` because `take` consumes
+    // the iterator and takes the answer with it.
+    let mut consumed = 0usize;
+    let mut stopped_on_bytes = false;
+    while consumed < max_tokens {
+        let Some(token) = tokens.next() else { break };
+        let i = consumed;
+        consumed += 1;
         if out.len() >= limits.max_total_len {
+            stopped_on_bytes = true;
             break;
         }
         if i > 0 {
@@ -903,7 +935,8 @@ fn normalise(text: &str, max_tokens: u32, limits: NormaliseLimits) -> String {
         };
         out.push_str(truncated);
     }
-    out
+    let token_cap_cut = !stopped_on_bytes && consumed == max_tokens && tokens.next().is_some();
+    (out, token_cap_cut)
 }
 
 /// Ceiling (bytes) for the UTF-16 BOM transcoder (F-J). A body larger than this
@@ -1116,7 +1149,7 @@ pub fn semantic_preprocessor<'a>(
         if !state.try_take_preprocess_bytes(raw.len()) {
             break;
         }
-        let lower_trunc = normalise(&raw, max_tokens, limits);
+        let (lower_trunc, token_cap_cut) = normalise(&raw, max_tokens, limits);
         if !state.try_take_preprocess_bytes(lower_trunc.len()) {
             break;
         }
@@ -1127,6 +1160,9 @@ pub fn semantic_preprocessor<'a>(
             text: raw.clone(),
             provenance: Provenance::Raw,
         });
+        if token_cap_cut {
+            state.record_token_cap_miss();
+        }
 
         // Capture the raw field text BEFORE the URL-decode loop consumes it: the
         // `+`-preserving transform seed below needs a form-of the field where a
@@ -1139,18 +1175,32 @@ pub fn semantic_preprocessor<'a>(
         // `views_for_field` starts at 1 (the raw view) and is compared against
         // the per-field view cap; a `while` loop (not a counted `for`) keeps the
         // stop condition explicit.
+        //
+        // The view cap is tested *after* the round has proved it decodes to
+        // something new, not as a loop guard. Testing it up front would leave the
+        // loop unable to say whether it stopped because there was nothing left to
+        // decode or because the cap took a round away from it — and those are the
+        // difference between a complete inspection and a narrowed one. The price
+        // is one extra `url_decode` on the field that hits the cap, of a text the
+        // per-field input cap has already bounded; under the shipped defaults
+        // (12 views, 3 rounds) the branch is unreachable, since this loop can
+        // never push more than four views.
         let mut current: Cow<'a, str> = raw;
         let mut views_for_field = 1u32;
         let mut round = 1u8;
-        while round <= max_rounds && views_for_field < max_views {
+        while round <= max_rounds {
             let decoded = crate::checks::url_decode(current.as_ref());
             if decoded.as_str() == current.as_ref() {
+                break;
+            }
+            if views_for_field >= max_views {
+                state.record_view_cap_miss();
                 break;
             }
             if !state.try_take_preprocess_bytes(decoded.len()) {
                 break;
             }
-            let lower_trunc = normalise(&decoded, max_tokens, limits);
+            let (lower_trunc, token_cap_cut) = normalise(&decoded, max_tokens, limits);
             if !state.try_take_preprocess_bytes(lower_trunc.len()) {
                 break;
             }
@@ -1161,6 +1211,9 @@ pub fn semantic_preprocessor<'a>(
                 text: Cow::Owned(decoded.clone()),
                 provenance: Provenance::UrlDecoded,
             });
+            if token_cap_cut {
+                state.record_token_cap_miss();
+            }
             current = Cow::Owned(decoded);
             views_for_field += 1;
             round += 1;
@@ -1204,6 +1257,11 @@ pub fn semantic_preprocessor<'a>(
             frontier.push((plus_seed, false, 1));
         }
         while let Some((text, tainted, depth)) = frontier.pop() {
+            // Not a recorded miss. A frontier text that is never scanned may hold
+            // no decodable payload at all — most do not — so counting this as
+            // lost coverage would put `degraded` on requests whose inspection was
+            // complete. The loss is recorded one level down, where a decoder has
+            // actually produced a view and the cap refuses it.
             if views_for_field >= max_views || depth > MAX_TRANSFORM_DEPTH {
                 continue;
             }
@@ -1213,7 +1271,11 @@ pub fn semantic_preprocessor<'a>(
                 break;
             }
             for child in transform_children(&text, tainted) {
+                // `child` is a decoded view already in hand; the cap is discarding
+                // it and every sibling behind it in this iterator. That is a
+                // demonstrated narrowing of what the detectors get to see.
                 if views_for_field >= max_views {
+                    state.record_view_cap_miss();
                     break;
                 }
                 let produced = child.text.clone();
@@ -1371,6 +1433,118 @@ mod tests {
         );
     }
 
+    // ── The two view-shaped budget keys report their misses (T23) ────────────
+    //
+    // `max_views_per_field` and `max_tokens_per_view` are enforced in the loops
+    // below rather than by a `try_take_*`, so they used to narrow what the lane
+    // looked at while leaving `degraded` false — a request whose payload was
+    // never normalised was indistinguishable from one that was read and found
+    // clean. These tests pin both the reporting and its restraint: a cap that
+    // took nothing away must stay silent.
+
+    #[test]
+    fn token_cap_that_drops_tokens_degrades_the_request() {
+        let budget = Budget {
+            max_tokens_per_view: 2,
+            ..Budget::default()
+        };
+        let req = req_with("/a", "", b"alpha beta gamma");
+        let mut st = ContentInspectionState::new(budget);
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Body, &req, &mut st);
+        let body = views.iter().find(|v| *v.location == *"body").expect("a body view");
+        assert_eq!(
+            body.lower_trunc, "alpha beta",
+            "the third token never reached a detector"
+        );
+        assert!(
+            st.is_degraded(),
+            "a view the detectors saw two thirds of is a narrowed inspection"
+        );
+    }
+
+    #[test]
+    fn token_cap_wide_enough_for_the_field_does_not_degrade() {
+        // The reverse control. Same body, default 512-token cap: nothing was cut,
+        // so nothing may be reported. A cap that merely *exists* is not a miss.
+        let req = req_with("/a", "", b"alpha beta gamma");
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Body, &req, &mut st);
+        let body = views.iter().find(|v| *v.location == *"body").expect("a body view");
+        assert_eq!(body.lower_trunc, "alpha beta gamma");
+        assert!(!st.is_degraded(), "a complete inspection must not claim to be degraded");
+    }
+
+    #[test]
+    fn whole_view_byte_ceiling_is_not_blamed_on_the_token_cap() {
+        // `NormaliseLimits::max_total_len` cuts this view long before the 512-token
+        // budget does. It is a different limit with its own exceed behaviour, and
+        // attributing it to the budget would flag requests the budget never touched.
+        let many = vec!["c".repeat(MAX_URL_TOKEN_LEN); 64].join(" ");
+        let (out, token_cap_cut) = normalise(&many, 512, NormaliseLimits::URL);
+        assert!(
+            out.len() <= MAX_NORMALISED_VIEW_BYTES,
+            "the byte ceiling bound the walk"
+        );
+        assert!(!token_cap_cut, "the token cap did not make this cut");
+    }
+
+    #[test]
+    fn view_cap_refusing_a_distinct_decode_round_degrades_the_request() {
+        // One view per field, and a query that decodes to something new: the round
+        // exists, it was proved distinct, and the cap took it away.
+        let budget = Budget {
+            max_views_per_field: 1,
+            ..Budget::default()
+        };
+        let req = req_with("/a", "q=%3Cscript%3E", b"");
+        let mut st = ContentInspectionState::new(budget);
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Header, &req, &mut st);
+        assert!(
+            views.iter().all(|v| v.round == 0),
+            "the decoded round is exactly what the cap refused"
+        );
+        assert!(st.is_degraded(), "the refused round is a view the detectors never got");
+    }
+
+    #[test]
+    fn view_cap_reached_with_nothing_left_to_decode_does_not_degrade() {
+        // Same one-view budget, but the field decodes to itself and synthesises no
+        // transform. The cap is reached and costs nothing — reporting it would make
+        // `degraded` a per-request constant for any tight budget, which is the same
+        // as reporting nothing at all.
+        let budget = Budget {
+            max_views_per_field: 1,
+            ..Budget::default()
+        };
+        let req = req_with("/a", "q=hello", b"");
+        let mut st = ContentInspectionState::new(budget);
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Header, &req, &mut st);
+        assert!(!views.is_empty(), "the raw views are still produced");
+        assert!(!st.is_degraded(), "nothing was lost, so nothing may be claimed");
+    }
+
+    #[test]
+    fn view_cap_discarding_a_produced_transform_degrades_the_request() {
+        // Two views per field: the raw view plus one comment-stripped child. The
+        // second child (the space-joined strip) is already decoded when the cap
+        // refuses it — the `push_extra_view` path rather than the decode-round one.
+        let budget = Budget {
+            max_views_per_field: 2,
+            max_fields_per_phase: 1,
+            ..Budget::default()
+        };
+        let req = req_with("/a", "", b"un/**/ion select");
+        let mut st = ContentInspectionState::new(budget);
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Body, &req, &mut st);
+        assert_eq!(views.len(), 2, "the cap admitted the raw view and one child");
+        assert!(st.is_degraded(), "the sibling child was decoded and then thrown away");
+    }
+
     #[test]
     fn field_budget_bounds_view_production() {
         // Budget allowing a single field only.
@@ -1431,8 +1605,9 @@ mod tests {
 
     #[test]
     fn normalise_lowercases_and_truncates() {
-        let out = normalise("SELECT   UNION", 8, NormaliseLimits::WHITESPACE);
+        let (out, token_cap_cut) = normalise("SELECT   UNION", 8, NormaliseLimits::WHITESPACE);
         assert_eq!(out, "select union");
+        assert!(!token_cap_cut, "two tokens under a cap of eight cut nothing");
     }
 
     // ── D2: URL-structured sources are not cut off at the 64-byte token cap ──
@@ -1535,11 +1710,15 @@ mod tests {
         // whose tokens would collectively overflow the view ceiling stops at
         // MAX_NORMALISED_VIEW_BYTES — never unbounded.
         let single = "b".repeat(MAX_URL_TOKEN_LEN * 3);
-        let out = normalise(&single, 512, NormaliseLimits::URL);
+        let (out, _) = normalise(&single, 512, NormaliseLimits::URL);
         assert_eq!(out.len(), MAX_URL_TOKEN_LEN, "one token is capped at the URL token cap");
 
         let many = vec!["c".repeat(MAX_URL_TOKEN_LEN); 16].join(" ");
-        let out = normalise(&many, 512, NormaliseLimits::URL);
+        let (out, token_cap_cut) = normalise(&many, 512, NormaliseLimits::URL);
+        assert!(
+            !token_cap_cut,
+            "the whole-view byte ceiling stopped this walk, not the 512-token cap"
+        );
         assert!(
             out.len() <= MAX_NORMALISED_VIEW_BYTES,
             "the whole view is capped at {MAX_NORMALISED_VIEW_BYTES}, got {}",
@@ -1556,7 +1735,7 @@ mod tests {
         // Truncation stays on a char boundary at the new cap too (never panics,
         // never emits invalid UTF-8).
         let text = "é".repeat(MAX_URL_TOKEN_LEN);
-        let out = normalise(&text, 512, NormaliseLimits::URL);
+        let (out, _) = normalise(&text, 512, NormaliseLimits::URL);
         assert!(out.len() <= MAX_URL_TOKEN_LEN);
         assert!(out.chars().all(|c| c == 'é'), "no partial code unit survived");
     }

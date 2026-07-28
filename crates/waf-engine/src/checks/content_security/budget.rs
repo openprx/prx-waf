@@ -19,7 +19,16 @@
 //! Every cap here also increments its own `prxwaf_budget_events_total` slot, so
 //! "which budget ran out" is answerable from a scrape rather than only from the
 //! per-request `degraded` column. That distinction matters: `degraded` is one
-//! flag for eleven different caps, and the remedy for each is a different key.
+//! flag for ten different caps, and the remedy for each is a different key.
+//!
+//! Two of those ten — `max_views_per_field` and `max_tokens_per_view` — are
+//! enforced inside the preprocessor's loops rather than by a `try_take_*` here,
+//! because the unit they bound (a field, a view) is not something this
+//! per-request state can see. They report through
+//! [`ContentInspectionState::record_view_cap_miss`] /
+//! [`ContentInspectionState::record_token_cap_miss`] instead, and only when the
+//! loss is demonstrated. The eleventh key, `max_list_items`, is accepted from
+//! the config and enforced nowhere — see [`Budget::max_list_items`].
 //!
 //! This module only *records* exhaustion. `degraded` means **"part of this request
 //! was never inspected"** — an abstention over the remainder — and it is
@@ -45,6 +54,17 @@ pub struct Budget {
     pub max_html_parse_attempts_per_request: u32,
     pub max_html_parse_input_bytes_total: usize,
     pub max_tokens_per_view: u32,
+    /// **Enforced nowhere.** Carried from the config so the compiled budget is a
+    /// faithful copy of what the operator wrote, but no code path reads it: the
+    /// list expansion it names is bounded by the structured extractor's own
+    /// hardcoded `MAX_VALUE_NODES` (256) and by `max_fields_per_phase`, neither
+    /// of which consults this key. Raising or lowering it changes nothing.
+    ///
+    /// Left in place rather than wired up because pointing it at
+    /// `MAX_VALUE_NODES` would move that bound from 256 to the configured 1 024
+    /// and change what the lane extracts — a detection change, not the
+    /// observability fix this comment belongs to. Recorded in
+    /// `docs/dos-budget.md` §2.1 so an operator does not tune a dead knob.
     pub max_list_items: u32,
     pub max_preprocess_output_bytes_total: usize,
     pub max_field_input_bytes: usize,
@@ -161,6 +181,33 @@ impl ContentInspectionState {
     /// detector layer attributes its own input caps to `detector_limit` — and a
     /// counter here would double-count both under a label meaning "something".
     pub const fn mark_degraded(&mut self) {
+        self.degraded = true;
+    }
+
+    /// Record that `max_views_per_field` cost this request a view it had already
+    /// produced (or a decode round it had already proved distinct).
+    ///
+    /// The two view-shaped caps live in the preprocessor's own loops rather than
+    /// behind a `try_take_*`, so until this existed they narrowed what the lane
+    /// looked at without setting `degraded` and without a counter — the exact
+    /// shape of miss the rest of this module exists to make visible. They are
+    /// deliberately **not** folded into a `try_take_view` counter: the cap is
+    /// per *field* while this state is per *request*, and the preprocessor is
+    /// the only place that knows which field it is on.
+    ///
+    /// Call sites must be certain of the loss. "The cap is reached and there
+    /// might have been more to see" is not a miss; a discarded view is.
+    pub fn record_view_cap_miss(&mut self) {
+        metrics::record_budget_event(BudgetEvent::Lane2ViewsPerField);
+        self.degraded = true;
+    }
+
+    /// Record that `max_tokens_per_view` cut a view's normalised text short with
+    /// tokens still unread. Same contract as [`Self::record_view_cap_miss`]: the
+    /// caller must have observed the dropped tokens, and must not attribute a
+    /// cut made by the whole-view byte ceiling to the token cap.
+    pub fn record_token_cap_miss(&mut self) {
+        metrics::record_budget_event(BudgetEvent::Lane2TokensPerView);
         self.degraded = true;
     }
 
