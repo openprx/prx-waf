@@ -1,5 +1,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod upgrade;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -43,7 +45,22 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Start the proxy and management API
-    Run,
+    Run {
+        /// Take the listening sockets over from a prx-waf already running on
+        /// this host instead of binding fresh ones, so that changing the
+        /// configuration or the binary does not drop connections.
+        ///
+        /// Start this process first; it waits on the handover socket. Then send
+        /// `SIGQUIT` to the running process, which hands its listeners over and
+        /// drains. If this process fails to start, nothing has been signalled
+        /// yet and the running one keeps serving.
+        ///
+        /// A launch flag rather than a config setting, because it describes
+        /// this one invocation: left in a file it would make every subsequent
+        /// restart wait for a predecessor that is not there.
+        #[arg(long)]
+        upgrade: bool,
+    },
     /// Run database migrations only
     Migrate,
     /// Seed the default admin user (admin / admin) if none exist
@@ -409,8 +426,8 @@ fn main() -> anyhow::Result<()> {
                 .build()?
                 .block_on(run_seed_admin(&config))?;
         }
-        Commands::Run => {
-            run_server(&config)?;
+        Commands::Run { upgrade } => {
+            run_server(&config, upgrade)?;
         }
         Commands::Crowdsec(sub) => {
             tokio::runtime::Builder::new_current_thread()
@@ -1836,8 +1853,36 @@ fn app_config_to_crowdsec(config: &AppConfig) -> CrowdSecConfig {
 }
 
 /// Start the full server: async init → API server thread → Pingora proxy
-fn run_server(config: &AppConfig) -> anyhow::Result<()> {
+///
+/// `taking_over` is the `run --upgrade` flag: this process is to receive the
+/// listening sockets of a prx-waf already running on this host rather than bind
+/// its own. See the `upgrade` module.
+fn run_server(config: &AppConfig, taking_over: bool) -> anyhow::Result<()> {
     use pingora_core::server::Server;
+    use pingora_core::server::configuration::Opt;
+
+    // Settled before anything expensive happens. On a handover launch an
+    // unusable socket directory is fatal, and discovering that after a database
+    // pool is open and the rule set is loaded would leave a half-started
+    // process racing the one it was meant to replace.
+    let handover_sock = match upgrade::resolve(config.proxy.upgrade_sock.as_deref()) {
+        Ok(sock) => Some(sock),
+        Err(e) if taking_over => {
+            return Err(e.context(
+                "this process was started with `run --upgrade` to take the listening sockets over from a running \
+                 prx-waf, and the socket that handover travels on cannot be placed. Nothing has been signalled, so \
+                 the running process is still serving",
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Graceful upgrade is UNAVAILABLE for this process: {e:#}. Startup and traffic filtering are \
+                 UNAFFECTED, but a future `run --upgrade` will have nowhere to hand the listeners over, so a \
+                 configuration or binary change will mean a restart that drops connections."
+            );
+            None
+        }
+    };
 
     // Resolved once, then both broadcast and handed to Pingora, so the line the
     // operator reads is the count the data plane is actually built with.
@@ -1872,6 +1917,11 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
         // Grouped with the other exposure lines because it is the same class of
         // question: a listener, its scope, and what reading it gets you.
         .chain(metrics_startup_broadcast(&config.metrics))
+        // Whether this process can be replaced without dropping connections,
+        // and on which path the replacement will reach it. Both halves of a
+        // handover have to name the same socket, and this line is where an
+        // operator reads back the one this process derived.
+        .chain(handover_startup_broadcast(handover_sock.as_ref(), taking_over))
     {
         match line.level {
             BroadcastLevel::Info => info!("{}", line.text),
@@ -1887,6 +1937,19 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     let (engine, router, api_state, acme_challenges, lb_registry, response_cache, _shutdown_guards, cluster_node_state) =
         rt.block_on(init_async(config))?;
 
+    // Pingora carries the proxy listener across an upgrade, and nothing else.
+    // The admin API, the metrics endpoint and the HTTP/3 listener each own a
+    // socket on a runtime of their own, outside the file-descriptor table
+    // Pingora hands over, and the process being replaced does not release those
+    // ports until it exits — after the close timeout, the grace period and the
+    // last in-flight request. An incoming process that binds them once would
+    // therefore find every one of them taken, log three errors and come up with
+    // no management plane at all, permanently, because the threads that failed
+    // are gone by the time the ports free up. So on a handover launch, and only
+    // then, each of the three keeps retrying for as long as the contention can
+    // plausibly last.
+    let handover_window = taking_over.then_some(upgrade::HANDOVER_BIND_WINDOW);
+
     // Start the management API in a background thread
     let api_listen = config.api.listen_addr.clone();
     let api_state_bg = Arc::clone(&api_state);
@@ -1899,7 +1962,11 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
             }
         };
         rt.block_on(async move {
-            if let Err(e) = start_api_server(&api_listen, api_state_bg).await {
+            let served = upgrade::serve_through_handover("Management API", handover_window, || {
+                start_api_server(&api_listen, Arc::clone(&api_state_bg))
+            })
+            .await;
+            if let Err(e) = served {
                 tracing::error!("API server error: {}", e);
             }
         });
@@ -1926,7 +1993,11 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
                 }
             };
             rt.block_on(async move {
-                if let Err(e) = waf_api::metrics_endpoint::serve(&metrics_listen).await {
+                let served = upgrade::serve_through_handover("Metrics endpoint", handover_window, || {
+                    waf_api::metrics_endpoint::serve(&metrics_listen)
+                })
+                .await;
+                if let Err(e) = served {
                     // `{e:#}` so the context chain from `serve` — which stage
                     // failed, and the OS error under it — reaches the log. The
                     // rest of this line exists because the previous version
@@ -2005,18 +2076,29 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
                 // Upstream is selected per-host via the router inside the H3
                 // server (same source as Pingora's upstream_peer); no hard-coded
                 // backend here (audit H-7).
-                if let Err(e) = gateway::http3::start_http3_server(
-                    addr,
-                    cert_pem,
-                    key_pem,
-                    h3_config.upstream_tls_verify,
-                    h3_smuggling_detection,
-                    Arc::clone(&h3_engine),
-                    Arc::clone(&h3_router),
-                    h3_upstream_timeouts,
-                )
-                .await
-                {
+                //
+                // Retried through a handover for the same reason as the other
+                // two listeners, with one caveat that no amount of retrying
+                // fixes: this is a UDP socket, and QUIC connection state lives
+                // in the process, not in the kernel. Even if the descriptor
+                // were carried across, the incoming process could not decrypt
+                // a connection the outgoing one negotiated. HTTP/3 clients are
+                // dropped at the handover and reconnect; only HTTP/1.1 and
+                // HTTP/2 over the Pingora listener survive it.
+                let served = upgrade::serve_through_handover("HTTP/3 listener", handover_window, || {
+                    gateway::http3::start_http3_server(
+                        addr,
+                        cert_pem.clone(),
+                        key_pem.clone(),
+                        h3_config.upstream_tls_verify,
+                        h3_smuggling_detection,
+                        Arc::clone(&h3_engine),
+                        Arc::clone(&h3_router),
+                        h3_upstream_timeouts,
+                    )
+                })
+                .await;
+                if let Err(e) = served {
                     tracing::error!("HTTP/3 server error: {e}");
                 }
             });
@@ -2067,7 +2149,31 @@ fn run_server(config: &AppConfig) -> anyhow::Result<()> {
     // (`pingora-core-0.8.1/src/server/mod.rs:705`), so leaving every service's
     // own override at `None` keeps one lever for the whole data plane instead
     // of a per-listener count that has to be kept in sync.
-    let mut server = Server::new_with_opt_and_conf(None, proxy_server_conf(worker_threads.threads)?);
+    //
+    // `Opt.upgrade` is the entire receiving half of the zero-downtime handover:
+    // `Bootstrap::new` copies it (`bootstrap_services.rs:95`) and `load_fds`
+    // reads the listening descriptors off the socket only when it is set
+    // (`bootstrap_services.rs:172`). Passing `None` here, as this did, left the
+    // outgoing process's SIGQUIT handler sending file descriptors that nothing
+    // was ever going to collect.
+    let mut server = Server::new_with_opt_and_conf(
+        Opt {
+            upgrade: taking_over,
+            ..Opt::default()
+        },
+        proxy_server_conf(worker_threads.threads, handover_sock.as_ref())?,
+    );
+    if taking_over {
+        info!(
+            "Waiting up to {}s for the running prx-waf to hand over its listening sockets. If it does not, this \
+             process exits and that one keeps serving.",
+            upgrade::HANDOVER_SOCK_RETRIES
+        );
+    }
+    // Blocks here on a handover launch, until the descriptors arrive or the
+    // wait is exhausted — in which case Pingora exits the process itself
+    // (`bootstrap_services.rs:158`), which is the outcome we want: no listener
+    // was taken, and the process being replaced is untouched.
     server.bootstrap();
 
     // ── Response-phase detectors ──────────────────────────────────────────────
@@ -2370,6 +2476,44 @@ fn render_admin_allowlist(allowlist: &[String]) -> String {
     }
 }
 
+/// Announce whether this process can be replaced without dropping connections.
+///
+/// Worth a startup line for the same reason the worker count is: it is a
+/// property of the running process that appears in no config file on a default
+/// install. Both halves of a handover have to name the same socket, and the
+/// derived path is a function of the effective uid, so printing it is how an
+/// operator confirms from the outgoing process's log what the incoming one will
+/// look for.
+fn handover_startup_broadcast(sock: Option<&upgrade::UpgradeSock>, taking_over: bool) -> Vec<BroadcastLine> {
+    let Some(sock) = sock else {
+        // The refusal was already logged in full, with its reason, where it was
+        // decided; repeating it here would only say it twice.
+        return Vec::new();
+    };
+    let path = sock.path.display();
+    let origin = match sock.source {
+        upgrade::SockSource::Configured => "set by [proxy] upgrade_sock / PRXWAF_UPGRADE_SOCK",
+        upgrade::SockSource::SystemRuntime => "derived — the system runtime directory, which this process owns",
+        upgrade::SockSource::UserTemp => "derived — a private per-uid directory, this process not being root",
+    };
+
+    if taking_over {
+        return vec![BroadcastLine::info(format!(
+            "Graceful upgrade: this process is TAKING OVER. It will wait on {path} ({origin}) for the running \
+             prx-waf to hand its listening sockets across. Send that process SIGQUIT now. Until then this process \
+             holds no listener, and if it gives up waiting it exits without having disturbed anything."
+        ))];
+    }
+
+    vec![BroadcastLine::info(format!(
+        "Graceful upgrade: available on {path} ({origin}). To change the configuration or the binary without \
+         dropping connections, start the new process with `prx-waf run --upgrade` FIRST and only then send this one \
+         SIGQUIT. Sending SIGQUIT with no process waiting on that socket is a shutdown, not an upgrade: this process \
+         will spend its retry budget looking for a successor that is not there and then exit, leaving the port \
+         unserved."
+    ))]
+}
+
 /// Build the Pingora server configuration the proxy data plane runs under.
 ///
 /// This exists so the worker-thread count has somewhere to be written. The
@@ -2378,12 +2522,27 @@ fn render_admin_allowlist(allowlist: &[String]) -> String {
 /// what pinned the whole data plane to one core regardless of the machine.
 /// `ServerConf::new()` is the same conf `Server::new(None)` would have built,
 /// so nothing else about the server changes.
-fn proxy_server_conf(threads: usize) -> anyhow::Result<pingora_core::server::configuration::ServerConf> {
+///
+/// `handover_sock` is the second thing written here. Pingora reads the socket
+/// path off this conf on both sides of an upgrade — the outgoing process at
+/// `server/mod.rs:283`, the incoming one at `bootstrap_services.rs:98` — so
+/// leaving it at the shipped `/tmp/pingora_upgrade.sock` would have put the
+/// handover in a world-writable directory. `None` leaves the default in place
+/// but nothing ever asks for the handover, since the flag that arms the
+/// receiving side is refused in the same breath.
+fn proxy_server_conf(
+    threads: usize,
+    handover_sock: Option<&upgrade::UpgradeSock>,
+) -> anyhow::Result<pingora_core::server::configuration::ServerConf> {
     use pingora_core::server::configuration::ServerConf;
 
     let mut conf =
         ServerConf::new().ok_or_else(|| anyhow::anyhow!("failed to build the default Pingora server configuration"))?;
     conf.threads = threads;
+    if let Some(sock) = handover_sock {
+        conf.upgrade_sock = sock.path.to_string_lossy().into_owned();
+        conf.upgrade_sock_connect_accept_max_retries = Some(upgrade::HANDOVER_SOCK_RETRIES);
+    }
     Ok(conf)
 }
 
@@ -4560,7 +4719,7 @@ mod tests {
     /// (`pingora-core-0.8.1/src/server/mod.rs:705`).
     #[test]
     fn proxy_server_conf_carries_the_worker_thread_count() {
-        let conf = proxy_server_conf(12).expect("default Pingora conf must build");
+        let conf = proxy_server_conf(12, None).expect("default Pingora conf must build");
         assert_eq!(conf.threads, 12);
         // Pingora's own default is the value this whole change exists to stop
         // inheriting; assert it is what we would have got, so the test fails if
@@ -4571,6 +4730,54 @@ mod tests {
                 .threads,
             1
         );
+    }
+
+    /// The handover socket has to reach Pingora on the same field both halves
+    /// read (`server/mod.rs:283` sending, `bootstrap_services.rs:98`
+    /// receiving), and it has to displace the shipped default rather than sit
+    /// beside it — that default is a path in a world-writable directory.
+    #[test]
+    fn proxy_server_conf_carries_the_handover_socket() {
+        let sock = upgrade::UpgradeSock {
+            path: PathBuf::from("/run/prx-waf/upgrade.sock"),
+            source: upgrade::SockSource::Configured,
+        };
+        let conf = proxy_server_conf(4, Some(&sock)).expect("default Pingora conf must build");
+        assert_eq!(conf.upgrade_sock, "/run/prx-waf/upgrade.sock");
+        assert_eq!(
+            conf.upgrade_sock_connect_accept_max_retries,
+            Some(upgrade::HANDOVER_SOCK_RETRIES)
+        );
+        assert_eq!(
+            pingora_core::server::configuration::ServerConf::new()
+                .expect("default conf")
+                .upgrade_sock,
+            "/tmp/pingora_upgrade.sock"
+        );
+    }
+
+    /// The startup line is the only place an operator reads back the derived
+    /// path, so it must name it, and it must say which order the two commands
+    /// go in — the reverse order is a shutdown.
+    #[test]
+    fn the_handover_broadcast_names_the_socket_and_the_order() {
+        let sock = upgrade::UpgradeSock {
+            path: PathBuf::from("/tmp/prx-waf-1000/upgrade.sock"),
+            source: upgrade::SockSource::UserTemp,
+        };
+        let lines = handover_startup_broadcast(Some(&sock), false);
+        let line = lines.first().expect("an available handover is announced");
+        assert!(line.text.contains("/tmp/prx-waf-1000/upgrade.sock"), "{}", line.text);
+        assert!(line.text.contains("run --upgrade"), "{}", line.text);
+        assert!(line.text.contains("SIGQUIT"), "{}", line.text);
+
+        let taking_over = handover_startup_broadcast(Some(&sock), true);
+        let line = taking_over.first().expect("a handover launch is announced");
+        assert!(line.text.contains("TAKING OVER"), "{}", line.text);
+
+        // An unavailable handover was already explained in full where it was
+        // refused; the broadcast does not repeat it.
+        assert!(handover_startup_broadcast(None, false).is_empty());
     }
 
     /// A default install must be told the count, since it appears in no config

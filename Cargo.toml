@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.108"
+version = "0.2.109"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -55,6 +55,10 @@ clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 bytes = "1"
 http = "1"
+# Only for `geteuid`, which the graceful-upgrade socket's directory check needs
+# and std does not expose. Already in the tree under pingora, and taken here in
+# preference to a raw `libc` call because the workspace denies `unsafe_code`.
+nix = { version = "0.24", features = ["user"] }
 
 # Phase 3 additions
 rhai = { version = "1", features = ["sync"] }

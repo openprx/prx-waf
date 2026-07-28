@@ -773,6 +773,25 @@ pub struct ProxyConfig {
     /// [`UpstreamTimeoutConfig`].
     #[serde(default)]
     pub upstream_timeouts: UpstreamTimeoutConfig,
+    /// Filesystem path of the Unix socket the two processes of a zero-downtime
+    /// upgrade use to hand the listening sockets over.
+    ///
+    /// **Absent** (the shipped default) means the path is derived from the
+    /// process's effective uid rather than read from a file, so the outgoing
+    /// and incoming process agree on it without either being configured. The
+    /// derivation is in `prx-waf`'s `upgrade` module and is announced at
+    /// startup.
+    ///
+    /// Set it only to move the socket somewhere specific — a persistent
+    /// runtime directory a supervisor creates, say. Whatever it points at, the
+    /// **parent directory** is the security boundary: the socket itself is
+    /// chmod 0666 by Pingora (`transfer_fd/mod.rs:133`), and whoever can create
+    /// a socket at this path while an upgrade is in flight receives the
+    /// listening file descriptors of the port this WAF is protecting. prx-waf
+    /// therefore refuses a parent directory that is a symlink, is owned by
+    /// another user, or grants any access to group or other.
+    #[serde(default)]
+    pub upgrade_sock: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -785,6 +804,7 @@ impl Default for ProxyConfig {
             trusted_proxies: Vec::new(),
             smuggling_detection: true,
             upstream_timeouts: UpstreamTimeoutConfig::default(),
+            upgrade_sock: None,
         }
     }
 }
@@ -1583,6 +1603,14 @@ where
     // baked-in TOML.
     if let Some(v) = get("PRXWAF_WORKER_THREADS") {
         config.proxy.worker_threads = Some(parse_env_usize("PRXWAF_WORKER_THREADS", &v)?);
+    }
+
+    // The upgrade socket has to sit somewhere both processes of a handover can
+    // reach, which under a supervisor is whatever runtime directory that
+    // supervisor allocated — a path the unit file knows and the baked-in TOML
+    // does not.
+    if let Some(v) = get("PRXWAF_UPGRADE_SOCK") {
+        config.proxy.upgrade_sock = Some(v);
     }
 
     // Where the scrape endpoint lives is a property of the deployment, not of
