@@ -100,7 +100,7 @@ notify = { version = "6", default-features = false, features = ["macos_fsevent"]
 url = "2"
 
 # Cluster additions
-lz4_flex = "0.11"
+lz4_flex = "0.14"
 hmac = "0.13"
 time = { version = "0.3", default-features = false, features = ["std"] }
 parking_lot = "0.12"

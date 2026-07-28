@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2743,9 +2743,9 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lz4_flex"
-version = "0.11.6"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 dependencies = [
  "twox-hash",
 ]
@@ -3744,7 +3744,7 @@ checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "prx-waf"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5690,7 +5690,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waf-api"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5731,7 +5731,7 @@ dependencies = [
 
 [[package]]
 name = "waf-cluster"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5762,7 +5762,7 @@ dependencies = [
 
 [[package]]
 name = "waf-common"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5781,7 +5781,7 @@ dependencies = [
 
 [[package]]
 name = "waf-engine"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5826,7 +5826,7 @@ dependencies = [
 
 [[package]]
 name = "waf-storage"
-version = "0.2.93"
+version = "0.2.102"
 dependencies = [
  "chrono",
  "parking_lot",
