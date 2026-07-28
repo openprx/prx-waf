@@ -29,7 +29,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use uuid::Uuid;
-use waf_storage::models::{AttackLog, AttackLogQuery};
+use waf_storage::models::{AttackLog, AttackLogQuery, CreateSecurityEvent, SecurityEventQuery};
 use waf_storage::{Database, StorageError};
 
 fn database_url() -> String {
@@ -86,6 +86,14 @@ async fn cleanup(db: &Database, host_code: &str) {
         .execute(db.pool())
         .await
         .expect("cleanup");
+}
+
+async fn cleanup_security_events(db: &Database, host_code: &str) {
+    sqlx::query("DELETE FROM security_events WHERE host_code = $1")
+        .bind(host_code)
+        .execute(db.pool())
+        .await
+        .expect("cleanup security_events");
 }
 
 /// The core regression: an IPv4 insert must succeed (was `42804`) and every
@@ -302,4 +310,153 @@ async fn stats_overview_counts_attack_logs() {
     );
 
     cleanup(&db, &host_code).await;
+}
+
+/// The batched insert behind `waf_engine::detection_sink`, against a real
+/// Postgres.
+///
+/// This is not redundant with the single-row tests above. `create_attack_logs`
+/// builds its statement text at runtime — one `VALUES` tuple per row, with the
+/// `$n` numbering and the `::inet` casts generated rather than written out — and
+/// none of that is exercised by a mock writer or by a single-row insert. The
+/// only production caller is a background worker that downgrades an error to a
+/// `warn!`, which is exactly the shape of failure that stayed invisible for the
+/// `INET` bug this file was created for: a malformed multi-row statement would
+/// fail the same silent way, and the table would simply never fill.
+///
+/// So: insert a batch, read every row back, and assert the values did not get
+/// shuffled between placeholder positions — the failure mode a hand-generated
+/// parameter list actually has, and one that produces perfectly valid rows
+/// carrying each other's data.
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn a_batch_insert_writes_every_row_with_its_own_values() {
+    let db = connect().await;
+    let host_code = tag();
+
+    let ips = ["203.0.113.20", "198.51.100.7", "2001:db8::42", "203.0.113.21"];
+    let batch: Vec<AttackLog> = ips
+        .iter()
+        .enumerate()
+        .map(|(i, ip)| {
+            let mut row = log_row(&host_code, ip, if i % 2 == 0 { "block" } else { "allow" });
+            row.path = format!("/row-{i}");
+            row.rule_name = format!("rule-name-{i}");
+            row
+        })
+        .collect();
+
+    db.create_attack_logs(batch.clone()).await.expect("batch insert");
+
+    let (rows, total) = db.list_attack_logs(&query_for(&host_code)).await.expect("read back");
+    assert_eq!(total, 4, "all four rows must land in one statement");
+    assert_eq!(rows.len(), 4);
+
+    for expected in &batch {
+        let got = rows
+            .iter()
+            .find(|r| r.id == expected.id)
+            .unwrap_or_else(|| panic!("row {} missing from the batch read-back", expected.id));
+        assert_eq!(got.path, expected.path, "path bound to the wrong row");
+        assert_eq!(got.rule_name, expected.rule_name, "rule_name bound to the wrong row");
+        assert_eq!(got.action, expected.action, "action bound to the wrong row");
+        assert_eq!(got.client_ip, expected.client_ip, "client_ip bound to the wrong row");
+        assert_eq!(got.method, expected.method);
+        assert_eq!(got.host, expected.host);
+        assert_eq!(got.query, expected.query);
+        assert_eq!(got.detail, expected.detail);
+    }
+
+    cleanup(&db, &host_code).await;
+}
+
+/// A batch is validated before any SQL is built, so one bad address fails the
+/// whole batch as a named error rather than as a raw Postgres `22P02` after some
+/// rows have already been composed into the statement.
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn one_bad_address_fails_the_batch_as_a_clean_error() {
+    let db = connect().await;
+    let host_code = tag();
+
+    let batch = vec![
+        log_row(&host_code, "203.0.113.30", "block"),
+        log_row(&host_code, "not-an-ip", "block"),
+    ];
+    let err = db
+        .create_attack_logs(batch)
+        .await
+        .expect_err("must reject the bad address");
+    assert!(
+        matches!(err, StorageError::InvalidInput(_)),
+        "expected a validation error naming the field, got {err:?}"
+    );
+
+    let (_, total) = db.list_attack_logs(&query_for(&host_code)).await.expect("read back");
+    assert_eq!(total, 0, "a rejected batch must not have written its good rows either");
+
+    cleanup(&db, &host_code).await;
+}
+
+/// The drain loop can legitimately produce an empty batch; it must not become an
+/// `INSERT ... VALUES` with nothing after it.
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn an_empty_batch_is_a_no_op() {
+    let db = connect().await;
+    db.create_attack_logs(Vec::new()).await.expect("empty attack log batch");
+    db.create_security_events(Vec::new())
+        .await
+        .expect("empty security event batch");
+}
+
+/// The `security_events` batch, likewise against a real database — same
+/// generated-placeholder risk, and it is the queue the flood actually fills.
+#[tokio::test]
+#[ignore = "requires live Postgres; run with --ignored"]
+async fn a_security_event_batch_writes_every_row_with_its_own_values() {
+    let db = connect().await;
+    let host_code = tag();
+
+    let batch: Vec<CreateSecurityEvent> = (0..4)
+        .map(|i| CreateSecurityEvent {
+            host_code: host_code.clone(),
+            client_ip: format!("203.0.113.{}", 40 + i),
+            method: "GET".to_string(),
+            path: format!("/sec-{i}"),
+            rule_id: Some(format!("rule-{i}")),
+            rule_name: format!("sql_injection_{i}"),
+            action: if i % 2 == 0 { "block" } else { "log_only" }.to_string(),
+            detail: Some(format!("detail-{i}")),
+            geo_info: None,
+        })
+        .collect();
+
+    db.create_security_events(batch.clone()).await.expect("batch insert");
+
+    let query = SecurityEventQuery {
+        host_code: Some(host_code.clone()),
+        client_ip: None,
+        rule_name: None,
+        action: None,
+        country: None,
+        iso_code: None,
+        page: None,
+        page_size: None,
+    };
+    let (rows, total) = db.list_security_events(&query).await.expect("read back");
+    assert_eq!(total, 4, "all four rows must land in one statement");
+
+    for expected in &batch {
+        let got = rows
+            .iter()
+            .find(|r| r.path == expected.path)
+            .unwrap_or_else(|| panic!("row {} missing from the batch read-back", expected.path));
+        assert_eq!(got.rule_name, expected.rule_name, "rule_name bound to the wrong row");
+        assert_eq!(got.action, expected.action, "action bound to the wrong row");
+        assert_eq!(got.client_ip, expected.client_ip, "client_ip bound to the wrong row");
+        assert_eq!(got.detail, expected.detail);
+    }
+
+    cleanup_security_events(&db, &host_code).await;
 }

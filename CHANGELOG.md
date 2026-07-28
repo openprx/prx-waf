@@ -11,6 +11,30 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`prxwaf_queue_depth` and `prxwaf_db_pool`: how far behind the write path
+  is, before it starts dropping.** The `subsystem="queue"` budget counters are
+  trailing indicators — they fire once a queue is already full, which is after
+  the interesting part, and a queue that is filling but has not yet overflowed
+  produces no signal from them at all. `prxwaf_queue_depth{queue}` is a gauge
+  over the five background writers, counting items handed to a writer and not
+  yet written; `prxwaf_db_pool{state}` publishes the `sqlx` pool's connection
+  and idle counts, sampled once a second. Depth rising against a pool pinned at
+  `storage.max_connections` with zero idle is the whole diagnosis in two series,
+  and it is what turned §6 of `tests/perf/RESULTS.md` from an open question into
+  a measured one. Seven more series, independent of `max_host_labels`.
+
+- **`tests/perf/soak.sh`: a memory-shape harness.** `run.sh` reports the peak
+  RSS from a ten-second window, which cannot distinguish a process that settles
+  at a working set from one that rises until a queue bound stops it from one
+  that rises for as long as traffic arrives — the three have the same first ten
+  seconds and completely different operational meanings. `soak.sh` drives one
+  posture for minutes and samples RSS, CPU, per-queue depth, pool occupancy, the
+  drop counters and the rows that actually reached the database once a second;
+  `soak_shape.py` fits the second half of the series and states the rule it used
+  so the verdict is arithmetic rather than a shape somebody saw in a graph. It
+  can freeze the database mid-run to exercise the overflow policy for real, and
+  it stops itself at an RSS ceiling rather than OOM-ing the host.
+
 - **Prometheus metrics on `/metrics`, on by default, bound to
   `127.0.0.1:9090`.** The WAF previously exported nothing: request rate, block
   rate, detection mix, per-lane detection cost and every budget/degradation
@@ -26,7 +50,7 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   label string — and `host` is capped by `[metrics] max_host_labels` (default
   128), folding into a single `__other__` series past the cap. Client IP, rule
   id, path and user agent are never labels. Total series is
-  `28 × max_host_labels + 214`, about 3 800 at the default, and does not move
+  `28 × max_host_labels + 223`, about 3 800 at the default, and does not move
   with request rate, attack volume or rule-set size.
 
   The endpoint is **unauthenticated by design** and runs on its own listener
@@ -147,6 +171,40 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   in `2024-recent.yaml`'s own comment on CVE-2024-6387.
 
 ### Fixed
+
+- **Sustained attack traffic no longer lets the attacker choose how much memory
+  the process uses.** Every enforced detection wrote an `attack_logs` and/or a
+  `security_events` row through one `tokio::spawn` per detection. Nothing
+  connected the two sides: the request path spawned as fast as the proxy could
+  block requests, the pool drained at `storage.max_connections`, and the
+  difference accumulated in memory with no ceiling of any kind. Under a
+  saturating SQLi flood from a single unauthenticated client this is 557,584
+  rows in flight after thirty-one seconds and RSS on a straight line —
+  **10.4 GiB per minute, R² 1.000** — which extrapolates to an OOM about three
+  minutes in. `tests/perf/RESULTS.md` §6 measured the first ten seconds of that
+  curve and said plainly that it could not tell whether it plateaued; §8 now
+  answers it with a time series, and the answer was no.
+
+  The two writers now share the bounded-channel discipline the audit log, the
+  semantic sink and the community reporter already used: two 4,096-slot MPSC
+  channels drained by one background worker, one synchronous `try_send` on the
+  request path, no task allocation. Memory in front of the database is a
+  constant of the configuration instead of a function of how long the attack has
+  been running. The worker also composes one multi-row `INSERT` per drained
+  batch rather than 256 round trips, which is what keeps the bound from
+  mattering at real rates: measured over twenty minutes of the same flood,
+  **RSS holds near 120 MiB and nothing is dropped at all** — every one of
+  22,000 blocked requests a second is still recorded.
+
+  **Overflow is loud, and it has to be.** A silently discarded security record
+  makes "nothing was detected" and "something was detected and not written down"
+  indistinguishable downstream. Two new budget counters,
+  `prxwaf_budget_events_total{subsystem="queue", limit="attack_log"}` and
+  `{limit="security_event"}`, count exactly the rows given up; the backlog
+  before any of it is given up is on the new `prxwaf_queue_depth` gauge; and the
+  worker WARNs a running total every thirty seconds. Freezing the database
+  mid-flood reconciles exactly: 2,808,798 requests blocked, 1,863,291 rows
+  written, 945,507 counted drops, no remainder — and RSS still flat at 114 MiB.
 
 - **HTTP/3 routes on `:authority`, so HTTP/3 works at all.** The H3 listener
   resolved its route from `headers["host"]`, and HTTP/3 has no Host header —
