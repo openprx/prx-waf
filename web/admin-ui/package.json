@@ -10,7 +10,7 @@
   "dependencies": {
     "axios": "^1.6.0",
     "lucide-vue-next": "^0.577.0",
-    "pinia": "^2.1.7",
+    "pinia": "^4.0.2",
     "vue": "^3.3.13",
     "vue-i18n": "^9.14.5",
     "vue-router": "^4.2.5"
