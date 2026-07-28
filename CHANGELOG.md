@@ -11,6 +11,51 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`run --upgrade`: change the configuration or the binary without dropping
+  connections.** A new process takes the listening sockets off the running one
+  — the same kernel sockets, same accept queue — serves from them immediately,
+  and the outgoing process finishes the requests it had already accepted and
+  exits by itself. The port is never unlistened. Previously every change meant a
+  restart, and a restart severed everything in flight.
+
+  Pingora carried both halves of this all along; only the receiving half was
+  ever armed. What had to be decided here was where the handover socket lives
+  (Pingora's shipped default is `/tmp/pingora_upgrade.sock` and the socket is
+  chmod `0666` at creation, so in a world-writable directory anyone local can
+  intercept the handover and receive the WAF's listening descriptors — prx-waf
+  derives a path in a `0700` directory it owns instead, and refuses one it does
+  not), and what happens to the three listeners Pingora does not carry.
+
+  Those three — admin API, metrics, HTTP/3 — are unavailable for the length of
+  the overlap and come back on the new process; the data plane is unaffected
+  throughout. HTTP/3 clients are dropped and reconnect, which QUIC makes
+  unavoidable: its connection state lives in the process, not in the socket.
+  Both processes hold a database pool during the overlap, so peak connections
+  are twice `[storage] max_connections`.
+
+  The order of the two commands matters and the reverse order is an outage.
+  Procedure, failure modes, systemd and container notes:
+  [`docs/graceful-upgrade.md`](docs/graceful-upgrade.md). New optional setting
+  `[proxy] upgrade_sock` / `PRXWAF_UPGRADE_SOCK` moves the socket; unset, it is
+  derived and announced at startup.
+
+### Changed
+
+- **Stopping now takes 30 seconds instead of 300.** `[proxy]
+  drain_timeout_secs` (new, default 30, `PRXWAF_DRAIN_TIMEOUT_SECS`) is how
+  long a process keeps serving already-accepted requests after `SIGTERM` or
+  after handing its listeners to a replacement. Pingora's default, which
+  prx-waf silently inherited, is 300 seconds — and it is an unconditional
+  sleep, not a drain detector, so every stop cost the full five minutes whether
+  or not anything was in flight. Under systemd that meant `systemctl stop` hung
+  until `TimeoutStopSec` (90s by default) `SIGKILL`ed it, severing exactly the
+  connections the wait was for; after a handover it meant five minutes of two
+  processes, two database pools and no management API.
+
+  Raise it if you proxy requests that legitimately run longer than 30 seconds,
+  and keep it below your supervisor's kill timeout. Set it to 300 to keep the
+  old behaviour. It is announced at startup either way.
+
 - **`prxwaf_queue_depth` and `prxwaf_db_pool`: how far behind the write path
   is, before it starts dropping.** The `subsystem="queue"` budget counters are
   trailing indicators — they fire once a queue is already full, which is after

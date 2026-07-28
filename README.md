@@ -138,6 +138,10 @@ Options:
 
 Commands:
   run          Start proxy + management API (blocks forever)
+  run --upgrade  Take the listening sockets over from a prx-waf already running
+                 on this host, so a config or binary change costs no dropped
+                 connections. See docs/graceful-upgrade.md for the procedure —
+                 the order of the two commands matters.
   migrate      Run database migrations only
   seed-admin   Create default admin user (username: admin, password: $ADMIN_PASSWORD if set, else a random 24-char password printed once to stdout)
   crowdsec     CrowdSec integration management

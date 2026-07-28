@@ -360,6 +360,12 @@ restore the previous `configs/`, start. Check the previous release's
 downgrading may require restoring a DB snapshot taken before the upgrade. Take
 that snapshot before every upgrade.
 
+A rollback that has to be done without dropping connections uses the same
+handover as an upgrade — see [graceful-upgrade.md](graceful-upgrade.md) — with
+the old binary as the incoming process. It only works when the version being
+rolled back to can read the current database schema, which is the same
+constraint as above.
+
 ---
 
 ## 8. Post-release
