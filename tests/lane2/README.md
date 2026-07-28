@@ -46,7 +46,7 @@ The shipped `log_only` posture, verbatim. Verdicts come from the
 | of which would block | — | **2 (0.91%)** |
 | clean | — | 207 |
 | sub-threshold | 1 | 3 |
-| misattributed / wrong-family | 4 / 4 | — |
+| misattributed / wrong-family | 2 / 4 | — |
 | blind | 40 | — |
 
 ### enforce mode — the blocking decision
