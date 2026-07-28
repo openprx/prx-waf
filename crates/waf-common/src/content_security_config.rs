@@ -6,10 +6,17 @@
 //! `DetectorId`; the engine compiles this into an immutable runtime config at
 //! startup (plan §6.5: "不得让 `waf-common` 反向依赖 engine 的 `DetectorId`").
 //!
-//! Everything here is **off by default**: a zero-config install never activates
-//! Lane 2. `enabled = false`, `enforcement_mode = "log_only"`, HPP off, dialect
-//! `generic`, no attack families — proving "零配置不启用" (plan §14.2 / task
-//! P1a zero-enforcement constraint).
+//! The **compiled** defaults in this module are all off: `enabled = false`,
+//! `enforcement_mode = "log_only"`, HPP off, dialect `generic`, no attack
+//! families — proving "零配置不启用" (plan §14.2 / task P1a zero-enforcement
+//! constraint). That guarantee is about a process started with **no config
+//! file**.
+//!
+//! It is not the posture of a normal install. `configs/default.toml` ships
+//! `enabled = true`, so any deployment using the packaged config runs Lane 2 on
+//! every request (in `log_only`, so it still never blocks). When the question is
+//! "can an attacker reach this code", the shipped config is the one to read;
+//! `Default::default()` here answers a different question.
 
 use std::collections::BTreeMap;
 
@@ -442,7 +449,11 @@ mod tests {
     #[test]
     fn default_is_off_and_valid() {
         let cfg = ContentSecurityConfig::default();
-        assert!(!cfg.enabled, "lane must be off by default");
+        assert!(
+            !cfg.enabled,
+            "the compiled default must leave the lane off; this says nothing about \
+             configs/default.toml, which ships enabled = true"
+        );
         assert_eq!(cfg.enforcement_mode, "log_only");
         assert!(!cfg.hpp);
         assert_eq!(cfg.rollout_bps, 0);

@@ -2054,7 +2054,13 @@ mod load_config_tests {
         let result = load_config(&path);
         let _ = std::fs::remove_file(&path);
         let cfg = result.expect("valid config must load");
-        assert!(!cfg.content_security.enabled, "semantic lane off by default");
+        // `AppConfig::default()` — the compiled default, which is what this test
+        // round-trips. `configs/default.toml` ships `enabled = true`; a real
+        // install runs the lane.
+        assert!(
+            !cfg.content_security.enabled,
+            "semantic lane off in the compiled default"
+        );
     }
 }
 

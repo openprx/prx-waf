@@ -11,12 +11,22 @@
 //!
 //! # Lane 2 — `semantic_scoring` (P1a foundation, additive)
 //! [`ContentSecuritySubsystem::evaluate_scoped`] runs Lane 1 first and, only when
-//! the semantic lane is enabled (off by default), then runs Lane 2: the
-//! phase-limited [`preprocess::semantic_preprocessor`] → detectors → the closed
+//! the semantic lane is enabled, then runs Lane 2: the phase-limited
+//! [`preprocess::semantic_preprocessor`] → detectors → the closed
 //! [`scoring::score`] model, returning [`ContentVerdict::Semantic`].
 //!
-//! The five attack families ship enabled but **shadow-only** by default: the
-//! shipped `enforcement_mode = log_only` (and the empty per-family
+//! ## "Default" means two different things here — say which one
+//! The **compiled** default (`ContentSecurityConfig::default`, what a process
+//! with no config file at all gets) is `enabled = false`: the lane
+//! never runs. The **shipped** default (`configs/default.toml`, what an install
+//! that uses the packaged config actually runs) is `enabled = true`. Every
+//! deployment that ships this repo's config file therefore reaches Lane 2 on
+//! every request, and any statement that the lane "is off by default" is only
+//! true of the zero-config build. Reasoning about reachability — which code an
+//! attacker can touch — must use the shipped config, not the compiled one.
+//!
+//! What both defaults do share is that Lane 2 cannot block: the shipped
+//! `enforcement_mode = log_only` (and the empty per-family
 //! `enforcement_overrides`) means a match is at most a `LogOnly` security event +
 //! a persisted observation, **never** a Block.
 //!
@@ -119,23 +129,33 @@ pub struct ContentSecuritySubsystem {
 }
 
 impl ContentSecuritySubsystem {
-    /// Build the subsystem with the four frozen Lane 1 detectors and the Lane 2
-    /// lane **off** (zero-config default).
+    /// Build the subsystem with the four frozen Lane 1 detectors and Lane 2
+    /// **off**, because that is the *compiled* default
+    /// ([`RuntimeContentSecurityConfig::default`], `enabled = false`).
+    ///
+    /// This is not the posture of an install running `configs/default.toml`,
+    /// which sets `enabled = true` and reaches Lane 2 on every request. The
+    /// production path builds the subsystem through [`Self::with_config`] from
+    /// the parsed config file; this constructor is what a caller that never
+    /// supplies one gets. See the module header.
     #[must_use]
     pub fn new() -> Self {
         Self::with_config(RuntimeContentSecurityConfig::default())
     }
 
     /// Build the subsystem with an explicit compiled Lane 2 config. Lane 1 is
-    /// always the same frozen four detectors; Lane 2 ships no detectors in P1a.
+    /// always the same frozen four detectors; Lane 2's detector set is the
+    /// production list constructed below.
     #[must_use]
     pub fn with_config(config: RuntimeContentSecurityConfig) -> Self {
         // Frozen order — must match the historical content_checkers vector.
         //
         // The Lane 1 body budget is threaded in here and nowhere else: this is
         // the single construction site for the four detectors, so one config
-        // value governs all of them and they cannot drift apart. The shipped
-        // default is `UNLIMITED`, i.e. the historical target set.
+        // value governs all of them and they cannot drift apart. Both defaults
+        // are 64 KiB (`Lane1BodyBudget::DEFAULT` compiled in,
+        // `content_security.lane1.max_body_bytes = 65536` shipped); `0` restores
+        // the historical unlimited target set and is an explicit opt-in.
         let lane1_body_budget = config.lane1_body_budget;
         if lane1_body_budget.is_unlimited() {
             // `0` is a deliberate operator choice and the process should say so:
@@ -334,14 +354,18 @@ impl ContentSecuritySubsystem {
             state.mark_degraded();
         }
 
-        // ── Lane 2: additive semantic scoring (off by default) ───────────────
+        // ── Lane 2: additive semantic scoring ────────────────────────────────
         // The lane runs only when it is enabled AND the enforcement mode is not
         // `off`. `off` means "produce no action at all" (codex A-2): no
         // preprocessing, no detection, no LogOnly event and no observation — it
         // is behaviourally identical to `enabled = false`. `log_only` and
-        // `enforce` both run the lane; in P1b `enforce` is not wired to the block
-        // path, so it behaves like `log_only` (detect + log + persist, never
-        // Block) and the startup logs a WARN.
+        // `enforce` both run the lane.
+        //
+        // The gate below is reached on every request under `configs/default.toml`
+        // (`enabled = true`, `enforcement_mode = "log_only"`) and passed: shipped
+        // installs run the whole preprocess → detect → score pipeline, they just
+        // never turn the result into a Block. Only a zero-config process, whose
+        // compiled default is `enabled = false`, returns here.
         if !self.config.enabled || self.config.enforcement_mode == EnforcementMode::Off {
             return ContentVerdict::None;
         }

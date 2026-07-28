@@ -154,10 +154,15 @@ pub fn pick(table: &[&'static str], selector: u8) -> &'static str {
 
 /// A Lane 2 runtime config with the semantic lane **on** in shadow mode.
 ///
-/// `enabled = false` (the shipped default) short-circuits `evaluate_scoped`
-/// before any preprocessing, which would leave the entire semantic engine —
-/// the whole point of these targets — unfuzzed. `LogOnly` keeps the lane
-/// side-effect free while still running preprocess → every detector → scoring.
+/// `ContentSecurityConfig::default()` is `enabled = false` — the **compiled**
+/// default, not the shipped one: `configs/default.toml` sets `enabled = true`,
+/// so real installs do run this lane. Building the harness config from the
+/// compiled default would short-circuit `evaluate_scoped` before any
+/// preprocessing and leave the entire semantic engine — the whole point of these
+/// targets, and the code an install actually reaches — unfuzzed. Turning
+/// `enabled` back on here is what makes the target match production. `LogOnly`
+/// (the shipped enforcement mode too) keeps the lane side-effect free while
+/// still running preprocess → every detector → scoring.
 ///
 /// Falls back to the compiled default if a future validation rule rejects the
 /// programmatic config, so the harness itself can never panic here.
