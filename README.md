@@ -232,6 +232,8 @@ enabled     = false
 listen_addr = "0.0.0.0:443"
 cert_pem    = "/etc/ssl/certs/server.pem"
 key_pem     = "/etc/ssl/private/server.key"
+# On a non-443 listen port, every [[hosts]] entry served over HTTP/3 must
+# declare that same port — see "HTTP/3 on a non-default port" below.
 
 [security]
 admin_ip_allowlist      = []        # empty = allow all
@@ -298,6 +300,40 @@ fallback_action       = "allow"     # allow | block | log — what the bouncer d
 # ssl         = false
 # guard_status = true
 ```
+
+### HTTP/3 on a non-default port
+
+A `[[hosts]]` entry is routable under `host:port`. It is *additionally* routable
+under the bare `host` only when its `port` is 80 or 443 — a request for
+`example.com:31337` does not inherit the `example.com:80` policy, deliberately.
+
+HTTP/3 carries no `Host` header. It is routed on RFC 9114's `:authority`, and
+clients include the port there whenever it is not the scheme default:
+`curl --http3 https://site.example:18443/` sends `:authority:
+site.example:18443`. So an off-port HTTP/3 listener must be matched by hosts
+declared on that same port:
+
+```toml
+[http3]
+enabled     = true
+listen_addr = "0.0.0.0:18443"
+
+[[hosts]]
+host        = "site.example"
+port        = 18443          # the [http3] listen port — not 443
+remote_host = "127.0.0.1"
+remote_port = 8080
+```
+
+Declare `port = 443` instead and every HTTP/3 request 404s: the lookup key is
+`site.example:18443`, the registered key is `site.example:443`, and the
+bare-hostname fallback is withheld because 18443 is not a default port. The
+upstream is never contacted, and nothing in the log mentions the port.
+
+The rule is the router's, not HTTP/3's — HTTP/1.1 on a non-default port has
+always behaved this way. HTTP/3 is just the first protocol here that is commonly
+run off-port, e.g. unprivileged or behind a NAT. Serving one site on both a
+default and a non-default port takes one `[[hosts]]` entry per port.
 
 ---
 

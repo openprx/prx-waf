@@ -1306,7 +1306,20 @@ impl Default for CacheConfig {
 pub struct Http3Config {
     /// Enable HTTP/3 listener
     pub enabled: bool,
-    /// UDP listen address for QUIC
+    /// UDP listen address for QUIC.
+    ///
+    /// On a port other than 443, every `[[hosts]]` entry to be served over
+    /// HTTP/3 must declare *that* port. HTTP/3 has no `Host` header and is
+    /// routed on RFC 9114's `:authority`, which clients populate with the port
+    /// whenever it is not the scheme default (`curl https://a.example:18443/`
+    /// sends `:authority: a.example:18443`). `gateway::router::HostRouter`
+    /// registers the bare-hostname key only for ports 80/443 and withholds the
+    /// bare-host fallback for any other port, so a host declared `port = 443`
+    /// behind an 18443 listener resolves to nothing and answers 404.
+    ///
+    /// This is the router's rule rather than anything new to HTTP/3 — HTTP/1.1
+    /// on a non-default port has always obeyed it. It is documented here because
+    /// HTTP/3 is the first listener commonly run off-port.
     pub listen_addr: String,
     /// Path to TLS certificate PEM (required when enabled)
     pub cert_pem: Option<String>,

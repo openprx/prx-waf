@@ -279,6 +279,32 @@ max_ttl_secs = 3600
 # HTTP/3 needs a TLS cert + key, so it stays off for a zero-config single node.
 # It auto-enables once BOTH cert_pem and key_pem are configured (no need to also
 # flip `enabled`); uncomment those two lines to turn it on.
+#
+# ON A NON-443 PORT, REGISTER YOUR HOSTS WITH THAT PORT.
+#
+# A `[[hosts]]` entry is routable under `host:port`, and additionally under the
+# bare `host` only when its `port` is 80 or 443. HTTP/3 carries no `Host` header;
+# it is routed on RFC 9114's `:authority`, and clients put the port in it whenever
+# it is not the scheme default — `curl https://site.example:18443/` sends
+# `:authority: site.example:18443`. So with `listen_addr = "0.0.0.0:18443"` a host
+# declared as `port = 443` is looked up under `site.example:18443`, does not match
+# `site.example:443`, is refused the bare-hostname fallback because 18443 is not a
+# default port, and answers 404 — the upstream is never contacted and nothing in
+# the log says "port".
+#
+#     [http3]
+#     listen_addr = "0.0.0.0:18443"
+#
+#     [[hosts]]
+#     host = "site.example"
+#     port = 18443            # must equal the [http3] listen port, not 443
+#     remote_host = "127.0.0.1"
+#     remote_port = 8080
+#
+# This is the router's long-standing rule and HTTP/1.1 on a non-default port has
+# always obeyed it; HTTP/3 is simply the first protocol here that is commonly run
+# off-port. Serving the same site on both a default and a non-default port needs
+# one `[[hosts]]` entry per port.
 [http3]
 enabled = false
 listen_addr = "0.0.0.0:443"
