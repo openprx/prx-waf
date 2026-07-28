@@ -7,6 +7,10 @@ can produce.
 The endpoint is **on by default** and bound to **`127.0.0.1:9127`**. It carries
 no credential. Both of those are deliberate; see [Exposure](#exposure).
 
+For how these series line up against the process log — which words match, which
+events one surface carries and the other does not, and why — see
+[`docs/logs-and-metrics.md`](logs-and-metrics.md).
+
 ---
 
 ## The endpoint
