@@ -9,13 +9,15 @@ use uuid::Uuid;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::{ProxyHttp, Session};
 
+use waf_common::metrics::{self, BudgetEvent, RequestAction};
 use waf_common::{HostConfig, RequestCtx, WafAction};
 use waf_engine::WafEngine;
 use waf_engine::checks::ResponseCheckSet;
 
 use crate::cache::ResponseCache;
 use crate::context::{
-    CACHE_BODY_LIMIT, FoldedHeaders, GatewayCtx, body_inspection_policy, fold_request_headers, rightmost_forwarded_for,
+    CACHE_BODY_LIMIT, FoldedHeaders, GatewayCtx, MAX_HEADER_VALUES_PER_NAME, body_inspection_policy,
+    fold_request_headers, rightmost_forwarded_for,
 };
 use crate::lb::LoadBalancerRegistry;
 use crate::response::{
@@ -389,6 +391,33 @@ fn release_body(forward: Option<Bytes>, end_of_stream: bool) -> Option<Bytes> {
     forward.or_else(|| withheld_body(end_of_stream))
 }
 
+/// Map a WAF decision onto the metric label, or `None` when the decision is a
+/// plain allow.
+///
+/// `None` rather than `Some(Allow)` so a later phase's real decision cannot be
+/// overwritten by an earlier phase's non-decision: the body phase runs after
+/// the header phase and both call this.
+const fn request_action_of(action: &WafAction) -> Option<RequestAction> {
+    match action {
+        WafAction::Allow => None,
+        WafAction::Block { .. } => Some(RequestAction::Block),
+        WafAction::LogOnly => Some(RequestAction::LogOnly),
+        WafAction::Redirect { .. } => Some(RequestAction::Redirect),
+    }
+}
+
+/// How many lines the raw request carries for `name`.
+///
+/// Only called on the refusal path, to tell the two `431` causes apart for the
+/// metric. `fold_request_headers` knows which bound it hit but returns only the
+/// offending name; threading a reason back out would put a metrics concern into
+/// the fold return type for the benefit of a path that is, by construction,
+/// rare.
+fn header_line_count(headers: &http::HeaderMap, name: &str) -> usize {
+    name.parse::<http::HeaderName>()
+        .map_or(0, |name| headers.get_all(&name).iter().count())
+}
+
 #[async_trait]
 impl ProxyHttp for WafProxy {
     type CTX = GatewayCtx;
@@ -461,6 +490,15 @@ impl ProxyHttp for WafProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut GatewayCtx) -> pingora_core::Result<bool> {
+        // Start the request clock before anything can return early, so the
+        // duration histogram covers ACME probes, 404s and refusals rather than
+        // only the requests that made it to an upstream. `enabled()` gates the
+        // clock read itself: with metrics off this is one `OnceLock` load and no
+        // `clock_gettime`.
+        if metrics::enabled() {
+            ctx.started_at = Some(std::time::Instant::now());
+        }
+
         // ── ACME HTTP-01 challenge (M-4) ──────────────────────────────────────
         // Answer Let's Encrypt validation probes before any host routing or WAF
         // inspection. Reads only the raw request path from the session and is
@@ -498,6 +536,8 @@ impl ProxyHttp for WafProxy {
         if folded.duplicate_host {
             // RFC 9112 §3.2: more than one Host line is unroutable — we would
             // pick one and the origin might pick the other.
+            metrics::record_budget_event(BudgetEvent::DuplicateHost);
+            ctx.metric_action = Some(RequestAction::Block);
             warn!(
                 "Rejecting request with duplicate Host headers: ip={}",
                 self.extract_client_ip(session)
@@ -512,6 +552,18 @@ impl ProxyHttp for WafProxy {
         if let Some(name) = &folded.overflow {
             // The folded value would be incomplete; inspecting a truncated
             // header is exactly the bypass the fold closes, so refuse instead.
+            // `fold_request_headers` records only the first offending name, so
+            // which of the two bounds was hit is re-derived here rather than
+            // threaded back out of the fold: over the line count, or over the
+            // byte count.
+            metrics::record_budget_event(
+                if header_line_count(&session.req_header().headers, name) > MAX_HEADER_VALUES_PER_NAME {
+                    BudgetEvent::HeaderValueCountExceeded
+                } else {
+                    BudgetEvent::HeaderFoldBytesExceeded
+                },
+            );
+            ctx.metric_action = Some(RequestAction::Block);
             warn!(
                 "Rejecting request: header '{name}' exceeds the fold limits: ip={}",
                 self.extract_client_ip(session)
@@ -534,10 +586,22 @@ impl ProxyHttp for WafProxy {
 
         debug!("Routing request for host: {}", host_header);
 
+        // Intern the host label once. Everything downstream indexes with the
+        // integer, so this is the only hash+probe on the request path. An
+        // unroutable host is deliberately resolved anyway: 404 volume per
+        // requested hostname is exactly the signal that tells an operator a
+        // site is misconfigured rather than merely quiet.
+        ctx.metric_host = metrics::resolve_host(&host_header);
+
         let Some(host_config) = self.router.resolve(&host_header) else {
             // Unknown host: previously fell through to a pass-through; now we
             // respond 404 so unrouted traffic is never forwarded / inspected.
             warn!("No route found for host: {host_header}");
+            // Counted as a Block: the WAF refused it and nothing reached an
+            // upstream. `prxwaf_responses_total{status="4xx"}` carries the 404
+            // itself, so the two together separate "refused by routing" from
+            // "refused by detection", which `prxwaf_detections_total` answers.
+            ctx.metric_action = Some(RequestAction::Block);
             let response = pingora_http::ResponseHeader::build(404, None)?;
             session.write_response_header(Box::new(response), false).await?;
             session
@@ -549,6 +613,7 @@ impl ProxyHttp for WafProxy {
         // Site administratively closed → 503 (previously an opaque proxy error).
         if !host_config.start_status {
             warn!("Site closed for host: {host_header}");
+            ctx.metric_action = Some(RequestAction::Block);
             let response = pingora_http::ResponseHeader::build(503, None)?;
             session.write_response_header(Box::new(response), false).await?;
             session
@@ -594,6 +659,14 @@ impl ProxyHttp for WafProxy {
 
         // Persist the (GeoIP-enriched) request context for the body phase and logging.
         ctx.request_ctx = Some(request_ctx);
+
+        // Record the decision even when it allows: `LogOnly` is an allow for
+        // the request and a detection for the operator, and the two must not be
+        // conflated. `record_detection` fires from the engine, which is the only
+        // place that knows which phase produced the verdict.
+        if let Some(action) = request_action_of(&decision.action) {
+            ctx.metric_action = Some(action);
+        }
 
         if !decision.is_allowed() {
             match &decision.action {
@@ -675,6 +748,8 @@ impl ProxyHttp for WafProxy {
         *body = withheld_body(end_of_stream);
 
         if step.reject {
+            metrics::record_budget_event(BudgetEvent::RequestBodyRejected);
+            ctx.metric_action = Some(RequestAction::Block);
             let policy = body_inspection_policy();
             let (ip, path, host) = ctx.request_ctx.as_ref().map_or_else(
                 || (String::from("unknown"), String::new(), String::new()),
@@ -697,6 +772,10 @@ impl ProxyHttp for WafProxy {
 
         if step.over_cap {
             // Only reachable under the opt-in fail-open policy — never silent.
+            // docs/dos-budget.md §1.1 recorded that this path had a WARN and no
+            // counter, so an operator could not alert on how much traffic was
+            // being forwarded past the inspection ceiling. This is that counter.
+            metrics::record_budget_event(BudgetEvent::RequestBodyForwardedUninspected);
             let policy = body_inspection_policy();
             warn!(
                 "Request body exceeds the {} byte inspection ceiling; remaining bytes are forwarded UNINSPECTED \
@@ -729,6 +808,10 @@ impl ProxyHttp for WafProxy {
             .engine
             .inspect_body_with_state(&mut request_ctx, &mut ctx.content_inspection)
             .await;
+
+        if let Some(action) = request_action_of(&decision.action) {
+            ctx.metric_action = Some(action);
+        }
 
         if !decision.is_allowed() {
             match &decision.action {
@@ -951,7 +1034,31 @@ impl ProxyHttp for WafProxy {
         Ok(None)
     }
 
-    async fn logging(&self, _session: &mut Session, error: Option<&pingora_core::Error>, ctx: &mut GatewayCtx) {
+    async fn logging(&self, session: &mut Session, error: Option<&pingora_core::Error>, ctx: &mut GatewayCtx) {
+        // Pingora calls this exactly once per request on every path — the normal
+        // finish (`pingora-proxy-0.8.1/src/lib.rs:411`), the `request_filter`
+        // short-circuit where the WAF already wrote the response (`:786`) and
+        // the error path (`:968`) — which makes it the only place a request
+        // counter can be incremented exactly once. Recording at the decision
+        // sites instead would double-count: a request is decided in the header
+        // phase and again per body window.
+        //
+        // The default is `Allow`, because reaching here with no stashed decision
+        // means nothing refused the request.
+        if metrics::enabled() {
+            let host = ctx.metric_host;
+            metrics::record_request(host, ctx.metric_action.unwrap_or(RequestAction::Allow));
+            // The status actually written downstream, not the one the WAF
+            // intended: an upstream 502 and a WAF 403 are both interesting and
+            // only this reads the real one.
+            if let Some(written) = session.response_written() {
+                metrics::record_response(host, written.status.as_u16());
+            }
+            if let Some(started) = ctx.started_at {
+                metrics::record_request_duration(host, started.elapsed());
+            }
+        }
+
         // Release the load-balanced backend's active-connection slot (paired
         // with the acquire in `upstream_peer`) so Least-Connections accounting
         // stays balanced even on errors / early termination.
@@ -972,6 +1079,11 @@ impl ProxyHttp for WafProxy {
                 _ => None,
             };
             if let Some(stage) = stage {
+                metrics::record_budget_event(match err.etype() {
+                    pingora_core::ErrorType::ConnectTimedout => BudgetEvent::UpstreamConnectTimeout,
+                    pingora_core::ErrorType::WriteTimedout => BudgetEvent::UpstreamWriteTimeout,
+                    _ => BudgetEvent::UpstreamReadTimeout,
+                });
                 warn!(
                     target: "waf.upstream_timeout",
                     "Upstream {stage} timeout ({}) → upstream={} host={} path={}",
@@ -1007,6 +1119,48 @@ mod tests {
     fn withheld_chunk_is_empty_not_none() {
         assert_eq!(withheld_body(false), Some(Bytes::new()));
         assert_eq!(withheld_body(true), None);
+    }
+
+    /// The header phase and the body phase both stash a decision, and the body
+    /// phase runs last. A plain allow must not be able to overwrite a `LogOnly`
+    /// the header phase already recorded, which is why this returns `None`
+    /// rather than `Some(Allow)`.
+    #[test]
+    fn a_plain_allow_does_not_overwrite_an_earlier_decision() {
+        assert_eq!(request_action_of(&WafAction::Allow), None);
+        assert_eq!(request_action_of(&WafAction::LogOnly), Some(RequestAction::LogOnly));
+        assert_eq!(
+            request_action_of(&WafAction::Block {
+                status: 403,
+                body: None
+            }),
+            Some(RequestAction::Block)
+        );
+        assert_eq!(
+            request_action_of(&WafAction::Redirect {
+                url: "https://example.test/".to_string()
+            }),
+            Some(RequestAction::Redirect)
+        );
+    }
+
+    /// The two `431` causes are distinguished by re-counting the header lines,
+    /// so the count has to be right — including for a name the request does not
+    /// carry at all, which the fold cannot produce but a future caller could.
+    #[test]
+    fn header_lines_are_counted_per_name() {
+        let mut headers = http::HeaderMap::new();
+        for value in ["a=1", "b=2", "c=3"] {
+            headers.append(
+                http::HeaderName::from_static("cookie"),
+                http::HeaderValue::from_static(value),
+            );
+        }
+        assert_eq!(header_line_count(&headers, "cookie"), 3);
+        assert_eq!(header_line_count(&headers, "user-agent"), 0);
+        // An unparseable name cannot index a HeaderMap; report zero rather than
+        // failing the refusal path that is trying to emit a metric.
+        assert_eq!(header_line_count(&headers, "not a header name"), 0);
     }
 
     #[test]

@@ -182,6 +182,7 @@ impl ResponseCache {
                 // Only involuntary removals are "evictions"; an operator
                 // purging a key is not cache pressure.
                 if matches!(cause, RemovalCause::Size | RemovalCause::Expired) {
+                    waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::CacheEviction);
                     evict_stats.evictions.fetch_add(1, Ordering::Relaxed);
                 }
             })
@@ -220,6 +221,7 @@ impl ResponseCache {
     /// counter meaning what its name says on the path that actually produces
     /// refusals.
     pub fn note_oversize_reject(&self) {
+        waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::CacheOversizeReject);
         self.stats.oversize_rejects.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -309,6 +311,7 @@ impl ResponseCache {
                 max_entry_bytes = self.max_entry_bytes,
                 "skipping cache: entry exceeds the per-entry size cap"
             );
+            waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::CacheOversizeReject);
             self.stats.oversize_rejects.fetch_add(1, Ordering::Relaxed);
             return false;
         }

@@ -565,6 +565,7 @@ where
     }
 
     if too_large {
+        waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::Http3BodyRejected);
         warn!(
             "H3 request body exceeds {} byte limit: ip={} host={}",
             MAX_H3_REQUEST_BODY, request_ctx.client_ip, request_ctx.host,

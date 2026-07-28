@@ -54,6 +54,7 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
 use tracing::warn;
+use waf_common::metrics::{self, BudgetEvent};
 use waf_common::{RequestCtx, ResponseCtx, is_inspectable_response_media_type, is_opaque_content_encoding};
 
 use crate::context::{MAX_FOLDED_HEADER_BYTES, MAX_HEADER_VALUES_PER_NAME};
@@ -493,6 +494,10 @@ impl ResponseInspector {
 
         self.holding_since = None;
         if over_cap {
+            // From here the rest of the body is delivered uninspected. Counted
+            // once per response, not per chunk: `passthrough` latches, and this
+            // is the transition, so a 100 MiB response contributes 1.
+            metrics::record_budget_event(BudgetEvent::ResponseBodyTruncated);
             self.passthrough = true;
         }
 

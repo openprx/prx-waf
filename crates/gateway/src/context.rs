@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
 use tracing::warn;
+use waf_common::metrics::{HostSlot, RequestAction};
 use waf_common::{HostConfig, RequestCtx};
 use waf_engine::ContentInspectionState;
 
@@ -484,6 +486,29 @@ pub struct GatewayCtx {
     /// Accumulated upstream response body for the pending cache store.
     pub cache_body: BytesMut,
     // ── Response-phase WAF ─────────────────────────────────────────────────────
+    // ── Metrics ────────────────────────────────────────────────────────────────
+    /// Interned `host` metric label, resolved once in `request_filter`.
+    ///
+    /// Held rather than re-resolved because the resolution is the only part of
+    /// recording that is not a bare atomic (it hashes and probes an
+    /// open-addressed table), and because a request must report the same host
+    /// slot in every phase even if the routing table changes underneath it.
+    /// Defaults to the `__other__` fold, which is what an unrouted request —
+    /// one answered 404 before a host was ever resolved — correctly reports as.
+    pub metric_host: HostSlot,
+    /// When this request entered the WAF. `None` when metrics are disabled, so
+    /// the clock is never read on a build nobody is scraping.
+    pub started_at: Option<Instant>,
+    /// The WAF's decision, stashed at the moment it is made and reported once
+    /// in `logging`.
+    ///
+    /// Recording at the decision site instead would double-count: a request can
+    /// be decided in the header phase and again per body window. `logging` is
+    /// called exactly once per request on every Pingora path — including the
+    /// short-circuit where `request_filter` already wrote the response
+    /// (`pingora-proxy-0.8.1/src/lib.rs:786`) and the error path (`:968`) — so
+    /// it is the only place an exactly-once request counter can live.
+    pub metric_action: Option<RequestAction>,
     /// Armed response-body inspector, or `None` when this response is not
     /// inspected.
     ///
