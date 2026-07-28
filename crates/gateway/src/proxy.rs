@@ -397,7 +397,11 @@ fn release_body(forward: Option<Bytes>, end_of_stream: bool) -> Option<Bytes> {
 /// `None` rather than `Some(Allow)` so a later phase's real decision cannot be
 /// overwritten by an earlier phase's non-decision: the body phase runs after
 /// the header phase and both call this.
-const fn request_action_of(action: &WafAction) -> Option<RequestAction> {
+///
+/// Shared with the HTTP/3 handler rather than duplicated there: the mapping is
+/// what makes `action="block"` mean the same thing on both protocols, and two
+/// copies of it would be free to drift on one dashboard.
+pub(crate) const fn request_action_of(action: &WafAction) -> Option<RequestAction> {
     match action {
         WafAction::Allow => None,
         WafAction::Block { .. } => Some(RequestAction::Block),

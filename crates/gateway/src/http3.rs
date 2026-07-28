@@ -23,10 +23,12 @@ use bytes::{Buf, Bytes};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use waf_common::metrics::{self, HostSlot, RequestAction};
 use waf_common::{HostConfig, RequestCtx, WafAction};
 use waf_engine::WafEngine;
 
 use crate::context::{BodyOverflowAction, BodyWindows, body_inspection_policy, fold_request_headers};
+use crate::proxy::request_action_of;
 use crate::router::HostRouter;
 use crate::upstream_timeout::{UpstreamTimeouts, headers_are_streaming};
 
@@ -335,13 +337,51 @@ async fn handle_quic_connection(
     Ok(())
 }
 
+// ─── RED accounting ───────────────────────────────────────────────────────────
+
+/// What one finished HTTP/3 request contributes to the RED metrics.
+///
+/// The HTTP/1.1 path stashes exactly these three values on `GatewayCtx` and
+/// reads them back in Pingora's `logging()` callback, which runs once on every
+/// completion path and is therefore the only place a per-request counter can be
+/// bumped exactly once (`crate::proxy`). HTTP/3 has no such callback: the
+/// forwarder does not run under Pingora at all, so there is no equivalent
+/// position to record from. [`handle_h3_request`] is the stand-in — it wraps the
+/// handler proper, which cannot return without passing back through it — and
+/// this struct is the stand-in for the context the handler writes its verdict
+/// into on the way out.
+///
+/// Recording at the refusal sites instead would over-count for the same reason
+/// it does on HTTP/1.1: a request is decided in the header phase and again per
+/// body window.
+#[derive(Default)]
+struct H3Outcome {
+    /// Interned `host` label. Left at the `__other__` fold for a request
+    /// refused before an authority was resolved, which is where the HTTP/1.1
+    /// path leaves its own pre-routing refusals.
+    host: HostSlot,
+    /// The WAF's decision. `None` means nothing refused the request and reads
+    /// as `action="allow"`, matching the HTTP/1.1 default.
+    action: Option<RequestAction>,
+    /// The status actually written downstream — not the one this handler
+    /// intended — so an upstream 502 and a WAF 403 stay distinguishable. `None`
+    /// when no response header ever went out, which is what
+    /// `Session::response_written()` reports on the HTTP/1.1 path.
+    status: Option<u16>,
+}
+
 /// Send a simple (self-generated) HTTP/3 response with a body and finish the
 /// stream.  Used for WAF blocks, routing errors and oversized-body rejections.
+///
+/// Records the status into `outcome` only once the header has actually gone out,
+/// so a stream that dies mid-response contributes a request and a duration but
+/// no response — the same asymmetry the HTTP/1.1 path has.
 async fn respond_simple<C>(
     stream: &mut h3::server::RequestStream<C, Bytes>,
     status: http::StatusCode,
     content_type: &str,
     body: Bytes,
+    outcome: &mut H3Outcome,
 ) -> anyhow::Result<()>
 where
     C: h3::quic::BidiStream<Bytes>,
@@ -355,11 +395,84 @@ where
         .map_err(|e| anyhow::anyhow!("failed to build H3 response: {e}"))?;
 
     stream.send_response(response).await.context("h3 send_response")?;
+    outcome.status = Some(status.as_u16());
     if !body.is_empty() {
         stream.send_data(body).await.context("h3 send_data")?;
     }
     stream.finish().await.context("h3 finish")?;
     Ok(())
+}
+
+/// Serve one HTTP/3 request and record it on the RED metrics exactly once.
+///
+/// This is the HTTP/3 counterpart of Pingora's `logging()` callback and exists
+/// for the same reason: [`serve_h3_request`] has a dozen return paths — four
+/// refusals before routing, two 413s, a WAF block, a WAF redirect, two upstream
+/// failures, the normal relay, and any `?` on the QUIC stream — and every one of
+/// them has to contribute one `prxwaf_requests_total`, one duration observation
+/// and at most one `prxwaf_responses_total`. Wrapping is the only structure that
+/// gets that for free; a counter at each site would be twelve places to forget.
+///
+/// The clock starts before routing, so the histogram covers refusals rather than
+/// only the requests that reached an upstream — as it does on HTTP/1.1.
+///
+/// Neither protocol adds a `proto` label. See `docs/metrics.md`.
+async fn handle_h3_request<C>(
+    req: http::Request<()>,
+    stream: h3::server::RequestStream<C, Bytes>,
+    clients: &UpstreamClients,
+    engine: &WafEngine,
+    router: &HostRouter,
+    peer: SocketAddr,
+    smuggling_detection: bool,
+) -> anyhow::Result<()>
+where
+    C: h3::quic::BidiStream<Bytes>,
+{
+    // `enabled()` gates the clock read itself: with metrics off this is one
+    // `OnceLock` load and no `clock_gettime`, per request.
+    let started = metrics::enabled().then(std::time::Instant::now);
+    let mut outcome = H3Outcome::default();
+
+    let result = serve_h3_request(
+        req,
+        stream,
+        clients,
+        engine,
+        router,
+        peer,
+        smuggling_detection,
+        &mut outcome,
+    )
+    .await;
+
+    // Recorded on the error path too: a request whose QUIC stream broke still
+    // happened, and dropping it would make the request count disagree with the
+    // duration count under exactly the conditions worth alerting on.
+    record_h3_outcome(&outcome, started);
+
+    result
+}
+
+/// Translate one finished request's [`H3Outcome`] into the three RED series.
+///
+/// Split out from [`handle_h3_request`] because it is the half that can be
+/// driven in a unit test: `h3::server::RequestStream` has no public constructor,
+/// so the handler itself is only reachable over a real QUIC connection (see
+/// `tests/e2e-http3-red-metrics.sh`), while this arithmetic — the `allow`
+/// default, the response series existing only when a header went out, the shared
+/// host table — is exactly where a divergence from HTTP/1.1 would hide.
+fn record_h3_outcome(outcome: &H3Outcome, started: Option<std::time::Instant>) {
+    if !metrics::enabled() {
+        return;
+    }
+    metrics::record_request(outcome.host, outcome.action.unwrap_or(RequestAction::Allow));
+    if let Some(status) = outcome.status {
+        metrics::record_response(outcome.host, status);
+    }
+    if let Some(started) = started {
+        metrics::record_request_duration(outcome.host, started.elapsed());
+    }
 }
 
 /// Handle one HTTP/3 request: route → WAF (header + body) → forward → relay.
@@ -373,7 +486,14 @@ where
 ///      ([`WafEngine::inspect_body`]).
 ///   4. Forward the request (original headers + body) to the per-host upstream
 ///      and relay the upstream status / headers / body back to the client.
-async fn handle_h3_request<C>(
+///
+/// Writes its verdict into `outcome` as it goes; [`handle_h3_request`] turns
+/// that into the metrics after this returns, however it returns.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one accounting out-parameter past the lint's bound"
+)]
+async fn serve_h3_request<C>(
     req: http::Request<()>,
     mut stream: h3::server::RequestStream<C, Bytes>,
     clients: &UpstreamClients,
@@ -381,6 +501,7 @@ async fn handle_h3_request<C>(
     router: &HostRouter,
     peer: SocketAddr,
     smuggling_detection: bool,
+    outcome: &mut H3Outcome,
 ) -> anyhow::Result<()>
 where
     C: h3::quic::BidiStream<Bytes>,
@@ -408,16 +529,21 @@ where
     if folded.duplicate_host {
         // Refused before `route_authority`, which compares `:authority` with
         // the first `Host` line only — as does the `h3` decoder.
+        // No authority has been settled on, so this lands on `__other__`, which
+        // is where the HTTP/1.1 path leaves the same refusal.
+        outcome.action = Some(RequestAction::Block);
         warn!("Rejecting H3 request with duplicate Host headers: ip={}", client_ip);
         return respond_simple(
             &mut stream,
             http::StatusCode::BAD_REQUEST,
             "text/plain; charset=utf-8",
             Bytes::from_static(b"Bad Request"),
+            outcome,
         )
         .await;
     }
     if let Some(name) = &folded.overflow {
+        outcome.action = Some(RequestAction::Block);
         warn!(
             "Rejecting H3 request: header '{name}' exceeds the fold limits: ip={}",
             client_ip
@@ -427,6 +553,7 @@ where
             http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             "text/plain; charset=utf-8",
             Bytes::from_static(b"Request Header Fields Too Large"),
+            outcome,
         )
         .await;
     }
@@ -436,6 +563,11 @@ where
     let authority = match route_authority(&parts.uri, &parts.headers) {
         RouteAuthority::Found(a) => a,
         RouteAuthority::Contradicted => {
+            // Deliberately not attributed to either candidate: the request is
+            // refused precisely because which host it addressed is unknowable,
+            // and interning one of the two would put a name on the wrong site's
+            // block rate.
+            outcome.action = Some(RequestAction::Block);
             warn!(
                 "Rejecting H3 request whose Host disagrees with :authority: ip={}",
                 client_ip
@@ -445,6 +577,7 @@ where
                 http::StatusCode::BAD_REQUEST,
                 "text/plain; charset=utf-8",
                 Bytes::from_static(b"Bad Request"),
+                outcome,
             )
             .await;
         }
@@ -453,6 +586,16 @@ where
         // default config, never a forward.
         RouteAuthority::Missing => "",
     };
+
+    // Intern the host label once, before routing, so a 404 is attributed to the
+    // authority that asked for it: per-authority 404 volume is what tells an
+    // operator a site is misconfigured rather than merely quiet. The empty
+    // string an unroutable request carries is interned as-is, which is what the
+    // HTTP/1.1 path does with a missing `Host` header, so the two protocols
+    // agree on that label value too. Every host past `max_host_labels` folds
+    // into `__other__` inside `resolve_host` — HTTP/3 shares that one bounded
+    // table rather than keeping its own.
+    outcome.host = metrics::resolve_host(authority);
 
     // The detectors must not see a different request depending on the wire
     // protocol: a rule that matches on the `Host` header has to fire on HTTP/3
@@ -470,12 +613,19 @@ where
         // Unknown authority: previously this path built a default HostConfig
         // and forwarded anyway (audit H-7). Now unrouted traffic is refused and
         // never reaches an upstream.
+        //
+        // Counted as a block, as on HTTP/1.1: the WAF refused it and nothing
+        // reached an upstream. `prxwaf_responses_total{status="4xx"}` carries
+        // the 404 itself, which is what separates "refused by routing" from
+        // "refused by detection".
+        outcome.action = Some(RequestAction::Block);
         warn!("No H3 route found for authority: {authority}");
         return respond_simple(
             &mut stream,
             http::StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
             Bytes::from_static(b"Not Found"),
+            outcome,
         )
         .await;
     };
@@ -497,12 +647,14 @@ where
 
     // Administratively closed site → 503.
     if !host_config.start_status {
+        outcome.action = Some(RequestAction::Block);
         warn!("H3 site closed for authority: {authority}");
         return respond_simple(
             &mut stream,
             http::StatusCode::SERVICE_UNAVAILABLE,
             "text/plain; charset=utf-8",
             Bytes::from_static(b"Service Unavailable"),
+            outcome,
         )
         .await;
     }
@@ -537,8 +689,15 @@ where
     let decision = engine
         .inspect_with_state(&mut request_ctx, &mut content_inspection)
         .await;
+    // Recorded even when the decision allows: `log_only` is an allow for the
+    // request and a detection for the operator, and conflating the two is what
+    // makes a shadow rollout unreadable. `request_action_of` is the HTTP/1.1
+    // mapping, imported rather than restated.
+    if let Some(action) = request_action_of(&decision.action) {
+        outcome.action = Some(action);
+    }
     if !decision.is_allowed()
-        && let Some(handled) = respond_waf_action(&mut stream, &decision.action, &request_ctx).await?
+        && let Some(handled) = respond_waf_action(&mut stream, &decision.action, &request_ctx, outcome).await?
     {
         return handled;
     }
@@ -565,7 +724,10 @@ where
     }
 
     if too_large {
-        waf_common::metrics::record_budget_event(waf_common::metrics::BudgetEvent::Http3BodyRejected);
+        metrics::record_budget_event(metrics::BudgetEvent::Http3BodyRejected);
+        // A refusal, so a block — the same label the HTTP/1.1 path puts on its
+        // own over-ceiling body rejection.
+        outcome.action = Some(RequestAction::Block);
         warn!(
             "H3 request body exceeds {} byte limit: ip={} host={}",
             MAX_H3_REQUEST_BODY, request_ctx.client_ip, request_ctx.host,
@@ -575,6 +737,7 @@ where
             http::StatusCode::PAYLOAD_TOO_LARGE,
             "text/plain; charset=utf-8",
             Bytes::from_static(b"Payload Too Large"),
+            outcome,
         )
         .await;
     }
@@ -589,6 +752,7 @@ where
         let ceiling = policy.max_total_bytes;
         if ceiling > 0 && body_buf.len() > ceiling {
             if policy.overflow == BodyOverflowAction::Reject {
+                outcome.action = Some(RequestAction::Block);
                 warn!(
                     "H3 request body ({} bytes) exceeds the {ceiling} byte inspection ceiling: ip={} host={}",
                     body_buf.len(),
@@ -600,6 +764,7 @@ where
                     http::StatusCode::PAYLOAD_TOO_LARGE,
                     "text/plain; charset=utf-8",
                     Bytes::from_static(b"Payload Too Large"),
+                    outcome,
                 )
                 .await;
             }
@@ -625,8 +790,14 @@ where
             let decision = engine
                 .inspect_body_with_state(&mut request_ctx, &mut content_inspection)
                 .await;
+            // A window that allows leaves an earlier phase's real decision
+            // standing — `request_action_of` returns `None` for a plain allow
+            // precisely so this loop cannot erase it.
+            if let Some(action) = request_action_of(&decision.action) {
+                outcome.action = Some(action);
+            }
             if !decision.is_allowed()
-                && let Some(handled) = respond_waf_action(&mut stream, &decision.action, &request_ctx).await?
+                && let Some(handled) = respond_waf_action(&mut stream, &decision.action, &request_ctx, outcome).await?
             {
                 return handled;
             }
@@ -672,12 +843,16 @@ where
     let resp = match req_builder.send().await {
         Ok(r) => r,
         Err(e) => {
+            // The decision stands as an allow: the WAF let this through and the
+            // upstream failed. `prxwaf_responses_total{status="5xx"}` carries
+            // the 502, and the pair of series is what tells the two apart.
             log_upstream_failure(&e, &request_ctx.host, &target, "request");
             return respond_simple(
                 &mut stream,
                 http::StatusCode::BAD_GATEWAY,
                 "text/plain; charset=utf-8",
                 Bytes::from_static(b"Bad Gateway"),
+                outcome,
             )
             .await;
         }
@@ -698,6 +873,7 @@ where
                 http::StatusCode::BAD_GATEWAY,
                 "text/plain; charset=utf-8",
                 Bytes::from_static(b"Bad Gateway"),
+                outcome,
             )
             .await;
         }
@@ -719,6 +895,9 @@ where
         .map_err(|e| anyhow::anyhow!("failed to build H3 response: {e}"))?;
 
     stream.send_response(response).await.context("h3 send_response")?;
+    // The upstream's status, not this handler's — an origin 500 relayed intact
+    // must show up as a 5xx even though the WAF's own decision was an allow.
+    outcome.status = Some(status.as_u16());
     if !body_bytes.is_empty() {
         stream.send_data(body_bytes).await.context("h3 send_data")?;
     }
@@ -754,6 +933,7 @@ async fn respond_waf_action<C>(
     stream: &mut h3::server::RequestStream<C, Bytes>,
     action: &WafAction,
     ctx: &RequestCtx,
+    outcome: &mut H3Outcome,
 ) -> anyhow::Result<Option<anyhow::Result<()>>>
 where
     C: h3::quic::BidiStream<Bytes>,
@@ -766,7 +946,14 @@ where
             );
             let status_code = http::StatusCode::from_u16(*status).unwrap_or(http::StatusCode::FORBIDDEN);
             let body_str = body.clone().unwrap_or_else(|| "Access Denied".to_string());
-            let result = respond_simple(stream, status_code, "text/html; charset=utf-8", Bytes::from(body_str)).await;
+            let result = respond_simple(
+                stream,
+                status_code,
+                "text/html; charset=utf-8",
+                Bytes::from(body_str),
+                outcome,
+            )
+            .await;
             Ok(Some(result))
         }
         WafAction::Redirect { url } => {
@@ -779,6 +966,7 @@ where
                 .map_err(|e| anyhow::anyhow!("failed to build H3 redirect response: {e}"))?;
             let result = async {
                 stream.send_response(response).await.context("h3 send_response")?;
+                outcome.status = Some(http::StatusCode::FOUND.as_u16());
                 stream.finish().await.context("h3 finish")?;
                 Ok(())
             }
@@ -1047,6 +1235,190 @@ mod tests {
         )
         .expect("build");
         assert!(clients.exempt.is_none());
+    }
+
+    // ── RED accounting ──────────────────────────────────────────────────────
+
+    /// Count of one `name{labels} value` series in a scrape, or 0 when the
+    /// series is absent — a counter that has never been touched is not exported.
+    fn series(text: &str, name: &str, labels: &str) -> u64 {
+        let prefix = format!("{name}{{{labels}}} ");
+        text.lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Every H3 return path, recorded once each, lands on the labels the
+    /// HTTP/1.1 path would have used for the same outcome.
+    ///
+    /// One test rather than several: `waf_common::metrics` is a process-global
+    /// registry, so two tests recording into it concurrently would each see the
+    /// other's counts. The whole table is driven here and asserted once.
+    ///
+    /// This proves the translation, not the wiring — that each request passes
+    /// through it exactly once is a property of the real handler and is asserted
+    /// against a live QUIC client in `tests/e2e-http3-red-metrics.sh`.
+    #[test]
+    fn every_h3_return_path_records_the_labels_http1_would_have() {
+        assert!(
+            waf_common::metrics::init(&waf_common::metrics::MetricsConfig::default()),
+            "no other gateway test may initialise the global registry"
+        );
+
+        let host = waf_common::metrics::resolve_host("h3.test");
+        // The refusals that happen before an authority is settled on keep the
+        // default slot, which is the `__other__` fold.
+        let unrouted = HostSlot::default();
+
+        // (host, action, status, times) — one row per return path of
+        // `serve_h3_request`, in the order they appear in it.
+        let paths: &[(HostSlot, Option<RequestAction>, Option<u16>, usize)] = &[
+            // duplicate Host → 400
+            (unrouted, Some(RequestAction::Block), Some(400), 1),
+            // header fold overflow → 431
+            (unrouted, Some(RequestAction::Block), Some(431), 1),
+            // :authority contradicted by Host → 400
+            (unrouted, Some(RequestAction::Block), Some(400), 1),
+            // unknown authority → 404
+            (host, Some(RequestAction::Block), Some(404), 2),
+            // site administratively closed → 503
+            (host, Some(RequestAction::Block), Some(503), 1),
+            // WAF header- or body-phase block → the rule's status
+            (host, Some(RequestAction::Block), Some(403), 1),
+            // WAF redirect
+            (host, Some(RequestAction::Redirect), Some(302), 1),
+            // body over the hard cap / inspection ceiling → 413
+            (host, Some(RequestAction::Block), Some(413), 1),
+            // log-only detection: an allow for the request, a detection for the
+            // operator, and the two must not be conflated
+            (host, Some(RequestAction::LogOnly), Some(200), 1),
+            // upstream unreachable → 502, still an allow decision
+            (host, None, Some(502), 1),
+            // normal relay
+            (host, None, Some(200), 3),
+            // the stream died before a response header went out: a request and
+            // a duration, no response
+            (host, None, None, 1),
+        ];
+
+        let mut sent = 0;
+        for &(host, action, status, times) in paths {
+            for _ in 0..times {
+                record_h3_outcome(&H3Outcome { host, action, status }, Some(std::time::Instant::now()));
+                sent += 1;
+            }
+        }
+
+        let text = waf_common::metrics::encode()
+            .expect("metrics are enabled")
+            .expect("encode");
+
+        // Requests, by action. 15 sent, 15 counted, none twice.
+        let routed = r#"host="h3.test""#;
+        let other = r#"host="__other__""#;
+        assert_eq!(
+            series(&text, "prxwaf_requests_total", &format!("{other},action=\"block\"")),
+            3
+        );
+        assert_eq!(
+            series(&text, "prxwaf_requests_total", &format!("{routed},action=\"block\"")),
+            5
+        );
+        assert_eq!(
+            series(&text, "prxwaf_requests_total", &format!("{routed},action=\"redirect\"")),
+            1
+        );
+        assert_eq!(
+            series(&text, "prxwaf_requests_total", &format!("{routed},action=\"log_only\"")),
+            1
+        );
+        // 5 allow: the 502, the three relays and the aborted stream. The
+        // log_only row is not one of them — that is the distinction the two
+        // series exist to keep.
+        assert_eq!(
+            series(&text, "prxwaf_requests_total", &format!("{routed},action=\"allow\"")),
+            5
+        );
+
+        let total: u64 = ["allow", "block", "log_only", "redirect"]
+            .iter()
+            .flat_map(|action| [other, routed].map(|host| format!("{host},action=\"{action}\"")))
+            .map(|labels| series(&text, "prxwaf_requests_total", &labels))
+            .sum();
+        assert_eq!(total, sent, "one request in, one counted");
+
+        // Responses, by class. One fewer than the requests: the row whose
+        // stream died wrote no header.
+        assert_eq!(
+            series(&text, "prxwaf_responses_total", &format!("{other},status=\"4xx\"")),
+            3
+        );
+        assert_eq!(
+            series(&text, "prxwaf_responses_total", &format!("{routed},status=\"2xx\"")),
+            4
+        );
+        assert_eq!(
+            series(&text, "prxwaf_responses_total", &format!("{routed},status=\"3xx\"")),
+            1
+        );
+        assert_eq!(
+            series(&text, "prxwaf_responses_total", &format!("{routed},status=\"4xx\"")),
+            4
+        );
+        assert_eq!(
+            series(&text, "prxwaf_responses_total", &format!("{routed},status=\"5xx\"")),
+            2
+        );
+
+        let responses: u64 = ["1xx", "2xx", "3xx", "4xx", "5xx"]
+            .iter()
+            .flat_map(|class| [other, routed].map(|host| format!("{host},status=\"{class}\"")))
+            .map(|labels| series(&text, "prxwaf_responses_total", &labels))
+            .sum();
+        assert_eq!(responses, sent - 1, "every request but the aborted one wrote a status");
+
+        // Durations: one observation per request, refusals included.
+        assert_eq!(
+            series(&text, "prxwaf_request_duration_seconds_count", routed)
+                + series(&text, "prxwaf_request_duration_seconds_count", other),
+            sent,
+        );
+
+        // The host label came from the shared bounded table, not a second one,
+        // so `max_host_labels` governs HTTP/3 as well.
+        assert_eq!(waf_common::metrics::resolve_host("h3.test"), host);
+    }
+
+    /// The default an unfinished outcome carries is the HTTP/1.1 default:
+    /// nothing refused the request, so it is an allow, attributed to the fold.
+    #[test]
+    fn a_request_no_path_decided_is_an_allow_on_the_fold() {
+        let outcome = H3Outcome::default();
+        assert_eq!(outcome.action.unwrap_or(RequestAction::Allow), RequestAction::Allow);
+        assert_eq!(outcome.host, HostSlot::default());
+        assert!(outcome.status.is_none());
+    }
+
+    /// The WAF-decision → label mapping is the HTTP/1.1 one, imported rather
+    /// than restated, so `action="block"` cannot come to mean two things.
+    #[test]
+    fn the_action_mapping_is_shared_with_http1() {
+        assert_eq!(request_action_of(&WafAction::Allow), None);
+        assert_eq!(
+            request_action_of(&WafAction::Block {
+                status: 403,
+                body: None
+            }),
+            Some(RequestAction::Block)
+        );
+        assert_eq!(request_action_of(&WafAction::LogOnly), Some(RequestAction::LogOnly));
+        assert_eq!(
+            request_action_of(&WafAction::Redirect {
+                url: "https://example.test/".to_string()
+            }),
+            Some(RequestAction::Redirect)
+        );
     }
 
     #[test]
