@@ -641,11 +641,28 @@ where
     for (name, value) in &parts.headers {
         let key = name.as_str();
         // Skip hop-by-hop headers and content-length (reqwest sets it from the
-        // body). The original Host header IS forwarded so upstream vhosts work.
-        if is_hop_by_hop(key) || key.eq_ignore_ascii_case("content-length") {
+        // body). `host` is re-derived below from the routed authority.
+        if is_hop_by_hop(key) || key.eq_ignore_ascii_case("content-length") || key.eq_ignore_ascii_case("host") {
             continue;
         }
         req_builder = req_builder.header(key, value.as_bytes());
+    }
+    // Name the origin's vhost with the authority this request was routed on.
+    // A compliant HTTP/3 client sends no Host line, so left alone reqwest
+    // derives one from the *upstream* address and a name-based origin serves
+    // the wrong site. Deriving it from the routed authority also makes the two
+    // impossible to disagree: whatever vhost the origin picks is the one whose
+    // policy the WAF just applied. The value is either a parsed
+    // `http::uri::Authority` or a `HeaderValue` the client already sent, so it
+    // cannot carry a control character into the upstream request.
+    if !authority.is_empty() {
+        match http::HeaderValue::from_str(authority) {
+            Ok(value) => req_builder = req_builder.header(http::header::HOST, value),
+            // Unreachable for anything h3 decoded — an authority holds no
+            // character a header value forbids. Record it instead of letting
+            // reqwest quietly substitute the backend address.
+            Err(e) => warn!("H3 authority '{authority}' is not a representable Host value: {e}"),
+        }
     }
     if !body_buf.is_empty() {
         req_builder = req_builder.body(body_buf);
