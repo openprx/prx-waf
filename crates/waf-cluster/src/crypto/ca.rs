@@ -103,16 +103,16 @@ impl CertificateAuthority {
             .context("failed to parse CA certificate DER")
     }
 
-    /// Reconstruct rcgen issuer objects from stored PEM for signing node certificates.
+    /// Reconstruct the rcgen issuer from stored PEM for signing node certificates.
     ///
-    /// Creates a fresh CA cert with the same keypair and subject DN so that
-    /// signed node certificates pass chain verification against the stored CA cert.
-    /// (The Subject Key Identifier is derived from the public key, so it matches
-    /// regardless of whether serial number / timestamps differ.)
+    /// Rebuilds the same subject DN and key usages the stored CA cert was minted
+    /// with, so signed node certificates pass chain verification against it. The
+    /// Authority Key Identifier is derived from the CA public key, which is the
+    /// key loaded here, so it matches regardless of serial number or timestamps.
     ///
     /// Returns an error if this CA was constructed without a private key
     /// (e.g. via [`Self::from_cert_pem`]).
-    pub fn as_rcgen_issuer(&self) -> Result<(rcgen::Certificate, rcgen::KeyPair)> {
+    pub fn as_rcgen_issuer(&self) -> Result<rcgen::Issuer<'static, rcgen::KeyPair>> {
         anyhow::ensure!(
             !self.key_pem.is_empty(),
             "CA private key is not available — this CA was loaded without a key (cert-only mode)"
@@ -128,11 +128,7 @@ impl CertificateAuthority {
         dn.push(DnType::OrganizationName, "prx-waf");
         ca_params.distinguished_name = dn;
 
-        let ca_cert = ca_params
-            .self_signed(&ca_key)
-            .context("failed to reconstruct CA cert for signing")?;
-
-        Ok((ca_cert, ca_key))
+        Ok(rcgen::Issuer::new(ca_params, ca_key))
     }
 }
 
@@ -165,8 +161,8 @@ mod tests {
     #[test]
     fn rcgen_issuer_reconstruction() {
         let ca = CertificateAuthority::generate(3650).unwrap();
-        let (cert, _key) = ca.as_rcgen_issuer().unwrap();
-        // The reconstructed cert should be self-signed (CA)
-        let _ = cert.pem();
+        let issuer = ca.as_rcgen_issuer().unwrap();
+        // The reconstructed issuer must carry the CA's signing key usages
+        assert_eq!(issuer.key_usages(), CA_KEY_USAGES);
     }
 }

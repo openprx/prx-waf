@@ -91,6 +91,21 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **rcgen 0.14 replaces the issuer certificate with an `Issuer` value, and the
+  cluster CA no longer mints a throwaway certificate to sign node certs.**
+  0.14 narrows `CertificateParams::signed_by` from `(key, &Certificate,
+  &KeyPair)` to `(key, &Issuer<'_, _>)`, where `Issuer` holds exactly the three
+  things signing actually reads: the issuer's distinguished name, its key
+  identifier method, and its key usages. `CertificateAuthority::as_rcgen_issuer`
+  previously had to self-sign a fresh CA certificate on every node-cert
+  issuance purely to have a `Certificate` to hand to `signed_by`; it now returns
+  `Issuer::new(params, key)` and that certificate is never built. The signed
+  output is unchanged — the DN, key usages and signing key are the same values
+  the discarded certificate carried, and the Authority Key Identifier still
+  derives from the CA public key. The cluster mTLS integration tests
+  (`two_node_heartbeat_exchange`, `mtls_rejects_unknown_cert`) exercise a real
+  QUIC handshake against a chain built this way and still pass.
+
 - **Two dependency majors with no call-site change: lz4_flex 0.14 and notify 8.**
   lz4_flex carries the cluster rule-sync snapshots (`sync/rules.rs`), where
   `checked_decompress` reads the four-byte little-endian uncompressed-size

@@ -31,7 +31,7 @@ impl NodeCertificate {
     /// Returns an error if CA reconstruction, keypair generation, or certificate
     /// signing fails.
     pub fn generate(node_id: &str, ca: &CertificateAuthority, validity_days: u32) -> Result<Self> {
-        let (ca_cert, ca_key) = ca.as_rcgen_issuer().context("failed to reconstruct CA")?;
+        let issuer = ca.as_rcgen_issuer().context("failed to reconstruct CA")?;
 
         let node_key = KeyPair::generate_for(&PKCS_ED25519).context("failed to generate node Ed25519 keypair")?;
 
@@ -60,7 +60,7 @@ impl NodeCertificate {
             vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
 
         let node_cert = node_params
-            .signed_by(&node_key, &ca_cert, &ca_key)
+            .signed_by(&node_key, &issuer)
             .context("failed to sign node certificate with CA")?;
 
         info!(node_id, validity_days, "Generated node certificate");
