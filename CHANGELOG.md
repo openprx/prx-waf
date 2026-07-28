@@ -101,6 +101,25 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **HTTP/3 routes on `:authority`, so HTTP/3 works at all.** The H3 listener
+  resolved its route from `headers["host"]`, and HTTP/3 has no Host header —
+  RFC 9114 §4.3.1 carries the authority in the `:authority` pseudo-header and
+  tells a client that sends it to omit Host. `h3` folds `:authority` into the
+  request URI and never writes a `host` field, so the lookup always came back
+  empty, the router was handed `""`, and every HTTP/3 request answered 404
+  whatever route it asked for. `curl --http3` and Chrome were both affected;
+  the protocol was inert for anyone who enabled it. It ships disabled and needs
+  a certificate to turn on, so a default install was never exposed.
+
+  Routing is no stricter and no looser than before: an authority that matches
+  no configured host is still refused with 404 and still reaches no upstream. A
+  Host that contradicts `:authority` is now refused outright rather than
+  resolved to either side. The routed authority is also what the origin is now
+  told, so name-based vhosts behind an H3 route resolve the same site the WAF
+  applied its policy to, and it is visible to the detectors as `host`, so a
+  rule matching the Host header fires the same on either protocol.
+  `tests/e2e-http3-authority.sh` covers both halves with a real QUIC client.
+
 - **`action: log` is no longer silent.** The `Log` arm of `evaluate_rules`
   wrote one `debug!` line and produced no contribution, and the audit log is
   built from the contributions — so a matching `log` rule left no audit-log
