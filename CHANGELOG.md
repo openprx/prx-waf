@@ -91,6 +91,27 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Two dependency majors with no call-site change: lz4_flex 0.14 and notify 8.**
+  lz4_flex carries the cluster rule-sync snapshots (`sync/rules.rs`), where
+  `checked_decompress` reads the four-byte little-endian uncompressed-size
+  prefix by hand before letting the decompressor allocate. 0.12 through 0.14
+  change nothing about that framing — `block::uncompressed_size` still decodes
+  a `u32` from the leading four bytes — so the M-18 bomb bound keeps holding
+  and a 0.11 node and a 0.14 node still understand each other's snapshots. What
+  the bump buys is upstream's own overflow work: 0.12 fixed integer overflows
+  when decoding large payloads, 0.13 fixed `get_maximum_output_size` on 32-bit
+  targets, and 0.13.1 fixed a panic in `From<io::Error> for frame::Error`.
+
+  notify drives rules hot-reload (`rules/hot_reload.rs`), which uses only
+  `RecommendedWatcher::new`, `watch`, and the three `EventKind` variants — all
+  unchanged across 6, 7 and 8. The one default worth checking is symlink
+  following, which 8.0 made configurable: `Config::default()` sets
+  `follow_symlinks: true`, matching what 6 did unconditionally, so a rules
+  directory reached through a symlink still reloads. On Linux the backend is
+  `INotifyWatcher` either way; the 8.2.0 fixes are in that backend (report
+  `max_user_watches` exhaustion, ignore events for unknown watch descriptors
+  instead of reporting them as `Q_OVERFLOW`).
+
 - **`[content_security.lane1] max_body_bytes` now defaults to `65536` instead of
   `0` (unlimited), and an over-budget body now degrades the verdict instead of
   being skipped silently.** Unbounded, the four Lane 1 regex detectors cost

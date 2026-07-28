@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.102"
+version = "0.2.103"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -94,13 +94,13 @@ rustls-pki-types = { version = "1", features = ["std"] }
 futures-util = "0.3"
 
 # Phase 7 additions
-notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 # URL validation
 url = "2"
 
 # Cluster additions
-lz4_flex = "0.11"
+lz4_flex = "0.14"
 hmac = "0.13"
 time = { version = "0.3", default-features = false, features = ["std"] }
 parking_lot = "0.12"
