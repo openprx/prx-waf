@@ -6276,17 +6276,35 @@ mod tests {
 
     // ── P0: brush-parser panic containment (shell AST) ───────────────────────
 
+    /// The containment guard itself, exercised directly. Every *known* panicking
+    /// input is now rejected before the parser, so nothing else in this suite
+    /// makes `contain_parser_panic` catch anything — and a guard with no test is
+    /// a guard that can be deleted without a failure. The point of it is the
+    /// brush-parser bug nobody has found yet, so the panic here is a stand-in for
+    /// that one.
+    #[test]
+    fn contain_parser_panic_turns_a_panicking_parse_into_no_signal() {
+        let caught: Option<u32> = contain_parser_panic(|| panic!("upstream parser bug"));
+        assert!(caught.is_none(), "a panicking parse must yield no signal");
+        // …and an ordinary parse is passed through untouched, both arms.
+        assert_eq!(contain_parser_panic(|| Some(7_u32)), Some(7), "success passes through");
+        assert_eq!(
+            contain_parser_panic(|| Option::<u32>::None),
+            None,
+            "parse error passes through"
+        );
+    }
+
     /// A redirection file descriptor wider than `i32` must not take the worker
     /// down. brush-parser 0.4.0 `peg.rs:695` (`io_number`) does `w.parse().unwrap()`
     /// into `ast::IoFd = i32`, so an all-digit word immediately followed by `<` or
     /// `>` panics on overflow. `.ok()` at the call site covers the `Err` arm and
-    /// does nothing for a panic. That this test *returns* is the proof the panic is
-    /// contained; `is_none()` is the proof it degrades to "no signal" rather than
-    /// to a bogus finding.
+    /// does nothing for a panic.
     ///
     /// Minimised from the 2026-07-27 `content_security` soak crash. Each payload
     /// carries a `shell_ast_prefilter` marker (`|` or `/etc/`), because without one
     /// the view never reaches the parser and the reproducer would prove nothing.
+    /// Before the guard landed this test aborted the run at `peg.rs:695:27`.
     #[test]
     fn rce_ast_oversized_io_number_is_contained() {
         for payload in [
