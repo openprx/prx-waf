@@ -203,7 +203,7 @@ invisible in the metrics.
 
 ### 2.1 The Lane 2 work budget
 
-`[content_security.budget]` in `configs/default.toml:464-475`, enforced in
+`[content_security.budget]` in `configs/default.toml:693-704`, enforced in
 `crates/waf-engine/src/checks/content_security/budget.rs`.
 
 | Key | Default | Bounds |
@@ -215,15 +215,51 @@ invisible in the metrics.
 | `max_html_parse_attempts_per_request` | 6 | HTML5 fragment parses |
 | `max_html_parse_input_bytes_total` | 262 144 | total bytes handed to the HTML parser |
 | `max_tokens_per_view` | 512 | tokens per view |
-| `max_list_items` | 1 024 | list expansion |
+| `max_list_items` | 1 024 | **nothing — see below** |
 | `max_preprocess_output_bytes_total` | 524 288 | **total normalised bytes per request** |
 | `max_field_input_bytes` | 16 384 | per field, checked before any decode/alloc |
 | `max_decode_rounds` | 3 | decode passes |
 
-Exceed behaviour is **degrade**: the unit of work is skipped and
-`SemanticVerdict::degraded` is set. Crucially, exhaustion does **not** retract
-signals already found — the comment at `budget.rs:19-27` explains why: letting
-exhaustion clear the verdict would hand an attacker a one-request kill switch.
+Exceed behaviour is **degrade** for the ten keys that bound something: the unit
+of work is skipped and `SemanticVerdict::degraded` is set. Crucially, exhaustion
+does **not** retract signals already found — the comment at `budget.rs:33-43`
+explains why: letting exhaustion clear the verdict would hand an attacker a
+one-request kill switch.
+
+Eight of those ten degrade through the budget's own `try_take_*` accounting.
+The other two — `max_views_per_field` and `max_tokens_per_view` — are enforced
+inside the preprocessor's loops, because the unit they bound (a field, a view)
+is not visible to the per-request budget state; they report through
+`ContentInspectionState::record_view_cap_miss` /
+`record_token_cap_miss` (`budget.rs:200`, `budget.rs:209`) instead. Until
+`v0.2.91` they reported nothing at all, and hitting them narrowed what the lane
+looked at with no flag and no counter.
+
+Those two are reported **only on a demonstrated loss**, which is narrower than
+"the cap was reached":
+
+* `max_views_per_field` degrades when a decode round already proved distinct
+  from the round before it is refused (`preprocess.rs:1197`), and when a
+  transform child that has already been decoded is thrown away
+  (`preprocess.rs:1278`, `preprocess.rs:551`). It does **not** degrade when a
+  pending transform frontier goes unscanned (`preprocess.rs:1265`) — most such
+  texts yield no view at all, and flagging them would report coverage loss that
+  may not exist.
+* `max_tokens_per_view` degrades when a view's normalised walk stopped with
+  tokens still unread (`preprocess.rs:938`). It does **not** degrade when the
+  whole-view byte ceiling (§1.3, `MAX_NORMALISED_VIEW_BYTES`) stopped the walk
+  first: that is a separate limit with a separate exceed behaviour, and billing
+  the token cap for its cut would flag requests the budget never narrowed.
+
+**`max_list_items` bounds nothing.** It is parsed, validated non-zero and
+compiled into `Budget` (`budget.rs:68`), and no code path reads it. The list
+expansion it names is bounded by the structured extractor's hardcoded
+`MAX_VALUE_NODES = 256` (`struct_extract.rs:108`) and by `max_fields_per_phase`,
+neither of which consults this key. Tuning it has no effect in either direction.
+It is left wired to nothing rather than pointed at `MAX_VALUE_NODES`, because
+that would move the bound from 256 to the configured 1 024 and change what the
+lane extracts — a detection change, not a budget one. Treat the row as a
+documented no-op until someone decides which of the two numbers is right.
 
 `max_preprocess_output_bytes_total = 512 KiB` is the de-facto cap on Lane 2's
 regex work per request. It is the primary Lane 2 knob if the WAF is CPU-bound —
@@ -231,7 +267,7 @@ but on a large body it is not the term that dominates; §2.2 is.
 
 ### 2.2 The Lane 1 body budget — 64 KiB, on by default
 
-`[content_security.lane1] max_body_bytes` in `configs/default.toml:694`,
+`[content_security.lane1] max_body_bytes` in `configs/default.toml:752`,
 compiled at `crates/waf-engine/src/checks/content_security/config.rs:137` and
 enforced by `Lane1BodyBudget::admits_body`
 (`crates/waf-engine/src/checks/mod.rs:337-346`), which `request_targets`
@@ -944,18 +980,22 @@ coverage boundary, not a threshold, so there is no moment at which it "binds".
 | `max_ast_input_bytes_total` | `lane2_budget` | `ast_input_bytes` |
 | `max_html_parse_attempts_per_request` | `lane2_budget` | `html_parse_attempts` |
 | `max_html_parse_input_bytes_total` | `lane2_budget` | `html_parse_input_bytes` |
+| `max_views_per_field` | `lane2_budget` | `views_per_field` |
+| `max_tokens_per_view` | `lane2_budget` | `tokens_per_view` |
 | `max_preprocess_output_bytes_total` | `lane2_budget` | `preprocess_output_bytes` |
 | `[content_security.lane1] max_body_bytes` | `lane1_body` | `max_body_bytes` |
 
-**`max_views_per_field`, `max_tokens_per_view` and `max_list_items` are not
-counted, and — checked while writing this table — they do not set `degraded`
-either.** They are enforced inside the preprocessor's own loops
-(`push_extra_view` returns early at `preprocess.rs:545`; `normalise` truncates)
-rather than through the budget's `try_take_*` accounting, which is the only
-place `degraded` is set. So §2.1's blanket "exceed behaviour is **degrade**" is
-true of the other eight keys and not of these three: hitting them silently
-narrows what the lane looked at, with no per-request flag and no counter. That
-is the one remaining hole in §2, and it predates this table.
+The last two `lane2_budget` rows count **views**, not requests: a field whose
+four views each lose tokens raises `tokens_per_view` four times. Both were added
+in `v0.2.91`; before that they were the hole this table's earlier revision
+described — enforced in the preprocessor's loops rather than through
+`try_take_*`, so they narrowed inspection without setting `degraded` and without
+a counter. They are raised only on a demonstrated loss, and §2.1 lists the
+cases each one deliberately stays quiet about.
+
+**`max_list_items` is still not counted, and cannot be: it bounds nothing.** No
+code path reads it (§2.1). A metric cannot be added to a limit that does not
+exist — the same finding §4 records for the CrowdSec decision cache.
 
 Every row above also raises `prxwaf_degraded_requests_total`, which counts
 **requests** while the rows above count **events**. Read the first for "how many
