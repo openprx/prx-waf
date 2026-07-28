@@ -406,12 +406,14 @@ where
 /// Serve one HTTP/3 request and record it on the RED metrics exactly once.
 ///
 /// This is the HTTP/3 counterpart of Pingora's `logging()` callback and exists
-/// for the same reason: [`serve_h3_request`] has a dozen return paths — four
-/// refusals before routing, two 413s, a WAF block, a WAF redirect, two upstream
-/// failures, the normal relay, and any `?` on the QUIC stream — and every one of
-/// them has to contribute one `prxwaf_requests_total`, one duration observation
-/// and at most one `prxwaf_responses_total`. Wrapping is the only structure that
-/// gets that for free; a counter at each site would be twelve places to forget.
+/// for the same reason: [`serve_h3_request`] has a dozen return paths — three
+/// refusals before an authority is even settled on, two more from routing, two
+/// 413s, a WAF block and a WAF redirect in each of the two inspection phases,
+/// two upstream failures, the normal relay, and any `?` on the QUIC stream — and
+/// every one of them has to contribute one `prxwaf_requests_total`, one duration
+/// observation and at most one `prxwaf_responses_total`. Wrapping is the only
+/// structure that gets that for free; a counter at each site would be a dozen
+/// places to forget one.
 ///
 /// The clock starts before routing, so the histogram covers refusals rather than
 /// only the requests that reached an upstream — as it does on HTTP/1.1.
