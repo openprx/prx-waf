@@ -574,7 +574,13 @@ const REQUEST_BUCKETS_NANOS: [u64; 16] = [
     60_000_000_000,
 ];
 
-/// Lock-free cumulative histogram over a fixed bound layout.
+/// Lock-free histogram over a fixed bound layout.
+///
+/// **Storage is one count per bucket, not a running total.** An observation
+/// increments exactly one slot; the cumulative form Prometheus publishes is
+/// produced by the encoder, at scrape time, from these. Saying "cumulative"
+/// here is what made the exposition wrong once already — see
+/// [`Self::snapshot`].
 ///
 /// `counts` has one slot per bound plus one for the `+Inf` overflow. The sum is
 /// kept in integer nanoseconds rather than as a float, because there is no
@@ -616,8 +622,34 @@ impl AtomicHistogram {
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `(sum_seconds, count, cumulative_buckets)` in the shape
-    /// [`MetricEncoder::encode_histogram`] wants.
+    /// `(sum_seconds, count, per_bucket_counts)` in the shape
+    /// [`prometheus_client::encoding::MetricEncoder::encode_histogram`] wants.
+    ///
+    /// # The values are per bucket, not cumulative
+    ///
+    /// Prometheus *publishes* cumulative buckets, but `encode_histogram` is the
+    /// thing that makes them cumulative — it keeps a running total across the
+    /// slice it is handed (`prometheus-client-0.25.0/src/encoding/text.rs:422`),
+    /// exactly as the library's own `Histogram` expects, since that stores one
+    /// count per bucket too. Accumulating here as well published every bucket
+    /// summed twice, which is silently wrong rather than obviously wrong: the
+    /// series still rises, so it still looks like a histogram, and every
+    /// `histogram_quantile` computed from it is a fabrication.
+    ///
+    /// So this returns the slots verbatim. That is also the cheaper shape —
+    /// [`Self::observe`] increments exactly one slot, so reading them back
+    /// unchanged is the identity, with no arithmetic to get wrong.
+    ///
+    /// # The last bound is `f64::MAX`, not `f64::INFINITY`
+    ///
+    /// The text encoder emits the literal `+Inf` only for `f64::MAX`
+    /// (`text.rs:429`), which is the sentinel its own `Histogram::new` appends
+    /// (`metrics/histogram.rs:326`). `f64::INFINITY` fails that comparison and
+    /// falls through to the numeric branch, where `dtoa` renders it `inf` — and
+    /// `le="inf"` is not a legal bucket bound in either the Prometheus text
+    /// format or `OpenMetrics`.
+    ///
+    /// # Concurrency
     ///
     /// The counts are read one at a time, so a scrape concurrent with traffic
     /// can observe a bucket total slightly ahead of `count`. Prometheus already
@@ -625,18 +657,17 @@ impl AtomicHistogram {
     /// alternative — a lock around the whole observation — is the cost this
     /// module exists to avoid.
     fn snapshot(&self) -> (f64, u64, Vec<(f64, u64)>) {
-        let mut cumulative = 0u64;
         let mut buckets = Vec::with_capacity(self.bounds.len() + 1);
         for (i, bound) in self.bounds.iter().enumerate() {
-            cumulative = cumulative.saturating_add(self.counts.get(i).map_or(0, |c| c.load(Ordering::Relaxed)));
-            buckets.push((nanos_to_seconds(*bound), cumulative));
+            let count = self.counts.get(i).map_or(0, |c| c.load(Ordering::Relaxed));
+            buckets.push((nanos_to_seconds(*bound), count));
         }
-        cumulative = cumulative.saturating_add(
-            self.counts
-                .get(self.bounds.len())
-                .map_or(0, |c| c.load(Ordering::Relaxed)),
-        );
-        buckets.push((f64::INFINITY, cumulative));
+        // The catch-all slot for observations past the last bound.
+        let overflow = self
+            .counts
+            .get(self.bounds.len())
+            .map_or(0, |c| c.load(Ordering::Relaxed));
+        buckets.push((f64::MAX, overflow));
         let sum = nanos_to_seconds(self.sum_nanos.load(Ordering::Relaxed));
         (sum, self.count.load(Ordering::Relaxed), buckets)
     }
@@ -1202,23 +1233,31 @@ mod tests {
         assert_eq!(cfg.effective_max_hosts(), MAX_HOST_LABELS_CEILING);
     }
 
+    /// `snapshot` returns **per-bucket** counts — the encoder accumulates them.
+    /// The published, cumulative form is asserted against the exposition text
+    /// in `histogram_buckets_are_cumulative_exactly_once`; this checks the raw
+    /// shape that feeds it.
     #[test]
-    fn histogram_buckets_are_cumulative_and_sum_in_seconds() {
+    fn histogram_snapshot_is_per_bucket_and_sums_in_seconds() {
         let h = AtomicHistogram::new(&LANE_BUCKETS_NANOS);
-        h.observe(500); // <= 1 µs
-        h.observe(3_000); // <= 5 µs
-        h.observe(2_000_000_000); // over the top bound -> +Inf
+        h.observe(500); // <= 1 µs      -> first bucket
+        h.observe(3_000); // <= 5 µs      -> third bucket
+        h.observe(2_000_000_000); // over the top bound -> overflow slot
         let (sum, count, buckets) = h.snapshot();
         assert_eq!(count, 3);
         assert!((sum - 2.000_003_5).abs() < 1e-6, "sum was {sum}");
+
+        // Exactly one observation in each of three distinct slots, and nothing
+        // anywhere else — not a running total.
+        assert_eq!(buckets.iter().map(|b| b.1).sum::<u64>(), count);
         assert_eq!(buckets.first().map(|b| b.1), Some(1));
-        assert_eq!(buckets.last().map(|b| b.1), Some(3));
-        // Cumulative: never decreasing.
-        let mut prev = 0;
-        for (_, c) in &buckets {
-            assert!(*c >= prev);
-            prev = *c;
-        }
+        assert_eq!(buckets.get(2).map(|b| b.1), Some(1));
+        assert_eq!(buckets.get(1).map(|b| b.1), Some(0));
+        assert_eq!(buckets.last().map(|b| b.1), Some(1));
+
+        // The overflow bound must be the sentinel the encoder tests for.
+        assert_eq!(buckets.last().map(|b| b.0), Some(f64::MAX));
+        assert!(buckets.iter().all(|b| b.0.is_finite()));
     }
 
     #[test]
@@ -1323,6 +1362,181 @@ mod tests {
             text.contains(r#"prxwaf_inspection_duration_seconds_count{lane="lane2"} 1"#),
             "{text}"
         );
+    }
+
+    // ── Histogram exposition ─────────────────────────────────────────────────
+    //
+    // These assert on the **text**, not on the store. The store was correct
+    // when the exposition was wrong: `observe` increments exactly one slot, and
+    // `snapshot` returned a series that satisfied every invariant a test of its
+    // return value would have checked. What it did not satisfy was the contract
+    // of the function it was passed to — `MetricEncoder::encode_histogram`
+    // accumulates the slice itself, so handing it accumulated values
+    // accumulated them twice and every `histogram_quantile` downstream was
+    // wrong. A test on either side of that seam passes; only one that reads the
+    // published bytes catches it.
+
+    /// One histogram's `le` bounds and values, plus its `_sum` and `_count`,
+    /// parsed back out of the exposition in emission order.
+    struct ParsedHistogram {
+        buckets: Vec<(String, u64)>,
+        count: u64,
+    }
+
+    /// Pull the histogram named `metric` with label text `labels` back out of
+    /// an exposition. Deliberately a dumb string parser: reconstructing the
+    /// values through the same types that produced them would re-import the
+    /// bug.
+    fn parse_histogram(text: &str, metric: &str, labels: &str) -> ParsedHistogram {
+        let mut buckets = Vec::new();
+        let mut count = None;
+        for line in text.lines() {
+            let Some(rest) = line.strip_prefix(metric) else {
+                continue;
+            };
+            let Some((head, value)) = rest.rsplit_once(' ') else {
+                continue;
+            };
+            if let Some(inner) = head.strip_prefix("_bucket{").and_then(|h| h.strip_suffix('}')) {
+                let Some(le) = inner.strip_prefix("le=\"").and_then(|i| i.split('"').next()) else {
+                    continue;
+                };
+                if !inner.contains(labels) {
+                    continue;
+                }
+                buckets.push((le.to_string(), value.parse().expect("bucket value is an integer")));
+            } else if head == format!("_count{{{labels}}}") {
+                count = Some(value.parse().expect("count is an integer"));
+            }
+        }
+        ParsedHistogram {
+            buckets,
+            count: count.unwrap_or_else(|| panic!("no _count line for {metric}{{{labels}}} in:\n{text}")),
+        }
+    }
+
+    /// Assert the three things a Prometheus histogram must satisfy, whatever
+    /// its bucket layout.
+    fn assert_histogram_is_well_formed(h: &ParsedHistogram, what: &str, text: &str) {
+        assert!(!h.buckets.is_empty(), "{what}: no buckets at all in:\n{text}");
+
+        // Cumulative: never decreasing as `le` grows.
+        let mut prev = 0u64;
+        for (le, value) in &h.buckets {
+            assert!(
+                *value >= prev,
+                "{what}: bucket le={le} is {value}, below the previous {prev} — buckets must be cumulative and \
+                 non-decreasing:\n{text}"
+            );
+            prev = *value;
+        }
+
+        // The catch-all bucket holds every observation, by definition.
+        let (last_le, last_value) = h.buckets.last().expect("buckets are non-empty");
+        assert_eq!(
+            last_le, "+Inf",
+            "{what}: the final bucket must be le=\"+Inf\", got {last_le:?}:\n{text}"
+        );
+        assert_eq!(
+            *last_value, h.count,
+            "{what}: the +Inf bucket is {last_value} but _count is {}. Every observation falls in some bucket, so \
+             these are the same number — a mismatch means the bucket values are not what was recorded:\n{text}",
+            h.count
+        );
+    }
+
+    /// The regression. Before the fix the +Inf bucket read 6 against a count of
+    /// 3, because the values were accumulated in `snapshot` and then again by
+    /// the encoder.
+    #[test]
+    fn histogram_buckets_are_cumulative_exactly_once() {
+        let m = Metrics::new(8);
+        for nanos in [500u64, 3_000, 2_000_000_000] {
+            if let Some(h) = m.state.lane_duration.get(Lane::Lane1.index()) {
+                h.observe(nanos);
+            }
+        }
+        let text = m.encode().expect("encode");
+        let h = parse_histogram(&text, "prxwaf_inspection_duration_seconds", r#"lane="lane1""#);
+        assert_eq!(h.count, 3);
+        assert_histogram_is_well_formed(&h, "lane1 inspection duration", &text);
+
+        // And the published values themselves, not just the invariants. Three
+        // observations at 500 ns, 3 µs and 2 s, so the cumulative series is
+        // 1 at le=1e-6, still 1 at le=2.5e-6, 2 from le=5e-6 onwards, and 3
+        // only in the catch-all. `le` is rendered by `dtoa`, hence the decimal
+        // spelling rather than the exponent form the bound is written in.
+        assert_eq!(h.buckets.first().map(|b| b.1), Some(1), "{text}");
+        assert_eq!(
+            h.buckets.iter().find(|b| b.0 == "0.0000025").map(|b| b.1),
+            Some(1),
+            "second bucket must not have absorbed the first:\n{text}"
+        );
+        assert_eq!(
+            h.buckets.iter().find(|b| b.0 == "0.000005").map(|b| b.1),
+            Some(2),
+            "{text}"
+        );
+        // The 2 s observation is past the 1 s top bound, so every finite bucket
+        // stops at 2 and only +Inf reaches 3.
+        assert_eq!(
+            h.buckets.iter().rev().nth(1).map(|b| b.1),
+            Some(2),
+            "the last finite bucket must not contain the overflow observation:\n{text}"
+        );
+    }
+
+    /// `le="inf"` is what `dtoa` prints for `f64::INFINITY`, and it is not a
+    /// legal `le` value — Prometheus and `OpenMetrics` both require the literal
+    /// `+Inf`. The encoder only emits that spelling for `f64::MAX`, which is
+    /// the sentinel its own `Histogram` uses.
+    #[test]
+    fn the_catch_all_bucket_is_spelled_plus_inf() {
+        let m = Metrics::new(8);
+        if let Some(h) = m.state.lane_duration.get(Lane::Crs.index()) {
+            h.observe(1);
+        }
+        let text = m.encode().expect("encode");
+        assert!(text.contains(r#"le="+Inf""#), "no le=\"+Inf\" bucket in:\n{text}");
+        assert!(
+            !text.contains(r#"le="inf""#),
+            "le=\"inf\" is not a legal bucket bound; f64::INFINITY reached dtoa:\n{text}"
+        );
+        assert!(!text.contains(r#"le="NaN""#), "{text}");
+    }
+
+    /// Both histogram families go through the same `snapshot`, so both are
+    /// checked — a fix applied to one call site and not the other would leave
+    /// half the histograms wrong.
+    #[test]
+    fn every_exported_histogram_is_well_formed() {
+        let m = Metrics::new(8);
+        let slot = m.state.hosts.resolve("site.example");
+        for (i, nanos) in [1u64, 900_000, 3_000_000, 90_000_000_000].iter().enumerate() {
+            if let Some(h) = m.state.request_duration.get(m.state.host_index(slot)) {
+                h.observe(*nanos);
+            }
+            if let Some(h) = m.state.lane_duration.get(i % Lane::ALL.len()) {
+                h.observe(*nanos);
+            }
+        }
+        let text = m.encode().expect("encode");
+
+        let request = parse_histogram(&text, "prxwaf_request_duration_seconds", r#"host="site.example""#);
+        assert_eq!(request.count, 4);
+        assert_histogram_is_well_formed(&request, "request duration", &text);
+
+        for lane in Lane::ALL {
+            let labels = format!(r#"lane="{}""#, lane.label());
+            let h = parse_histogram(&text, "prxwaf_inspection_duration_seconds", &labels);
+            assert_histogram_is_well_formed(&h, lane.label(), &text);
+        }
+
+        // A histogram nothing was recorded into must still be well formed:
+        // every bucket zero, +Inf zero, count zero.
+        let untouched = parse_histogram(&text, "prxwaf_request_duration_seconds", r#"host="__other__""#);
+        assert_eq!(untouched.count, 0);
+        assert_histogram_is_well_formed(&untouched, "untouched host", &text);
     }
 
     /// The cardinality claim in the docs is only true if the fold actually
