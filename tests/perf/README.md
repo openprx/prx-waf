@@ -17,6 +17,38 @@ One command brings up Postgres, an `albedo` origin and prx-waf, drives load with
 `oha`, and writes `raw.jsonl` (one record per posture/workload/round),
 `summary.json` and `summary.md`. Nothing is left running.
 
+## The other two scripts here
+
+`run.sh` answers "what does a posture cost per request". Two questions it cannot
+answer have their own instruments, deliberately kept separate so a change to one
+cannot move the other's numbers:
+
+```bash
+tests/perf/soak.sh                              # does memory converge under attack?
+RATE=2000 MINUTES=20 tests/perf/soak.sh         # a rate-limited attacker
+STALL_DB_AT=20 STALL_DB_FOR=40 tests/perf/soak.sh   # freeze the database mid-run
+tests/perf/quiet_check.sh <pid> 0-3 8           # were the subject's cores its own?
+```
+
+**[`soak.sh`](soak.sh)** measures the *shape* of the memory curve rather than its
+peak. `run.sh` reports the highest RSS it saw in ten seconds, which cannot
+distinguish a process that settles at a working set from one that rises until a
+queue bound stops it from one that rises for as long as traffic keeps arriving —
+the three have identical first ten seconds and completely different operational
+meanings. It samples RSS, CPU, per-queue depth, pool occupancy, the drop counters
+and the rows that actually reached the database once a second;
+[`soak_shape.py`](soak_shape.py) fits the second half of the series and states
+the rule it used, so the verdict is arithmetic a reader can check. It stops
+itself at `RSS_ABORT_MIB` rather than OOM-ing the host, and an abort is reported
+as a result. Results are in [`RESULTS.md`](RESULTS.md) §8.
+
+**[`quiet_check.sh`](quiet_check.sh)** implements the host-quiet criterion this
+page switched to when the data plane went multi-threaded: compare the busy
+jiffies on the subject's pinned cores against the subject's own `utime+stime`
+over the same window and report the residual. It has to run *during* a
+measurement — a background process that wakes up halfway through leaves no trace
+in a before/after load average.
+
 ---
 
 ## Why this is not a CI gate
