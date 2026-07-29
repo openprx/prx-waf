@@ -299,7 +299,35 @@ fallback_action       = "allow"     # allow | block | log — what the bouncer d
 # remote_port = 8080
 # ssl         = false
 # guard_status = true
+# upstream_ssl = false   # see "Site TLS vs upstream TLS" below
 ```
+
+### Site TLS vs upstream TLS
+
+`ssl` describes the **site**: it is the flag ACME issues and renews a
+certificate against. It is *not* a statement about the origin, but until
+`upstream_ssl` existed it decided that too — on HTTP/1.1 and HTTP/3 alike — so
+the commonest reverse-proxy arrangement there is,
+
+```toml
+[[hosts]]
+host        = "site.example"
+port        = 443
+ssl         = true          # public HTTPS
+remote_host = "127.0.0.1"
+remote_port = 8080          # plaintext origin
+```
+
+dialled `https://127.0.0.1:8080` and answered `502 Bad Gateway`. Add
+`upstream_ssl = false` and the origin is dialled in cleartext while the site
+keeps its certificate; `upstream_ssl = true` on a plaintext site does the
+reverse.
+
+Leaving `upstream_ssl` unset keeps the old behaviour exactly — it falls back to
+`ssl` — so nothing changes on upgrade, and in particular an origin connection
+that really was encrypted is not silently downgraded. Every host still relying
+on that fallback is named in a warning at startup; setting `upstream_ssl` either
+way silences it.
 
 ### HTTP/3 on a non-default port
 

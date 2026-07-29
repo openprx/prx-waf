@@ -3182,6 +3182,9 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
             host: entry.host.clone(),
             port: entry.port,
             ssl: entry.ssl.unwrap_or(false),
+            // Absent → None → `upstream_uses_tls()` falls back to `ssl`, the
+            // behaviour of every config file written before the key existed.
+            upstream_ssl: entry.upstream_ssl,
             guard_status: entry.guard_status.unwrap_or(true),
             remote_host: entry.remote_host.clone(),
             remote_port: entry.remote_port,
@@ -3211,6 +3214,29 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
     }
 
     info!("Registered {} host routes", router.len());
+
+    // Name every host whose upstream is encrypted only because `ssl = true` and
+    // nobody said otherwise. `ssl` answers "is the site TLS" (it is what ACME
+    // issues against, below) and used to answer "is the origin TLS" as well, so
+    // the overwhelmingly common shape — public HTTPS in front, plaintext
+    // 127.0.0.1 behind — dialled the origin over TLS and got a 502 with nothing
+    // in the log connecting the two. The fallback stays, because removing it
+    // would silently downgrade a genuinely encrypted origin connection to
+    // cleartext. This makes the ambiguity loud instead, once, at startup.
+    for host in router.list() {
+        if host.upstream_tls_is_inferred_from_site_tls() {
+            tracing::warn!(
+                "Host {}:{} has ssl = true and no upstream_ssl, so its upstream {}:{} is dialled over \
+                 TLS. `ssl` states that the SITE is TLS (it is what ACME issues for); if the origin \
+                 speaks plaintext this connection fails with 502. Set upstream_ssl explicitly — false \
+                 for a plaintext origin, true to keep TLS and silence this.",
+                host.host,
+                host.port,
+                host.remote_host,
+                host.remote_port,
+            );
+        }
+    }
 
     // Build a load balancer for every host that declares a multi-backend pool.
     // Hosts without `backends` are absent from the registry and continue to use

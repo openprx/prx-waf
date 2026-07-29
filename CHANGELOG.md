@@ -11,6 +11,21 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`upstream_ssl` splits "the site is TLS" from "the origin is TLS".** `ssl`
+  was answering both questions with one bit. It is the flag ACME issues a
+  certificate against — a statement about what clients speak to the site — and
+  it was also, on HTTP/1.1 and HTTP/3 alike, the switch that decided whether
+  this proxy dialled the origin over TLS. Those are independent in the
+  commonest reverse proxy there is: public HTTPS in front, plaintext
+  `127.0.0.1:8080` behind. Writing the only thing that expresses the first
+  (`ssl = true`) silently asserted the second, and every request to that host
+  returned `502 Bad Gateway` with nothing in the log tying the two together.
+
+  `upstream_ssl = false` now gives a TLS site a cleartext origin, and
+  `upstream_ssl = true` gives a plaintext site an encrypted one. Both data
+  paths read it through one predicate, so they cannot drift apart on the
+  question again.
+
 - **`block_page_template` can now be set on a `[[hosts]]` entry.** The renderer
   has honoured a per-host block page since block pages existed, but only for
   hosts whose `hosts` row someone had edited by hand: the admin API does not
@@ -27,6 +42,17 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   description for the admin UI's database-backed host list, and
   `exclude_url_log` is read by no code in any crate. Accepting them would
   reproduce the `start_status` failure — a key that parses and does nothing.
+
+### Changed
+
+- **A host relying on `ssl` to imply its upstream scheme is named at startup.**
+  Leaving `upstream_ssl` unset still falls back to `ssl`, so no existing
+  deployment changes behaviour — defaulting to plaintext instead would have
+  silently downgraded an origin connection that really was encrypted, and a
+  proxy that quietly stops encrypting is worse than a loud 502. The
+  compatibility path is now a `WARN` per affected host instead, naming the host
+  and the upstream it is about to dial over TLS. Setting `upstream_ssl` either
+  way silences it.
 
 ### Removed
 

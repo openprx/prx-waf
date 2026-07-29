@@ -533,7 +533,44 @@ pub struct HostConfig {
     pub code: String,
     pub host: String,
     pub port: u16,
+    /// Whether the *site* is TLS.
+    ///
+    /// Its unambiguous consumer is ACME: `prx-waf` requests and renews a
+    /// certificate for every registered host with `ssl = true` and no active
+    /// cert. That is a statement about what clients speak to this site, not
+    /// about what this process speaks to the origin.
+    ///
+    /// It has historically also been the *upstream* TLS switch on both data
+    /// paths, which is the second job described on [`Self::upstream_ssl`]. Read
+    /// [`Self::upstream_uses_tls`], never this field, when the question is how
+    /// to dial the backend.
     pub ssl: bool,
+    /// Whether the *upstream* is dialled over TLS, when the answer differs from
+    /// [`Self::ssl`].
+    ///
+    /// `None` — the default, and what every database row yields, since there is
+    /// no column for it — falls back to `ssl`, which is exactly what both data
+    /// paths did before this field existed. Setting it makes the upstream
+    /// scheme independent of the site's own scheme.
+    ///
+    /// The field exists because `ssl` was answering two different questions
+    /// with one bit. "Clients reach this site over HTTPS" and "this proxy
+    /// reaches the origin over HTTPS" are independent in the commonest reverse
+    /// proxy there is — public TLS in front, plaintext to `127.0.0.1:8080`
+    /// behind — and `ssl = true` was the only way to say the first, so it
+    /// silently said the second too and the origin connection failed. Both
+    /// protocols got this wrong identically (`gateway::proxy::upstream_peer`,
+    /// `gateway::http3::upstream_scheme`), so the split is not an HTTP/3
+    /// question.
+    ///
+    /// The fallback is kept rather than defaulting to plaintext because the
+    /// alternative failure is worse: an operator relying on `ssl = true` to get
+    /// a TLS backend would have been silently downgraded to cleartext by the
+    /// change, and a proxy that quietly stops encrypting is a security
+    /// regression, whereas a 502 is loud. `init_async` warns at startup on
+    /// every host that is still relying on the fallback.
+    #[serde(default)]
+    pub upstream_ssl: Option<bool>,
     pub guard_status: bool,
     pub remote_host: String,
     pub remote_port: u16,
@@ -580,6 +617,39 @@ const fn default_backend_weight() -> u32 {
     1
 }
 
+impl HostConfig {
+    /// Whether to dial this host's upstream over TLS.
+    ///
+    /// The single answer for both data paths — `gateway::proxy::upstream_peer`
+    /// (HTTP/1.1 and HTTP/2, via `HttpPeer::new`) and
+    /// `gateway::http3::upstream_scheme` (the `http`/`https` in the forwarded
+    /// URL). Neither reads [`Self::ssl`] directly any more, so the two protocols
+    /// cannot drift apart on the question.
+    ///
+    /// [`Self::upstream_ssl`] wins when set; otherwise this is `ssl`, which is
+    /// what both call sites used unconditionally before and is why nothing about
+    /// an existing deployment changes.
+    #[must_use]
+    pub const fn upstream_uses_tls(&self) -> bool {
+        match self.upstream_ssl {
+            Some(explicit) => explicit,
+            None => self.ssl,
+        }
+    }
+
+    /// Whether this host reaches its upstream over TLS only because
+    /// [`Self::upstream_ssl`] is unset and [`Self::ssl`] is true — i.e. it is
+    /// relying on the compatibility fallback, and its origin connection is
+    /// encrypted as a side effect of a statement about the *site's* scheme.
+    ///
+    /// Startup reports these so the ambiguity is loud once rather than a 502
+    /// nobody can explain. `ssl = false` is not ambiguous: both readings agree.
+    #[must_use]
+    pub const fn upstream_tls_is_inferred_from_site_tls(&self) -> bool {
+        self.upstream_ssl.is_none() && self.ssl
+    }
+}
+
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
@@ -587,6 +657,7 @@ impl Default for HostConfig {
             host: String::new(),
             port: 80,
             ssl: false,
+            upstream_ssl: None,
             guard_status: true,
             remote_host: String::new(),
             remote_port: 8080,
@@ -722,6 +793,77 @@ mod tests {
 
     fn pairs(input: &str) -> Vec<(&str, &str)> {
         split_form_args(input).into_iter().map(|a| (a.name, a.value)).collect()
+    }
+
+    /// The compatibility half of the `ssl` split: an unset `upstream_ssl` must
+    /// reproduce what both data paths did when they read `ssl` directly, or
+    /// every existing deployment changes behaviour on upgrade.
+    #[test]
+    fn upstream_tls_falls_back_to_site_tls() {
+        let plain = HostConfig::default();
+        assert!(!plain.ssl);
+        assert!(!plain.upstream_uses_tls());
+
+        let tls_site = HostConfig {
+            ssl: true,
+            ..HostConfig::default()
+        };
+        assert!(tls_site.upstream_uses_tls(), "unset upstream_ssl must follow ssl");
+    }
+
+    /// And the half that fixes the trap: an explicit value wins in both
+    /// directions, so a TLS site can have a plaintext origin and vice versa.
+    #[test]
+    fn explicit_upstream_ssl_wins_over_site_tls() {
+        let tls_site_plain_origin = HostConfig {
+            ssl: true,
+            upstream_ssl: Some(false),
+            ..HostConfig::default()
+        };
+        assert!(!tls_site_plain_origin.upstream_uses_tls());
+
+        let plain_site_tls_origin = HostConfig {
+            ssl: false,
+            upstream_ssl: Some(true),
+            ..HostConfig::default()
+        };
+        assert!(plain_site_tls_origin.upstream_uses_tls());
+    }
+
+    /// Only the ambiguous combination is worth a startup warning: `ssl = false`
+    /// means both readings agree, and an explicit `upstream_ssl` means the
+    /// operator has already answered.
+    #[test]
+    fn only_the_ambiguous_host_is_reported() {
+        let ambiguous = HostConfig {
+            ssl: true,
+            ..HostConfig::default()
+        };
+        assert!(ambiguous.upstream_tls_is_inferred_from_site_tls());
+
+        for settled in [
+            HostConfig {
+                ssl: false,
+                ..HostConfig::default()
+            },
+            HostConfig {
+                ssl: true,
+                upstream_ssl: Some(true),
+                ..HostConfig::default()
+            },
+            HostConfig {
+                ssl: true,
+                upstream_ssl: Some(false),
+                ..HostConfig::default()
+            },
+        ] {
+            assert!(
+                !settled.upstream_tls_is_inferred_from_site_tls(),
+                "ssl={} upstream_ssl={:?} is not ambiguous",
+                settled.ssl,
+                settled.upstream_ssl
+            );
+        }
     }
 
     /// A phase missing from `Phase::ALL` is a detection nobody can graph. The

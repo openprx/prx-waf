@@ -1251,7 +1251,18 @@ pub struct HostEntry {
     pub port: u16,
     pub remote_host: String,
     pub remote_port: u16,
+    /// Whether the *site* is TLS. Drives ACME issuance and renewal for this
+    /// host, and — unless `upstream_ssl` says otherwise — the scheme used to
+    /// reach the upstream. See [`crate::types::HostConfig::ssl`]. Absent →
+    /// `false`.
     pub ssl: Option<bool>,
+    /// Whether the *upstream* is dialled over TLS, when that differs from
+    /// `ssl`. Absent → follow `ssl`, which is the behaviour every existing
+    /// config file has. Set it to `false` on a TLS site with a plaintext origin
+    /// (`ssl = true`, `remote_host = "127.0.0.1"`), which otherwise 502s on
+    /// both protocols. See [`crate::types::HostConfig::upstream_ssl`].
+    #[serde(default)]
+    pub upstream_ssl: Option<bool>,
     pub guard_status: Option<bool>,
     pub cert_file: Option<String>,
     pub key_file: Option<String>,
@@ -2163,6 +2174,44 @@ mod load_config_tests {
         assert!(!closed.start_status, "start_status = false must reach HostEntry");
         // Omitting the key keeps the historical behaviour: the site serves.
         assert!(open.start_status, "an absent start_status must default to serving");
+    }
+
+    /// `upstream_ssl` must survive deserialization in both directions, and its
+    /// absence must stay `None` rather than becoming a `false` that would
+    /// silently take TLS off an origin connection that had it.
+    #[test]
+    fn host_upstream_ssl_survives_parsing() {
+        let dir = std::env::temp_dir();
+        let path = format!("{}/prx-waf-upstream-ssl-{}.toml", dir.display(), std::process::id());
+        let serialized = toml::to_string(&AppConfig::default()).expect("serialize default");
+        let toml_text = serialized.replace(
+            "hosts = []",
+            "hosts = [\n\
+             { host = \"edge.example\", port = 443, remote_host = \"127.0.0.1\", \
+             remote_port = 8080, ssl = true, upstream_ssl = false },\n\
+             { host = \"inherit.example\", port = 443, remote_host = \"127.0.0.1\", \
+             remote_port = 8443, ssl = true },\n]",
+        );
+        assert_ne!(
+            toml_text, serialized,
+            "serialized default no longer carries `hosts = []`"
+        );
+        std::fs::write(&path, toml_text).expect("write temp config");
+        let result = load_config(&path);
+        let _ = std::fs::remove_file(&path);
+        let cfg = result.expect("valid config must load");
+        let split = cfg.hosts.first().expect("first host entry");
+        let inherit = cfg.hosts.get(1).expect("second host entry");
+        assert_eq!(split.ssl, Some(true));
+        assert_eq!(
+            split.upstream_ssl,
+            Some(false),
+            "upstream_ssl = false must reach HostEntry"
+        );
+        assert!(
+            inherit.upstream_ssl.is_none(),
+            "an absent upstream_ssl must stay None so it follows ssl"
+        );
     }
 
     /// `block_page_template` on a `[[hosts]]` entry must survive

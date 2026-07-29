@@ -353,6 +353,15 @@ cors_origins = []
 # remote_host = "127.0.0.1"
 # remote_port = 8080
 # guard_status = true
+# # `ssl` describes the SITE, not the upstream: it is what ACME issues and renews
+# # a certificate for. It ALSO decides how the origin is dialled, on both
+# # HTTP/1.1 and HTTP/3, whenever `upstream_ssl` is unset — which is why a TLS
+# # site in front of a plaintext 127.0.0.1 origin, the commonest arrangement
+# # there is, returns 502 until you say so. Say so with `upstream_ssl = false`.
+# # Leaving it unset keeps the historical behaviour and logs a warning at startup
+# # naming the host; set it either way and the warning goes.
+# ssl = true
+# upstream_ssl = false
 # # Detect but do not enforce: every block this host would produce is logged and
 # # the request is proxied through anyway. ModSecurity's `SecRuleEngine
 # # DetectionOnly`. Default false (enforce).

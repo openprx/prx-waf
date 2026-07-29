@@ -57,8 +57,17 @@ pub fn alt_svc_header(port: u16) -> String {
 // ─── Upstream helpers ─────────────────────────────────────────────────────────
 
 /// Scheme (`http`/`https`) to use when connecting to a host's upstream.
+///
+/// Delegates to [`HostConfig::upstream_uses_tls`], the same predicate
+/// [`crate::proxy`] hands to `HttpPeer::new`, so the two protocols answer "is
+/// the origin connection encrypted" from one place. Reading `host_config.ssl`
+/// here directly is what let the site's own scheme decide the upstream's.
 const fn upstream_scheme(host_config: &HostConfig) -> &'static str {
-    if host_config.ssl { "https" } else { "http" }
+    if host_config.upstream_uses_tls() {
+        "https"
+    } else {
+        "http"
+    }
 }
 
 /// Build the absolute upstream URL for a request, using the per-host
@@ -1012,6 +1021,41 @@ mod tests {
     fn upstream_target_uses_https_when_ssl() {
         let cfg = host_cfg("a.com", "backend", 8443, true);
         assert_eq!(upstream_target(&cfg, "/"), "https://backend:8443/");
+    }
+
+    /// The commonest reverse proxy there is: TLS at the edge, plaintext origin.
+    /// `ssl = true` alone sends `https://` at a backend that does not speak it
+    /// and the request 502s, so `upstream_ssl = false` has to override it.
+    #[test]
+    fn upstream_ssl_false_overrides_a_tls_site() {
+        let mut cfg = HostConfig {
+            host: "a.com".to_string(),
+            port: 443,
+            ssl: true,
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 8080,
+            start_status: true,
+            ..HostConfig::default()
+        };
+        assert_eq!(upstream_target(&Arc::new(cfg.clone()), "/"), "https://127.0.0.1:8080/");
+        cfg.upstream_ssl = Some(false);
+        assert_eq!(upstream_target(&Arc::new(cfg), "/"), "http://127.0.0.1:8080/");
+    }
+
+    /// And the other direction: a plaintext listener in front of a TLS origin.
+    #[test]
+    fn upstream_ssl_true_overrides_a_plaintext_site() {
+        let cfg = HostConfig {
+            host: "a.com".to_string(),
+            port: 80,
+            ssl: false,
+            upstream_ssl: Some(true),
+            remote_host: "origin.internal".to_string(),
+            remote_port: 8443,
+            start_status: true,
+            ..HostConfig::default()
+        };
+        assert_eq!(upstream_target(&Arc::new(cfg), "/"), "https://origin.internal:8443/");
     }
 
     #[test]

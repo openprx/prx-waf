@@ -450,7 +450,10 @@ impl ProxyHttp for WafProxy {
             )
         })?;
 
-        let use_tls = host_config.ssl;
+        // `upstream_ssl` when the operator set it, `ssl` otherwise — see
+        // `HostConfig::upstream_uses_tls`. Shared with the HTTP/3 forwarder so
+        // one host cannot dial its origin two different ways.
+        let use_tls = host_config.upstream_uses_tls();
 
         // Multi-backend path: if this host has a registered load balancer, pick a
         // backend from the pool. The client IP (already resolved in
