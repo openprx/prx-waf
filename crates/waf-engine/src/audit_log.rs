@@ -494,7 +494,10 @@ impl AuditLogWorker {
     fn log_and_reset_drops(&self) {
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         if dropped > 0 {
-            warn!(dropped, "Audit log channel full — dropped records (back-pressure)");
+            warn!(
+                queue = BudgetEvent::AuditLogDrop.limit(),
+                dropped, "audit_log queue full — dropped rule-hit records (back-pressure)"
+            );
         }
     }
 }

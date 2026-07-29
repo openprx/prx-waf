@@ -264,15 +264,17 @@ impl SemanticObservationWorker {
         let obs_dropped = self.obs_dropped.swap(0, Ordering::Relaxed);
         if obs_dropped > 0 {
             warn!(
+                queue = BudgetEvent::SemanticObservationDrop.limit(),
                 dropped = obs_dropped,
-                "Semantic observation channel full — dropped observations (back-pressure)"
+                "semantic_observations queue full — dropped Lane 2 observations (back-pressure)"
             );
         }
         let event_dropped = self.event_dropped.swap(0, Ordering::Relaxed);
         if event_dropped > 0 {
             warn!(
+                queue = BudgetEvent::SemanticEventDrop.limit(),
                 dropped = event_dropped,
-                "Semantic shadow security-event channel full — dropped events (back-pressure)"
+                "semantic_events queue full — dropped Lane 2 shadow security events (back-pressure)"
             );
         }
     }

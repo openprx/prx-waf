@@ -238,8 +238,8 @@ impl CommunityReporter {
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         if dropped > 0 {
             warn!(
-                dropped,
-                "Community signal channel full — dropped signals (back-pressure)"
+                queue = waf_common::metrics::BudgetEvent::CommunityReportDrop.limit(),
+                dropped, "community_reporter queue full — dropped community threat signals (back-pressure)"
             );
         }
     }

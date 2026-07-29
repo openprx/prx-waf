@@ -334,16 +334,24 @@ impl DetectionLogWorker {
     fn log_and_reset_drops(&self) {
         let attack_dropped = self.attack_dropped.swap(0, Ordering::Relaxed);
         if attack_dropped > 0 {
+            // `queue` is the metric's own label, so the token in the alert
+            // (`{subsystem="queue", limit="attack_log"}`) is the token in the
+            // log the alert sends you to. The message keeps the table name,
+            // which is what an operator will look in next.
             warn!(
+                queue = BudgetEvent::AttackLogWriteDrop.limit(),
                 dropped = attack_dropped,
-                "attack_logs queue full — detections were BLOCKED but not recorded (back-pressure)"
+                "attack_log queue full — detections were BLOCKED but the attack_logs row was not recorded \
+                 (back-pressure)"
             );
         }
         let event_dropped = self.event_dropped.swap(0, Ordering::Relaxed);
         if event_dropped > 0 {
             warn!(
+                queue = BudgetEvent::SecurityEventWriteDrop.limit(),
                 dropped = event_dropped,
-                "security_events queue full — detections were BLOCKED but not recorded (back-pressure)"
+                "security_event queue full — detections were BLOCKED but the security_events row was not recorded \
+                 (back-pressure)"
             );
         }
     }

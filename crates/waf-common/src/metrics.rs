@@ -535,6 +535,22 @@ impl BudgetEvent {
         self as usize
     }
 
+    /// The exported `limit` label value.
+    ///
+    /// **Public because the drop WARNs use it too.** `docs/metrics.md` sends an
+    /// operator to alert on
+    /// `prxwaf_budget_events_total{subsystem="queue", limit="attack_log"}`; when
+    /// that alert fires they go to the log, and the seven queue-drop WARNs each
+    /// used to invent their own word for the same thing — `attack_logs queue
+    /// full`, `Semantic observation channel full`, `Community signal channel
+    /// full`. None of those contain the token in the alert. Reading it from here
+    /// means the string that fired is the string to grep, and a relabelling
+    /// cannot leave the log behind. See `docs/logs-and-metrics.md` §4.2.
+    #[must_use]
+    pub const fn limit(self) -> &'static str {
+        self.labels().1
+    }
+
     /// `(subsystem, limit)` — the two labels this event is exported under.
     const fn labels(self) -> (&'static str, &'static str) {
         match self {
@@ -1650,6 +1666,33 @@ mod tests {
 
         for (i, gauge) in PoolGauge::ALL.iter().enumerate() {
             assert_eq!(gauge.index(), i, "PoolGauge::ALL is out of declaration order at {i}");
+        }
+    }
+
+    /// The pair `docs/metrics.md` tells operators to graph together —
+    /// `prxwaf_queue_depth{queue="attack_log"}` against
+    /// `prxwaf_budget_events_total{subsystem="queue", limit="attack_log"}` —
+    /// only joins if the two families spell the queue the same way. They are
+    /// separate enumerations that happen to agree, so nothing but this stops
+    /// one of them from being renamed alone. The drop WARNs read the same word
+    /// off `QueueGauge::label`, so a divergence would take the log with it.
+    #[test]
+    fn every_queue_gauge_has_a_drop_counter_spelled_the_same() {
+        let drop_limits: Vec<&str> = BudgetEvent::ALL
+            .iter()
+            .map(|e| e.labels())
+            .filter(|(subsystem, _)| *subsystem == "queue")
+            .map(|(_, limit)| limit)
+            .collect();
+        for queue in QueueGauge::ALL {
+            assert!(
+                drop_limits.contains(&queue.label()),
+                "prxwaf_queue_depth{{queue={:?}}} has no matching \
+                 prxwaf_budget_events_total{{subsystem=\"queue\", limit={:?}}}; the depth and the drop \
+                 cannot be graphed together",
+                queue.label(),
+                queue.label(),
+            );
         }
     }
 

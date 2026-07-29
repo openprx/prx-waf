@@ -147,25 +147,31 @@ moves it. The naming of individual folded hosts stays out of both surfaces. See
 
 ### 4.2 Aggregated into a periodic WARN
 
-Five queues report drops on a timer rather than per drop, which is the correct
-shape: a drop storm must not become a log storm.
+Seven of the eight `subsystem="queue"` counters report drops on a timer rather
+than per drop, which is the correct shape: a drop storm must not become a log
+storm.
 
-| Metric labels | Periodic log text | file:line | aligned? |
+Text below is **as it was before this pass**; §7.2 says what it is now.
+
+| Metric labels | Periodic log text, before | file:line (before) | aligned? |
 |---|---|---|---|
-| `queue` / `attack_log` | `"attack_logs queue full — detections were BLOCKED but not recorded (back-pressure)"` | metric `detection_sink.rs:182`, log `:335-341` | **near** — the label is `attack_log`, the log says `attack_logs`; grepping the metric's token misses the line |
+| `queue` / `attack_log` | `"attack_logs queue full — detections were BLOCKED but not recorded (back-pressure)"` | metric `detection_sink.rs:182`, log `:335-341` | **near** — the label is `attack_log`, the log said `attack_logs`; grepping the metric's token missed the line |
 | `queue` / `security_event` | `"security_events queue full — …"` | `detection_sink.rs:193` / `:342-348` | **near**, same singular/plural drift |
 | `queue` / `semantic_observations` | `"Semantic observation channel full — dropped observations (back-pressure)"` | `semantic_sink.rs:144` / `:264-269` | **NO** — "channel" not "queue", "Semantic observation" not `semantic_observations` |
 | `queue` / `semantic_events` | `"Semantic shadow security-event channel full — dropped events (back-pressure)"` | `semantic_sink.rs:156` / `:271-276` | **NO**, same |
 | `queue` / `audit_log` | `"Audit log channel full — dropped records (back-pressure)"` | `audit_log.rs:342` / `:494-499` | **NO**, same |
+| `queue` / `notifications` | `"Notification queue full — events dropped (back-pressure); delivery is degraded"` | metric `waf-common/src/notify.rs:185`, log `waf-api/src/notify_runtime.rs:259-265` (reads `NotificationBus::take_dropped`) | **NO** — "Notification", not `notifications` |
+| `queue` / `community_reporter` | `"Community signal channel full — dropped signals (back-pressure)"` | metric `community/reporter.rs:161`, log `:238-246` | **NO** — nothing in the line resembles `community_reporter` |
+| `queue` / `cluster_peer` | — none | metric `waf-cluster/src/node.rs:324` | **NO** — counter only; the only queue with no periodic WARN at all |
 
 **The finding.** `docs/metrics.md` tells operators to alert on
 `prxwaf_budget_events_total{subsystem="queue", limit="attack_log"}`. When that
-alert fires, the token in it does not appear in the log. Five series, five
+alert fires, the token in it does not appear in the log. Seven series, seven
 different words for "queue".
 
-**Fixed by** adding a `queue = "<the metric's limit label>"` field to all five
-WARNs and using the word *queue* consistently in the message. Off the request
-path (a 30 s timer), so the cost is nil.
+**Fixed by** having every one of the seven read the token off
+`BudgetEvent::limit()` into a `queue = …` field, and using that same token in
+the message. Off the request path (a 30 s timer), so the cost is nil.
 
 ### 4.3 Counted, never logged — correctly
 
@@ -192,9 +198,17 @@ answer.**
 | Metric labels | Site | Why it stands out |
 |---|---|---|
 | `lane2_detector` / `parser_panic` | `detectors.rs:3058` | `metrics.rs:383-389` states outright that any non-zero value is "an upstream parser bug reachable from the network and worth an alert". It is the one budget event that is a *bug report*, not a tuning signal, and it is invisible to anyone without Prometheus. It is also replayable at rate, so a per-occurrence log is exactly the amplification trap — the answer is one line per process, not one per panic |
-| `queue` / `notifications` | `waf-common/src/notify.rs:185`; `NotificationBus::dropped()` (`:198`) is **never read outside tests** | the other five queues all have a periodic drop WARN; this one has a counter and an unused accessor |
-| `queue` / `community_reporter` | `community/reporter.rs:161` | same shape |
-| `queue` / `cluster_peer` | `waf-cluster/src/node.rs:324` | same shape; the doc comment at `:313-316` says the drop "can contribute to a spurious election while leaving no trace at all — it now leaves a counter", which is true and is only half the sentence |
+| `queue` / `cluster_peer` | `waf-cluster/src/node.rs:324` | the other seven queues all have a periodic drop WARN; this one has a counter and nothing else. The doc comment at `node.rs:313-316` says the drop "can contribute to a spurious election while leaving no trace at all — it now leaves a counter", which is true and is only half the sentence |
+
+> **Correction.** A first pass of this audit listed `queue`/`notifications` and
+> `queue`/`community_reporter` here as counter-only. They are not: both have
+> periodic drop WARNs, at `waf-api/src/notify_runtime.rs:259-265` and
+> `community/reporter.rs:238-246`. The first pass missed them by grepping for
+> `.dropped()` while the notification path spells its accessor `take_dropped()`,
+> and by reading only the lines around each `record_budget_event` call rather
+> than the whole worker. Both are in §4.2 where they belong. The lesson is the
+> obvious one: "no log for this" is a claim about the *absence* of code, and
+> absence is the one thing a targeted grep is worst at proving.
 
 ### 4.5 `prxwaf_degraded_requests_total`
 
@@ -286,7 +300,24 @@ allocation, no formatting. Every site is a path that was already writing an HTTP
 response and returning; a clean forwarded request reaches none of them, and the
 `logging` callback is untouched.
 
-### 7.2 (pending)
+### 7.2 One word for a queue
+
+`BudgetEvent::limit()` (`metrics.rs:550`) is now `pub`, and all seven periodic
+queue-drop WARNs read the `queue` field off it — `detection_sink.rs:342` and
+`:351`, `semantic_sink.rs:267` and `:275`, `audit_log.rs:498`,
+`community/reporter.rs:241`, `waf-api/src/notify_runtime.rs:263` — with the same
+token repeated in the message text so a plain-text grep works as well as a
+field query.
+
+`every_queue_gauge_has_a_drop_counter_spelled_the_same` in `metrics.rs` also
+pins the other half of the pair `docs/metrics.md` asks operators to graph
+together: `prxwaf_queue_depth{queue}` and
+`prxwaf_budget_events_total{subsystem="queue", limit}` are separate
+enumerations that happen to agree, and nothing but that test stops one from
+being renamed alone.
+
+All seven fire from a 30 s timer in a background worker. None is on the request
+path.
 
 ### 7.3 (pending)
 

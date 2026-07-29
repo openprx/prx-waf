@@ -260,8 +260,8 @@ fn report_suppression(bus: &Arc<NotificationBus>, coalescer: &mut Coalescer) {
     let dropped = bus.take_dropped();
     if dropped > 0 {
         warn!(
-            dropped,
-            "Notification queue full — events dropped (back-pressure); delivery is degraded"
+            queue = waf_common::metrics::BudgetEvent::NotificationDrop.limit(),
+            dropped, "notifications queue full — events dropped (back-pressure); delivery is degraded"
         );
     }
     let overflow = coalescer.take_overflow();
