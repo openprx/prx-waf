@@ -250,25 +250,45 @@ Recorded so that a future reader does not "fix" them:
 
 ## 7. What changed
 
-Three changes, all off the per-request fast path:
+Three changes, all off the per-request fast path.
 
-1. **`action = "block"` / `"redirect"` as a structured field** on every
-   HTTP/1.1 terminal-refusal log line in `gateway/src/proxy.rs`, spelled exactly
-   as the `RequestAction` label it corresponds to, and a first-ever log line for
-   the redirect verdict. These are `&'static str` fields on `warn!` calls that
-   already existed on paths that were already writing an HTTP response and
-   returning; a clean request reaches none of them.
-2. **`queue = "<limit label>"` on the five periodic queue-drop WARNs**, plus the
-   word *queue* in the message where it said *channel*. Emitted from a 30 s
-   timer in a background worker.
-3. **A one-shot WARN when the host label table is found saturated**, emitted
-   from the `/metrics` scrape handler (`waf-api/src/metrics_endpoint.rs`) —
-   which is the natural place, because the thing being folded is the thing being
-   scraped, and because `waf-common` deliberately carries no `tracing`
-   dependency. Backed by `metrics::host_labels_exhausted()`, one relaxed atomic
-   load, called once per scrape and from nowhere on the request path.
+### 7.1 One definition of the action word
 
-Nothing in the request path gained a log call, a string format or an allocation.
+`RequestAction::label()` (`metrics.rs:162`) is now `pub`, and
+`RequestAction::of(&WafAction)` (`metrics.rs:180`) maps the engine's verdict
+onto it. Every surface reads the word from there:
+
+* the **metric** label, as before;
+* the **evidence tables** — `engine.rs:1236` and `:1282` used to each carry
+  their own four-arm `match` producing the same four strings, which is two
+  copies too many; both now call `RequestAction::of(&decision.action).label()`;
+* the **log**, at every HTTP/1.1 terminal refusal in `gateway/src/proxy.rs` —
+  duplicate `Host` (`:550`), header fold (`:577`), unrouted host (`:610`),
+  closed site (`:629`), detection block (`:698`), body-ceiling reject (`:800`),
+  body-phase block (`:867`) — each of which now carries
+  `action = RequestAction::Block.label()` alongside its existing message.
+
+`metrics.rs`'s `the_action_word_has_exactly_one_definition` pins both halves.
+
+The **redirect verdict got its first log line ever** (`proxy.rs:722` header
+phase, `:889` body phase). It fires only when a configured rule resolves to
+`redirect` — the same frequency class as a block, which has always logged — and
+the destination it names is operator-configured, not request-controlled.
+
+The two detection-block lines also gained `phase = <Phase::metric_label()>`,
+which is the `prxwaf_detections_total{phase}` spelling and therefore joinable.
+Deliberately *not* `Phase::to_string()`: that is the `attack_logs.phase` form
+(§2), and a log carrying it would have been a third spelling of a word that
+already has two.
+
+**Cost.** Every added field is a `&'static str` from a `const fn` match — no
+allocation, no formatting. Every site is a path that was already writing an HTTP
+response and returning; a clean forwarded request reaches none of them, and the
+`logging` callback is untouched.
+
+### 7.2 (pending)
+
+### 7.3 (pending)
 
 ---
 

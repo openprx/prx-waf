@@ -149,12 +149,40 @@ impl RequestAction {
         self as usize
     }
 
-    const fn label(self) -> &'static str {
+    /// The exported `action` label value.
+    ///
+    /// **Public because the log uses it too.** The refusal paths in
+    /// `gateway::proxy` tag their `warn!` with `action = …` so that the word an
+    /// operator reads off a dashboard is the word they can grep for, and reading
+    /// it from here rather than writing `"block"` a second time is what keeps
+    /// the two from drifting: renaming a label renames the log field with it,
+    /// and there is no spelling of this word that only one surface knows about.
+    /// `docs/logs-and-metrics.md` §1 is the audit that made this necessary.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Allow => "allow",
             Self::Block => "block",
             Self::LogOnly => "log_only",
             Self::Redirect => "redirect",
+        }
+    }
+
+    /// The action a [`crate::types::WafAction`] is counted and written down as.
+    ///
+    /// The evidence tables — `attack_logs.action`, `security_events.action` —
+    /// store this same word, and they used to derive it from their own `match`
+    /// over `WafAction`, one copy per sink. Three copies of a four-arm match is
+    /// three chances for one surface to be renamed and the others not; routing
+    /// them all through here makes the metric label, the log field and the
+    /// database column one string with one definition.
+    #[must_use]
+    pub const fn of(action: &crate::types::WafAction) -> Self {
+        match action {
+            crate::types::WafAction::Allow => Self::Allow,
+            crate::types::WafAction::Block { .. } => Self::Block,
+            crate::types::WafAction::LogOnly => Self::LogOnly,
+            crate::types::WafAction::Redirect { .. } => Self::Redirect,
         }
     }
 }
@@ -1527,6 +1555,47 @@ mod tests {
         for (i, l) in Lane::ALL.iter().enumerate() {
             assert_eq!(l.index(), i);
         }
+    }
+
+    /// The `action` word is written on three surfaces — the metric label, the
+    /// `action = …` field on the gateway's refusal logs, and the `action`
+    /// column of `attack_logs` / `security_events`. All three now read it from
+    /// [`RequestAction::label`], and this pins both halves of that: the mapping
+    /// off `WafAction` is total and correct, and the four words themselves are
+    /// what `docs/metrics.md` and `docs/logs-and-metrics.md` promise. Renaming
+    /// one has to be a deliberate edit here, not a silent divergence between a
+    /// dashboard and a `grep`.
+    #[test]
+    fn the_action_word_has_exactly_one_definition() {
+        use crate::types::WafAction;
+
+        assert_eq!(RequestAction::of(&WafAction::Allow), RequestAction::Allow);
+        assert_eq!(
+            RequestAction::of(&WafAction::Block {
+                status: 403,
+                body: None
+            }),
+            RequestAction::Block
+        );
+        assert_eq!(RequestAction::of(&WafAction::LogOnly), RequestAction::LogOnly);
+        assert_eq!(
+            RequestAction::of(&WafAction::Redirect {
+                url: "https://example.test/".to_string()
+            }),
+            RequestAction::Redirect
+        );
+
+        assert_eq!(RequestAction::Allow.label(), "allow");
+        assert_eq!(RequestAction::Block.label(), "block");
+        assert_eq!(RequestAction::LogOnly.label(), "log_only");
+        assert_eq!(RequestAction::Redirect.label(), "redirect");
+
+        // A detection's three actions must be spelled identically to the
+        // request's, or `detections_total{action="block"}` and
+        // `requests_total{action="block"}` would not join.
+        assert_eq!(VerdictAction::Block.label(), RequestAction::Block.label());
+        assert_eq!(VerdictAction::LogOnly.label(), RequestAction::LogOnly.label());
+        assert_eq!(VerdictAction::Redirect.label(), RequestAction::Redirect.label());
     }
 
     #[test]

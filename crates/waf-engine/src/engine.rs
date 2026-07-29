@@ -1233,12 +1233,7 @@ impl WafEngine {
             return;
         };
 
-        let action_str = match &decision.action {
-            WafAction::Block { .. } => "block",
-            WafAction::Allow => "allow",
-            WafAction::LogOnly => "log_only",
-            WafAction::Redirect { .. } => "redirect",
-        };
+        let action_str = metrics::RequestAction::of(&decision.action).label();
 
         record_detection_metric(decision, result);
 
@@ -1284,12 +1279,7 @@ impl WafEngine {
             return;
         };
 
-        let action_str = match &decision.action {
-            WafAction::Block { .. } => "block",
-            WafAction::Allow => "allow",
-            WafAction::LogOnly => "log_only",
-            WafAction::Redirect { .. } => "redirect",
-        };
+        let action_str = metrics::RequestAction::of(&decision.action).label();
 
         record_detection_metric(decision, result);
 

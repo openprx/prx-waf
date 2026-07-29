@@ -545,7 +545,12 @@ impl ProxyHttp for WafProxy {
             // pick one and the origin might pick the other.
             metrics::record_budget_event(BudgetEvent::DuplicateHost);
             ctx.metric_action = Some(RequestAction::Block);
+            // `action` is the metric's own label value, not a second spelling of
+            // it: this refusal lands in `prxwaf_requests_total{action="block"}`
+            // and an operator pivoting off that series has to be able to grep
+            // the same token. Same for every refusal below.
             warn!(
+                action = RequestAction::Block.label(),
                 "Rejecting request with duplicate Host headers: ip={}",
                 self.extract_client_ip(session)
             );
@@ -572,6 +577,7 @@ impl ProxyHttp for WafProxy {
             );
             ctx.metric_action = Some(RequestAction::Block);
             warn!(
+                action = RequestAction::Block.label(),
                 "Rejecting request: header '{name}' exceeds the fold limits: ip={}",
                 self.extract_client_ip(session)
             );
@@ -603,7 +609,10 @@ impl ProxyHttp for WafProxy {
         let Some(host_config) = self.router.resolve(&host_header) else {
             // Unknown host: previously fell through to a pass-through; now we
             // respond 404 so unrouted traffic is never forwarded / inspected.
-            warn!("No route found for host: {host_header}");
+            warn!(
+                action = RequestAction::Block.label(),
+                "No route found for host: {host_header}"
+            );
             // Counted as a Block: the WAF refused it and nothing reached an
             // upstream. `prxwaf_responses_total{status="4xx"}` carries the 404
             // itself, so the two together separate "refused by routing" from
@@ -619,7 +628,10 @@ impl ProxyHttp for WafProxy {
 
         // Site administratively closed → 503 (previously an opaque proxy error).
         if !host_config.start_status {
-            warn!("Site closed for host: {host_header}");
+            warn!(
+                action = RequestAction::Block.label(),
+                "Site closed for host: {host_header}"
+            );
             ctx.metric_action = Some(RequestAction::Block);
             let response = pingora_http::ResponseHeader::build(503, None)?;
             session.write_response_header(Box::new(response), false).await?;
@@ -675,10 +687,21 @@ impl ProxyHttp for WafProxy {
             ctx.metric_action = Some(action);
         }
 
+        // The phase that produced the verdict, spelled as
+        // `prxwaf_detections_total{phase=…}` spells it. `Phase::to_string()` —
+        // which is what `attack_logs.phase` stores — renders "SQL Injection",
+        // and a log carrying that form would be a third spelling of a thing
+        // that already has two.
+        let detected_phase = decision.result.as_ref().map(|r| r.phase.metric_label());
+
         if !decision.is_allowed() {
             match &decision.action {
                 WafAction::Block { status, body } => {
-                    warn!("WAF blocked request: ip={client_ip} path={path} host={host}");
+                    warn!(
+                        action = RequestAction::Block.label(),
+                        phase = detected_phase,
+                        "WAF blocked request: ip={client_ip} path={path} host={host}"
+                    );
                     let status_code = *status;
                     let body_str = body.clone().unwrap_or_else(|| "Access Denied".to_string());
 
@@ -689,6 +712,20 @@ impl ProxyHttp for WafProxy {
                     return Ok(true);
                 }
                 WafAction::Redirect { url } => {
+                    // Previously silent. A redirect verdict increments
+                    // `prxwaf_requests_total{action="redirect"}` exactly as a
+                    // block increments its own label, and a counter that moves
+                    // with nothing in the log to explain it is the shape of
+                    // divergence this pass exists to remove. Same frequency
+                    // class as a block — it fires only when a configured rule
+                    // resolves to `redirect` — so it costs what the block line
+                    // costs. The destination is operator-configured, not
+                    // request-controlled, so naming it is safe.
+                    warn!(
+                        action = RequestAction::Redirect.label(),
+                        phase = detected_phase,
+                        "WAF redirected request: ip={client_ip} path={path} host={host} to={url}"
+                    );
                     let mut response = pingora_http::ResponseHeader::build(302, None)?;
                     response.insert_header("location", url.as_str())?;
                     session.write_response_header(Box::new(response), true).await?;
@@ -763,6 +800,7 @@ impl ProxyHttp for WafProxy {
                 |c| (c.client_ip.to_string(), c.path.clone(), c.host.clone()),
             );
             warn!(
+                action = RequestAction::Block.label(),
                 "WAF rejected request body over the {} byte inspection ceiling: ip={ip} path={path} host={host}",
                 policy.max_total_bytes,
             );
@@ -820,6 +858,8 @@ impl ProxyHttp for WafProxy {
             ctx.metric_action = Some(action);
         }
 
+        let detected_phase = decision.result.as_ref().map(|r| r.phase.metric_label());
+
         if !decision.is_allowed() {
             match &decision.action {
                 WafAction::Block {
@@ -827,8 +867,12 @@ impl ProxyHttp for WafProxy {
                     body: block_body,
                 } => {
                     warn!(
+                        action = RequestAction::Block.label(),
+                        phase = detected_phase,
                         "WAF blocked request (body): ip={} path={} host={}",
-                        request_ctx.client_ip, request_ctx.path, request_ctx.host,
+                        request_ctx.client_ip,
+                        request_ctx.path,
+                        request_ctx.host,
                     );
                     let status_code = *status;
                     let body_str = block_body.clone().unwrap_or_else(|| "Access Denied".to_string());
@@ -844,6 +888,14 @@ impl ProxyHttp for WafProxy {
                     ));
                 }
                 WafAction::Redirect { url } => {
+                    warn!(
+                        action = RequestAction::Redirect.label(),
+                        phase = detected_phase,
+                        "WAF redirected request (body): ip={} path={} host={} to={url}",
+                        request_ctx.client_ip,
+                        request_ctx.path,
+                        request_ctx.host,
+                    );
                     let mut response = pingora_http::ResponseHeader::build(302, None)?;
                     response.insert_header("location", url.as_str())?;
                     session.write_response_header(Box::new(response), true).await?;
