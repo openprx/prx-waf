@@ -372,6 +372,61 @@ plain_sqli="$(curl -s -o /dev/null -A "$UA" -H "Host: $HOSTNAME_UNDER_TEST:$HTTP
     && pass "HTTP and HTTPS agree on the verdict ($plain_sqli)" \
     || fail "HTTP said $plain_sqli and HTTPS said $sqli_status for the same payload"
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Test 4: the handover carries the TLS listener
+# ═════════════════════════════════════════════════════════════════════════════
+# `run --upgrade` is the answer this feature gives to every question it cannot
+# answer itself — a renewed certificate, an uploaded one, a changed
+# tls_cert_pem — so a handover that dropped the TLS listener would make the
+# advice wrong in exactly the situation it is given. Pingora carries listening
+# descriptors by address and each process builds its own acceptor from its own
+# materialised files, which is a claim worth one measurement.
+echo
+echo "Test 4: a graceful upgrade keeps HTTPS up"
+# The daemon refuses a handover socket in a directory anything else can write
+# to; $WORK comes from mktemp -d, which is 0700 and ours.
+printf 'upgrade_sock = "%s/upgrade.sock"\n' "$WORK" >> "$WORK/waf-cert.toml"
+stop_daemon
+if ! start_daemon "$WORK/waf-cert.toml" "$WORK/waf-sock.log"; then
+    echo "ERROR: the daemon never restarted with a handover socket" >&2
+    tail -20 "$WORK/waf-sock.log" >&2
+    exit 1
+fi
+OLD_PID="$(pgrep -f "$WORK/waf-cert.toml" | head -1)"
+
+JWT_SECRET="${JWT_SECRET:-e2e-tls-termination-secret-0123456789abcdef}" \
+    "$BIN" --config "$WORK/waf-cert.toml" run --upgrade > "$WORK/waf-new.log" 2>&1 &
+NEW_PID=$!
+disown || true
+for _ in $(seq 1 100); do
+    grep -q 'Waiting up to' "$WORK/waf-new.log" && break
+    kill -0 "$NEW_PID" 2>/dev/null || break
+    sleep 0.2
+done
+[ -n "$OLD_PID" ] && kill -QUIT "$OLD_PID" 2>/dev/null || true
+for _ in $(seq 1 120); do
+    kill -0 "$OLD_PID" 2>/dev/null || break
+    sleep 0.5
+done
+
+upgraded="$(curl -s -A "$UA" --cacert "$WORK/store-cert.pem" --max-time 10 \
+    --resolve "$HOSTNAME_UNDER_TEST:$TLS_PORT:127.0.0.1" -w '\nHTTP_STATUS=%{http_code}\n' \
+    "https://$HOSTNAME_UNDER_TEST:$TLS_PORT/probe" || true)"
+echo "$upgraded" | grep -q 'HTTP_STATUS=200' \
+    && pass "HTTPS still answers 200 after the handover" \
+    || fail "the TLS listener did not survive the handover"
+
+UPGRADED_FP="$(echo | openssl s_client -connect "127.0.0.1:$TLS_PORT" \
+    -servername "$HOSTNAME_UNDER_TEST" 2>/dev/null \
+    | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true)"
+[ -n "$UPGRADED_FP" ] && [ "$UPGRADED_FP" = "$STORED_FP" ] \
+    && pass "the replacement serves the same stored certificate" \
+    || fail "the certificate changed across the handover"
+
+grep -q "TLS termination active on 127.0.0.1:$TLS_PORT" "$WORK/waf-new.log" \
+    && pass "the replacement resolved a certificate of its own" \
+    || fail "the replacement never reported an active TLS listener"
+
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
