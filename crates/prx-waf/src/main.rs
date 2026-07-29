@@ -2057,7 +2057,7 @@ fn run_server(config: &AppConfig, taking_over: bool) -> anyhow::Result<()> {
     // would fail without certificates), treat "both cert_pem and key_pem are
     // configured" as intent to enable — an operator who points HTTP/3 at a
     // keypair clearly wants it. With no certs it stays disabled.
-    let http3_enabled = config.http3.enabled || (config.http3.cert_pem.is_some() && config.http3.key_pem.is_some());
+    let http3_enabled = http3_is_enabled(&config.http3);
 
     // Optionally start HTTP/3 listener
     if http3_enabled {
@@ -2331,6 +2331,16 @@ impl BroadcastLine {
     }
 }
 
+/// Whether the HTTP/3 listener will run.
+///
+/// A function rather than an expression at its one former call site because the
+/// TLS listener's startup broadcast asks the same question — whether a second
+/// certificate is about to be served on the same port from a different source —
+/// and two copies of "or both paths are configured" would drift.
+const fn http3_is_enabled(http3: &waf_common::config::Http3Config) -> bool {
+    http3.enabled || (http3.cert_pem.is_some() && http3.key_pem.is_some())
+}
+
 /// What `[proxy] listen_addr_tls` resolved to on this launch.
 ///
 /// Three states rather than an `Option`, because "no TLS listener" has two very
@@ -2405,14 +2415,14 @@ impl TlsListener {
                             .to_string(),
                     ));
                 }
-                if http3.enabled && material.origin == gateway::tls_listener::CertOrigin::ConfiguredFiles {
+                if http3_is_enabled(http3) && material.origin == gateway::tls_listener::CertOrigin::ConfiguredFiles {
                     lines.push(BroadcastLine::info(
                         "HTTP/3 reads [http3] cert_pem / key_pem and this listener reads [proxy] tls_cert_pem / \
                          tls_key_pem. Point both pairs at the same files unless the two protocols are meant to \
                          present different certificates."
                             .to_string(),
                     ));
-                } else if http3.enabled {
+                } else if http3_is_enabled(http3) {
                     lines.push(BroadcastLine::warn(
                         "HTTP/3 is enabled and the two TLS listeners have different certificate sources: this one \
                          serves the certificates table, HTTP/3 serves the files named in [http3] cert_pem / key_pem \
