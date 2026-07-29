@@ -1972,6 +1972,19 @@ fn run_server(config: &AppConfig, taking_over: bool) -> anyhow::Result<()> {
     let handover_window = taking_over
         .then(|| upgrade::handover_bind_window(std::time::Duration::from_secs(config.proxy.drain_timeout_secs)));
 
+    // What `[proxy] listen_addr_tls` will actually do on this launch. Resolved
+    // here rather than beside the other startup broadcasts because the shipped
+    // answer comes out of the database, which does not exist until `init_async`
+    // has run; and before the HTTP/3 thread is spawned so its own certificate
+    // line can be compared with this one in the log without scrolling.
+    let tls_listener = rt.block_on(resolve_tls_listener(&config.proxy, &api_state.db));
+    for line in tls_listener.startup_broadcast(&config.http3) {
+        match line.level {
+            BroadcastLevel::Info => info!("{}", line.text),
+            BroadcastLevel::Warn => tracing::warn!("{}", line.text),
+        }
+    }
+
     // Start the management API in a background thread
     let api_listen = config.api.listen_addr.clone();
     let api_state_bg = Arc::clone(&api_state);
@@ -2275,6 +2288,7 @@ fn run_server(config: &AppConfig, taking_over: bool) -> anyhow::Result<()> {
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
     proxy_service.add_tcp(&config.proxy.listen_addr);
+    add_tls_endpoint(&mut proxy_service, &tls_listener);
     server.add_service(proxy_service);
 
     info!("Proxy listening on {}", config.proxy.listen_addr);
@@ -2314,6 +2328,160 @@ impl BroadcastLine {
             level: BroadcastLevel::Warn,
             text: text.into(),
         }
+    }
+}
+
+/// What `[proxy] listen_addr_tls` resolved to on this launch.
+///
+/// Three states rather than an `Option`, because "no TLS listener" has two very
+/// different causes and an operator who reads only the log must be able to tell
+/// them apart: switched off deliberately, or asked for and not deliverable.
+enum TlsListener {
+    /// `[proxy] listen_addr_tls` is empty. Nothing was asked for.
+    NotRequested,
+    /// The address will be bound and this certificate served on it.
+    Ready {
+        addr: String,
+        material: Box<gateway::tls_listener::TlsMaterial>,
+    },
+    /// The address was asked for and will not be bound.
+    Unavailable { addr: String, reason: String },
+}
+
+impl TlsListener {
+    /// Say, at every launch, exactly what this port is doing.
+    ///
+    /// `listen_addr_tls` has shipped with a default of `0.0.0.0:443` since long
+    /// before anything listened on it, so silence here is indistinguishable
+    /// from the bug this replaces. Every branch emits a line.
+    fn startup_broadcast(&self, http3: &waf_common::config::Http3Config) -> Vec<BroadcastLine> {
+        let mut lines = Vec::new();
+        match self {
+            Self::NotRequested => {
+                lines.push(BroadcastLine::info(
+                    "TLS termination is off: [proxy] listen_addr_tls is empty. Clients reach this WAF over plaintext \
+                     HTTP only. Set it to an address (0.0.0.0:443 is the shipped default) and provision a certificate \
+                     to serve HTTPS here."
+                        .to_string(),
+                ));
+            }
+            Self::Unavailable { addr, reason } => {
+                lines.push(BroadcastLine::warn(format!(
+                    "TLS termination is NOT active: [proxy] listen_addr_tls = {addr} was requested but nothing will \
+                     bind it, so HTTPS clients get connection refused while the plaintext listener keeps serving. \
+                     {reason}"
+                )));
+            }
+            Self::Ready { addr, material } => {
+                lines.push(BroadcastLine::info(format!(
+                    "TLS termination active on {addr}, certificate from {}. TLS 1.2 and 1.3 only — Pingora's rustls \
+                     backend builds the acceptor with exactly those two protocol versions and the ring provider's \
+                     cipher suites, so 1.0/1.1, export and null suites cannot be negotiated. ALPN offers h2 and \
+                     http/1.1.",
+                    material.origin.describe()
+                )));
+                if !material.unserved_domains.is_empty() {
+                    lines.push(BroadcastLine::warn(format!(
+                        "One certificate serves this port and {} other active certificate(s) in the store will NOT be \
+                         presented: {}. Pingora 0.8.1's rustls backend has one certificate per endpoint and no SNI \
+                         callback, so clients asking for those names get a certificate-name mismatch. Cover them with \
+                         one SAN or wildcard certificate, pin the right one with [proxy] tls_cert_pem / tls_key_pem, \
+                         or terminate their TLS elsewhere.",
+                        material.unserved_domains.len(),
+                        material.unserved_domains.join(", ")
+                    )));
+                }
+                // Renewal writes to the database and to nothing else. The
+                // acceptor holds certificates rustls parsed once, at listener
+                // construction (`listeners/tls/rustls/mod.rs:49-83`), and
+                // Pingora exposes no way to replace them on a running endpoint.
+                if matches!(material.origin, gateway::tls_listener::CertOrigin::AcmeStore { .. }) {
+                    lines.push(BroadcastLine::info(
+                        "This certificate was read once, at startup. ACME renewal updates the certificates table but \
+                         cannot reach the running listener — Pingora's rustls acceptor parses its certificate when \
+                         the endpoint is built and offers no way to swap it afterwards — so a renewed certificate is \
+                         served only after a restart. `prx-waf run --upgrade` does that without dropping connections."
+                            .to_string(),
+                    ));
+                }
+                if http3.enabled && material.origin == gateway::tls_listener::CertOrigin::ConfiguredFiles {
+                    lines.push(BroadcastLine::info(
+                        "HTTP/3 reads [http3] cert_pem / key_pem and this listener reads [proxy] tls_cert_pem / \
+                         tls_key_pem. Point both pairs at the same files unless the two protocols are meant to \
+                         present different certificates."
+                            .to_string(),
+                    ));
+                } else if http3.enabled {
+                    lines.push(BroadcastLine::warn(
+                        "HTTP/3 is enabled and the two TLS listeners have different certificate sources: this one \
+                         serves the certificates table, HTTP/3 serves the files named in [http3] cert_pem / key_pem \
+                         and never reads the database. A client that negotiates h3 over the Alt-Svc advertisement can \
+                         therefore be shown a different certificate from the one it got over TCP. Set [proxy] \
+                         tls_cert_pem / tls_key_pem to the same files [http3] uses to make the two agree."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        lines
+    }
+}
+
+/// Decide what `[proxy] listen_addr_tls` does on this launch.
+async fn resolve_tls_listener(proxy: &waf_common::config::ProxyConfig, db: &Database) -> TlsListener {
+    let addr = proxy.listen_addr_tls.trim();
+    if addr.is_empty() {
+        return TlsListener::NotRequested;
+    }
+    let addr = addr.to_string();
+
+    // A malformed address is caught before the certificate work rather than
+    // after it, so the operator is told about the typo instead of about a
+    // certificate that was never the problem.
+    if addr.parse::<std::net::SocketAddr>().is_err() {
+        return TlsListener::Unavailable {
+            reason: format!("{addr:?} does not parse as an address:port."),
+            addr,
+        };
+    }
+
+    let plan = gateway::tls_listener::resolve(
+        proxy.tls_cert_pem.as_deref(),
+        proxy.tls_key_pem.as_deref(),
+        db,
+        upgrade::private_tls_dir,
+    )
+    .await;
+
+    match plan {
+        gateway::tls_listener::TlsPlan::Ready(material) => TlsListener::Ready { addr, material },
+        gateway::tls_listener::TlsPlan::Unavailable { reason } => TlsListener::Unavailable { addr, reason },
+    }
+}
+
+/// Attach the TLS endpoint to the proxy service, when there is one to attach.
+///
+/// `enable_h2` sets the ALPN to prefer h2 with http/1.1 allowed, which is what
+/// a browser expects of an HTTPS origin; the plaintext listener is untouched
+/// and stays HTTP/1.1. The certificate and key have already been parsed and
+/// paired by `gateway::tls_listener::validate`, which is what keeps the
+/// `panic!`/`unwrap` inside Pingora's own `TlsSettings::build` out of reach.
+fn add_tls_endpoint<SV>(service: &mut pingora_core::services::listening::Service<SV>, listener: &TlsListener) {
+    let TlsListener::Ready { addr, material } = listener else {
+        return;
+    };
+    let (cert, key) = (material.cert_path.display(), material.key_path.display());
+    match pingora_core::listeners::tls::TlsSettings::intermediate(&cert.to_string(), &key.to_string()) {
+        Ok(mut settings) => {
+            settings.enable_h2();
+            service.add_tls_with_settings(addr, None, settings);
+        }
+        // Unreachable with the rustls backend, whose `intermediate` only ever
+        // returns Ok. Reported rather than ignored so that swapping the backend
+        // cannot turn TLS off in silence.
+        Err(e) => tracing::error!(
+            "TLS listener on {addr} could not be created from {cert} / {key}: {e}. The plaintext listener is unaffected."
+        ),
     }
 }
 

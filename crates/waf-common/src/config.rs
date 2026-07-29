@@ -730,7 +730,44 @@ const fn default_appsec_timeout() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub listen_addr: String,
+    /// Where the proxy terminates TLS. Set to the empty string to run no TLS
+    /// listener at all.
+    ///
+    /// A certificate is required before this can bind, and the default install
+    /// has none, so the listener is created only when one can be resolved —
+    /// from [`Self::tls_cert_pem`] if configured, otherwise from the newest
+    /// usable row in the `certificates` table, which is what ACME issues into.
+    /// When neither yields a certificate the address is not bound and the
+    /// reason is logged at WARN; the plaintext listener is unaffected.
+    ///
+    /// **One certificate, no SNI.** Pingora 0.8.1's rustls backend builds each
+    /// endpoint's acceptor with `with_single_cert`
+    /// (`pingora-core-0.8.1/src/listeners/tls/rustls/mod.rs:70`) and its
+    /// `TlsSettings` exposes no certificate callback — `with_callbacks` there
+    /// returns "Certificate callbacks are not supported with feature
+    /// \"rustls\"" (:114-118) — so one certificate serves every hostname that
+    /// arrives on this port. Hosts not covered by it get a name-mismatch
+    /// failure in the client. Cover several names with one SAN or wildcard
+    /// certificate, or terminate their TLS elsewhere.
     pub listen_addr_tls: String,
+    /// PEM certificate chain file for [`Self::listen_addr_tls`], leaf first.
+    ///
+    /// Set together with [`Self::tls_key_pem`] to serve a specific certificate
+    /// instead of whatever the `certificates` table currently holds. That is
+    /// the way to pin one host when several are provisioned, to run TLS with
+    /// no ACME at all, and to make the TCP listener serve the same file
+    /// `[http3] cert_pem` does — HTTP/3 reads only from configured paths and
+    /// never from the database, so leaving this unset while HTTP/3 is enabled
+    /// means the two protocols can present different certificates.
+    ///
+    /// Renewal is not this file's business: whatever writes it is responsible
+    /// for keeping it current, and a change is picked up on restart.
+    #[serde(default)]
+    pub tls_cert_pem: Option<String>,
+    /// PEM private key file for [`Self::tls_cert_pem`]. Both must be set for
+    /// either to take effect.
+    #[serde(default)]
+    pub tls_key_pem: Option<String>,
     /// Worker threads for the Pingora proxy data plane — the runtime every
     /// request is accepted, inspected and relayed on.
     ///
@@ -823,6 +860,8 @@ impl Default for ProxyConfig {
         Self {
             listen_addr: "0.0.0.0:80".to_string(),
             listen_addr_tls: "0.0.0.0:443".to_string(),
+            tls_cert_pem: None,
+            tls_key_pem: None,
             worker_threads: None,
             trust_proxy_headers: false,
             trusted_proxies: Vec::new(),

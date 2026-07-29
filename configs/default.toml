@@ -7,7 +7,47 @@
 # WARN. Genuine IPv6 clients are matched as IPv6 and are unaffected.
 [proxy]
 listen_addr = "0.0.0.0:80"
+
+# ── TLS termination ───────────────────────────────────────────────────────────
+# Where HTTPS is terminated. Set to "" to run no TLS listener at all.
+#
+# Binding it needs a certificate, and a fresh install has none, so this address
+# is bound only once one can be resolved. Two sources, in this order:
+#
+#   1. tls_cert_pem + tls_key_pem below, if both are set;
+#   2. otherwise the newest usable row in the `certificates` table — which is
+#      where ACME issues, and where a management-API upload lands.
+#
+# When neither yields a certificate the port is NOT bound and startup says why
+# at WARN. HTTPS clients get connection refused; the plaintext listener above is
+# unaffected. Every launch logs one line about this port whichever way it goes.
+#
+# ONE CERTIFICATE, NO SNI. Pingora 0.8.1's rustls backend gives an endpoint a
+# single certificate and offers no hook to choose one per client hostname, so
+# whatever is resolved here is presented to every connection on this port.
+# Hosts it does not cover fail with a certificate-name mismatch in the client.
+# Cover several names with one SAN or wildcard certificate, pin a specific one
+# with tls_cert_pem below, or terminate their TLS elsewhere. When the store
+# holds more than one active certificate, startup names the ones not served.
+#
+# RENEWAL NEEDS A RESTART. The certificate is read once, while the listener is
+# built. ACME renewal updates the database and cannot reach a running listener.
+# `prx-waf run --upgrade` picks up the new one without dropping connections.
 listen_addr_tls = "0.0.0.0:443"
+
+# Serve a certificate from files instead of from the database. Both or neither;
+# setting one alone is a startup error rather than a silent fallback.
+#
+# This is how to pin one host when several are provisioned, how to run HTTPS
+# with no ACME at all, and how to make this listener and the HTTP/3 one agree —
+# [http3] cert_pem / key_pem below are always file paths and never read the
+# database, so leaving these unset while HTTP/3 is on means the two protocols
+# can present different certificates. Startup warns when that is the case.
+#
+# Nothing here is renewed for you: whatever writes these files owns keeping them
+# current, and a change takes effect on restart.
+# tls_cert_pem = "/etc/prx-waf/tls/cert.pem"
+# tls_key_pem  = "/etc/prx-waf/tls/key.pem"
 
 # ── Stopping, and replacing a running process ─────────────────────────────────
 # How long this process keeps serving requests it has already accepted after it

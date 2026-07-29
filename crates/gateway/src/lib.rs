@@ -7,6 +7,7 @@ pub mod response;
 pub mod router;
 pub mod smuggling;
 pub mod ssl;
+pub mod tls_listener;
 pub mod tunnel;
 pub mod upstream_timeout;
 

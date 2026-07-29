@@ -268,6 +268,53 @@ pub fn resolve(configured: Option<&str>) -> anyhow::Result<UpgradeSock> {
     )
 }
 
+/// Subdirectory of the runtime directory that holds certificate material.
+const TLS_DIR_NAME: &str = "tls";
+
+/// A private directory this process can write the TLS listener's certificate
+/// and key into.
+///
+/// Pingora's rustls backend loads certificates from paths rather than memory
+/// (`listeners/tls/rustls/mod.rs:54`), so a certificate that lives in Postgres
+/// has to become a file before it can be served, and a private key written
+/// anywhere a local user can read it is a private key that has been disclosed.
+/// The candidates and the vetting are the handover socket's, for the same
+/// reason and with the same verdicts: a directory that is a symlink, is owned
+/// by somebody else, or grants anything to group or other is refused rather
+/// than used. Reusing them also means one runtime directory per uid instead of
+/// two, and it is created 0700 at the moment it is created rather than
+/// chmod'ed afterwards.
+pub fn private_tls_dir() -> anyhow::Result<PathBuf> {
+    let euid = effective_uid();
+    let mut rejections = Vec::new();
+
+    for base in auto_sock_dirs(euid) {
+        match prepare_dir(&base, euid) {
+            Ok(DirVerdict::Usable) => {}
+            Ok(verdict) => {
+                rejections.push(verdict.describe(&base));
+                continue;
+            }
+            Err(e) => {
+                rejections.push(format!("{}: {e}", base.display()));
+                continue;
+            }
+        }
+        let dir = base.join(TLS_DIR_NAME);
+        match prepare_dir(&dir, euid) {
+            Ok(DirVerdict::Usable) => return Ok(dir),
+            Ok(verdict) => rejections.push(verdict.describe(&dir)),
+            Err(e) => rejections.push(format!("{}: {e}", dir.display())),
+        }
+    }
+
+    anyhow::bail!(
+        "no private directory is available to hold the TLS listener's certificate ({}). Set [proxy] tls_cert_pem and \
+         tls_key_pem to serve a certificate from paths this process can already read, which needs no such directory.",
+        rejections.join("; ")
+    )
+}
+
 /// Does this error chain bottom out in "address already in use"?
 ///
 /// Matched on the `io::ErrorKind` rather than on rendered text: every listener

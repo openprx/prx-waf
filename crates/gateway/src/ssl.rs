@@ -278,8 +278,21 @@ impl SslManager {
             let domain = cert.domain.clone();
             let host_code = cert.host_code.clone();
             tokio::spawn(async move {
-                if let Err(e) = mgr.request_certificate(&host_code, &domain).await {
-                    error!("Failed to renew certificate for {}: {}", domain, e);
+                match mgr.request_certificate(&host_code, &domain).await {
+                    // The renewal has reached the database, and that is as far
+                    // as it goes on its own. The TLS listener parsed its
+                    // certificate when Pingora built the endpoint and Pingora
+                    // offers no way to replace it on a running one, so the old
+                    // certificate stays on the wire until the process is
+                    // replaced. Said here, at the moment it becomes true,
+                    // rather than left for an expiry alert to reveal.
+                    Ok(_) => info!(
+                        "Renewed certificate for {} and stored it. The TLS listener still serves the previous \
+                         certificate: it is read once at startup. Run `prx-waf run --upgrade` to pick the new one up \
+                         without dropping connections.",
+                        domain
+                    ),
+                    Err(e) => error!("Failed to renew certificate for {}: {}", domain, e),
                 }
             });
         }
