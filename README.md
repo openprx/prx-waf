@@ -211,7 +211,14 @@ Configuration is loaded from a TOML file (default: `configs/default.toml`).
 ```toml
 [proxy]
 listen_addr     = "0.0.0.0:80"
+# Bound only once a certificate resolves — from tls_cert_pem/tls_key_pem if set,
+# otherwise from the `certificates` table that ACME issues into. With neither,
+# the port is left unbound and startup says so. One certificate serves the whole
+# port (no SNI), and it is read at startup, so a renewal takes effect on the
+# next start; `prx-waf run --upgrade` does that without dropping connections.
 listen_addr_tls = "0.0.0.0:443"
+# tls_cert_pem  = "/etc/prx-waf/tls/cert.pem"   # both, or neither
+# tls_key_pem   = "/etc/prx-waf/tls/key.pem"
 worker_threads  = 4          # optional; unset or 0 = the CPUs this process may use
 
 [api]

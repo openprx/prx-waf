@@ -282,8 +282,16 @@ const TLS_DIR_NAME: &str = "tls";
 /// reason and with the same verdicts: a directory that is a symlink, is owned
 /// by somebody else, or grants anything to group or other is refused rather
 /// than used. Reusing them also means one runtime directory per uid instead of
-/// two, and it is created 0700 at the moment it is created rather than
+/// two, and each is created 0700 at the moment it is created rather than
 /// chmod'ed afterwards.
+///
+/// The leaf is this process's pid, which is not decoration. Two prx-waf
+/// processes run as the same uid more often than it looks — a graceful upgrade
+/// holds two at once by design, and a host can serve two configs — and a shared
+/// file name would let one overwrite the certificate the other wrote in the
+/// window before Pingora reads it, so a process could serve a certificate it
+/// never chose. Directories left by processes that are gone are removed on the
+/// way past, which is the only thing that stops them accumulating.
 pub fn private_tls_dir() -> anyhow::Result<PathBuf> {
     let euid = effective_uid();
     let mut rejections = Vec::new();
@@ -300,7 +308,20 @@ pub fn private_tls_dir() -> anyhow::Result<PathBuf> {
                 continue;
             }
         }
-        let dir = base.join(TLS_DIR_NAME);
+        let parent = base.join(TLS_DIR_NAME);
+        match prepare_dir(&parent, euid) {
+            Ok(DirVerdict::Usable) => {}
+            Ok(verdict) => {
+                rejections.push(verdict.describe(&parent));
+                continue;
+            }
+            Err(e) => {
+                rejections.push(format!("{}: {e}", parent.display()));
+                continue;
+            }
+        }
+        prune_dead_tls_dirs(&parent);
+        let dir = parent.join(std::process::id().to_string());
         match prepare_dir(&dir, euid) {
             Ok(DirVerdict::Usable) => return Ok(dir),
             Ok(verdict) => rejections.push(verdict.describe(&dir)),
@@ -313,6 +334,31 @@ pub fn private_tls_dir() -> anyhow::Result<PathBuf> {
          tls_key_pem to serve a certificate from paths this process can already read, which needs no such directory.",
         rejections.join("; ")
     )
+}
+
+/// Delete the per-pid certificate directories of processes that no longer exist.
+///
+/// Best effort throughout: a directory that cannot be removed is left alone
+/// rather than reported, because failing to tidy up is not a reason to refuse to
+/// serve TLS. Only names that are entirely digits are considered, so nothing
+/// this function did not create can be deleted by it.
+fn prune_dead_tls_dirs(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // `/proc/<pid>` rather than `kill(0)`: the question is whether any
+        // process holds that id, not whether this one may signal it.
+        if Path::new("/proc").join(name).exists() {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
 }
 
 /// Does this error chain bottom out in "address already in use"?

@@ -74,10 +74,10 @@ trap cleanup EXIT
 psql "$DATABASE_URL" -c 'SELECT 1' >/dev/null 2>&1 \
     || { echo "ERROR: cannot reach $DATABASE_URL" >&2; exit 1; }
 
-# The daemon writes the store's certificate into its own private runtime
-# directory. Isolating HOME/TMPDIR is not enough — the path is derived from the
-# effective uid — so the test reads it from where the daemon says it is rather
-# than guessing, and only asserts on files this run created.
+# The daemon writes the store's certificate into a per-pid directory under its
+# private runtime directory. Isolating HOME/TMPDIR would not move it — the path
+# is derived from the effective uid — so the test clears the tree before the run
+# that should populate it and then asserts on whatever pid appeared.
 MATERIAL_DIR="/run/prx-waf/tls"
 [ -w /run/prx-waf ] 2>/dev/null || MATERIAL_DIR="/tmp/prx-waf-$(id -u)/tls"
 
@@ -255,7 +255,7 @@ echo
 echo "Test 2: the certificate in the store is the certificate on the wire"
 # Clear anything an earlier run left behind, so "the key is 0600" cannot pass on
 # a stale file written by a different binary.
-rm -f "$MATERIAL_DIR/listener.crt" "$MATERIAL_DIR/listener.key"
+rm -rf "$MATERIAL_DIR"
 write_config "$WORK/waf-cert.toml"
 if ! start_daemon "$WORK/waf-cert.toml" "$WORK/waf-cert.log"; then
     echo "ERROR: the daemon never started; last lines:" >&2
@@ -304,13 +304,20 @@ case "$NEGOTIATED" in
 esac
 
 # ── 7. The materialized key is not readable by anyone else ───────────────────
-if [ -f "$MATERIAL_DIR/listener.key" ]; then
-    keymode="$(stat -c '%a' "$MATERIAL_DIR/listener.key")"
+keyfile="$(find "$MATERIAL_DIR" -name listener.key -type f 2>/dev/null | head -1 || true)"
+if [ -n "$keyfile" ]; then
+    keymode="$(stat -c '%a' "$keyfile")"
+    dirmode="$(stat -c '%a' "$(dirname "$keyfile")")"
+    echo "    key=$keyfile mode=$keymode dir_mode=$dirmode"
     [ "$keymode" = "600" ] \
         && pass "the key written out of the database is mode 0600" \
         || fail "the key is mode $keymode — readable beyond this process"
+    [ "$dirmode" = "700" ] \
+        && pass "the directory holding it is mode 0700" \
+        || fail "the directory holding the key is mode $dirmode"
 else
-    fail "no key was materialized at $MATERIAL_DIR/listener.key"
+    fail "no key was materialized under $MATERIAL_DIR"
+    fail "no directory was created to hold one"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════

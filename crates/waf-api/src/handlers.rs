@@ -571,6 +571,13 @@ pub async fn upload_certificate(
             "id": row.id,
             "domain": row.domain,
             "status": "active",
+            // Stored is not served. The TLS listener reads this table once,
+            // while Pingora builds the endpoint, and Pingora offers no way to
+            // replace an acceptor's certificate on a running one — so an upload
+            // that reported success and changed nothing on the wire would be
+            // indistinguishable, from here, from one that worked.
+            "activation": "Stored. The proxy's TLS listener reads certificates at startup only; \
+                           run `prx-waf run --upgrade` to serve this one without dropping connections.",
         }
     })))
 }
