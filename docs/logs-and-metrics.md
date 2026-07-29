@@ -392,7 +392,23 @@ announcement.
 |---|---|
 | `attack_logs.phase` says `SQL Injection` where the metric says `sql_injection` (§2) | needs a data migration to rewrite existing rows; changing only new writes would split the column between two spellings, which is worse |
 | HTTP/3's refusal log lines (`http3.rs:537,549,573,624,653,733`) did not get the `action` field its HTTP/1.1 twins did | `gateway/src/http3.rs` is being edited concurrently; the change is mechanical and should follow |
-| `notifications`, `community_reporter` and `cluster_peer` drops have counters and no periodic WARN (§4.4) | each needs its own timer in its own worker; three separate small changes, none urgent — the counters exist and are alertable |
+| `cluster_peer` drops have a counter and no periodic WARN (§4.4) | needs a timer in the cluster worker, which has no drop-reporting tick of its own; the counter exists and is alertable meanwhile |
 | `lane2_detector`/`parser_panic` has no log (§4.4) | wants the same one-shot-latch treatment as the host fold; deferred to keep this change reviewable |
 | `waf.smuggling` has a log and no counter (§5) | a counter needs a `Phase` variant, which is a detection-model decision, not a logging one |
 | The header-fold WARN cannot say which of `values_per_name` / `folded_bytes` fired (§4.1) | `fold_request_headers` records only the offending name; the metric re-derives the limit at `proxy.rs:564`, and threading it back out is a refactor of the fold's return type |
+| `note_oversize_reject` (`cache.rs:223-226`) — the path the proxy actually takes for a streamed oversize response — counts and does not log (§4.1) | one line per oversize response is per-response frequency on a path a client can drive; wants the same judgement call the rest of §4.3 got, and was not worth making inside this pass |
+
+**How the last two findings were arrived at**, because it bears on how much the
+rest of this document should be trusted:
+
+* §4.4 originally listed `notifications` and `community_reporter` as
+  counter-only. They were not. The grep was for `.dropped()` while one of them
+  spells its accessor `take_dropped()`, and the reading was of the lines around
+  each `record_budget_event` rather than of the whole worker. **A claim that
+  something has no log is a claim about absent code, and a targeted grep is the
+  worst instrument for proving absence.**
+* §7.4 — that every structured field in this codebase was ungreppable in a
+  redirected log — was not visible from any amount of reading. It took starting
+  the daemon, sending traffic and running the actual `grep`. **A correspondence
+  between two surfaces is only established by reading both surfaces from one
+  run.**
