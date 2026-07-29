@@ -19,7 +19,7 @@ make them one:
 | Surface | Written by | Read for | Bounded by |
 |---|---|---|---|
 | `/metrics` | `waf-common::metrics` | aggregate rates and trends | cardinality (`max_host_labels`) |
-| the process log | `tracing`, plain `fmt` layer (`crates/prx-waf/src/main.rs:391`) | per-event forensics, startup posture, background-task health | log level and volume |
+| the process log | `tracing`, `fmt` layer, ANSI only on a terminal (`crates/prx-waf/src/main.rs:385-404`) | per-event forensics, startup posture, background-task health | log level and volume |
 | `attack_logs` / `security_events` / the audit log | the engine's sinks | per-request evidence, retention-bounded | database retention, file rotation |
 
 Alignment means the words and the boundaries match. It does not mean the log has
@@ -344,6 +344,45 @@ Three things it deliberately is not:
 
 It still does not name the hosts inside `__other__`, and it never will: naming
 them is exactly what the bound exists to prevent.
+
+### 7.4 Stop colouring a log nobody is looking at
+
+Found by running §7.1 against a real daemon rather than by reading the code.
+`fmt::layer()` enables ANSI unconditionally, and the escapes land **between the
+field name and its `=`**. A line that reads
+
+```
+WAF blocked request: ip=127.0.0.1 path=/search action="block" phase="sql_injection"
+```
+
+on a terminal is, in the redirected file:
+
+```
+WAF blocked request: ... \e[3maction\e[0m\e[2m=\e[0m"block" \e[3mphase\e[0m\e[2m=\e[0m"sql_injection"
+```
+
+so `grep 'action="block"'` matches nothing. Every structured field in this
+codebase was already affected — `dropped=`, `rows=`, `key=` — and §7.1 would
+have shipped a set of fields that could not be grepped for, which is the entire
+use they exist for. The first run of
+`tests/e2e-log-metric-alignment.sh` reported 7 counted blocks against 0 matching
+log lines, and that is what it was.
+
+`crates/prx-waf/src/main.rs:390` now sets `with_ansi` from
+`IsTerminal::is_terminal` on the writer it is about to use. A terminal keeps its
+colours; a pipe, a file, a container log and a journal — all machine-read by
+definition — get plain text.
+
+### 7.5 The reproduction
+
+`tests/e2e-log-metric-alignment.sh` drives one real daemon with 3 benign
+requests, 2 SQLi, and 6 refusals spread across 5 hostnames, then reconciles the
+`/metrics` deltas against `grep` counts over the same run's log. It asserts
+equality, not presence: 9 counted blocks and 9 log lines carrying
+`action="block"`, 2 counted `phase="sql_injection"` detections and 2 log lines
+carrying the same token. It runs with `max_host_labels = 2` so the fold is
+exercised, and asserts exactly 3 host label values and exactly one fold
+announcement.
 
 ---
 

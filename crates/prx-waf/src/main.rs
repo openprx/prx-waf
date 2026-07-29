@@ -378,17 +378,34 @@ fn main() -> anyhow::Result<()> {
 
     let filter =
         EnvFilter::from_default_env().add_directive(tracing_subscriber::filter::Directive::from(tracing::Level::INFO));
+    // Colour only when a human is watching. `fmt::layer()` turns ANSI on
+    // unconditionally, and the escapes land *between the field name and its
+    // `=`* — a line reading `action="block"` on screen is
+    // `\e[3maction\e[0m\e[2m=\e[0m"block"` in the file, so `grep 'action="block"'`
+    // over a redirected log, a container log or a journal finds nothing. That
+    // grep is the entire point of the structured fields the refusal paths now
+    // carry (`docs/logs-and-metrics.md` §1), so a decoration that breaks it is
+    // not a cosmetic default. Piped output is machine-read by definition;
+    // a terminal is not.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
     // `rules export` writes a machine-readable document to stdout. A log line
     // interleaved into it would make `rules export > rules.json` produce a file
     // that does not parse, so this one command's logs join its summary on
     // stderr. Every other command keeps logging to stdout.
     if matches!(&cli.command, Commands::Rules(RulesCommands::Export { .. })) {
         tracing_subscriber::registry()
-            .with(fmt::layer().with_writer(std::io::stderr))
+            .with(
+                fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr())),
+            )
             .with(filter)
             .init();
     } else {
-        tracing_subscriber::registry().with(fmt::layer()).with(filter).init();
+        tracing_subscriber::registry()
+            .with(fmt::layer().with_ansi(ansi))
+            .with(filter)
+            .init();
     }
 
     info!("PRX-WAF v{}", env!("CARGO_PKG_VERSION"));
