@@ -2376,8 +2376,9 @@ impl TlsListener {
                 lines.push(BroadcastLine::info(format!(
                     "TLS termination active on {addr}, certificate from {}. TLS 1.2 and 1.3 only — Pingora's rustls \
                      backend builds the acceptor with exactly those two protocol versions and the ring provider's \
-                     cipher suites, so 1.0/1.1, export and null suites cannot be negotiated. ALPN offers h2 and \
-                     http/1.1.",
+                     cipher suites, so 1.0/1.1, export and null suites cannot be negotiated. HTTP/1.1 only: no ALPN \
+                     is advertised, because host routing here reads the Host header and Pingora's h2 server delivers \
+                     the authority in the request URI instead, so an h2 request would route on nothing and 404.",
                     material.origin.describe()
                 )));
                 if !material.unserved_domains.is_empty() {
@@ -2461,21 +2462,32 @@ async fn resolve_tls_listener(proxy: &waf_common::config::ProxyConfig, db: &Data
 
 /// Attach the TLS endpoint to the proxy service, when there is one to attach.
 ///
-/// `enable_h2` sets the ALPN to prefer h2 with http/1.1 allowed, which is what
-/// a browser expects of an HTTPS origin; the plaintext listener is untouched
-/// and stays HTTP/1.1. The certificate and key have already been parsed and
-/// paired by `gateway::tls_listener::validate`, which is what keeps the
-/// `panic!`/`unwrap` inside Pingora's own `TlsSettings::build` out of reach.
+/// The certificate and key have already been parsed and paired by
+/// `gateway::tls_listener::validate`, which is what keeps the `panic!`/`unwrap`
+/// inside Pingora's own `TlsSettings::build` out of reach.
+///
+/// **No ALPN, so no h2.** `TlsSettings::enable_h2` is deliberately not called,
+/// and the endpoint therefore negotiates HTTP/1.1 like the plaintext one. Not
+/// because h2 is unwanted, but because this proxy cannot route it yet: host
+/// routing reads `session.get_header("host")` (`gateway::proxy`), and Pingora's
+/// h2 server never writes one — it hands the request up with `:authority` in
+/// `RequestHeader::uri` and the field map untouched
+/// (`pingora-core-0.8.1/src/protocols/http/v2/server.rs:155-157`). Every
+/// compliant h2 request would therefore route on the empty string and get 404,
+/// which is the same defect `gateway::http3::route_authority` was written to
+/// fix for HTTP/3. Advertising h2 here before that resolver is shared across
+/// all three protocols would turn TLS on and browsers off in one step. It also
+/// cannot be a one-line fallback: an `:authority` that contradicts a `Host` is
+/// a request-desync primitive, which is why the HTTP/3 side refuses that case
+/// rather than picking a side, and settling it for HTTP/1.1 means re-running
+/// the smuggling and CRS baselines.
 fn add_tls_endpoint<SV>(service: &mut pingora_core::services::listening::Service<SV>, listener: &TlsListener) {
     let TlsListener::Ready { addr, material } = listener else {
         return;
     };
     let (cert, key) = (material.cert_path.display(), material.key_path.display());
     match pingora_core::listeners::tls::TlsSettings::intermediate(&cert.to_string(), &key.to_string()) {
-        Ok(mut settings) => {
-            settings.enable_h2();
-            service.add_tls_with_settings(addr, None, settings);
-        }
+        Ok(settings) => service.add_tls_with_settings(addr, None, settings),
         // Unreachable with the rustls backend, whose `intermediate` only ever
         // returns Ok. Reported rather than ignored so that swapping the backend
         // cannot turn TLS off in silence.
