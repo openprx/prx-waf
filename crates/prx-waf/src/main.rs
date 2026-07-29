@@ -2445,6 +2445,17 @@ async fn resolve_tls_listener(proxy: &waf_common::config::ProxyConfig, db: &Data
             addr,
         };
     }
+    // Both endpoints belong to one Pingora service, so an address given twice
+    // is a bind conflict inside `run_forever` — after the point where anything
+    // can report it usefully. Refused here, where the setting can be named.
+    if addr == proxy.listen_addr.trim() {
+        return TlsListener::Unavailable {
+            reason: "it is the same address as [proxy] listen_addr, which already serves plaintext there. Give the \
+                     TLS listener an address of its own, or empty it to switch TLS off."
+                .to_string(),
+            addr,
+        };
+    }
 
     let plan = gateway::tls_listener::resolve(
         proxy.tls_cert_pem.as_deref(),
