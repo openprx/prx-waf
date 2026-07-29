@@ -26,10 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: npm
@@ -44,7 +44,7 @@ jobs:
         run: npm run build
 
       - name: Upload admin UI dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: admin-ui-dist
           path: web/admin-ui/dist
@@ -59,7 +59,7 @@ jobs:
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -68,7 +68,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Download admin UI dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: admin-ui-dist
           path: web/admin-ui/dist
@@ -116,7 +116,7 @@ jobs:
             cross: true
             strip: aarch64-linux-gnu-strip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -127,7 +127,7 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Download admin UI dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: admin-ui-dist
           path: web/admin-ui/dist
@@ -179,7 +179,7 @@ jobs:
           ls -l "dist/${pkg}.tar.gz"
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -196,7 +196,7 @@ jobs:
       id-token: write # OIDC token for cosign keyless signing and attestations
       attestations: write # store the SLSA build provenance attestation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -205,7 +205,7 @@ jobs:
           key: release-sbom
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist
@@ -230,7 +230,7 @@ jobs:
       # second dependency resolution that could, in principle, disagree with
       # this one.
       - name: Upload SBOM for the image job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-cyclonedx
           path: dist/*.cdx.json
@@ -266,7 +266,7 @@ jobs:
           ls -l
 
       - name: Attest build provenance (SLSA)
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/*.tar.gz
@@ -337,7 +337,7 @@ jobs:
           cat release-notes.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: prx-waf ${{ github.ref_name }}
           body_path: release-notes.md
@@ -371,19 +371,19 @@ jobs:
     env:
       IMAGE: ghcr.io/${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Download release tarballs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: artifacts
           merge-multiple: true
 
       - name: Download SBOM
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sbom-cyclonedx
           path: sbom
@@ -431,15 +431,15 @@ jobs:
       # copied in, never executed at build time. Emulation is therefore needed
       # for one short layer, not for a compile.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # GITHUB_TOKEN is the run-scoped token GitHub mints for this job, not a
       # stored repository secret. The project still holds no credentials.
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -451,7 +451,7 @@ jobs:
       # Expressed here so that it holds without anyone remembering it.
       - name: Compute image tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           flavor: latest=false
@@ -470,7 +470,7 @@ jobs:
       # dependency tree the release actually documents.
       - name: Build and push multi-arch image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.release
@@ -511,7 +511,7 @@ jobs:
             "${IMAGE}@${DIGEST}"
 
       - name: Attest image build provenance (SLSA)
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
