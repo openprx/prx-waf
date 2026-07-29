@@ -103,7 +103,7 @@ jobs:
           - smuggling_headers
           - url_validator
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -193,7 +193,7 @@ jobs:
       #     main from a branch.
       - name: Restore fuzz corpus
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -296,7 +296,7 @@ jobs:
       # for public repositories; a repository configured lower simply clamps.
       - name: Upload crash reproducers
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts-${{ matrix.target }}-${{ github.run_id }}
           path: |
@@ -313,7 +313,7 @@ jobs:
       # is tens of thousands of files, and `seeds/` is the curated set instead.
       - name: Upload grown corpus
         if: github.event_name == 'schedule' && always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           path: fuzz/corpus/${{ matrix.target }}/
@@ -406,7 +406,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
