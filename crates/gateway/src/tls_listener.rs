@@ -155,6 +155,28 @@ struct UsableCert {
     not_after: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// The domains in `usable` that the certificate at `served` does not cover.
+///
+/// Names, not rows, and that distinction is the whole function. Renewal inserts
+/// a new certificate and leaves the superseded one active, so a domain renewed
+/// once has two rows and a domain renewed ten times has eleven. Counting rows
+/// would announce at WARN that this listener refuses to serve a hostname it is
+/// serving right now, and would do it more loudly the longer the WAF had been
+/// running.
+fn unserved_domains(usable: &[UsableCert], served: usize) -> Vec<String> {
+    let Some(served_domain) = usable.get(served).map(|c| c.domain.as_str()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for cert in usable {
+        if cert.domain == served_domain || out.iter().any(|seen| seen == &cert.domain) {
+            continue;
+        }
+        out.push(cert.domain.clone());
+    }
+    out
+}
+
 /// Decide what the TLS listener should serve.
 ///
 /// Configured files win over the store, because an operator who names a path
@@ -163,6 +185,13 @@ struct UsableCert {
 /// candidates are tried in ascending domain order, which is stable across
 /// restarts — "newest" would move the served certificate every time a host was
 /// added — and the first that validates is used.
+///
+/// Ties inside one domain go to the most recent row, and that matters more than
+/// it looks: renewal INSERTS rather than updates (`SslManager::request_certificate`
+/// calls `create_certificate` every time) and leaves the superseded row active,
+/// so a domain that has ever been renewed has several. The sort is stable and
+/// the rows arrive newest-first from `list_certificates`, which is what makes
+/// the freshest certificate for a domain the one that gets served.
 ///
 /// `material_dir` is a thunk rather than a path because resolving one has a
 /// cost — it creates and vets a private directory — that configured files do
@@ -275,12 +304,7 @@ where
                 };
             }
         };
-        let unserved_domains = usable
-            .iter()
-            .enumerate()
-            .filter(|(other, _)| *other != index)
-            .map(|(_, c)| c.domain.clone())
-            .collect();
+        let unserved_domains = unserved_domains(&usable, index);
         return TlsPlan::Ready(Box::new(TlsMaterial {
             cert_path,
             key_path,
@@ -405,6 +429,43 @@ mod tests {
             TlsPlan::Unavailable { reason } => assert!(reason.contains("tls_cert_pem"), "{reason}"),
             TlsPlan::Ready(_) => panic!("a missing file must not produce a listener"),
         }
+    }
+
+    fn row(domain: &str) -> UsableCert {
+        UsableCert {
+            domain: domain.to_string(),
+            cert_pem: String::new(),
+            key_pem: String::new(),
+            not_after: None,
+        }
+    }
+
+    #[test]
+    fn renewed_rows_of_the_served_domain_are_not_reported_as_unserved() {
+        // What the store looks like after `waf.test` has been renewed twice.
+        let usable = [row("waf.test"), row("waf.test"), row("waf.test")];
+        assert!(unserved_domains(&usable, 0).is_empty());
+    }
+
+    #[test]
+    fn each_other_domain_is_named_once_however_many_rows_it_has() {
+        let usable = [
+            row("a.test"),
+            row("b.test"),
+            row("b.test"),
+            row("c.test"),
+            row("a.test"),
+        ];
+        assert_eq!(
+            unserved_domains(&usable, 0),
+            vec!["b.test".to_string(), "c.test".to_string()]
+        );
+    }
+
+    #[test]
+    fn nothing_is_unserved_when_nothing_is_served() {
+        assert!(unserved_domains(&[], 0).is_empty());
+        assert!(unserved_domains(&[row("a.test")], 7).is_empty());
     }
 
     #[test]
