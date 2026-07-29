@@ -113,18 +113,17 @@ hostnames are inside the fold.** The fold is unnamed by construction — that is
 the whole point of the cardinality bound, and putting the folded names into a
 label would undo it.
 
-Worse, until now **the fold was completely silent**. `HostSlots::resolve`
-(`metrics.rs:927-930`) hands back `HostSlot::OTHER` the moment `used >= max` and
-says nothing; the startup broadcast states the configured cap
-(`crates/prx-waf/src/main.rs:2736-2739`) but nothing ever reports that the cap
+Worse, until this pass **the fold was completely silent**. `HostSlots::resolve`
+handed back `HostSlot::OTHER` the moment `used >= max` and said nothing; the
+startup broadcast states the configured cap
+(`crates/prx-waf/src/main.rs:2736-2739`) but nothing ever reported that the cap
 was *reached*. An operator whose 200-site node runs at the 128 default reads
 `__other__` as a small tail forever, and every per-host dashboard they build is
 quietly wrong for 72 sites.
 
-**Fixed by** a one-shot WARN emitted at scrape time (not on the request path)
-the first time the table is found saturated, naming the cap and the setting that
-moves it. The naming of individual folded hosts stays out of both surfaces. See
-[§7](#7-what-changed).
+**Fixed by** a one-shot WARN emitted at scrape time — not on the request path —
+the first time a hostname is actually turned away. The naming of individual
+folded hosts stays out of both surfaces. See [§7.3](#73-announce-the-host-fold-once).
 
 ---
 
@@ -319,7 +318,32 @@ being renamed alone.
 All seven fire from a 30 s timer in a background worker. None is on the request
 path.
 
-### 7.3 (pending)
+### 7.3 Announce the host fold, once
+
+`HostSlots` gained a `folded` flag (`metrics.rs:921`) set by `note_fold()`
+(`:951`) on the three `resolve` paths that actually turn a hostname away.
+`metrics::host_labels_folding()` (`:1379`) and `host_label_bound()` (`:1386`)
+read it, and `warn_once_if_host_labels_are_folding()` in the scrape handler
+(`waf-api/src/metrics_endpoint.rs:60`, called at `:90`) emits one WARN per
+process naming the bound, the two settings that move it, the cost per host, and
+the fact that the log still carries the real `Host`.
+
+Three things it deliberately is not:
+
+* **Not `used >= max`.** A node with exactly `max_host_labels` hostnames fills
+  the table and refuses nobody; warning it about a bound it fits inside would be
+  a false alarm on a signal that is emitted once and can never be corrected.
+  `the_fold_flag_needs_a_host_actually_turned_away` pins that.
+* **Not raised under `max_host_labels = 0`.** That is the documented "fold
+  everything" posture and the startup broadcast already states it.
+* **Not at the fold site.** `resolve_host` runs once per request on every worker
+  thread, and `waf-common` carries no `tracing` dependency on purpose. The flag
+  itself is a relaxed load guarding a relaxed store, so after the first fold it
+  is a read of a line every thread already holds shared — no write, no bounce.
+  Everything else happens in the scrape handler.
+
+It still does not name the hosts inside `__other__`, and it never will: naming
+them is exactly what the bound exists to prevent.
 
 ---
 

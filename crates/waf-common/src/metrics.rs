@@ -908,6 +908,17 @@ struct HostSlots {
     cells: Box<[OnceLock<Box<str>>]>,
     used: AtomicUsize,
     max: usize,
+    /// Set the first time a host was actually turned away into `__other__`
+    /// because the table was full.
+    ///
+    /// **Not** `used >= max`: a node with exactly `max_host_labels` hostnames
+    /// fills the table and folds nothing, and reporting that as a fold would
+    /// send an operator to change a setting that is already right. This says
+    /// what happened, not what could have.
+    ///
+    /// Deliberately excludes the `max == 0` posture, which means "fold
+    /// everything" and is a configuration, not a surprise.
+    folded: std::sync::atomic::AtomicBool,
 }
 
 impl HostSlots {
@@ -926,6 +937,20 @@ impl HostSlots {
             cells,
             used: AtomicUsize::new(0),
             max,
+            folded: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Note that a host was turned away, for [`host_labels_folding`].
+    ///
+    /// Load before store so that after the first fold this is a relaxed read of
+    /// a line every worker thread holds shared, rather than a write that bounces
+    /// it between them on every folded request. The flag is one-way, so a lost
+    /// race merely means the next folded request sets it.
+    #[inline]
+    fn note_fold(&self) {
+        if !self.folded.load(Ordering::Relaxed) {
+            self.folded.store(true, Ordering::Relaxed);
         }
     }
 
@@ -957,6 +982,7 @@ impl HostSlots {
         for probe in 0..capacity {
             let idx = (start + probe) & mask;
             let Some(cell) = self.cells.get(idx) else {
+                self.note_fold();
                 return HostSlot::OTHER;
             };
             if let Some(existing) = cell.get() {
@@ -970,6 +996,7 @@ impl HostSlots {
             // folds into `__other__`.
             if self.used.fetch_add(1, Ordering::AcqRel) >= self.max {
                 self.used.fetch_sub(1, Ordering::AcqRel);
+                self.note_fold();
                 return HostSlot::OTHER;
             }
             if cell.set(host.into()).is_ok() {
@@ -983,6 +1010,9 @@ impl HostSlots {
                 return HostSlot(idx);
             }
         }
+        // Every cell probed and none was free or ours. Capacity is twice `max`,
+        // so this is only reachable once the table is full.
+        self.note_fold();
         HostSlot::OTHER
     }
 
@@ -1327,6 +1357,36 @@ pub fn encode() -> Option<Result<String, std::fmt::Error>> {
     metrics().map(Metrics::encode)
 }
 
+/// Whether at least one hostname has been turned away into `host="__other__"`
+/// because `max_host_labels` was already spent.
+///
+/// The fold is the mechanism that makes this process's series count a property
+/// of its configuration rather than of its traffic, so it is not a fault — but
+/// it is invisible from both surfaces once it happens. `__other__` cannot name
+/// what is inside it without undoing the bound, and the log carries the real
+/// host with no indication of which bucket it landed in. An operator whose node
+/// fronts more sites than the bound therefore reads `__other__` as a small tail
+/// forever, and every per-host panel they build silently omits the remainder.
+///
+/// Exposed so the scrape endpoint can say so once. Deliberately reports
+/// `false` under `max_host_labels = 0`, which is the documented "fold
+/// everything" posture: the operator asked for it and the startup broadcast
+/// already stated it.
+///
+/// Two relaxed loads. Called from the scrape handler, never from the request
+/// path.
+#[must_use]
+pub fn host_labels_folding() -> bool {
+    metrics().is_some_and(|m| m.state.hosts.folded.load(Ordering::Relaxed))
+}
+
+/// The effective `max_host_labels` this process is running with, for the
+/// message [`host_labels_folding`] justifies. Zero when metrics are off.
+#[must_use]
+pub fn host_label_bound() -> usize {
+    metrics().map_or(0, |m| m.state.hosts.max)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Recording API — the only way to write a metric
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1497,6 +1557,32 @@ mod tests {
         let slots = HostSlots::new(0);
         assert_eq!(slots.resolve("a"), HostSlot::OTHER);
         assert_eq!(slots.label(slots.capacity()), OTHER_HOST_LABEL);
+        // "Fold everything" is a configuration, not an exhaustion. Reporting it
+        // would send an operator to change a setting they chose on purpose.
+        assert!(!slots.folded.load(Ordering::Relaxed));
+    }
+
+    /// The fold flag has to say what happened, not what could have. A node with
+    /// exactly `max_host_labels` hostnames fills the table and turns nobody
+    /// away; warning it about a bound it fits inside would be a false alarm on
+    /// the one signal that is only ever emitted once.
+    #[test]
+    fn the_fold_flag_needs_a_host_actually_turned_away() {
+        let slots = HostSlots::new(3);
+        for host in ["a.example", "b.example", "c.example"] {
+            assert_ne!(slots.resolve(host), HostSlot::OTHER);
+        }
+        assert!(
+            !slots.folded.load(Ordering::Relaxed),
+            "a full table that refused nobody is not a fold"
+        );
+
+        // Re-resolving a host already interned is a hit, not a fold.
+        assert_ne!(slots.resolve("b.example"), HostSlot::OTHER);
+        assert!(!slots.folded.load(Ordering::Relaxed));
+
+        assert_eq!(slots.resolve("d.example"), HostSlot::OTHER);
+        assert!(slots.folded.load(Ordering::Relaxed));
     }
 
     #[test]

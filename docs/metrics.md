@@ -78,6 +78,12 @@ series count is therefore a function of the setting, not of the traffic — a
 client sending a million distinct `Host` headers produces `N + 1` label values,
 which the test suite asserts directly.
 
+The first time a hostname is actually turned away, **the log says so once** —
+one WARN naming the bound and the settings that move it, emitted from the scrape
+handler rather than from the request path. Without it, a node fronting more
+sites than the bound reads `__other__` as a small tail forever. It never names
+what is inside the fold; naming it is what the bound exists to prevent.
+
 ### Worst case, exactly
 
 | Metric | Label combinations | Series each | Total |

@@ -24,16 +24,56 @@
 //! break monitoring.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context as _;
 use axum::Router;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Content type Prometheus expects from a text-format scrape.
 const TEXT_FORMAT: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
+
+/// Latch for [`warn_once_if_host_labels_are_folding`].
+static HOST_FOLD_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Say once, in the log, that the `host` label bound has started folding.
+///
+/// The fold is what keeps the series count a function of `max_host_labels`
+/// rather than of the traffic, so it is working as designed — but it is silent
+/// on both surfaces at once. `host="__other__"` cannot name what is inside it
+/// without undoing the bound it exists to enforce, and the log carries the real
+/// hostname with nothing to say which bucket it landed in. The result is that a
+/// node fronting more sites than the bound reads `__other__` as a small tail
+/// forever, and nobody finds out from either place.
+///
+/// **Here rather than at the fold**: `resolve_host` runs once per request on
+/// every worker thread, and `waf-common` deliberately carries no `tracing`
+/// dependency. The scrape is the natural reader — the thing being folded is the
+/// thing being scraped — and it is off the request path entirely.
+///
+/// **Once rather than per scrape**: the condition is permanent (the table is
+/// append-only), so repeating it every 15 seconds would be a slow leak of an
+/// unactionable line into the log for the life of the process.
+fn warn_once_if_host_labels_are_folding() {
+    if !waf_common::metrics::host_labels_folding() {
+        return;
+    }
+    if HOST_FOLD_REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    warn!(
+        max_host_labels = waf_common::metrics::host_label_bound(),
+        "Metrics host labels exhausted: distinct hostnames past [metrics] max_host_labels are now folded into \
+         host=\"__other__\", so per-host panels cover only the first ones seen and the rest are summed into one \
+         series that names none of them. The log still records the real Host on every line — the fold is a \
+         property of the metric, not of the request. Raise [metrics] max_host_labels (or \
+         PRXWAF_METRICS_MAX_HOST_LABELS) to cover every site this node fronts, at roughly 28 extra series per \
+         host, or leave it and read __other__ as an explicit aggregate. Reported once per process."
+    );
+}
 
 /// Render the exposition.
 ///
@@ -47,6 +87,7 @@ const TEXT_FORMAT: &str = "application/openmetrics-text; version=1.0.0; charset=
 ///   task exists to close;
 /// * otherwise the text.
 async fn scrape() -> Response {
+    warn_once_if_host_labels_are_folding();
     match waf_common::metrics::encode() {
         Some(Ok(body)) => ([(header::CONTENT_TYPE, TEXT_FORMAT)], body).into_response(),
         Some(Err(e)) => {
