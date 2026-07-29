@@ -32,12 +32,20 @@
 #   RUSTSEC-2025-0069  daemonize 0.5.0 unmaintained, via pingora-core.
 #   RUSTSEC-2024-0388  derivative 2.2.0 unmaintained, via pingora-core
 #                      (build-time derive macro only).
+#   RUSTSEC-2025-0134  rustls-pemfile 2.2.0 unmaintained (repository archived),
+#                      via pingora-rustls 0.8.1 — both directly and through
+#                      rustls-native-certs 0.7.3. Arrived with the
+#                      `pingora-core/rustls` feature, without which the proxy
+#                      cannot terminate TLS. No upgrade exists; the alternative
+#                      pingora TLS backends pull openssl-sys, which deny.toml
+#                      bans by name.
 [advisories]
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0437",
     "RUSTSEC-2025-0069",
     "RUSTSEC-2024-0388",
+    "RUSTSEC-2025-0134",
 ]
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"

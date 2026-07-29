@@ -145,6 +145,43 @@ ignore = [
     # review-by: 2026-10-01
     # remove-when: the rsa crate ships a constant-time release, or jsonwebtoken exposes an
     #              HMAC-only feature that drops rsa from the tree without re-adding aws-lc-rs.
+    # rustls-pemfile 2.2.0 unmaintained (repository archived August 2025) — arrived on
+    # 2026-07-29 with `pingora-core/rustls`, the feature that makes the proxy able to
+    # terminate TLS at all. Two paths, both inside pingora-rustls 0.8.1:
+    #   pingora-rustls 0.8.1 -> rustls-pemfile 2.2.0            (direct)
+    #   pingora-rustls 0.8.1 -> rustls-native-certs 0.7.3 -> rustls-pemfile 2.2.0
+    # cargo-deny reports "Solution: No safe upgrade is available!" — pingora-rustls
+    # 0.8.1's manifest pins `rustls-pemfile = "2.1.2"` and there is no 3.x to move to;
+    # the crate was archived rather than superseded, its functionality having been
+    # folded into rustls-pki-types' PemObject trait.
+    #
+    # This is an unmaintained advisory, not a vulnerability: no CVE, no known defect,
+    # no attacker-reachable claim. The code is a PEM tokenizer that pingora runs once
+    # per process, while constructing the TLS listener, over certificate and key files
+    # named in this WAF's own configuration. It never sees network input.
+    #
+    # Removal paths evaluated & rejected on 2026-07-29:
+    #   1. Switch pingora to the `openssl` or `boringssl` backend — REJECTED, and not
+    #      by preference: `[bans] deny` in this same file bans `openssl` and
+    #      `openssl-sys` by name. Verified empirically, not assumed: building with
+    #      `pingora-core/openssl` clears the advisories check but fails bans with
+    #      `error[banned]: crate 'openssl = 0.10.81' is explicitly banned` and the
+    #      same for openssl-sys 0.9.117. boringssl and s2n substitute a different C
+    #      library for the same reason and are no better on supply chain.
+    #   2. Ship without any TLS backend (the status quo before this entry) — REJECTED.
+    #      That is what left `[proxy] listen_addr_tls` inert since it was introduced,
+    #      and it also made an `ssl = true` origin a silent black hole; see the
+    #      pingora block in Cargo.toml for the noop_tls line numbers.
+    #   3. `[patch.crates-io]` a local pingora-rustls with `default-features = false`
+    #      on tokio-rustls/rustls, which is also the only way to keep aws-lc-rs out —
+    #      REJECTED: `[sources] unknown-git = "deny"` and vendoring a Cloudflare crate
+    #      to carry a one-line manifest change is a larger and more permanent supply
+    #      chain liability than one archived PEM parser.
+    # review-by: 2026-10-01
+    # remove-when: pingora-rustls drops rustls-pemfile for rustls-pki-types' PemObject
+    #              (upstream tracking issue rustls/pemfile#61), or pingora publishes a
+    #              release whose rustls backend no longer depends on it.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: unmaintained (archived), pingora-rustls 0.8.1 transitive with no upgrade path; parses only files this process wrote, never network input; the alternative backends are banned by [bans] in this file" },
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: compiled via jsonwebtoken(rust_crypto) but waf-api uses only HMAC/HS256; RSA code path unreachable; no upstream fix; removal via aws_lc_rs rejected (reverses ring-only commit 1b7e23f), feature-trim impossible (rust_crypto bundles rsa+hmac), lib swap risks auth regression" },
 ]
 

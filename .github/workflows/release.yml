@@ -132,9 +132,15 @@ jobs:
           name: admin-ui-dist
           path: web/admin-ui/dist
 
-      # The dependency tree has no openssl-sys/aws-lc-sys; the only C code is
-      # ring and zstd-sys, both of which honour the CC_<target> convention. A
-      # plain GNU cross toolchain is therefore enough — no container needed.
+      # The dependency tree has no openssl-sys, which deny.toml bans by name.
+      # It does carry aws-lc-sys, which came back with `pingora-core/rustls`
+      # (pingora-rustls takes rustls at default features); alongside ring and
+      # zstd-sys that makes three native dependencies, all of which honour the
+      # CC_<target>/AR_<target> convention set below. aws-lc-sys additionally
+      # needs cmake, which the ubuntu-latest image already provides. A plain
+      # GNU cross toolchain is therefore still enough — no container needed.
+      # Verified by cross-checking prx-waf for aarch64-unknown-linux-gnu with
+      # exactly these four variables and nothing else.
       - name: Install aarch64 cross toolchain
         if: matrix.cross
         run: |

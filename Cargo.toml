@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.135"
+version = "0.2.136"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -22,9 +22,28 @@ repository = "https://github.com/openprx/prx-waf"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP proxy
-pingora-core = { version = "0.8" }
-pingora-proxy = { version = "0.8" }
+# HTTP proxy.
+#
+# `rustls` is not decoration: pingora-core's default feature set is empty, and
+# with no TLS backend selected `crate::tls` resolves to
+# `protocols::tls::noop_tls` (pingora-core-0.8.1/src/lib.rs:121-122), whose
+# listener acceptor is `unimplemented!("No tls feature was specified")`
+# (noop_tls/mod.rs:95) and whose *upstream* connector hands back a stream that
+# reads instant EOF and swallows every write (noop_tls/mod.rs:128-152). So the
+# feature buys two separate things: the ability to terminate TLS on
+# `[proxy] listen_addr_tls` at all, and an origin dialled over real TLS when a
+# site sets `ssl`/`upstream_ssl` — which until now was a silent black hole that
+# surfaced only as a 502.
+#
+# `rustls` rather than `openssl`/`boringssl`/`s2n` because deny.toml bans
+# openssl and openssl-sys outright ("Use rustls-tls instead"), and because the
+# other three all drag a C library into a tree whose only native code is ring
+# and zstd-sys. The price is spelled out in deny.toml's RUSTSEC-2025-0134
+# entry: pingora-rustls takes tokio-rustls and rustls at default features, so
+# aws-lc-rs returns to the graph and rustls-pemfile arrives unmaintained. The
+# process still pins `ring` explicitly at startup (crates/prx-waf/src/main.rs).
+pingora-core = { version = "0.8", features = ["rustls"] }
+pingora-proxy = { version = "0.8", features = ["rustls"] }
 pingora-http = { version = "0.8" }
 pingora-timeout = { version = "0.8" }
 
