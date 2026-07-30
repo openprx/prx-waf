@@ -2329,10 +2329,18 @@ const PICKLE_RULES: &[CodeRule] = &[PICKLE_REDUCE_RULE, PICKLE_NAMED_RULE];
 ///   module docs for the boundary it holds.
 pub struct DeserStructuralDetector {
     rules: Vec<CompiledRule>,
-    /// The operator's amendment, consulted by the pickle walk. Held rather than
-    /// resolved into two bools so the walk reads the two grades the same way the
-    /// classifier reads them everywhere else.
-    toggles: RuleToggles,
+    /// The two pickle grades, resolved once. The regex rows next to them are
+    /// resolved at construction too (a disabled row is not compiled), and the
+    /// walk asks about both grades on every view, so there is nothing to gain
+    /// from deferring the question and a per-view cost to pay for it.
+    pickle: PickleGrades,
+}
+
+/// Which verdict grades the pickle opcode walker may report.
+#[derive(Debug, Clone, Copy)]
+struct PickleGrades {
+    reduce: bool,
+    named: bool,
 }
 
 impl DeserStructuralDetector {
@@ -2354,7 +2362,10 @@ impl DeserStructuralDetector {
     pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
             rules: compile_table(DESER_RULES, toggles, "DeserStructuralDetector"),
-            toggles: toggles.clone(),
+            pickle: PickleGrades {
+                reduce: toggles.allows(&PICKLE_REDUCE_RULE),
+                named: toggles.allows(&PICKLE_NAMED_RULE),
+            },
         }
     }
 
@@ -2388,7 +2399,7 @@ impl SemanticDetector for DeserStructuralDetector {
         // lowercased form destroys the very token it has to decode.
         let regex_hit = best_match(&self.rules, view.lower_trunc.as_str())
             .map(|rule| finding_for(rule, AttackKind::Deserialization, "deserialization"));
-        let pickle_hit = pickle_finding(view.text.as_ref(), state, &self.toggles);
+        let pickle_hit = pickle_finding(view.text.as_ref(), state, self.pickle);
         match (regex_hit, pickle_hit) {
             (Some(regex), Some(pickle)) => {
                 // Same tie-break the regex table itself uses: strongest wins.
@@ -2420,16 +2431,14 @@ impl SemanticDetector for DeserStructuralDetector {
 /// grade rather than vanishing, because a stream that reduced a dangerous global
 /// did also name one: the weaker claim is still true, and reporting it is the same
 /// strongest-enabled-wins rule the rest of the engine follows.
-fn pickle_finding(text: &str, state: &mut ContentInspectionState, on: &RuleToggles) -> Option<DetectionFinding> {
-    let reduce_on = on.allows(&PICKLE_REDUCE_RULE);
-    let named_on = on.allows(&PICKLE_NAMED_RULE);
-    if !reduce_on && !named_on {
+fn pickle_finding(text: &str, state: &mut ContentInspectionState, on: PickleGrades) -> Option<DetectionFinding> {
+    if !on.reduce && !on.named {
         return None;
     }
     let hit = super::pickle::scan_view_text(text, state)?;
-    let (rule, grade) = if hit.reduced && reduce_on {
+    let (rule, grade) = if hit.reduced && on.reduce {
         (&PICKLE_REDUCE_RULE, "reduced by")
-    } else if named_on {
+    } else if on.named {
         (&PICKLE_NAMED_RULE, "names")
     } else {
         return None;
@@ -2876,6 +2885,11 @@ fn classify_set_expr(body: &SetExpr, depth: usize, on: &RuleToggles) -> Option<&
 ///   `GenericDialect`, so the AST does not model them.
 pub struct AstSqlDetector {
     toggles: RuleToggles,
+    /// Whether any of the five structures is enabled, answered once at
+    /// construction. `detect` reads it before the prefilter on every view, so
+    /// asking the toggles five times there would put a fixed cost on the hot
+    /// path to answer a question that cannot change after startup.
+    any_structure_on: bool,
 }
 
 impl AstSqlDetector {
@@ -2897,6 +2911,7 @@ impl AstSqlDetector {
     pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
             toggles: toggles.clone(),
+            any_structure_on: AST_RULES.iter().any(|r| toggles.allows(r)),
         }
     }
 }
@@ -2927,7 +2942,7 @@ impl SemanticDetector for AstSqlDetector {
         // classification. Unreachable in the shipped posture (all five are
         // default-on); reachable the moment an operator disables all five, which
         // is the only honest way to turn the AST layer off from config.
-        if !AST_RULES.iter().any(|r| self.toggles.allows(r)) {
+        if !self.any_structure_on {
             return None;
         }
         // Cheap gate — clean traffic exits here without touching the AST budget.
