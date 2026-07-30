@@ -211,8 +211,13 @@ positive that keeps `plain_dotdot` switched off. `import x from '../util'`
 normalizes to an escaping path just as `../../etc/passwd` does. The escape is
 real in both. The thing that separates them is whether the field feeds a
 filesystem open, which is the RASP ceiling and is not visible to a reverse proxy.
-Normalization would buy a cleaner rule with the identical false-positive rate,
-which is not a reason to add a dependency.
+Normalization would buy a cleaner rule with the identical false-positive rate.
+
+This is the one rejection in the survey that is *not* about cost. `typed-path`
+0.12.3 (2026-02-11) has **zero transitive dependencies**, MIT OR Apache-2.0, no C
+toolchain, no advisories — the cleanest candidate examined. It is rejected purely
+because it does not move the number that is stuck, which is worth stating plainly:
+a cheap dependency is still not free if it buys nothing.
 
 **Verdict: do not.**
 
