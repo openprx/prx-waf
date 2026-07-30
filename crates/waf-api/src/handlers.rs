@@ -559,18 +559,113 @@ pub async fn list_certificates(
     Ok(Json(json!({ "success": true, "data": safe })))
 }
 
+/// The PEM the TLS listener will actually try to serve for this row.
+///
+/// `tls_listener::resolve` appends `chain_pem` to `cert_pem` before validating,
+/// so checking `cert_pem` on its own here would wave through an upload whose
+/// intermediate bundle is the broken half and leave the listener to discover it
+/// at the next start. Validation has to see the same bytes serving will.
+fn served_chain(cert_pem: &str, chain_pem: Option<&str>) -> String {
+    match chain_pem {
+        Some(chain) if !chain.trim().is_empty() => format!("{}\n{}", cert_pem.trim_end(), chain.trim_start()),
+        _ => cert_pem.to_string(),
+    }
+}
+
+/// A required PEM field, present and not blank.
+fn require_pem<'a>(value: Option<&'a String>, field: &str) -> ApiResult<&'a str> {
+    value
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadRequest(format!("{field} is required and must hold PEM text")))
+}
+
+/// Store a certificate the proxy could actually serve.
+///
+/// Until this checked anything, the endpoint accepted any two strings, reported
+/// `status: active`, and left the operator believing a certificate was installed.
+/// The listener then skipped the row at startup with a WARN, because Pingora's
+/// `build()` panics on material it cannot load and [`gateway::tls_listener`]
+/// screens for that first — so the upload was not merely unvalidated, it was
+/// *known* to be unusable by the only component that would ever read it, one
+/// restart later and in a log nobody was watching.
+///
+/// Rejection is limited to what can never work for anyone: PEM that does not
+/// parse, and a key that is not the certificate's. **Expiry is not a rejection.**
+/// A not-yet-valid certificate is a legitimate upload — staging a renewal ahead
+/// of its `notBefore` is the normal way to avoid a scramble — and an expired one
+/// still has uses (a pinned client, a verification-off internal probe) and fails
+/// loudly and visibly at the browser rather than silently at startup. Checking it
+/// at the door would also buy less than it appears to: nothing re-checks the row
+/// afterwards, so "it validated on upload" would mean only that it had not
+/// expired at one past instant, while inviting the reading that a stored
+/// certificate is a valid one. Both cases are reported as `warnings` instead, and
+/// the validity window is now persisted so the expiry alert
+/// (`list_certificates_expiring_within`, which filters `not_after IS NOT NULL`)
+/// can see a manual upload at all — it never could before.
 pub async fn upload_certificate(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateCertificate>,
 ) -> ApiResult<Json<Value>> {
+    let cert_pem = require_pem(req.cert_pem.as_ref(), "cert_pem")?;
+    let key_pem = require_pem(req.key_pem.as_ref(), "key_pem")?;
+    let chain = served_chain(cert_pem, req.chain_pem.as_deref());
+
+    gateway::tls_listener::validate(&chain, key_pem).map_err(|e| {
+        ApiError::BadRequest(format!(
+            "{e:#}. Nothing was stored. Confirm the two files belong together — `openssl x509 -noout -pubkey -in \
+             cert.pem` and `openssl pkey -pubout -in key.pem` must print the same key — and that each holds the \
+             whole BEGIN/END block."
+        ))
+    })?;
+    let facts = gateway::tls_listener::inspect(&chain)
+        .map_err(|e| ApiError::BadRequest(format!("{e:#}. Nothing was stored.")))?;
+
+    let now = chrono::Utc::now();
+    let mut warnings: Vec<String> = Vec::new();
+    if facts.not_after <= now {
+        warnings.push(format!(
+            "this certificate expired on {} and every client will refuse it; it was stored and will be served anyway, \
+             because refusing it here would not be a decision this endpoint can keep making",
+            facts.not_after.format("%Y-%m-%d %H:%M:%SZ")
+        ));
+    } else if facts.not_before > now {
+        warnings.push(format!(
+            "this certificate is not valid until {}; clients will refuse it until then",
+            facts.not_before.format("%Y-%m-%d %H:%M:%SZ")
+        ));
+    }
+
     let row = state.db.create_certificate(req.clone()).await?;
-    state.db.update_certificate_status(row.id, "active", None).await?;
+    // Second statement, and deliberately not folded into the INSERT: the insert
+    // lands `status = 'pending'`, and only this fills the validity window and
+    // promotes the row to `active`. If it fails, what survives is a pending row
+    // with no metadata — which the listener skips — rather than an active row
+    // whose columns say nothing about what it holds.
+    state
+        .db
+        .update_certificate_pem(&waf_storage::models::UpdateCertificatePem {
+            id: row.id,
+            cert_pem,
+            key_pem,
+            chain_pem: req.chain_pem.as_deref(),
+            not_before: facts.not_before,
+            not_after: facts.not_after,
+            issuer: &facts.issuer,
+            subject: &facts.subject,
+        })
+        .await?;
     Ok(Json(json!({
         "success": true,
         "data": {
             "id": row.id,
             "domain": row.domain,
             "status": "active",
+            "not_before": facts.not_before,
+            "not_after": facts.not_after,
+            "issuer": facts.issuer,
+            "subject": facts.subject,
+            "warnings": warnings,
             // Stored is not served. The TLS listener reads this table once,
             // while Pingora builds the endpoint, and Pingora offers no way to
             // replace an acceptor's certificate on a running one — so an upload
@@ -595,6 +690,47 @@ pub async fn delete_certificate(State(state): State<Arc<AppState>>, Path(id): Pa
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    // ── Certificate upload validation ────────────────────────────────────────
+    //
+    // The pairing and parse checks themselves are `gateway::tls_listener`'s and
+    // are tested there against real rcgen material. What is pinned here is the
+    // part this module owns: that the upload path hands the listener the SAME
+    // bytes it will serve (leaf + chain, not the leaf alone), and that a blank
+    // field is refused before any of it runs.
+
+    #[test]
+    fn a_missing_pem_field_is_refused_by_name() {
+        let err = super::require_pem(None, "cert_pem").expect_err("a missing field must not pass");
+        assert!(format!("{err}").contains("cert_pem"), "{err}");
+    }
+
+    #[test]
+    fn a_whitespace_only_pem_field_is_refused() {
+        let blank = "   \n\t ".to_string();
+        assert!(super::require_pem(Some(&blank), "key_pem").is_err());
+    }
+
+    #[test]
+    fn a_present_pem_field_is_trimmed_not_rejected() {
+        let padded = "  -----BEGIN CERTIFICATE-----\n".to_string();
+        let got = super::require_pem(Some(&padded), "cert_pem").expect("a non-blank field must pass");
+        assert!(got.starts_with("-----BEGIN"), "{got}");
+    }
+
+    #[test]
+    fn the_chain_is_appended_the_way_the_listener_appends_it() {
+        // Mirrors `tls_listener::resolve`: leaf first, one newline, intermediates
+        // after. Validating the leaf alone would accept a broken bundle.
+        let joined = super::served_chain("LEAF\n", Some("  INTERMEDIATE\n"));
+        assert_eq!(joined, "LEAF\nINTERMEDIATE\n");
+    }
+
+    #[test]
+    fn an_absent_or_blank_chain_leaves_the_leaf_alone() {
+        assert_eq!(super::served_chain("LEAF", None), "LEAF");
+        assert_eq!(super::served_chain("LEAF", Some("   ")), "LEAF");
+    }
 
     /// Replicates the port validation logic used in `create_host` / `update_host`.
     fn is_valid_port(port: i32) -> bool {

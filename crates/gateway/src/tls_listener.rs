@@ -114,6 +114,55 @@ pub fn validate(cert_pem: &str, key_pem: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a certificate says about itself: the identity it claims and the window
+/// it claims it for.
+///
+/// The `certificates` table has columns for all four and, for a manual upload,
+/// has never held any of them — `create_certificate` inserts the PEM and leaves
+/// `not_before` / `not_after` / `issuer` / `subject` NULL. That is not cosmetic:
+/// `list_certificates_due_renewal` and `list_certificates_expiring_within` both
+/// filter on `not_after IS NOT NULL`, so an uploaded certificate is invisible to
+/// the renewal worklist and to the expiry alert — the one certificate class that
+/// most needs the alert, because nothing else is going to renew it.
+#[derive(Debug, Clone)]
+pub struct CertificateFacts {
+    pub not_before: chrono::DateTime<chrono::Utc>,
+    pub not_after: chrono::DateTime<chrono::Utc>,
+    pub issuer: String,
+    pub subject: String,
+}
+
+/// Read the validity window and the names out of the leaf of a PEM chain.
+///
+/// Separate from [`validate`] and deliberately not folded into it: `validate`
+/// answers "can this be served at all", which is the question whose wrong answer
+/// makes Pingora panic, and it must keep answering only that. This answers "what
+/// is it", which nothing on the serving path needs and which the store does.
+pub fn inspect(cert_pem: &str) -> anyhow::Result<CertificateFacts> {
+    use rustls::pki_types::CertificateDer;
+    use rustls_pki_types::pem::PemObject as _;
+    use x509_parser::prelude::{FromDer as _, X509Certificate};
+
+    let leaf: CertificateDer<'static> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .next()
+        .transpose()
+        .context("the certificate PEM does not parse")?
+        .ok_or_else(|| anyhow::anyhow!("the certificate PEM holds no CERTIFICATE block"))?;
+
+    let (_, leaf) = X509Certificate::from_der(leaf.as_ref()).context("the leaf certificate is not valid X.509 DER")?;
+    let validity = leaf.validity();
+    let not_before = chrono::DateTime::from_timestamp(validity.not_before.timestamp(), 0)
+        .context("the certificate's notBefore is not a representable instant")?;
+    let not_after = chrono::DateTime::from_timestamp(validity.not_after.timestamp(), 0)
+        .context("the certificate's notAfter is not a representable instant")?;
+    Ok(CertificateFacts {
+        not_before,
+        not_after,
+        issuer: leaf.issuer().to_string(),
+        subject: leaf.subject().to_string(),
+    })
+}
+
 /// Write `cert_pem` and `key_pem` into `dir` and return their paths.
 ///
 /// Both files are created 0600 and renamed into place, so a reader never sees a
@@ -177,14 +226,33 @@ fn unserved_domains(usable: &[UsableCert], served: usize) -> Vec<String> {
     out
 }
 
+/// Serving order for the store's candidates: anything still inside its validity
+/// window first, then ascending domain.
+///
+/// The domain order alone is what an operator hits the moment an expired
+/// certificate is allowed into the store — and the upload endpoint allows one
+/// deliberately, because staging a renewal and pinned internal clients are real.
+/// Sorted on the name only, `expired.test` outranks `waf.test`, and the listener
+/// presents a certificate every browser refuses while a perfectly good one sits
+/// in the same table.
+///
+/// A row with no recorded `not_after` — every manual upload made before the
+/// validity window was persisted — counts as unexpired. Nothing is known about
+/// it, and demoting it on no evidence would change which certificate an existing
+/// install serves across an upgrade.
+fn order_candidates(usable: &mut [UsableCert], now: chrono::DateTime<chrono::Utc>) {
+    let expired = |c: &UsableCert| c.not_after.is_some_and(|end| end <= now);
+    usable.sort_by(|a, b| expired(a).cmp(&expired(b)).then_with(|| a.domain.cmp(&b.domain)));
+}
+
 /// Decide what the TLS listener should serve.
 ///
 /// Configured files win over the store, because an operator who names a path
 /// has said which certificate this port presents and should not have that
 /// silently overridden by whatever ACME provisioned last. Within the store the
-/// candidates are tried in ascending domain order, which is stable across
-/// restarts — "newest" would move the served certificate every time a host was
-/// added — and the first that validates is used.
+/// candidates are tried unexpired-first and then in ascending domain order,
+/// which is stable across restarts — "newest" would move the served certificate
+/// every time a host was added — and the first that validates is used.
 ///
 /// Ties inside one domain go to the most recent row, and that matters more than
 /// it looks: renewal INSERTS rather than updates (`SslManager::request_certificate`
@@ -260,7 +328,7 @@ where
             })
         })
         .collect();
-    usable.sort_by(|a, b| a.domain.cmp(&b.domain));
+    order_candidates(&mut usable, chrono::Utc::now());
 
     if usable.is_empty() {
         return TlsPlan::Unavailable {
@@ -287,6 +355,16 @@ where
     let mut rejected = Vec::new();
     for (index, candidate) in usable.iter().enumerate() {
         if let Err(e) = validate(&candidate.cert_pem, &candidate.key_pem) {
+            // Say so per row, not only in the all-candidates-failed summary
+            // below. A store holding one good certificate and one broken one
+            // resolves happily off the good one and the broken row's only trace
+            // is a `rejected` entry that this function then never emits — so the
+            // row an operator has to fix is exactly the row nothing mentions.
+            // Rows predating upload validation are the ones this finds.
+            tracing::warn!(
+                domain = %candidate.domain,
+                "certificates row is active but unusable and will never be served: {e:#}"
+            );
             rejected.push(format!("{}: {e:#}", candidate.domain));
             continue;
         }
@@ -402,6 +480,35 @@ mod tests {
     }
 
     #[test]
+    fn inspect_reads_the_leafs_window_and_names() {
+        provider();
+        let (cert, _) = self_signed("waf.test");
+        let facts = inspect(&cert).expect("a self-signed certificate must be inspectable");
+        let now = chrono::Utc::now();
+        assert!(facts.not_before <= now, "{:?}", facts.not_before);
+        assert!(facts.not_after > now, "{:?}", facts.not_after);
+        assert_eq!(facts.issuer, facts.subject, "a self-signed leaf issues itself");
+    }
+
+    #[test]
+    fn inspect_refuses_text_that_is_not_a_certificate() {
+        provider();
+        // Well-formed base64 between the markers, so the PEM layer is happy and
+        // the failure has to come from the DER decode. That distinction is the
+        // reason the two steps report separately.
+        let err = inspect("-----BEGIN CERTIFICATE-----\nbm9wZQ==\n-----END CERTIFICATE-----")
+            .expect_err("garbage inside the markers must not inspect");
+        assert!(format!("{err:#}").contains("X.509 DER"), "{err:#}");
+    }
+
+    #[test]
+    fn inspect_refuses_an_empty_chain() {
+        provider();
+        let err = inspect("").expect_err("an empty PEM must not inspect");
+        assert!(format!("{err:#}").contains("no CERTIFICATE block"), "{err:#}");
+    }
+
+    #[test]
     fn materialized_key_is_private_and_reloadable() {
         provider();
         let (cert, key) = self_signed("waf.test");
@@ -438,6 +545,48 @@ mod tests {
             key_pem: String::new(),
             not_after: None,
         }
+    }
+
+    fn row_expiring(domain: &str, not_after: chrono::DateTime<chrono::Utc>) -> UsableCert {
+        UsableCert {
+            not_after: Some(not_after),
+            ..row(domain)
+        }
+    }
+
+    #[test]
+    fn an_expired_certificate_does_not_outrank_a_valid_one_on_alphabetical_order() {
+        let now = chrono::Utc::now();
+        let mut usable = vec![
+            row_expiring("aaa-expired.test", now - chrono::Duration::days(1)),
+            row_expiring("zzz-valid.test", now + chrono::Duration::days(30)),
+        ];
+        order_candidates(&mut usable, now);
+        let first = usable.first().expect("the fixture has two rows");
+        assert_eq!(first.domain, "zzz-valid.test");
+    }
+
+    #[test]
+    fn a_row_with_no_recorded_expiry_keeps_its_place() {
+        // Legacy manual uploads have a NULL not_after. Sorting them behind
+        // everything would change which certificate an upgraded install serves.
+        let now = chrono::Utc::now();
+        let mut usable = vec![row_expiring("b.test", now + chrono::Duration::days(30)), row("a.test")];
+        order_candidates(&mut usable, now);
+        let first = usable.first().expect("the fixture has two rows");
+        assert_eq!(first.domain, "a.test");
+    }
+
+    #[test]
+    fn among_valid_certificates_the_order_is_still_the_domain() {
+        let now = chrono::Utc::now();
+        let mut usable = vec![
+            row_expiring("b.test", now + chrono::Duration::days(30)),
+            row_expiring("a.test", now + chrono::Duration::days(1)),
+        ];
+        order_candidates(&mut usable, now);
+        let first = usable.first().expect("the fixture has two rows");
+        assert_eq!(first.domain, "a.test");
     }
 
     #[test]
