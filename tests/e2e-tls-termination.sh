@@ -336,9 +336,12 @@ echo "$body" | sed 's/^/    /'
 echo "$body" | grep -q 'HTTP_STATUS=200' \
     && pass "a real HTTPS client completed the handshake and got 200" \
     || fail "the HTTPS request did not succeed"
-# No ALPN is advertised on purpose; h2 would route on an absent Host header.
-echo "$body" | grep -q 'HTTP_VERSION=1.1' \
-    && pass "the session is HTTP/1.1, as the listener advertises" \
+# ALPN offers h2 first, and curl offers both, so this negotiates HTTP/2. The
+# h2-specific assertions — ALPN order, routing on `:authority`, the contradiction
+# refusal — are `tests/e2e-tls-h2.sh`; what matters here is that the version on
+# the wire is the one the listener says it prefers.
+echo "$body" | grep -q 'HTTP_VERSION=2' \
+    && pass "the session is HTTP/2, which is what ALPN offers first" \
     || fail "an unexpected HTTP version was negotiated"
 echo "$body" | grep -q "host-header=$HOSTNAME_UNDER_TEST:$TLS_PORT" \
     && pass "the plaintext origin saw the decrypted request with the client's Host" \
