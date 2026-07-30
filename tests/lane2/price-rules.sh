@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Price the default-off Lane 2 rules, one at a time, against both halves of the
-# corpus.
+# Price the Lane 2 rules, one at a time, against both halves of the corpus.
 #
 #   tests/lane2/price-rules.sh                       # every default-off rule
 #   tests/lane2/price-rules.sh sql.stacked ssti.getclass
 #   COMBO=recommended:nosql.expr_operator,xxe.entity_expansion \
 #     tests/lane2/price-rules.sh                     # ... plus a named combination
+#   DIRECTION=disable tests/lane2/price-rules.sh     # every default-ON rule
 #
 # Every Lane 2 rule ships either on or off, and the ones that ship off are the
 # ones nobody has priced. `[content_security] rules_enabled` makes the question
@@ -18,6 +18,23 @@
 #
 # Read the result with `price-rules.py`, which diffs each run against the
 # baseline and prints the per-rule table.
+#
+# ── Both directions ─────────────────────────────────────────────────────────
+# DIRECTION=enable (the default) sweeps the default-off rules through
+# `rules_enabled`, and prices a rule nobody has ever run.
+#
+# DIRECTION=disable sweeps the default-ON rules through `rules_disabled`, and
+# prices a rule that has been running all along. It is the same experiment
+# pointed the other way, and it exists because the enable sweep answered a
+# question about rules that are off while leaving the same question unasked
+# about the ones that are on: which running rules are in contact with benign
+# traffic and are held off the false positive list by nothing more than the
+# distance to a threshold. That contact is invisible in the shipped posture —
+# the rule is already on, so no bucket delta, no FP count and no fp-block count
+# moves — and the only way to see it is to take the rule away and look at what
+# stops firing. The baseline is the same untouched run in both directions;
+# `price-rules.py --direction disable` reverses the subtraction so every column
+# still reads as what the rule does when it is ON.
 #
 # ── Why it mirrors the tree instead of editing configs/default.toml ──────────
 # `run.sh` slices the `[content_security]` block out of `$SRC/configs/default.toml`
@@ -45,6 +62,9 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 WORK="${WORK:-${TMPDIR:-/tmp}/prx-waf-lane2-pricing}"
 OUT="${OUT:-$WORK/pricing}"
 PRXWAF_BIN="${PRXWAF_BIN:-}"
+# enable  — sweep the default-off rules through `rules_enabled`
+# disable — sweep the default-on rules through `rules_disabled`
+DIRECTION="${DIRECTION:-enable}"
 # One combination per entry, `name:key,key,...`; several separated by spaces.
 COMBO="${COMBO:-}"
 # Ports and Postgres are handed to run.sh unchanged if the caller set them.
@@ -57,6 +77,12 @@ export PG_CONTAINER="${PG_CONTAINER:-prx-waf-lane2-pricing-pg}"
 
 log() { printf '\033[1;36m[price]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[price] %s\033[0m\n' "$*" >&2; exit 1; }
+
+case "$DIRECTION" in
+  enable)  SWITCH_KEY="rules_enabled";  INVENTORY_STATE="off" ;;
+  disable) SWITCH_KEY="rules_disabled"; INVENTORY_STATE="on" ;;
+  *) die "DIRECTION must be enable or disable, got '$DIRECTION'" ;;
+esac
 
 mkdir -p "$WORK" "$OUT"
 
@@ -120,14 +146,14 @@ cp "$REPO_ROOT"/configs/*.toml "$MIRROR/configs/"
 if [ "$#" -gt 0 ]; then
   RULES=("$@")
 else
-  log "reading the default-off inventory out of the binary"
+  log "reading the default-$INVENTORY_STATE inventory out of the binary"
   mapfile -t RULES < <(
-    "$PRXWAF_BIN" rules semantic --state off --format json 2>/dev/null \
+    "$PRXWAF_BIN" rules semantic --state "$INVENTORY_STATE" --format json 2>/dev/null \
       | python3 -c 'import json,sys; [print(r["rule_key"]) for r in json.load(sys.stdin)]'
   )
 fi
 [ "${#RULES[@]}" -gt 0 ] || die "no rules to price"
-log "${#RULES[@]} rule(s) to price, plus the baseline"
+log "$DIRECTION sweep: ${#RULES[@]} rule(s) to price, plus the baseline"
 
 # ── One experiment ───────────────────────────────────────────────────────────
 # $1 = tag, $2 = comma-separated rule keys ("" for the baseline).
@@ -140,23 +166,25 @@ run_one() {
   fi
   rm -rf "$dst"; mkdir -p "$dst"
 
-  python3 - "$MIRROR/configs/default.toml" "$REPO_ROOT/configs/default.toml" "$keys" <<'PY'
+  python3 - "$MIRROR/configs/default.toml" "$REPO_ROOT/configs/default.toml" "$keys" \
+           "$SWITCH_KEY" <<'PY'
 import sys
-dst, src, keys = sys.argv[1], sys.argv[2], sys.argv[3]
+dst, src, keys, switch = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 text = open(src, encoding="utf-8").read()
-anchor = "\nrules_enabled = []\n"
+anchor = f"\n{switch} = []\n"
 # The substitution must bite. A default.toml that stopped carrying this line
-# would otherwise be measured thirty-eight times as the baseline, and the sweep
-# would report that no rule costs anything.
+# would otherwise be measured once per rule as the baseline, and the sweep would
+# report that no rule costs anything — or, in the disable direction, that no
+# running rule contributes anything.
 if text.count(anchor) != 1:
-    sys.exit("configs/default.toml drift: `rules_enabled = []` is not there exactly once")
+    sys.exit(f"configs/default.toml drift: `{switch} = []` is not there exactly once")
 body = ", ".join(f'"{k}"' for k in keys.split(",") if k)
-open(dst, "w", encoding="utf-8").write(text.replace(anchor, f"\nrules_enabled = [{body}]\n"))
+open(dst, "w", encoding="utf-8").write(text.replace(anchor, f"\n{switch} = [{body}]\n"))
 PY
 
   log "$tag — replaying both modes"
   WORK="$WORK/run" OUT="$dst" SRC="$MIRROR" PRXWAF_BIN="$PRXWAF_BIN" \
-  MODE="shadow,enforce" RECORDED_FROM="price-rules/$tag" \
+  MODE="shadow,enforce" RECORDED_FROM="price-rules/$DIRECTION/$tag" \
     "$SCRIPT_DIR/run.sh" >"$dst/run.log" 2>&1 \
     || { tail -20 "$dst/run.log" >&2; die "$tag failed, see $dst/run.log"; }
 }
@@ -170,4 +198,4 @@ for combo in $COMBO; do
 done
 
 log "reports in $OUT — read them with:"
-log "  python3 $SCRIPT_DIR/price-rules.py --dir $OUT"
+log "  python3 $SCRIPT_DIR/price-rules.py --dir $OUT --direction $DIRECTION"
