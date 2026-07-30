@@ -419,20 +419,45 @@ run_mode() {
   fi
 
   # Sanity gate. A harness that is not wired to the engine reports a beautiful
-  # 0 % FP rate, so prove the lane is alive before believing anything. The probe
-  # is a plain SQLi in a query string with every Lane 1 detector and the CRS
-  # check off — only Lane 2 can produce a verdict for it.
-  local benign attack
+  # 0 % FP rate, so prove the lane is alive before believing anything. Every
+  # probe is a plain attack in a query string with every Lane 1 detector and the
+  # CRS check off — only Lane 2 can produce a verdict for one.
+  #
+  # There are three of them, from three families, and enforce mode requires ONE
+  # of them to block rather than a particular one. A single hard-coded probe
+  # conflates two failures that must not be conflated: enforcement not working,
+  # and the one rule that carries that probe not being loaded. The second is a
+  # legitimate configuration — `rules_disabled` exists — and it is exactly what
+  # `price-rules.sh DIRECTION=disable` does sixty-six times in a row, so a
+  # single-probe gate turns a valid experiment into a harness failure. Three
+  # families cannot be silenced by removing one rule, and nothing short of
+  # enforcement being broken silences all three.
+  local benign
   benign=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOST_NAME" \
     "http://127.0.0.1:$WAF_PORT/?hello=world")
-  attack=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOST_NAME" \
-    "http://127.0.0.1:$WAF_PORT/?id=1%20UNION%20SELECT%20NULL,NULL,NULL--")
-  log "$mode: sanity — benign=$benign attack=$attack"
   [ "$benign" = "200" ] || die "sanity: benign request returned $benign, expected 200"
+  # One SQLi, one LDAP filter break, one XPath function call. The second and
+  # third are the on-the-wire form of corpus rows `ldap-002` and `xpath-003`,
+  # which the enforce baseline blocks, so this list is not a guess.
+  local probes=(
+    "id=1%20UNION%20SELECT%20NULL,NULL,NULL--"
+    "name=*)(%7C(objectclass=*"
+    "q=count(//user)"
+  )
+  local codes=() blocked=0 code
+  for probe in "${probes[@]}"; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $HOST_NAME" \
+      "http://127.0.0.1:$WAF_PORT/?$probe")
+    codes+=("$code")
+    [ "$code" = "403" ] && blocked=$((blocked + 1))
+  done
+  log "$mode: sanity — benign=$benign attacks=${codes[*]}"
   if [ "$mode" = "enforce" ]; then
-    [ "$attack" = "403" ] || die "sanity: enforce mode must block a UNION SELECT, got $attack"
+    [ "$blocked" -ge 1 ] \
+      || die "sanity: enforce mode blocked none of the three probes (${codes[*]}) — enforcement is not in force"
   else
-    [ "$attack" = "200" ] || die "sanity: shadow mode must not block, but got $attack"
+    [ "$blocked" = "0" ] \
+      || die "sanity: shadow mode must not block, but got ${codes[*]}"
     local seen=0
     for _ in $(seq 1 40); do
       psql_json "select coalesce(json_agg(t),'[]'::json) from (select 1 from semantic_observations limit 1) t" \
@@ -440,7 +465,7 @@ run_mode() {
       if [ "$(cat "$WORK/sanity-$mode.json")" != "[]" ]; then seen=1; break; fi
       sleep 0.25
     done
-    [ "$seen" = "1" ] || die "sanity: the semantic lane wrote no observation for a UNION SELECT — Lane 2 is not running"
+    [ "$seen" = "1" ] || die "sanity: the semantic lane wrote no observation for any of the three probes — Lane 2 is not running"
     log "$mode: sanity — the semantic lane records observations"
   fi
   # The sanity probe's own rows must not enter the measurement.
