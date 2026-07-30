@@ -133,6 +133,20 @@ nothing at all.
 Read `ssti` 33.3% as a price that has been paid deliberately, not as "the SSTI
 detector is bad".
 
+The same script pointed the other way (`DIRECTION=disable`) prices a rule that
+is already running, by taking it away — that sweep is
+[`docs/lane2-rule-pricing.md`](../../docs/lane2-rule-pricing.md#the-eighteen-rules-that-decide-in-code)
+for the eighteen rules that decide in code and
+[`docs/lane2-latent-pressure.md`](../../docs/lane2-latent-pressure.md) for the
+sixty-six that were switchable before them. Between the three sweeps every one
+of the 115 keys `prx-waf rules semantic` lists has a number, except
+`ast.comment_obfusc`, which is a label rather than a rule and has no switch.
+
+The single most useful number they produce for this table: `xss.script_tag`
+carries eight of the eighteen XSS detections **and** two of the ten false
+positives, at an identical score of 45 on both, so 90.0% and 4.55% are the same
+decision read from two ends.
+
 ## What is measured
 
 **Lane 2 and nothing else.** The generated host turns off every Lane 1 detector
