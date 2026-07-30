@@ -252,8 +252,14 @@ impl RuleToggles {
         Ok(out)
     }
 
-    /// A single unambiguous near-miss, or nothing. Deliberately narrow: a wrong
-    /// suggestion is worse than none when the message's job is to end a search.
+    /// A single unambiguous near-miss, or nothing.
+    ///
+    /// The refusal's job is to end the operator's search, and a refusal that
+    /// does not name the key they meant sends them to `grep` instead. Case
+    /// folding and containment catch the copy-paste mistakes; the bounded edit
+    /// distance catches the typing ones (a dropped or doubled character), which
+    /// is what a hand-typed rule key mostly gets wrong. A tie suggests nothing —
+    /// a wrong suggestion is worse than none.
     fn did_you_mean(key: &str, known: &BTreeSet<&'static str>) -> String {
         let mut hits = known.iter().filter(|k| k.eq_ignore_ascii_case(key));
         if let (Some(hit), None) = (hits.next(), hits.next()) {
@@ -263,7 +269,29 @@ impl RuleToggles {
         if let (Some(hit), None) = (hits.next(), hits.next()) {
             return format!(" (did you mean '{hit}'?)");
         }
-        String::new()
+        // Nearest by edit distance, but only when it is close AND alone. The cap
+        // scales with the key so a short key cannot match half the table.
+        let cap = (key.len() / 4).clamp(1, 3);
+        let mut best: Option<(usize, &'static str)> = None;
+        let mut tied = false;
+        for candidate in known {
+            let d = edit_distance(key, candidate, cap);
+            if d > cap {
+                continue;
+            }
+            match best {
+                Some((bd, _)) if d > bd => {}
+                Some((bd, _)) if d == bd => tied = true,
+                _ => {
+                    best = Some((d, candidate));
+                    tied = false;
+                }
+            }
+        }
+        match best {
+            Some((_, hit)) if !tied => format!(" (did you mean '{hit}'?)"),
+            _ => String::new(),
+        }
     }
 
     /// Turn on every rule in the inventory. Test-only: production reaches the
@@ -312,6 +340,42 @@ impl RuleToggles {
     pub fn is_empty(&self) -> bool {
         self.on.is_empty() && self.off.is_empty()
     }
+}
+
+/// Levenshtein distance between two ASCII-ish keys, giving up at `cap`.
+///
+/// Rule keys are short and there are fewer than a hundred of them, so the two-row
+/// table is the whole cost. Returns `cap + 1` for anything further apart, which
+/// is all the caller needs to know. Byte-wise: every rule key is ASCII by
+/// construction, and a multi-byte typo simply scores as far away.
+fn edit_distance(a: &str, b: &str, cap: usize) -> usize {
+    let over = cap + 1;
+    if a.len().abs_diff(b.len()) > cap {
+        return over;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = Vec::with_capacity(b.len() + 1);
+    for (i, ac) in a.bytes().enumerate() {
+        cur.clear();
+        cur.push(i + 1);
+        let mut row_best = i + 1;
+        for (j, bc) in b.bytes().enumerate() {
+            // `cur.last()` is the cell to the left, `prev[j]` the diagonal and
+            // `prev[j + 1]` the one above. Read through `get` / `last` so the
+            // loop carries no panic path at all.
+            let diagonal = prev.get(j).copied().unwrap_or(over);
+            let above = prev.get(j + 1).copied().unwrap_or(over);
+            let left = cur.last().copied().unwrap_or(over);
+            let best = (diagonal + usize::from(ac != bc)).min(above + 1).min(left + 1);
+            cur.push(best);
+            row_best = row_best.min(best);
+        }
+        if row_best > cap {
+            return over;
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev.last().copied().unwrap_or(over).min(over)
 }
 
 /// Return the strongest firing rule (highest confidence) over the haystack, or
@@ -4050,8 +4114,27 @@ mod tests {
 
     #[test]
     fn near_miss_is_suggested() {
+        // Wrong case — a copy-paste out of prose.
         let err = RuleToggles::resolve(&["SQL.INFO_SCHEMA".to_string()], &[]).expect_err("must not resolve");
         assert!(err.contains("did you mean 'sql.info_schema'"), "{err}");
+
+        // One dropped character — a hand-typed key.
+        let err = RuleToggles::resolve(&["nosql.comparison_operatr".to_string()], &[]).expect_err("must not resolve");
+        assert!(err.contains("did you mean 'nosql.comparison_operator'"), "{err}");
+
+        // Nothing close enough: say nothing rather than point somewhere wrong.
+        let err = RuleToggles::resolve(&["please_block_everything".to_string()], &[]).expect_err("must not resolve");
+        assert!(!err.contains("did you mean"), "{err}");
+    }
+
+    #[test]
+    fn edit_distance_gives_up_at_the_cap() {
+        assert_eq!(edit_distance("abc", "abc", 2), 0);
+        assert_eq!(edit_distance("abc", "abd", 2), 1);
+        assert_eq!(edit_distance("abc", "ac", 2), 1);
+        // Beyond the cap the exact value is not computed, only "further away".
+        assert_eq!(edit_distance("abc", "xyzzy", 2), 3);
+        assert_eq!(edit_distance("", "ab", 2), 2);
     }
 
     #[test]
