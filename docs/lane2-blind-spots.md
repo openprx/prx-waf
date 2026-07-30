@@ -272,13 +272,19 @@ demonstrably matches the payload and the product clears the threshold — so
 they match, and `rce.cmd_sep_common` (45 × 0.5 weight = 22) is excluded for the
 same reason.
 
-It could not be measured, because **`default_on` is a compile-time bool with no
-config surface**. `[content_security.attacks.*]` can set thresholds, weights
-and a hard-veto allowlist, but there is no per-rule enable key. Measuring the
-15 requires either that key or a throwaway build, and the number it would
-produce on the *benign* half is the one that actually matters — `README.md`
-says as much: turning these on "would also be the single most likely way to
-move the FP column".
+It could not be measured when this was written, because **`default_on` was a
+compile-time bool with no config surface**. `[content_security.attacks.*]` could
+set thresholds, weights and a hard-veto allowlist, but there was no per-rule
+enable key, so measuring the 15 needed either that key or a throwaway build.
+
+> **Since measured (`v0.2.175` added `rules_enabled`).** All 15 are recovered,
+> so the arithmetic held on the attack half — and it was silent about the two
+> numbers that decide anything. Eleven of the 15 come from seven rules that flag
+> nothing; the other four cost **five benign false positives** and take the FP
+> column from 4.55% to 6.82%. And **not one of the 15 changes what gets
+> blocked**: every recovered row scores its rule's confidence, 45 to 75, against
+> a `block_threshold` of 80. See [lane2-rule-pricing.md](lane2-rule-pricing.md)
+> for the per-rule table and the named benign rows.
 
 ---
 
@@ -442,11 +448,13 @@ tier doing what the `hard` tier is for.
 
 ## 6. What this document does not establish
 
-* **The 15 "recoverable by enabling an existing rule" are arithmetic.** Nothing
-  was flipped and re-measured, because there is no config key to flip. The
-  number is confidence × weight vs `log_threshold` with the pattern checked by
-  eye against the payload. Item 1 of the fix list exists to turn it into a
-  measurement.
+* **The 15 "recoverable by enabling an existing rule" were arithmetic** — and
+  are no longer. As written, nothing had been flipped and re-measured, because
+  there was no config key to flip; the number was confidence × weight vs
+  `log_threshold` with the pattern checked by eye. Item 1 of the fix list has
+  since landed and the sweep has run: all 15 recover, at a cost of five benign
+  false positives and no change to any blocking decision
+  ([lane2-rule-pricing.md](lane2-rule-pricing.md)). The rest of this list stands.
 * **No FP cost in this document is measured except the budget one.** The only
   measured FP movement is `max_ast_attempts_per_request` 6 → 64 taking
   `content-033` from `fp-log` to `fp-block` (0.91% → 1.36% of the benign half).
