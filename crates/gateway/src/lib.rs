@@ -1,3 +1,4 @@
+pub mod authority;
 pub mod cache;
 pub mod context;
 pub mod http3;

@@ -13,7 +13,9 @@
 //!
 //! "Authority" is deliberate: HTTP/3 has no `Host` *header*, it has an
 //! `:authority` pseudo-header, and a compliant client sends only that.  See
-//! [`route_authority`] for how the two are reconciled.
+//! [`crate::authority`] for how the two are reconciled — that resolver is
+//! shared with the HTTP/1.1 and h2 paths so all three protocols answer "which
+//! site is this?" the same way.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,6 +29,7 @@ use waf_common::metrics::{self, HostSlot, RequestAction};
 use waf_common::{HostConfig, RequestCtx, WafAction};
 use waf_engine::WafEngine;
 
+use crate::authority::{RouteAuthority, route_authority};
 use crate::context::{BodyOverflowAction, BodyWindows, body_inspection_policy, fold_request_headers};
 use crate::proxy::request_action_of;
 use crate::router::HostRouter;
@@ -99,63 +102,6 @@ fn is_hop_by_hop(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
-}
-
-// ─── Routing authority ────────────────────────────────────────────────────────
-
-/// Outcome of deciding which authority a request must be routed on.
-enum RouteAuthority<'a> {
-    /// The authority to route on, borrowed verbatim from the request.
-    Found(&'a str),
-    /// An `:authority` and a `Host` were both present and disagreed.
-    Contradicted,
-    /// Neither carried a usable value; nothing can be routed.
-    Missing,
-}
-
-/// Decide the authority an HTTP/3 request is routed on.
-///
-/// HTTP/3 does not carry a `Host` header. RFC 9114 §4.3.1 defines the
-/// `:authority` pseudo-header and says a client that sends `:authority`
-/// **SHOULD NOT** also send `Host`; `curl --http3`, Chrome and quiche-based
-/// clients all send `:authority` alone. Reading `headers["host"]` therefore
-/// found nothing on every compliant request, and the empty string routed to
-/// `None` — a 404 for all HTTP/3 traffic.
-///
-/// `h3` hands the authority up in [`http::Uri`], not in the header map: its
-/// `Header::into_request_parts` folds `:authority` (or, absent that, a `Host`
-/// field) into `Uri::authority` and leaves the field map untouched. So the URI
-/// is the authoritative source here, with the header map as the fallback for
-/// callers that build a request the other way round.
-///
-/// The disagreement case is refused rather than resolved. `h3` 0.0.8 already
-/// rejects it at decode time (`HeaderError::ContradictedAuthority`), so on
-/// today's dependency this branch is belt-and-braces — but that check is an
-/// internal detail of a 0.0.x crate, not a contract, and the consequence of
-/// silently picking one side is a desync primitive: this WAF would apply the
-/// policy of authority A while the origin resolves its vhost from the `Host`
-/// line carrying B. One `!=` is a cheap price for making the choice a property
-/// of this function instead of an assumption about a dependency.
-fn route_authority<'a>(uri: &'a http::Uri, headers: &'a http::HeaderMap) -> RouteAuthority<'a> {
-    let authority = uri
-        .authority()
-        .map(http::uri::Authority::as_str)
-        .filter(|a| !a.is_empty());
-    // First line only, which is all `h3` compares too. A request carrying more
-    // than one `Host` is refused before this point (`FoldedHeaders::duplicate_host`).
-    let host = headers
-        .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .filter(|h| !h.is_empty());
-
-    match (authority, host) {
-        // Byte-exact, matching the decoder's own comparison: `a.com` and
-        // `a.com:443` are different authorities and may hold different policy.
-        (Some(a), Some(h)) if a != h => RouteAuthority::Contradicted,
-        (Some(a), _) => RouteAuthority::Found(a),
-        (None, Some(h)) => RouteAuthority::Found(h),
-        (None, None) => RouteAuthority::Missing,
-    }
 }
 
 // ─── Upstream clients ─────────────────────────────────────────────────────────
@@ -1115,37 +1061,14 @@ mod tests {
     /// The regression this whole path exists for: a compliant HTTP/3 client
     /// sends `:authority` and no `Host` at all. Reading the header map found
     /// nothing and every such request 404'd.
+    ///
+    /// The resolver's own truth table — contradiction, empty `Host`, `Host`
+    /// alone — is asserted once, in `crate::authority`, because all three
+    /// protocols now share it. What is asserted here is the part that is
+    /// HTTP/3's: the shape `h3` hands up, and what the router then does with it.
     #[test]
     fn authority_pseudo_header_alone_is_routable() {
         assert_eq!(authority_of(Some("a.com"), None).as_deref(), Some("a.com"));
-    }
-
-    /// A `Host` with no `:authority` still routes — `h3` folds it into the URI
-    /// on the way in, and a caller that does not gets the header-map fallback.
-    #[test]
-    fn host_header_alone_is_routable() {
-        assert_eq!(authority_of(None, Some("a.com")).as_deref(), Some("a.com"));
-    }
-
-    /// Both present and equal: route on it, once.
-    #[test]
-    fn agreeing_authority_and_host_route_on_that_value() {
-        assert_eq!(authority_of(Some("a.com"), Some("a.com")).as_deref(), Some("a.com"));
-    }
-
-    /// Both present and different is a desync primitive, not a preference:
-    /// refuse rather than pick a side. Byte-exact, so a port that appears on
-    /// only one of the two counts as a disagreement.
-    #[test]
-    fn contradicting_authority_and_host_are_refused() {
-        assert_eq!(
-            authority_of(Some("a.com"), Some("evil.com")).as_deref(),
-            Some("<contradicted>")
-        );
-        assert_eq!(
-            authority_of(Some("a.com"), Some("a.com:443")).as_deref(),
-            Some("<contradicted>")
-        );
     }
 
     /// Neither present: nothing to route on. The handler turns this into the
@@ -1158,13 +1081,6 @@ mod tests {
         let router = HostRouter::new();
         router.register(&host_cfg("known.com", "10.0.0.1", 8080, false));
         assert!(router.resolve("").is_none());
-    }
-
-    /// An empty `Host` line is "no host", not an empty authority to route on.
-    #[test]
-    fn empty_host_field_falls_back_to_the_pseudo_header() {
-        assert_eq!(authority_of(Some("a.com"), Some("")).as_deref(), Some("a.com"));
-        assert!(authority_of(None, Some("")).is_none());
     }
 
     /// The authority is routed verbatim, so the router's port rules (and its
