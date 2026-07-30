@@ -94,9 +94,9 @@ corpus (LDAP, below). Neither prototype is in the tree; this is a survey.
 | XXE | DTD/prolog regex, no parser (`detectors.rs:720`) | `quick-xml` (already in tree) | nothing; all 3 misses are config + one regex row | entity expansion, if you ever use a validating parser | — | **do not** |
 | Traversal | encoding regexes (`detectors.rs:582`) | `typed-path` | nothing; both misses are default-off rules | small | small | **do not** |
 | SSTI | delimiter+sink co-occurrence (`detectors.rs:1141`) | none — six incompatible grammars | would need 6 parsers for ~6 rows | six template parsers | high | **do not** — no parser exists that covers the family |
-| LDAP | filter-break regexes (`detectors.rs:1342`) | none usable; ~120 lines of our own | +1 attack, 3× benign FPs (measured) | small (tiny grammar) | negligible | **do not** — measured, not assumed |
+| LDAP | filter-break regexes (`detectors.rs:1342`) | none exists; ~120 lines of our own | +1 attack, benign firings 1 → 6 (measured) | small (tiny grammar) | negligible | **do not** — measured, not assumed |
 | XPath | structural regexes (`detectors.rs:1536`) | `sxd-xpath` — usable, but unmaintained since 2018 | nothing: its one catchable miss is already caught by the SQL AST | recursive-descent expression parser | small | **do not** — the parse is already paid for |
-| Deserialization | format-magic + gadget regexes (`detectors.rs:1787`) | pickle: our own ~200-line opcode walker | **protocol ≥2 pickles, which are every real pickle** | ~zero — a flat opcode loop, no recursion, no unpickling | negligible | **should, and the candidate is ours to write** |
+| Deserialization | format-magic + gadget regexes (`detectors.rs:1787`) | pickle: our own ~200-line opcode walker | **protocol ≥4 pickles — i.e. the `pickle.dumps` default since Python 3.8** | near-zero on parse, but see the stack-VM caveat | negligible | **should, and the candidate is ours to write** |
 | XSS-JS | token scan of extracted handler bodies (`xss_js.rs`) | `boa_parser` / `oxc_parser` / `swc_ecma_parser` | see below | **the largest in the survey** | high | see below |
 
 ## Per family
@@ -426,11 +426,13 @@ the application's filter early and appending your own.
 
 It picks up `ldap-007` and `ldap-015`, loses `ldap-009` (hex-escaped `\2a\29\28`,
 which the escape regex catches and a parser only catches if you decode RFC 4515
-escapes first), and triples the benign false positives. The four new ones are
-parenthesised prose that structurally *is* a filter fragment: a code-review
-comment containing `` `$(git rev-parse HEAD)` ``, a markdown code fence, an ORM
-debug log, a reporting filter DSL. A parser cannot tell those apart from an
-injection, because structurally they are not different.
+escapes first), and takes benign firings from one to six. The five new ones are
+parenthesised prose that structurally *is* a filter fragment: a markdown code
+fence (`content-001`), a code-review comment containing `` `$(git rev-parse HEAD)` ``
+(`content-040`), an ORM debug log (`content-048`), a reporting filter DSL
+(`content-050`) and a Grafana dashboard definition (`content-096`). A parser
+cannot tell those apart from an injection, because structurally they are not
+different.
 
 **And it does not fix the one thing worth fixing.** `content-099` — an LDAP admin
 page saving `(&(objectClass=person)(uid=jsmith))` — is one of only two benign
