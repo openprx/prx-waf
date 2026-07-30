@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.154-rc.1"
+version = "0.2.154"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -94,7 +94,17 @@ scraper = "0.27"
 
 # Phase 4 additions
 argon2 = { version = "0.5", features = ["std"] }
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# `aws_lc_rs`, not the `rust_crypto` default, and the two are mutually
+# exclusive: jsonwebtoken picks its process-wide CryptoProvider from crate
+# features (crypto/mod.rs `from_crate_features`) and panics on the first
+# sign/verify if both or neither are on. The reason for choosing this one is
+# supply chain, not speed — `rust_crypto` is one monolithic feature that drags
+# in `rsa`, which carries RUSTSEC-2023-0071 (Marvin) with no fixed release, and
+# there is no HMAC-only subset to ask for. aws-lc-rs is already in the tree via
+# `pingora-core/rustls`, so this costs no new C dependency. We sign and verify
+# HS256 only; the backend swap is transparent to already-issued tokens because
+# both implementations compute the same RFC 7515 HMAC-SHA256.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 aes-gcm = "0.11"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "smtp-transport", "builder"] }

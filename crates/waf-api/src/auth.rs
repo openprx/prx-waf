@@ -56,8 +56,10 @@ pub fn generate_access_token(user_id: Uuid, username: &str, role: &str, secret: 
 pub fn validate_access_token(token: &str, secret: &str) -> anyhow::Result<Claims> {
     // `Validation::default()` == `Validation::new(Algorithm::HS256)`, i.e. `algorithms` is
     // exactly `[HS256]`; `decode()` rejects any other `alg` header before a verifier is even
-    // constructed. Keep it that way — widening `algorithms` would make the RSA code path in
-    // jsonwebtoken reachable (see the RUSTSEC-2023-0071 entry in deny.toml).
+    // constructed. Keep it that way — this is the check that stops a caller-chosen `alg`
+    // header from selecting the verifier, and `EncodingKey::from_secret` is tagged
+    // `AlgorithmFamily::Hmac` on the signing side, so HS256 is the only algorithm this
+    // service will ever produce or accept.
     let v = Validation {
         leeway: 0,
         ..Validation::default()
