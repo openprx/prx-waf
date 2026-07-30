@@ -918,9 +918,14 @@ const fn is_b64_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'-' || b == b'_'
 }
 
+/// Whether `b` may appear inside a hex token.
+const fn is_hex_byte(b: u8) -> bool {
+    b.is_ascii_hexdigit()
+}
+
 /// Inspect one preprocessor view's text for a pickle.
 ///
-/// Two input paths, in order:
+/// Three input paths, in order:
 ///
 /// 1. **the text itself**, anchored at byte 0 — a raw pickle body (`content-type:
 ///    application/octet-stream`) arrives this way;
@@ -930,33 +935,69 @@ const fn is_b64_byte(b: u8) -> bool {
 ///    and hands detectors a `String`, and a protocol-4 pickle is neither
 ///    printable nor UTF-8. So this decodes for itself, from `view.text` rather
 ///    than `view.lower_trunc` — base64 is case-significant and the lowercased
-///    normalisation destroys it.
+///    normalisation destroys it;
+/// 3. **hex tokens inside it**, for the same reason and by the same argument —
+///    the preprocessor blind-decodes hex too, and the deserialization table
+///    already carries a hex rule (`deser.java_hex_magic`), so hex delivery is a
+///    shape this family has seen.
 ///
-/// Bounded by [`MAX_B64_CANDIDATES`] decodes per view, each into one reused
-/// buffer, and by the parse-byte budget inside [`walk_stream`].
+/// Bounded by [`MAX_B64_CANDIDATES`] decodes per encoding per view, each into one
+/// reused buffer, and by the parse-byte budget inside [`walk_stream`].
 ///
 /// The whole-request cost is bounded without needing a budget of its own. The
 /// candidates in one view are disjoint substrings of it, so the decode input per
 /// view is at most the view's own length; and the sum of every view's length is
 /// already capped by `max_preprocess_output_bytes_total` (512 KiB by default),
 /// which the preprocessor charges as it produces them. A request therefore
-/// cannot drive more than that many bytes of base64 decode here, whatever shape
-/// it takes.
+/// cannot drive more than that many bytes of decode here, whatever shape it
+/// takes.
 pub(super) fn scan_view_text(text: &str, state: &mut ContentInspectionState) -> Option<PickleHit> {
     if let Some(hit) = walk_stream(text.as_bytes(), state) {
         return Some(hit);
     }
     let mut buf: Vec<u8> = Vec::new();
+    if let Some(hit) = scan_encoded(
+        text,
+        is_b64_byte,
+        MIN_B64_TOKEN,
+        MAX_B64_TOKEN,
+        decode_b64,
+        &mut buf,
+        state,
+    ) {
+        return Some(hit);
+    }
+    scan_encoded(
+        text,
+        is_hex_byte,
+        MIN_PICKLE_BYTES * 2,
+        MAX_PICKLE_BYTES * 2,
+        decode_hex,
+        &mut buf,
+        state,
+    )
+}
+
+/// Walk the decoded form of every candidate token of one encoding.
+fn scan_encoded(
+    text: &str,
+    is_token_byte: fn(u8) -> bool,
+    min_len: usize,
+    max_len: usize,
+    decode: for<'b> fn(&str, &'b mut Vec<u8>) -> Option<&'b [u8]>,
+    buf: &mut Vec<u8>,
+    state: &mut ContentInspectionState,
+) -> Option<PickleHit> {
     let mut decoded_tokens = 0usize;
-    for token in text.split(|c: char| !c.is_ascii() || !is_b64_byte(c as u8)) {
+    for token in text.split(|c: char| !c.is_ascii() || !is_token_byte(u8::try_from(c).unwrap_or(0xff))) {
         if decoded_tokens >= MAX_B64_CANDIDATES {
             break;
         }
-        if token.len() < MIN_B64_TOKEN || token.len() > MAX_B64_TOKEN {
+        if token.len() < min_len || token.len() > max_len {
             continue;
         }
         decoded_tokens = decoded_tokens.saturating_add(1);
-        let Some(bytes) = decode_b64(token, &mut buf) else {
+        let Some(bytes) = decode(token, buf) else {
             continue;
         };
         if let Some(hit) = walk_stream(bytes, state) {
@@ -982,6 +1023,21 @@ fn decode_b64<'b>(token: &str, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
         }
     }
     None
+}
+
+/// Decode one hex token into `buf`. Odd-length tokens are declined rather than
+/// padded — an odd run is not a hex-encoded byte string.
+fn decode_hex<'b>(token: &str, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
+    if !token.len().is_multiple_of(2) {
+        return None;
+    }
+    let capacity = token.len() / 2;
+    if buf.len() < capacity {
+        buf.resize(capacity, 0);
+    }
+    let out = buf.get_mut(..capacity)?;
+    hex::decode_to_slice(token, out).ok()?;
+    buf.get(..capacity)
 }
 
 #[cfg(test)]
@@ -1369,6 +1425,13 @@ mod tests {
         // tests/lane2/corpus/attack-t2.jsonl, verbatim.
         let body = r#"{"blob":"gASVIAAAAAAAAACMBXBvc2l4lIwGc3lzdGVtlJOUjAJpZJSFlFKULg=="}"#;
         let hit = scan(body).expect("base64-wrapped protocol-4 pickle");
+        assert_eq!((hit.module, hit.callable, hit.reduced), ("posix", "system", true));
+    }
+
+    #[test]
+    fn a_hex_wrapped_pickle_is_recognised() {
+        let hex_form = hex::encode(PROTO4);
+        let hit = scan(&format!("payload={hex_form}")).expect("hex-wrapped protocol-4 pickle");
         assert_eq!((hit.module, hit.callable, hit.reduced), ("posix", "system", true));
     }
 
