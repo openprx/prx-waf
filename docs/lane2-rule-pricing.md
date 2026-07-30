@@ -730,7 +730,10 @@ The batch-1 text already said its unique contribution was `trav-016` alone,
 because `traversal.sensitive_abs_ops` recovers `trav-005` for free. That is now
 the arithmetic as well as the prose: `traversal.sensitive_abs_ops` ships on, so
 `trav-005` is in the baseline, and the rule buys **one attack for two false
-positives**. It was the worst bargain of the four costly batch-1 rules when it
+positives**. `traversal.plain_dotdot` no longer even appears on `trav-005` —
+both rules are in the single `traversal` detector, the canonical is an arg-max,
+and 55 outranks 50, so it is masked there the same way `xss.base_href` is masked
+on `content-010`. It was the worst bargain of the four costly batch-1 rules when it
 read `+2/+2`; at `+1/+2` it is the only rule in the whole default-off set whose
 detections are outnumbered by its false positives.
 
