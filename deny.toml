@@ -182,7 +182,14 @@ ignore = [
     #              (upstream tracking issue rustls/pemfile#61), or pingora publishes a
     #              release whose rustls backend no longer depends on it.
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: unmaintained (archived), pingora-rustls 0.8.1 transitive with no upgrade path; parses only files this process wrote, never network input; the alternative backends are banned by [bans] in this file" },
-    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: compiled via jsonwebtoken(rust_crypto) but waf-api uses only HMAC/HS256; RSA code path unreachable; no upstream fix; removal via aws_lc_rs rejected (reverses ring-only commit 1b7e23f), feature-trim impossible (rust_crypto bundles rsa+hmac), lib swap risks auth regression" },
+    # review-by: 2026-10-01
+    # remove-when: jsonwebtoken is switched from `rust_crypto` to its `aws_lc_rs` feature,
+    #              which drops the rsa crate outright. That switch was rejected while this
+    #              tree was ring-only; wiring the Pingora TLS backend (v0.2.136) brought
+    #              aws-lc-rs back for its own reasons, so the objection no longer holds and
+    #              this exemption should now be removable — it needs its own verification
+    #              pass over the auth path, not a drive-by edit.
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: compiled via jsonwebtoken(rust_crypto) but waf-api uses only HMAC/HS256, so the RSA code path is unreachable; no upstream fix. Feature-trim is impossible (rust_crypto bundles rsa+hmac). The aws_lc_rs escape route is open again now that the TLS backend pulls aws-lc-rs regardless — see remove-when" },
 ]
 
 [licenses]
