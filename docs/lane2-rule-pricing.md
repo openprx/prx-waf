@@ -476,16 +476,18 @@ because neither rule was ever behind one.
 
 ### The AST rules block more than they detect, and that is the design
 
-Five rules, four detections and seven blocks between them. `sqlparser-rs` runs
-at weight 0.5 in a two-detector family, so an AST structure on its own scores 39
-to 45 and mostly rides along with the regex rule that already logged the row —
-which is why `ast.union` and `ast.dangerous_fn` carry no detection at all and
-still carry two blocks each. **The blocks are the whole of their value**: they
-are the corroborating half of `0.5·c_struct + 0.5·c_ast ≥ 80`, and without them
-`sqli-004` `sqli-006` `sqli-010` `sqli-014` `sqli-015` are logged and not
-blocked. Read against `docs/lane2-blind-spots.md`, this is the measured version
-of "the AST layer is doing real work": seven of the seventy-five blocks in the
-whole corpus need one of these five rules to exist.
+Five rules, five detections and five blocks between them, on ten distinct rows.
+`sqlparser-rs` runs at weight 0.5 in a two-detector family, so an AST structure
+on its own scores 39 to 45 and mostly rides along with the regex rule that
+already logged the row — which is why `ast.union` and `ast.dangerous_fn` carry
+no detection at all and still carry two blocks each. **For those two the blocks
+are the whole of their value**: they are the corroborating half of
+`0.5·c_struct + 0.5·c_ast ≥ 80`, and without one of the five, `sqli-004`
+`sqli-006` `sqli-010` `sqli-014` `sqli-015` are logged and not blocked. Read
+against `docs/lane2-blind-spots.md`, this is the measured version of "the AST
+layer is doing real work": **five of the seventy-five blocks in the whole
+corpus, one in fifteen, need one of these five rules to exist**, and no other
+family's blocks depend on a single detector this way.
 
 `ast.tautology` is the exception in the other direction — three detections, no
 blocks, and contact with **nine** attack rows, six of which are XPath. A quote

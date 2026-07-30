@@ -22,9 +22,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   detections, a block and the third false positive. Taking both away is measured
   as its own run rather than summed: shadow 139 → **127**, false positives 10 →
   **7**, one block lost, blocking false positives unmoved. The five SQL-AST
-  structures carry seven of the corpus's seventy-five blocks and only four
-  detections, which is the corroborating half of a two-detector family doing
-  exactly what it is weighted to do.
+  structures carry five of the corpus's seventy-five blocks and five detections
+  on ten distinct rows, and two of the five carry blocks and no detection at
+  all — the corroborating half of a two-detector family doing exactly what it is
+  weighted to do.
 
   Of the three that shipped off behind a `#[cfg(test)]` constructor,
   `xss.object_embed` costs the eleventh false positive — a CMS page embedding a
