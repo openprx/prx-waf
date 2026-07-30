@@ -59,6 +59,7 @@ use scraper::Html;
 use scraper::node::Element;
 
 use super::budget::ContentInspectionState;
+use super::detectors::{CodeRule, RuleToggles};
 use super::preprocess::{PreprocessCtx, SemanticDetector, View};
 use super::types::{AttackKind, Confidence, DetectionFinding, DetectorId};
 
@@ -399,6 +400,85 @@ const EVENT_HANDLERS: &[&str] = &[
     "onwheel",
 ];
 
+// ── The construct table ───────────────────────────────────────────────────────
+//
+// Nine dangerous constructs, six default-on. They are declared once here and
+// referenced by the walk, so the key and the confidence an operator reads out of
+// `prx-waf rules semantic` are literally the ones the detector emits — there is no
+// second copy to drift.
+
+/// A `<script>` element that really parses as one.
+const SCRIPT_TAG: CodeRule = CodeRule {
+    key: "xss.script_tag",
+    confidence: 90,
+    default_on: true,
+};
+/// `<svg onload=…>` — its own key because the SVG load handler is the classic
+/// filter-bypass vector.
+const SVG_ONLOAD: CodeRule = CodeRule {
+    key: "xss.svg_onload",
+    confidence: 88,
+    default_on: true,
+};
+/// `<iframe srcdoc=…>` — an inline document the browser parses and executes.
+const IFRAME_SRCDOC: CodeRule = CodeRule {
+    key: "xss.iframe_srcdoc",
+    confidence: 85,
+    default_on: true,
+};
+/// Any other real `on*=` event-handler attribute on a parsed element.
+const EVENT_HANDLER: CodeRule = CodeRule {
+    key: "xss.event_handler",
+    confidence: 85,
+    default_on: true,
+};
+/// A `javascript:` / `vbscript:` URL in a real URL attribute.
+const JS_URL: CodeRule = CodeRule {
+    key: "xss.js_url",
+    confidence: 85,
+    default_on: true,
+};
+/// A `data:text/html` URL in a real URL attribute.
+const DATA_HTML_URL: CodeRule = CodeRule {
+    key: "xss.data_html_url",
+    confidence: 82,
+    default_on: true,
+};
+/// FP-4 (P-XSS-2): `<object>` / `<embed>`. **DEFAULT-OFF** — legitimate PDF and
+/// media embeds hit it 3/3 in the fire drill.
+const OBJECT_EMBED: CodeRule = CodeRule {
+    key: "xss.object_embed",
+    confidence: 80,
+    default_on: false,
+};
+/// FP-4 (P-XSS-2): `<base href=…>`. **DEFAULT-OFF** — SPA `<base href="/app/">`
+/// hits it unconditionally.
+const BASE_HREF: CodeRule = CodeRule {
+    key: "xss.base_href",
+    confidence: 80,
+    default_on: false,
+};
+/// Plan §4 坑1 weak signal: the input ends in an unclosed dangerous start tag.
+/// **DEFAULT-OFF** pending shadow calibration.
+const DANGLING_OPEN_TAG: CodeRule = CodeRule {
+    key: "xss.dangling_open_tag",
+    confidence: 50,
+    default_on: false,
+};
+
+/// Every construct this detector can name, for [`semantic_rule_inventory`].
+pub(super) const XSS_DOM_RULES: &[CodeRule] = &[
+    SCRIPT_TAG,
+    SVG_ONLOAD,
+    IFRAME_SRCDOC,
+    EVENT_HANDLER,
+    JS_URL,
+    DATA_HTML_URL,
+    OBJECT_EMBED,
+    BASE_HREF,
+    DANGLING_OPEN_TAG,
+];
+
 /// Is `attr` a genuine event-handler content attribute? Cheap `on` prefix reject
 /// first, then an allowlist membership test — a bare `on` prefix never matches.
 fn is_event_handler(attr: &str) -> bool {
@@ -412,7 +492,7 @@ fn is_event_handler(attr: &str) -> bool {
 /// inside the scheme (`java script:`) makes it inert, and the browser does not
 /// execute it, so neither do we (FP-3). Returns the strongest dangerous-scheme
 /// construct, or `None`.
-fn dangerous_scheme(value: &str) -> Option<(&'static str, u8)> {
+fn dangerous_scheme(value: &str) -> Option<&'static CodeRule> {
     let mut norm = String::with_capacity(value.len());
     for c in value.chars() {
         if c == '\t' || c == '\n' || c == '\r' {
@@ -422,19 +502,34 @@ fn dangerous_scheme(value: &str) -> Option<(&'static str, u8)> {
     }
     let scheme = norm.trim_start_matches(|c: char| c == ' ' || c.is_control());
     if scheme.starts_with("javascript:") || scheme.starts_with("vbscript:") {
-        Some(("xss.js_url", 85))
+        Some(&JS_URL)
     } else if scheme.starts_with("data:text/html") {
-        Some(("xss.data_html_url", 82))
+        Some(&DATA_HTML_URL)
     } else {
         None
     }
 }
 
-/// Keep `cand` if it is strictly stronger (higher confidence) than the current
-/// best. Ties keep the incumbent — the walk order is deterministic (arena order),
-/// but confidence alone decides the reported construct.
-fn keep_stronger(best: &mut Option<(&'static str, u8)>, cand: (&'static str, u8)) {
-    if best.is_none_or(|b| cand.1 > b.1) {
+/// Keep `cand` if the operator's toggles leave it enabled AND it is strictly
+/// stronger (higher confidence) than the current best. Ties keep the incumbent —
+/// the walk order is deterministic (arena order), but confidence alone decides
+/// the reported construct.
+///
+/// This is the **single** gate for the whole detector: every construct the walk
+/// can name is proposed here, so a switched-off construct is skipped and the next
+/// strongest still wins. That matters — an `<svg onload=…>` inside a `<script>`
+/// block reports `xss.script_tag` today, and disabling `xss.script_tag` must leave
+/// it reporting `xss.svg_onload`, not nothing. The three P-XSS-2 default-off
+/// constructs (`object_embed`, `base_href`, `dangling_open_tag`) come through the
+/// same gate, which is what replaced the old `include_weak` flag: they were
+/// reachable only from a `#[cfg(test)]` constructor and are now reachable from
+/// `rules_enabled`, which is the difference between a rule that could be
+/// calibrated and one that could only be described.
+fn keep_stronger(best: &mut Option<&'static CodeRule>, cand: &'static CodeRule, on: &RuleToggles) {
+    if !on.allows(cand) {
+        return;
+    }
+    if best.is_none_or(|b| cand.confidence > b.confidence) {
         *best = Some(cand);
     }
 }
@@ -475,25 +570,30 @@ fn js_url_body(value: &str) -> Option<String> {
 /// [`EVENT_HANDLERS`] allowlist (not a bare `on` prefix); the URL-scheme branches
 /// run only on the curated [`URL_ATTRS`] set.
 ///
-/// `include_weak` gates the P-XSS-2 default-off constructs: `<object>`/`<embed>`
-/// and `<base href>` fired unconditionally at confidence 80 in P-XSS-1, but the
+/// The two P-XSS-2 default-off constructs — `<object>`/`<embed>` and
+/// `<base href>` — fired unconditionally at confidence 80 in P-XSS-1, but the
 /// fire-drill showed legitimate PDF/media embeds and SPA `<base href="/app/">`
 /// hit them 3/3 (`report/prx-waf-pxss-fire-drill-2026-07-23.md` §4.3). Per the
-/// "default-on 只留低误报" discipline they now ship **default-off** (only under the
-/// test/future all-constructs set), leaving corroboration to demote any residual
-/// hit — they carry no JS sink, so the token detector never corroborates them and
-/// a lone structural hit stays at Log.
-fn scan_element(el: &Element, include_weak: bool, js_contexts: &mut Vec<String>) -> Option<(&'static str, u8)> {
+/// "default-on 只留低误报" discipline they ship **default-off**, leaving
+/// corroboration to demote any residual hit — they carry no JS sink, so the token
+/// detector never corroborates them and a lone structural hit stays at Log. They
+/// are proposed unconditionally here and rejected by [`keep_stronger`], so an
+/// operator can price one through `rules_enabled` without a code change.
+///
+/// The JS execution contexts are collected **regardless** of whether the
+/// construct that exposed them is switched on. Disabling `xss.event_handler`
+/// silences that construct's own signal; it does not blind the token detector to
+/// an `eval(` sitting in the handler it silenced, because the two are separate
+/// rules and only one of them was switched.
+fn scan_element(el: &Element, on: &RuleToggles, js_contexts: &mut Vec<String>) -> Option<&'static CodeRule> {
     let name = el.name(); // html5ever lowercases HTML local names
-    let mut best: Option<(&'static str, u8)> = None;
+    let mut best: Option<&'static CodeRule> = None;
 
     match name {
-        "script" => keep_stronger(&mut best, ("xss.script_tag", 90)),
-        // FP-4 (P-XSS-2): default-off — legitimate media/PDF embeds and SPA
-        // `<base href>` hit these unconditionally.
-        "object" | "embed" if include_weak => keep_stronger(&mut best, ("xss.object_embed", 80)),
-        "base" if include_weak && el.attr("href").is_some() => keep_stronger(&mut best, ("xss.base_href", 80)),
-        "iframe" if el.attr("srcdoc").is_some() => keep_stronger(&mut best, ("xss.iframe_srcdoc", 85)),
+        "script" => keep_stronger(&mut best, &SCRIPT_TAG, on),
+        "object" | "embed" => keep_stronger(&mut best, &OBJECT_EMBED, on),
+        "base" if el.attr("href").is_some() => keep_stronger(&mut best, &BASE_HREF, on),
+        "iframe" if el.attr("srcdoc").is_some() => keep_stronger(&mut best, &IFRAME_SRCDOC, on),
         _ => {}
     }
 
@@ -502,9 +602,9 @@ fn scan_element(el: &Element, include_weak: bool, js_contexts: &mut Vec<String>)
             // P-XSS-2: the handler's VALUE is a JS execution context.
             js_contexts.push(value.to_string());
             if name == "svg" && attr == "onload" {
-                keep_stronger(&mut best, ("xss.svg_onload", 88));
+                keep_stronger(&mut best, &SVG_ONLOAD, on);
             } else {
-                keep_stronger(&mut best, ("xss.event_handler", 85));
+                keep_stronger(&mut best, &EVENT_HANDLER, on);
             }
         }
         if URL_ATTRS.contains(&attr)
@@ -515,7 +615,7 @@ fn scan_element(el: &Element, include_weak: bool, js_contexts: &mut Vec<String>)
             if let Some(body) = js_url_body(value) {
                 js_contexts.push(body);
             }
-            keep_stronger(&mut best, cand);
+            keep_stronger(&mut best, cand, on);
         }
     }
 
@@ -533,10 +633,10 @@ const DANGLING_TAGS: &[&str] = &[
 /// Default-off weak signal (plan §4 坑1): the input ends with an **unclosed**
 /// dangerous start tag (`…<img src=x onerror=alert(1)` with no trailing `>`),
 /// which the fragment parser discards but a browser would complete. Low
-/// confidence, non-hard-veto by construction; kept only under
-/// [`XssDomDetector::with_all_constructs`] so it can be shadow-calibrated before
-/// it ever runs in production.
-fn dangling_open_tag(s: &str) -> Option<(&'static str, u8)> {
+/// confidence, non-hard-veto by construction; switched on with
+/// `rules_enabled = ["xss.dangling_open_tag"]` so it can be shadow-calibrated
+/// before it ever runs in production.
+fn dangling_open_tag(s: &str) -> Option<&'static CodeRule> {
     // Find the last tag-open `<name`; if nothing closes it, it is dangling.
     let mut idx = s.len();
     for (i, c) in s.char_indices().rev() {
@@ -559,7 +659,7 @@ fn dangling_open_tag(s: &str) -> Option<(&'static str, u8)> {
         .collect::<String>()
         .to_ascii_lowercase();
     if !name.is_empty() && DANGLING_TAGS.contains(&name.as_str()) {
-        Some(("xss.dangling_open_tag", 50))
+        Some(&DANGLING_OPEN_TAG)
     } else {
         None
     }
@@ -569,25 +669,34 @@ fn dangling_open_tag(s: &str) -> Option<(&'static str, u8)> {
 /// attack family; parses each normalised view's text as an HTML fragment and
 /// fires on the strongest dangerous construct.
 pub struct XssDomDetector {
-    /// Include the default-off high-noise constructs (currently the
-    /// `dangling_open_tag` weak signal). `false` in production — set only by the
-    /// test-only [`Self::with_all_constructs`], mirroring the structural
-    /// detectors' default-on / all split.
-    include_weak: bool,
+    /// The operator's per-rule amendment, consulted by [`keep_stronger`] as each
+    /// construct is proposed. Empty is the shipped posture and reproduces the
+    /// six-construct default-on set exactly.
+    toggles: RuleToggles,
 }
 
 impl XssDomDetector {
-    /// Compile with the **default-on** low-false-positive construct set only.
+    /// Emit the **default-on** low-false-positive construct set only.
+    ///
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { include_weak: false }
+    pub fn new() -> Self {
+        Self::with_toggles(&RuleToggles::default())
     }
 
-    /// Test-only: also emit the default-off weak `dangling_open_tag` signal.
+    /// Emit the constructs the operator's [`RuleToggles`] leaves enabled.
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
+        Self {
+            toggles: toggles.clone(),
+        }
+    }
+
+    /// Test-only: also emit the three default-off constructs.
     #[cfg(test)]
     #[must_use]
-    pub const fn with_all_constructs() -> Self {
-        Self { include_weak: true }
+    pub fn with_all_constructs() -> Self {
+        Self::with_toggles(&RuleToggles::all())
     }
 
     /// Walk a parsed fragment and return the strongest default-on construct,
@@ -601,11 +710,11 @@ impl XssDomDetector {
     /// `check_template` flag to keep the common (no-template) walk O(n).
     fn scan_fragment(
         html: &Html,
-        include_weak: bool,
+        on: &RuleToggles,
         check_template: bool,
         js_contexts: &mut Vec<String>,
-    ) -> Option<(&'static str, u8)> {
-        let mut best: Option<(&'static str, u8)> = None;
+    ) -> Option<&'static CodeRule> {
+        let mut best: Option<&'static CodeRule> = None;
         // Arena-order node iteration — non-recursive, so a deeply-nested tree is
         // walked (and later dropped) in O(n) without stack growth.
         for node in html.tree.nodes() {
@@ -620,8 +729,8 @@ impl XssDomDetector {
             {
                 continue;
             }
-            if let Some(cand) = scan_element(el, include_weak, js_contexts) {
-                keep_stronger(&mut best, cand);
+            if let Some(cand) = scan_element(el, on, js_contexts) {
+                keep_stronger(&mut best, cand, on);
             }
         }
         best
@@ -697,7 +806,7 @@ impl SemanticDetector for XssDomDetector {
         // dangerous token).
         let mut js_contexts: Vec<String> = Vec::new();
         let html = Html::parse_fragment(text);
-        let mut best = Self::scan_fragment(&html, self.include_weak, check_template, &mut js_contexts);
+        let mut best = Self::scan_fragment(&html, &self.toggles, check_template, &mut js_contexts);
         // FN-1/FN-2: the body-context fragment parse drops `<body>`/`<frameset>`
         // start-tag event handlers (asymmetric with `<html>`, which it keeps), and
         // a full document parse still drops a `<frameset on*=>` once the WHATWG
@@ -721,21 +830,24 @@ impl SemanticDetector for XssDomDetector {
             && state.try_take_html_parse_input_bytes(doc_input.len())
             && let Some(cand) = Self::scan_fragment(
                 &Html::parse_document(doc_input),
-                self.include_weak,
+                &self.toggles,
                 check_template,
                 &mut js_contexts,
             )
         {
-            keep_stronger(&mut best, cand);
+            keep_stronger(&mut best, cand, &self.toggles);
         }
         // Hand the extracted JS contexts to the token detector (P-XSS-2). Done
         // before the weak-signal fallback: `dangling_open_tag` is text-level and
         // exposes no parsed attribute, so it contributes no JS context.
         state.stash_xss_js_contexts(js_contexts);
-        if best.is_none() && self.include_weak {
-            best = dangling_open_tag(text);
+        if best.is_none()
+            && let Some(cand) = dangling_open_tag(text)
+        {
+            keep_stronger(&mut best, cand, &self.toggles);
         }
-        let (rule_key, confidence) = best?;
+        let rule = best?;
+        let (rule_key, confidence) = (rule.key, rule.confidence);
         Some(DetectionFinding {
             attack: AttackKind::Xss,
             confidence: Confidence::saturating(confidence),
@@ -793,6 +905,105 @@ mod tests {
 
     fn fire(text: &str) -> Option<DetectionFinding> {
         run(&XssDomDetector::new(), text)
+    }
+
+    fn fire_without(off: &[&str], text: &str) -> Option<DetectionFinding> {
+        let keys: Vec<String> = off.iter().map(|k| (*k).to_string()).collect();
+        let toggles = RuleToggles::resolve(&[], &keys).expect("xss dom keys are in the inventory");
+        run(&XssDomDetector::with_toggles(&toggles), text)
+    }
+
+    /// The two constructs `docs/lane2-latent-pressure.md` attributes three of the
+    /// ten benign-corpus false positives to. Until this shipped they could only be
+    /// silenced by taking the whole `xss` family.
+    #[test]
+    fn script_tag_and_event_handler_can_be_switched_off() {
+        assert_eq!(
+            fire("<script>alert(1)</script>").expect("fires by default").rule_key,
+            "xss.script_tag"
+        );
+        assert!(
+            fire_without(&["xss.script_tag"], "<script>alert(1)</script>").is_none(),
+            "the script-tag construct must go quiet"
+        );
+        assert_eq!(
+            fire("<div onclick=\"x()\">y</div>").expect("fires by default").rule_key,
+            "xss.event_handler"
+        );
+        assert!(fire_without(&["xss.event_handler"], "<div onclick=\"x()\">y</div>").is_none());
+        // Neither switch touches the other construct.
+        assert_eq!(
+            fire_without(&["xss.event_handler"], "<script>alert(1)</script>")
+                .expect("still fires")
+                .rule_key,
+            "xss.script_tag"
+        );
+    }
+
+    /// A switched-off construct must not take the rest of the walk with it: the
+    /// detector keeps parsing and the next-strongest enabled construct wins.
+    #[test]
+    fn the_next_strongest_construct_still_wins() {
+        let payload = "<div onclick=y()>z</div><script>x</script><svg onload=alert(1)>";
+        assert_eq!(
+            fire(payload).expect("script tag outranks svg onload").rule_key,
+            "xss.script_tag"
+        );
+        assert_eq!(
+            fire_without(&["xss.script_tag"], payload)
+                .expect("the svg handler is still there")
+                .rule_key,
+            "xss.svg_onload"
+        );
+        assert_eq!(
+            fire_without(&["xss.script_tag", "xss.svg_onload"], payload)
+                .expect("and below that, the generic handler")
+                .rule_key,
+            "xss.event_handler"
+        );
+    }
+
+    /// The three P-XSS-2 default-off constructs used to be reachable only from a
+    /// `#[cfg(test)]` constructor. They ship off exactly as before, and are now
+    /// priceable one at a time through `rules_enabled`.
+    #[test]
+    fn default_off_constructs_are_reachable_from_config() {
+        let payload = "<object data=x.swf></object>";
+        assert!(fire(payload).is_none(), "still default-off");
+        let toggles = RuleToggles::resolve(&["xss.object_embed".to_string()], &[]).expect("known key");
+        let f = run(&XssDomDetector::with_toggles(&toggles), payload).expect("switched on, it fires");
+        assert_eq!(f.rule_key, "xss.object_embed");
+        assert_eq!(f.confidence, 80);
+        // And nothing else came along with it.
+        assert!(
+            run(&XssDomDetector::with_toggles(&toggles), "<base href=\"/app/\">").is_none(),
+            "enabling one default-off construct must not enable its neighbour"
+        );
+    }
+
+    /// Disabling a construct silences that construct's own signal; it does not
+    /// blind the token detector to what the construct exposed. The two are
+    /// separate rules and only one of them was switched.
+    #[test]
+    fn switching_a_construct_off_still_feeds_the_token_detector() {
+        let req = throwaway_req();
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let mut st = ContentInspectionState::default();
+        let toggles = RuleToggles::resolve(&[], &["xss.event_handler".to_string()]).expect("known key");
+        let det = XssDomDetector::with_toggles(&toggles);
+        assert!(
+            det.detect(&view("<div onclick=\"eval(atob('YQ=='))\">y</div>"), &pctx, &mut st)
+                .is_none(),
+            "the DOM construct is switched off"
+        );
+        assert_eq!(
+            st.take_xss_js_contexts(),
+            vec!["eval(atob('YQ=='))".to_string()],
+            "the handler value is still handed to the token detector"
+        );
     }
 
     fn run(det: &dyn SemanticDetector, text: &str) -> Option<DetectionFinding> {

@@ -105,6 +105,14 @@ pub struct ContentSecurityConfig {
     /// It is still a detection this WAF stops performing, so every key listed
     /// here is named in a startup `WARN`.
     ///
+    /// Both lists reach every rule the engine carries, including the ones a
+    /// detector decides in code rather than by matching a pattern. Those are
+    /// marked `code` in `rules semantic`'s DECIDES column, and switching one off
+    /// means something slightly different: the detector still runs and still
+    /// reports its other constructs, it merely stops naming that one. Only
+    /// `ast.comment_obfusc` is outside the surface — it labels a structure that
+    /// already matched rather than matching anything itself.
+    ///
     /// An unknown key — in either list — fails startup rather than being ignored.
     /// A rule switch that silently does nothing would be indistinguishable from
     /// one that works, and this repository has shipped that defect before

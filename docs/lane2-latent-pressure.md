@@ -192,9 +192,9 @@ reach.
 
 ### The rules this table cannot include
 
-`prx-waf rules semantic` lists 97 keys, 66 on and 31 off. The engine emits
-fourteen more on this corpus that are in no keyed table and are therefore in
-neither sweep:
+At the time of this run `prx-waf rules semantic` listed 97 keys, 66 on and 31
+off. The engine emits fourteen more on this corpus that were in no keyed table
+and are therefore in neither sweep:
 
 | keys | detector |
 |---|---|
@@ -202,14 +202,23 @@ neither sweep:
 | `xss.script_tag` `xss.event_handler` `xss.svg_onload` `xss.iframe_srcdoc` `xss.js_url` `xss.js_sink` `xss.js_exfil` | the two XSS detectors (`xss_dom`, `xss_js`) |
 | `deser.py_pickle_reduce_exec` | the pickle opcode walker |
 
-This is deliberate and the CLI says so — those detectors decide in code rather
-than from a table, and naming one in `rules_enabled` or `rules_disabled` is
+This was deliberate and the CLI said so — those detectors decide in code rather
+than from a table, and naming one in `rules_enabled` or `rules_disabled` was
 refused at startup like any other unknown key. It is worth stating here anyway,
 because **three of the ten false positives and part of a fourth come from two of
 those keys**, and no amount of sweeping the switchable inventory will ever show
 that. `xss.script_tag` fires on three benign rows and eight attack rows,
 `xss.event_handler` on one benign row and five attack rows. Turning either off
-means turning off the XSS family.
+meant turning off the XSS family.
+
+> **Superseded in `v0.2.192`.** Thirteen of those fourteen keys are switchable
+> now, along with five more the corpus never reached, so the inventory is 115
+> keys rather than 97 and every sweep in this document can be pointed at them.
+> The measurements above are unchanged — the default posture is byte-identical,
+> and this section describes what could be *reached*, not what fired. The one key
+> still outside the surface is `ast.comment_obfusc`, which is a label the AST
+> detector puts on whichever structure it already matched rather than a rule with
+> a confidence of its own; disabling the structure reaches it.
 
 ## The five rules with the most benign contact
 
@@ -327,8 +336,10 @@ Two limits on the `touched` numbers specifically:
   All three are already false positives, so this cannot hide a clean row, but it
   can understate `touched` for rules that would have fired later in the budget.
 * **The fourteen out-of-inventory keys are not in the table**, so the sixty-six
-  rows are the switchable set and not the whole engine. On the benign half those
-  keys contribute four rows of contact, three of which are false positives.
+  rows are the switchable set and not the whole engine at the time of this run.
+  On the benign half those keys contribute four rows of contact, three of which
+  are false positives. Thirteen of the fourteen entered the inventory in
+  `v0.2.192` and a later sweep can price them; this run predates that.
 
 `docs/lane2-blind-spots.md` remains the attack-side companion; this document
 says nothing about what Lane 2 misses.

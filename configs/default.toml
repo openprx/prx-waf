@@ -841,6 +841,26 @@ rollout_salt = ""                     # stable salt for deterministic canary buc
 # Every Lane 2 detector rule ships either on or off. These two lists are how a
 # rule's state is changed without editing Rust and cutting a release.
 #
+# All 115 of them, including the ones whose detector decides in code rather than
+# by matching a pattern — the five SQL-AST structures, the shell-AST RCE rules,
+# the nine XSS DOM constructs, the two XSS JS token classes and the two pickle
+# opcode grades. `rules semantic` marks those `code` in its DECIDES column, which
+# says how a rule matches and not how it is switched: switching one off leaves
+# its detector running (still parsing, still feeding the corroboration channel)
+# and merely stops it naming that construct, so the next-strongest enabled
+# construct on the same input is still reported. A `table` rule is compiled out
+# of its detector's regex set and cannot match at all. This mattered:
+# `docs/lane2-latent-pressure.md` traced three of the ten benign-corpus false
+# positives to `xss.script_tag` and `xss.event_handler`, which until v0.2.192 no
+# configuration could reach — the only hammers were the whole `xss` family or the
+# whole lane, both of which cost far more detection than the two constructs were
+# producing.
+#
+# One key the engine emits is deliberately NOT switchable: `ast.comment_obfusc`
+# is the label the AST SQLi detector puts on whichever structure it already
+# matched when the view carried a comment marker, so it has no confidence of its
+# own and nothing to switch. Disable the structure instead.
+#
 # The thirty-one that ship off are no longer "unmeasured": `docs/lane2-rule-pricing.md`
 # priced all thirty-eight of the then-default-off rules one at a time against the
 # `tests/lane2/` corpus, and `v0.2.187` shipped the seven that cost nothing on.

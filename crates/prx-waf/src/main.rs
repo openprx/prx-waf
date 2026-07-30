@@ -961,6 +961,7 @@ fn print_semantic_rules(
                         "confidence": r.confidence,
                         "min_matches": r.min_matches,
                         "default_on": r.default_on,
+                        "decided_by": r.source.as_str(),
                         "enabled": toggles.is_enabled(r.key, r.default_on),
                     })
                 })
@@ -969,10 +970,10 @@ fn print_semantic_rules(
         }
         "table" => {
             println!(
-                "{:<36} {:<16} {:<13} {:<5} {:<8} {:<9} Effective",
-                "RULE KEY", "FAMILY", "DETECTOR", "CONF", "MATCHES", "SHIPPED"
+                "{:<36} {:<16} {:<13} {:<5} {:<8} {:<7} {:<9} Effective",
+                "RULE KEY", "FAMILY", "DETECTOR", "CONF", "MATCHES", "DECIDES", "SHIPPED"
             );
-            println!("{}", "-".repeat(110));
+            println!("{}", "-".repeat(118));
             for r in &rules {
                 let on = toggles.is_enabled(r.key, r.default_on);
                 let effective = match (on, on == r.default_on) {
@@ -982,12 +983,13 @@ fn print_semantic_rules(
                     (false, false) => "off (rules_disabled)",
                 };
                 println!(
-                    "{:<36} {:<16} {:<13} {:<5} {:<8} {:<9} {effective}",
+                    "{:<36} {:<16} {:<13} {:<5} {:<8} {:<7} {:<9} {effective}",
                     truncate(r.key, 35),
                     truncate(r.family.as_config_key(), 15),
                     truncate(r.detector.as_config_str(), 12),
                     r.confidence,
                     r.min_matches,
+                    r.source.as_str(),
                     if r.default_on { "on" } else { "off" },
                 );
             }
@@ -1008,12 +1010,20 @@ fn print_semantic_rules(
                  tests/lane2/."
             );
             println!(
-                "Not listed, and not switchable: the AST SQLi detector, both XSS detectors, and \
-                 the pickle opcode walker (deser.py_pickle_reduce_exec, \
-                 deser.py_pickle_dangerous_global) decide in code rather than from a keyed table. \
-                 Naming one of those in rules_enabled or rules_disabled is refused at startup like \
-                 any other unknown key — to turn the pickle walker off, disable the \
-                 deserialization family."
+                "DECIDES says how a rule matches, not how it is switched — both kinds answer to \
+                 rules_enabled / rules_disabled identically. `table` is a regex row, compiled out \
+                 of its detector when off. `code` is a judgement about parsed structure (the two \
+                 AST detectors, both XSS detectors, the pickle opcode walker); switching one off \
+                 leaves its detector running and merely stops it naming that construct, so the \
+                 next-strongest enabled construct on the same input is still reported."
+            );
+            println!(
+                "One key the engine emits is deliberately absent: `ast.comment_obfusc` is the \
+                 label the AST SQLi detector puts on whichever structure it already matched when \
+                 the view carried a comment marker, so it has no confidence of its own and \
+                 nothing to switch — disable the structure (ast.stacked / ast.union / \
+                 ast.dangerous_fn / ast.tautology / ast.subquery) instead. Naming it, or any \
+                 other unknown key, is refused at startup."
             );
         }
         other => anyhow::bail!("--format must be table or json, got '{other}'"),

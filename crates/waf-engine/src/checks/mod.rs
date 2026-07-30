@@ -21,7 +21,7 @@ pub use bot::{
 pub use cc::CcCheck;
 pub use content_security::{
     AttackKind, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict, EnforcementMode, InspectionScope,
-    RuleToggles, RuntimeContentSecurityConfig, SemanticAction, SemanticRuleInfo, SemanticVerdict,
+    RuleToggles, RuntimeContentSecurityConfig, SemanticAction, SemanticRuleInfo, SemanticRuleSource, SemanticVerdict,
     semantic_rule_inventory,
 };
 pub use dir_traversal::DirTraversalCheck;

@@ -68,8 +68,9 @@ pub use canary::{BreakerState, CircuitBreaker, canary_bucket, in_canary};
 pub use config::{Dialect, EnforcementMode, RuntimeContentSecurityConfig};
 pub use detectors::{
     AstSqlDetector, DeserStructuralDetector, LdapStructuralDetector, NoSqlStructuralDetector, RceAstDetector,
-    RceStructuralDetector, RuleToggles, SemanticRuleInfo, SstiStructuralDetector, StructuralSqlDetector,
-    TraversalStructuralDetector, XpathStructuralDetector, XxeStructuralDetector, semantic_rule_inventory,
+    RceStructuralDetector, RuleToggles, SemanticRuleInfo, SemanticRuleSource, SstiStructuralDetector,
+    StructuralSqlDetector, TraversalStructuralDetector, XpathStructuralDetector, XxeStructuralDetector,
+    semantic_rule_inventory,
 };
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
@@ -185,9 +186,11 @@ impl ContentSecuritySubsystem {
         // The operator's per-rule amendment, already resolved against the rule
         // inventory by `RuntimeContentSecurityConfig::compile` — so every key in
         // it names a rule that exists, and an empty one (the shipped posture)
-        // reproduces the compiled-in `default_on` sets byte for byte. Detectors
-        // whose rules are decided in code rather than a keyed table (the AST SQLi
-        // detector, both XSS detectors) take no toggles and are unaffected.
+        // reproduces the compiled-in `default_on` sets byte for byte. Every
+        // detector takes it, including the four that decide in code rather than
+        // from a keyed table: the regex detectors resolve it once into a compiled
+        // rule set, the code-decided ones hold it and consult it where the
+        // judgement names a construct.
         let toggles = &config.rule_toggles;
         for key in config.rule_toggles.forced_off() {
             // A rule an operator switched off is a detection this process no
@@ -221,12 +224,12 @@ impl ContentSecuritySubsystem {
         // stash on every view, so no earlier view can leak forward.
         let detectors: Vec<Box<dyn SemanticDetector>> = vec![
             Box::new(detectors::StructuralSqlDetector::with_toggles(toggles)),
-            Box::new(detectors::AstSqlDetector::new()),
+            Box::new(detectors::AstSqlDetector::with_toggles(toggles)),
             Box::new(detectors::RceStructuralDetector::with_toggles(toggles)),
             Box::new(detectors::RceAstDetector::with_toggles(toggles)),
             Box::new(detectors::TraversalStructuralDetector::with_toggles(toggles)),
-            Box::new(xss_dom::XssDomDetector::new()),
-            Box::new(xss_js::XssJsTokenDetector::new()),
+            Box::new(xss_dom::XssDomDetector::with_toggles(toggles)),
+            Box::new(xss_js::XssJsTokenDetector::with_toggles(toggles)),
             // T2-A: structural XXE detector (single-detector `xxe` family). Runs no
             // XML parser, so it adds no parse-time DoS surface; matches DTD/prolog
             // markers on the same normalised view text as the other structural

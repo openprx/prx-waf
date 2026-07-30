@@ -53,8 +53,25 @@
 use std::borrow::Cow;
 
 use super::budget::ContentInspectionState;
+use super::detectors::{CodeRule, RuleToggles};
 use super::preprocess::{PreprocessCtx, SemanticDetector, View};
 use super::types::{AttackKind, Confidence, DetectionFinding, DetectorId};
+
+/// Credential / storage exfiltration — the higher-confidence class.
+const JS_EXFIL: CodeRule = CodeRule {
+    key: "xss.js_exfil",
+    confidence: 88,
+    default_on: true,
+};
+/// Dynamic execution / obfuscation decode — the sink class.
+const JS_SINK: CodeRule = CodeRule {
+    key: "xss.js_sink",
+    confidence: 85,
+    default_on: true,
+};
+
+/// Both token classes, for [`semantic_rule_inventory`].
+pub(super) const XSS_JS_RULES: &[CodeRule] = &[JS_EXFIL, JS_SINK];
 
 /// Credential / storage exfiltration tokens — the higher-confidence class
 /// (`xss.js_exfil`, conf 88). Each names an **attack-specific** action a benign
@@ -87,13 +104,15 @@ const SINK_TOKENS: &[&str] = &[
     "unescape(",
 ];
 
-/// Classify one JS execution context into its strongest dangerous class, or
-/// `None`. Exfiltration outranks a plain sink (data theft is the worse outcome).
-fn classify_context(lower: &str) -> Option<(&'static str, u8)> {
-    if EXFIL_TOKENS.iter().any(|t| lower.contains(t)) {
-        Some(("xss.js_exfil", 88))
-    } else if SINK_TOKENS.iter().any(|t| lower.contains(t)) {
-        Some(("xss.js_sink", 85))
+/// Classify one JS execution context into its strongest **enabled** dangerous
+/// class, or `None`. Exfiltration outranks a plain sink (data theft is the worse
+/// outcome); with `xss.js_exfil` switched off a context carrying both is reported
+/// as the sink it also is, rather than going silent.
+fn classify_context(lower: &str, on: &RuleToggles) -> Option<&'static CodeRule> {
+    if on.allows(&JS_EXFIL) && EXFIL_TOKENS.iter().any(|t| lower.contains(t)) {
+        Some(&JS_EXFIL)
+    } else if on.allows(&JS_SINK) && SINK_TOKENS.iter().any(|t| lower.contains(t)) {
+        Some(&JS_SINK)
     } else {
         None
     }
@@ -105,13 +124,22 @@ fn classify_context(lower: &str) -> Option<(&'static str, u8)> {
 /// [`super::xss_dom::XssDomDetector`], whose single HTML parse feeds it the JS
 /// execution contexts to classify.
 pub struct XssJsTokenDetector {
-    _private: (),
+    toggles: RuleToggles,
 }
 
 impl XssJsTokenDetector {
+    /// Production detector — both token classes ship on.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { _private: () }
+    pub fn new() -> Self {
+        Self::with_toggles(&RuleToggles::default())
+    }
+
+    /// Emit the token classes the operator's [`RuleToggles`] leaves enabled.
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
+        Self {
+            toggles: toggles.clone(),
+        }
     }
 }
 
@@ -136,16 +164,17 @@ impl SemanticDetector for XssJsTokenDetector {
         // execution contexts it extracted from THIS view; drain them. Empty ⇒ no
         // parsed handler/js-url context on this view ⇒ nothing to corroborate.
         let contexts = state.take_xss_js_contexts();
-        let mut best: Option<(&'static str, u8)> = None;
+        let mut best: Option<&'static CodeRule> = None;
         for ctx in &contexts {
             let lower = ctx.to_ascii_lowercase();
-            if let Some(cand) = classify_context(&lower)
-                && best.is_none_or(|b| cand.1 > b.1)
+            if let Some(cand) = classify_context(&lower, &self.toggles)
+                && best.is_none_or(|b| cand.confidence > b.confidence)
             {
                 best = Some(cand);
             }
         }
-        let (rule_key, confidence) = best?;
+        let rule = best?;
+        let (rule_key, confidence) = (rule.key, rule.confidence);
         Some(DetectionFinding {
             attack: AttackKind::Xss,
             confidence: Confidence::saturating(confidence),
@@ -213,6 +242,43 @@ mod tests {
         // DOM detector first: it stashes the extracted JS contexts into `st`.
         let _ = XssDomDetector::new().detect(&v, &pctx, &mut st);
         XssJsTokenDetector::new().detect(&v, &pctx, &mut st)
+    }
+
+    fn js_fire_without(off: &[&str], text: &str) -> Option<DetectionFinding> {
+        let keys: Vec<String> = off.iter().map(|k| (*k).to_string()).collect();
+        let toggles = RuleToggles::resolve(&[], &keys).expect("xss js keys are in the inventory");
+        let req = throwaway_req();
+        let pctx = PreprocessCtx {
+            scope: InspectionScope::Body,
+            req: &req,
+        };
+        let mut st = ContentInspectionState::default();
+        let v = view(text);
+        let _ = XssDomDetector::new().detect(&v, &pctx, &mut st);
+        XssJsTokenDetector::with_toggles(&toggles).detect(&v, &pctx, &mut st)
+    }
+
+    /// The two token classes switch independently, and dropping the stronger one
+    /// falls back to the weaker true claim rather than to silence — a context that
+    /// reads `document.cookie` inside an `eval(` is still a sink.
+    #[test]
+    fn token_classes_switch_independently() {
+        let both = "<img src=x onerror=\"eval(document.cookie)\">";
+        assert_eq!(js_fire(both).expect("exfil outranks sink").rule_key, "xss.js_exfil");
+        assert_eq!(
+            js_fire_without(&["xss.js_exfil"], both)
+                .expect("the sink claim survives")
+                .rule_key,
+            "xss.js_sink"
+        );
+        let sink_only = "<div onclick=\"unescape('%61')\">y</div>";
+        assert!(js_fire_without(&["xss.js_sink"], sink_only).is_none());
+        assert_eq!(
+            js_fire_without(&["xss.js_exfil"], sink_only)
+                .expect("the sink class is untouched")
+                .rule_key,
+            "xss.js_sink"
+        );
     }
 
     // ── Positive: a dangerous JS token in a parsed handler / js-url fires ───────

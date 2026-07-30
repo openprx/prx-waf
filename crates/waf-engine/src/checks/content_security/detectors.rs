@@ -105,6 +105,54 @@ fn compile_table(table: &[RuleRow], toggles: &RuleToggles, who: &str) -> Vec<Com
 // so a key that names no rule is a startup failure rather than a line in a config
 // file that silently does nothing.
 
+/// One rule a detector decides **in code** rather than by matching a pattern from
+/// a table: no regex, so no [`RuleRow`], but the same `(key, confidence,
+/// default_on)` vocabulary so the scorer, the shadow event log, the per-rule
+/// corpus report and [`RuleToggles`] see one uniform rule namespace.
+///
+/// Four detectors are built this way — the shell-AST RCE walker, the `sqlparser`
+/// SQL-AST classifier, the two XSS detectors and the pickle opcode walker — and
+/// the reason is always the same: the judgement is about *parsed structure*, and
+/// a structure has no pattern to compile. That is a fact about how the rule is
+/// evaluated, not about whether an operator may switch it, which is why every one
+/// of these rows is in [`semantic_rule_inventory`] alongside the regex rows.
+pub(super) struct CodeRule {
+    /// Stable matching key — the same namespace [`RuleRow`]'s keys live in.
+    pub key: &'static str,
+    /// Graded confidence `0..=100` contributed on a match.
+    pub confidence: u8,
+    /// Whether the rule fires with no operator amendment.
+    pub default_on: bool,
+}
+
+/// How a rule decides it fired — the one thing an operator cannot infer from a
+/// rule key, and the reason `rules semantic` prints a column for it.
+///
+/// It changes nothing about how a rule is switched (both kinds answer to
+/// `rules_enabled` / `rules_disabled` identically) but it changes what switching
+/// one *means*: a `Table` rule is compiled out of its detector's regex set and
+/// cannot match at all, while a `Code` rule's detector still runs — still parses,
+/// still walks, still feeds whatever corroboration channel it feeds — and merely
+/// stops naming that one construct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticRuleSource {
+    /// A row of a regex rule table, compiled by [`compile_table`].
+    Table,
+    /// A judgement the detector makes about parsed structure ([`CodeRule`]).
+    Code,
+}
+
+impl SemanticRuleSource {
+    /// Stable spelling for the CLI and its JSON output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Code => "code",
+        }
+    }
+}
+
 /// One rule in the compiled-in Lane 2 inventory: what it is, which family and
 /// detector own it, and the state it ships in.
 ///
@@ -129,6 +177,9 @@ pub struct SemanticRuleInfo {
     pub min_matches: usize,
     /// Whether the rule is compiled in with no operator amendment.
     pub default_on: bool,
+    /// Whether the rule is a regex table row or a code-decided structural
+    /// judgement. See [`SemanticRuleSource`] for why switching one differs.
+    pub source: SemanticRuleSource,
 }
 
 /// Every regex rule table, with the family and detector that own it. The single
@@ -146,7 +197,48 @@ const RULE_TABLES: &[(AttackKind, DetectorId, &[RuleRow])] = &[
     (AttackKind::Deserialization, DetectorId::DeserStruct, DESER_RULES),
 ];
 
-/// Every keyed rule this build carries, in table order.
+/// Every code-decided rule table, with the family and detector that own it — the
+/// [`CodeRule`] counterpart of [`RULE_TABLES`].
+///
+/// The shell-AST RCE walker has been here since it shipped. The other four
+/// arrived later and for a worse reason: they decided in code, so nobody gave
+/// them a table, so they were not in the inventory, so `rules_enabled` /
+/// `rules_disabled` refused their keys — and `docs/lane2-latent-pressure.md`
+/// measured three of the ten benign-corpus false positives coming from
+/// `xss.script_tag` and `xss.event_handler` with no configuration surface able to
+/// touch them. "Decides in code" is a statement about how a rule is evaluated;
+/// it was never a reason for an operator to be left with only the family switch.
+const CODE_RULE_TABLES: &[(AttackKind, DetectorId, &[CodeRule])] = &[
+    (AttackKind::SqlInjection, DetectorId::Ast, AST_RULES),
+    (AttackKind::Rce, DetectorId::RceAst, RCE_AST_RULES),
+    (AttackKind::Xss, DetectorId::XssDom, super::xss_dom::XSS_DOM_RULES),
+    (AttackKind::Xss, DetectorId::XssJs, super::xss_js::XSS_JS_RULES),
+    // The pickle grades are emitted by `DeserStructuralDetector`, so they are
+    // scored on the `deser_struct` weight like its regex rows.
+    (AttackKind::Deserialization, DetectorId::DeserStruct, PICKLE_RULES),
+];
+
+/// Keys the engine can emit that are deliberately **not** switchable, each with
+/// the reason, so naming one is refused with an explanation instead of a guess
+/// from [`RuleToggles::did_you_mean`].
+///
+/// One entry, and it is not an oversight. `ast.comment_obfusc` is not a rule: it
+/// is the label the AST `SQLi` detector puts on whichever of the five structures it
+/// already matched when the source view still carried a comment marker. It has no
+/// confidence of its own (it inherits the structure's, 78 to 90), so it cannot
+/// have an honest inventory row, and "disable it" has two irreconcilable readings
+/// — *stop relabelling* and *stop detecting comment-obfuscated injection* — which
+/// is exactly the condition [`RuleToggles::resolve`] refuses to resolve by
+/// precedence elsewhere.
+const NON_SWITCHABLE_KEYS: &[(&str, &str)] = &[(
+    "ast.comment_obfusc",
+    "it is a label the AST SQLi detector puts on whichever structure it already matched when the \
+     view carried a comment marker, not a rule of its own — disable the structure instead \
+     (ast.stacked / ast.union / ast.dangerous_fn / ast.tautology / ast.subquery)",
+)];
+
+/// Every keyed rule this build carries, in table order: the regex rows first,
+/// then the code-decided ones.
 ///
 /// Completeness is load-bearing twice over: [`RuleToggles::resolve`] rejects any
 /// key not listed here, and [`RuleToggles::all`] is what the `with_all_rules`
@@ -168,21 +260,24 @@ pub fn semantic_rule_inventory() -> Vec<SemanticRuleInfo> {
                     RuleKind::Count(n) => *n,
                 },
                 default_on: *default_on,
+                source: SemanticRuleSource::Table,
             });
         }
     }
-    // The shell-AST RCE rules are keyed the same way but carry no regex, so they
-    // live in their own table shape. They belong in the inventory all the same:
-    // `rce_ast.cmd_subst_any` is a default-off rule an operator may want to price.
-    for rule in RCE_AST_RULES {
-        out.push(SemanticRuleInfo {
-            key: rule.key,
-            family: AttackKind::Rce,
-            detector: DetectorId::RceAst,
-            confidence: rule.confidence,
-            min_matches: 1,
-            default_on: rule.default_on,
-        });
+    for (family, detector, table) in CODE_RULE_TABLES {
+        for rule in *table {
+            out.push(SemanticRuleInfo {
+                key: rule.key,
+                family: *family,
+                detector: *detector,
+                confidence: rule.confidence,
+                // A structural judgement fires on one occurrence of the structure;
+                // there is no density grade to report.
+                min_matches: 1,
+                default_on: rule.default_on,
+                source: SemanticRuleSource::Code,
+            });
+        }
     }
     out
 }
@@ -240,11 +335,15 @@ impl RuleToggles {
         let mut out = BTreeSet::new();
         for key in keys {
             let Some(resolved) = known.get(key.as_str()) else {
+                if let Some((_, why)) = NON_SWITCHABLE_KEYS.iter().find(|(k, _)| *k == key) {
+                    return Err(format!(
+                        "content_security.{field} references '{key}', which the engine can emit \
+                         but which is not switchable: {why}"
+                    ));
+                }
                 return Err(format!(
                     "content_security.{field} references '{key}', which is not a switchable \
-                     rule key{}. `prx-waf rules semantic` lists every key that can be switched \
-                     (the AST SQLi detector, both XSS detectors and the pickle opcode walker \
-                     decide in code and expose none)",
+                     rule key{}. `prx-waf rules semantic` lists every key that can be switched",
                     Self::did_you_mean(key, known)
                 ));
             };
@@ -322,6 +421,22 @@ impl RuleToggles {
         } else {
             default_on
         }
+    }
+
+    /// [`Self::is_enabled`] for a code-decided rule, consulted at the moment the
+    /// detector is about to name it.
+    ///
+    /// The regex detectors resolve their rules once, at construction, because
+    /// they can: a disabled row is simply not compiled. A structural judgement has
+    /// nothing to leave out of a compile step, so the check lands here instead —
+    /// and the shipped posture makes it very nearly free, because both sets are
+    /// empty and `BTreeSet::contains` on an empty tree is a null check on the
+    /// root, no hashing and no comparison. An operator who does switch something
+    /// pays a `log2(k)` string compare against a set of at most a handful of keys,
+    /// and pays it only where a construct actually matched.
+    #[must_use]
+    pub(super) fn allows(&self, rule: &CodeRule) -> bool {
+        self.is_enabled(rule.key, rule.default_on)
     }
 
     /// The keys forced on, in sorted order — for the startup broadcast.
@@ -2150,18 +2265,6 @@ const DESER_RULES: &[RuleRow] = &[
     ),
 ];
 
-/// One verdict grade of the pickle opcode walker.
-///
-/// These two are **not** rows of [`DESER_RULES`]: the verdict comes from
-/// [`super::pickle::scan_view_text`] walking an opcode stream, not from a regex
-/// over view text, so there is no pattern to compile. They keep the same
-/// `(rule_key, confidence)` shape the regex rows use so the scorer, the shadow
-/// event log and the per-rule corpus report see one uniform rule vocabulary.
-struct PickleRule {
-    rule_key: &'static str,
-    confidence: u8,
-}
-
 /// A dangerous callable that a **reduction opcode actually consumed** — `REDUCE`
 /// / `INST` / `OBJ` / `NEWOBJ` / `NEWOBJ_EX` applied to a global the walker's
 /// closed table names. This is not "the payload looks like an attack", it is
@@ -2176,9 +2279,10 @@ struct PickleRule {
 /// `decimal.Decimal`, `builtins.set` — is outside that list and produces
 /// nothing. Measured: 0 hits across the 220-row benign corpus, and 0 across 58
 /// real `CPython` pickles of benign objects taken at every protocol.
-const PICKLE_REDUCE_RULE: PickleRule = PickleRule {
-    rule_key: "deser.py_pickle_reduce_exec",
+const PICKLE_REDUCE_RULE: CodeRule = CodeRule {
+    key: "deser.py_pickle_reduce_exec",
     confidence: 92,
+    default_on: true,
 };
 
 /// A dangerous callable **named** by `GLOBAL` / `STACK_GLOBAL` but not seen
@@ -2187,10 +2291,21 @@ const PICKLE_REDUCE_RULE: PickleRule = PickleRule {
 /// `EXT`-registry callable, a memo path we decline to model). **DEFAULT-ON**: it
 /// requires the same closed deny list, so it adds no false-positive surface the
 /// grade above does not already carry.
-const PICKLE_NAMED_RULE: PickleRule = PickleRule {
-    rule_key: "deser.py_pickle_dangerous_global",
+///
+/// It has also never been observed firing: `docs/lane2-rule-pricing.md` records no
+/// hit on either half of the corpus, so the grade below the one that fires is
+/// carrying, so far as anyone has measured, nothing at all. That is an argument
+/// for putting it in the inventory where the sweep can price it, not for leaving
+/// it out of reach — an unmeasured rule that no config can remove is the shape of
+/// problem this whole surface exists to end.
+const PICKLE_NAMED_RULE: CodeRule = CodeRule {
+    key: "deser.py_pickle_dangerous_global",
     confidence: 85,
+    default_on: true,
 };
+
+/// The two pickle grades, strongest first.
+const PICKLE_RULES: &[CodeRule] = &[PICKLE_REDUCE_RULE, PICKLE_NAMED_RULE];
 
 /// Structural unsafe-deserialization detector (plan T2-F).
 ///
@@ -2214,6 +2329,10 @@ const PICKLE_NAMED_RULE: PickleRule = PickleRule {
 ///   module docs for the boundary it holds.
 pub struct DeserStructuralDetector {
     rules: Vec<CompiledRule>,
+    /// The operator's amendment, consulted by the pickle walk. Held rather than
+    /// resolved into two bools so the walk reads the two grades the same way the
+    /// classifier reads them everywhere else.
+    toggles: RuleToggles,
 }
 
 impl DeserStructuralDetector {
@@ -2235,6 +2354,7 @@ impl DeserStructuralDetector {
     pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
             rules: compile_table(DESER_RULES, toggles, "DeserStructuralDetector"),
+            toggles: toggles.clone(),
         }
     }
 
@@ -2268,7 +2388,7 @@ impl SemanticDetector for DeserStructuralDetector {
         // lowercased form destroys the very token it has to decode.
         let regex_hit = best_match(&self.rules, view.lower_trunc.as_str())
             .map(|rule| finding_for(rule, AttackKind::Deserialization, "deserialization"));
-        let pickle_hit = pickle_finding(view.text.as_ref(), state);
+        let pickle_hit = pickle_finding(view.text.as_ref(), state, &self.toggles);
         match (regex_hit, pickle_hit) {
             (Some(regex), Some(pickle)) => {
                 // Same tie-break the regex table itself uses: strongest wins.
@@ -2289,20 +2409,38 @@ impl SemanticDetector for DeserStructuralDetector {
 /// The reported `module` / `callable` are compile-time constants from the
 /// walker's own table — never bytes copied out of the request — so `detail` stays
 /// de-identified exactly like [`finding_for`]'s.
-fn pickle_finding(text: &str, state: &mut ContentInspectionState) -> Option<DetectionFinding> {
+///
+/// Both grades off means the walk itself is skipped: it is the most expensive
+/// thing this detector does, and with nothing left to report there is nothing to
+/// spend it on. That is also the only way to stop the pickle walker from config
+/// without taking the whole `deserialization` family — the nine regex rows keep
+/// working.
+///
+/// A reduced hit with `deser.py_pickle_reduce_exec` off falls back to the named
+/// grade rather than vanishing, because a stream that reduced a dangerous global
+/// did also name one: the weaker claim is still true, and reporting it is the same
+/// strongest-enabled-wins rule the rest of the engine follows.
+fn pickle_finding(text: &str, state: &mut ContentInspectionState, on: &RuleToggles) -> Option<DetectionFinding> {
+    let reduce_on = on.allows(&PICKLE_REDUCE_RULE);
+    let named_on = on.allows(&PICKLE_NAMED_RULE);
+    if !reduce_on && !named_on {
+        return None;
+    }
     let hit = super::pickle::scan_view_text(text, state)?;
-    let (rule, grade) = if hit.reduced {
+    let (rule, grade) = if hit.reduced && reduce_on {
         (&PICKLE_REDUCE_RULE, "reduced by")
-    } else {
+    } else if named_on {
         (&PICKLE_NAMED_RULE, "names")
+    } else {
+        return None;
     };
     Some(DetectionFinding {
         attack: AttackKind::Deserialization,
         confidence: Confidence::saturating(rule.confidence),
-        rule_key: rule.rule_key,
+        rule_key: rule.key,
         detail: Cow::Owned(format!(
             "pickle opcode walk: stream {grade} {}.{} (rule '{}', confidence {})",
-            hit.module, hit.callable, rule.rule_key, rule.confidence
+            hit.module, hit.callable, rule.key, rule.confidence
         )),
     })
 }
@@ -2489,12 +2627,12 @@ fn ast_structural_depth_ok(s: &str) -> bool {
 /// Spend one AST attempt (subject to the per-request budget) parsing `sql` and
 /// classifying it. Returns `None` when the budget is exhausted, the parse fails,
 /// or the parse is an ordinary single-value query.
-fn ast_attempt(sql: &str, state: &mut ContentInspectionState) -> Option<(&'static str, u8)> {
+fn ast_attempt(sql: &str, state: &mut ContentInspectionState, on: &RuleToggles) -> Option<&'static CodeRule> {
     if !state.try_take_ast_attempt() {
         return None;
     }
     let stmts = parse_wrapped(sql)?;
-    classify_statements(&stmts)
+    classify_statements(&stmts, on)
 }
 
 /// Parse a wrapped statement string, returning the statements on a full,
@@ -2607,8 +2745,43 @@ fn walk_where(e: &Expr, depth: usize, flags: &mut AstFlags) {
     }
 }
 
-/// Classify a parsed statement list into an injection `(rule_key, confidence)`,
-/// or `None` when it is an ordinary single-value query.
+/// The five injection structures the AST classifier recognises, strongest first.
+///
+/// All five are default-on and each is independently switchable: they name
+/// disjoint structures (a statement separator, a set operation, a dangerous
+/// function call, a constant-vs-constant comparison, a nested query), so removing
+/// one leaves the other four saying exactly what they said before. What is *not*
+/// in this table is `ast.comment_obfusc` — see [`NON_SWITCHABLE_KEYS`].
+const AST_STACKED: CodeRule = CodeRule {
+    key: "ast.stacked",
+    confidence: 90,
+    default_on: true,
+};
+const AST_UNION: CodeRule = CodeRule {
+    key: "ast.union",
+    confidence: 85,
+    default_on: true,
+};
+const AST_DANGEROUS_FN: CodeRule = CodeRule {
+    key: "ast.dangerous_fn",
+    confidence: 85,
+    default_on: true,
+};
+const AST_TAUTOLOGY: CodeRule = CodeRule {
+    key: "ast.tautology",
+    confidence: 80,
+    default_on: true,
+};
+const AST_SUBQUERY: CodeRule = CodeRule {
+    key: "ast.subquery",
+    confidence: 78,
+    default_on: true,
+};
+
+const AST_RULES: &[CodeRule] = &[AST_STACKED, AST_UNION, AST_DANGEROUS_FN, AST_TAUTOLOGY, AST_SUBQUERY];
+
+/// Classify a parsed statement list into an injection [`CodeRule`], or `None`
+/// when it is an ordinary single-value query.
 ///
 /// The input was wrapped as `select * from t where c = <input>` (pitfall ②:
 /// UNION / stacked statements are invisible at the expression level, so we parse
@@ -2616,44 +2789,52 @@ fn walk_where(e: &Expr, depth: usize, flags: &mut AstFlags) {
 /// whose body is a `Select` with a `c = <literal>` `WHERE` and nothing else; every
 /// branch below fires only on structure the *input* grafted in, which a single
 /// value can never contribute.
-fn classify_statements(stmts: &[Statement]) -> Option<(&'static str, u8)> {
+///
+/// `on` is the operator's per-rule amendment. A structure whose rule is switched
+/// off is not reported and the classification **continues** past it — a stacked
+/// query with `ast.stacked` off is still read as its first statement, and a
+/// `WHERE` carrying both a dangerous function and a subquery with
+/// `ast.dangerous_fn` off still reports `ast.subquery`. That is the same
+/// strongest-enabled-wins rule [`best_match`] applies to the regex tables, and it
+/// is what keeps a single switch from silently taking a second structure with it.
+fn classify_statements(stmts: &[Statement], on: &RuleToggles) -> Option<&'static CodeRule> {
     // Stacked query: the wrapper is one statement — more than one means the input
     // injected a statement separator.
-    if stmts.len() > 1 {
-        return Some(("ast.stacked", 90));
+    if stmts.len() > 1 && on.allows(&AST_STACKED) {
+        return Some(&AST_STACKED);
     }
     let Some(Statement::Query(query)) = stmts.first() else {
         return None;
     };
-    classify_set_expr(&query.body, 0)
+    classify_set_expr(&query.body, 0, on)
 }
 
 /// Classify a query body (recursing through a parenthesised sub-body).
-fn classify_set_expr(body: &SetExpr, depth: usize) -> Option<(&'static str, u8)> {
+fn classify_set_expr(body: &SetExpr, depth: usize, on: &RuleToggles) -> Option<&'static CodeRule> {
     if depth > 64 {
         return None;
     }
     match body {
         // UNION / EXCEPT / INTERSECT grafted onto `c = <input>` — a value can
         // never introduce a set operation.
-        SetExpr::SetOperation { .. } => Some(("ast.union", 85)),
+        SetExpr::SetOperation { .. } => on.allows(&AST_UNION).then_some(&AST_UNION),
         SetExpr::Select(select) => {
             let mut flags = AstFlags::default();
             if let Some(expr) = &select.selection {
                 walk_where(expr, 0, &mut flags);
             }
-            // Highest-confidence structure wins.
-            if flags.dangerous_fn {
-                Some(("ast.dangerous_fn", 85))
-            } else if flags.tautology {
-                Some(("ast.tautology", 80))
-            } else if flags.subquery {
-                Some(("ast.subquery", 78))
+            // Highest-confidence ENABLED structure wins.
+            if flags.dangerous_fn && on.allows(&AST_DANGEROUS_FN) {
+                Some(&AST_DANGEROUS_FN)
+            } else if flags.tautology && on.allows(&AST_TAUTOLOGY) {
+                Some(&AST_TAUTOLOGY)
+            } else if flags.subquery && on.allows(&AST_SUBQUERY) {
+                Some(&AST_SUBQUERY)
             } else {
                 None
             }
         }
-        SetExpr::Query(inner) => classify_set_expr(&inner.body, depth + 1),
+        SetExpr::Query(inner) => classify_set_expr(&inner.body, depth + 1, on),
         _ => None,
     }
 }
@@ -2694,13 +2875,29 @@ fn classify_set_expr(body: &SetExpr, depth: usize) -> Option<(&'static str, u8)>
 ///   positions are not reachable from the value-context wrapper under
 ///   `GenericDialect`, so the AST does not model them.
 pub struct AstSqlDetector {
-    _private: (),
+    toggles: RuleToggles,
 }
 
 impl AstSqlDetector {
+    /// Production detector — every structure ships on, so with no operator
+    /// amendment all five may fire.
+    ///
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { _private: () }
+    pub fn new() -> Self {
+        Self::with_toggles(&RuleToggles::default())
+    }
+
+    /// Let the structures the operator's [`RuleToggles`] leaves enabled fire.
+    ///
+    /// The toggles are held rather than pre-filtered: this detector compiles
+    /// nothing, it classifies a parse tree, so the amendment is consulted where
+    /// the classification names a structure ([`classify_statements`]).
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
+        Self {
+            toggles: toggles.clone(),
+        }
     }
 }
 
@@ -2725,6 +2922,14 @@ impl SemanticDetector for AstSqlDetector {
         if s.is_empty() {
             return None;
         }
+        // Every structure switched off — nothing this parse could report, so skip
+        // it entirely rather than spend the AST budget producing a discarded
+        // classification. Unreachable in the shipped posture (all five are
+        // default-on); reachable the moment an operator disables all five, which
+        // is the only honest way to turn the AST layer off from config.
+        if !AST_RULES.iter().any(|r| self.toggles.allows(r)) {
+            return None;
+        }
         // Cheap gate — clean traffic exits here without touching the AST budget.
         if !ast_prefilter(s) {
             return None;
@@ -2745,20 +2950,24 @@ impl SemanticDetector for AstSqlDetector {
         // carries a quote) to the single-quote breakout context — pitfall ①:
         // `1' or '1'='1` breaks out of a quoted value, and the quoted wrapper
         // reveals the tautology the numeric wrapper cannot parse.
-        let (structural_key, confidence) =
-            ast_attempt(&format!("select * from t where c = {s}"), state).or_else(|| {
+        let structural =
+            ast_attempt(&format!("select * from t where c = {s}"), state, &self.toggles).or_else(|| {
                 if s.contains('\'') {
-                    ast_attempt(&format!("select * from t where c = '{s}'"), state)
+                    ast_attempt(&format!("select * from t where c = '{s}'"), state, &self.toggles)
                 } else {
                     None
                 }
             })?;
+        let confidence = structural.confidence;
         // Pitfall ③: a confirmed injection whose source view still carried a comment
-        // marker is comment-obfuscated (the AST alone cannot see the comment).
+        // marker is comment-obfuscated (the AST alone cannot see the comment). This
+        // is a relabelling of the structure above, which is why it carries the
+        // structure's confidence and is not itself switchable — the switch that
+        // reaches it is the structure's.
         let rule_key = if has_comment {
             "ast.comment_obfusc"
         } else {
-            structural_key
+            structural.key
         };
         Some(DetectionFinding {
             attack: AttackKind::SqlInjection,
@@ -3314,53 +3523,47 @@ fn cmdsubst_inner_is_dangerous(inner: &str) -> bool {
 /// `rce_ast.cmd_subst_any` (any command substitution regardless of inner command)
 /// ships **disabled** pending holdout calibration, exactly like the structural
 /// detector's default-off rows.
-struct ShellAstRule {
-    key: &'static str,
-    confidence: u8,
-    default_on: bool,
-}
-
-const RCE_AST_RULES: &[ShellAstRule] = &[
+const RCE_AST_RULES: &[CodeRule] = &[
     // `/dev/tcp` redirect, or `nc -e` — a complete reverse/bind-shell structure.
-    ShellAstRule {
+    CodeRule {
         key: "rce_ast.reverse_shell",
         confidence: 90,
         default_on: true,
     },
     // Interpreter fed by a here-document / here-string: `python <<EOF … EOF`,
     // `bash <<< "id"`. The structural detector has ZERO here-doc coverage.
-    ShellAstRule {
+    CodeRule {
         key: "rce_ast.heredoc_interp",
         confidence: 82,
         default_on: true,
     },
     // Interpreter with an inline-code exec flag as a real command head: `bash -c`,
     // `python -c`, `perl -e`, `powershell -enc`.
-    ShellAstRule {
+    CodeRule {
         key: "rce_ast.interp_exec_flag",
         confidence: 82,
         default_on: true,
     },
     // A pipeline whose downstream stage is an interpreter / net-shell: `curl x | bash`.
-    ShellAstRule {
+    CodeRule {
         key: "rce_ast.pipe_to_interp",
         confidence: 80,
         default_on: true,
     },
     // Command substitution whose inner command is a dangerous binary: `$(id)`.
-    ShellAstRule {
+    CodeRule {
         key: "rce_ast.cmd_subst",
         confidence: 78,
         default_on: true,
     },
     // Process substitution `<(…)` / `>(…)` — always a code-execution construct.
-    ShellAstRule {
+    CodeRule {
         key: "rce_ast.proc_subst",
         confidence: 72,
         default_on: true,
     },
     // Reader command against a sensitive path: `cat /etc/passwd` (AST corroboration).
-    ShellAstRule {
+    CodeRule {
         key: "rce_ast.sensitive_read",
         confidence: 70,
         default_on: true,
@@ -3376,7 +3579,7 @@ const RCE_AST_RULES: &[ShellAstRule] = &[
     // Block on its own — a false positive costs one shadow log line, never a
     // dropped request. Reaching Block still needs the structural detector to
     // corroborate independently.
-    ShellAstRule {
+    CodeRule {
         key: "rce_ast.cmd_chain_injection",
         confidence: 80,
         default_on: true,
@@ -3385,7 +3588,7 @@ const RCE_AST_RULES: &[ShellAstRule] = &[
     // `Command::ExtendedTest` used to be an explicit empty arm, so the whole
     // conditional form was dropped on the floor. 0.5·70 = 35 < log_threshold, so
     // this is corroboration + shadow telemetry, never a standalone verdict.
-    ShellAstRule {
+    CodeRule {
         key: "rce_ast.cond_sensitive_path",
         confidence: 70,
         default_on: true,
@@ -3396,7 +3599,7 @@ const RCE_AST_RULES: &[ShellAstRule] = &[
     // executes nothing, so 0.5·60 = 30 < log_threshold(40) by construction: it can
     // never raise a verdict alone, it only lands in `semantic_observations` for
     // holdout calibration and corroborates a second RCE detector.
-    ShellAstRule {
+    CodeRule {
         key: "rce_ast.param_indirect",
         confidence: 60,
         default_on: true,
@@ -3404,14 +3607,14 @@ const RCE_AST_RULES: &[ShellAstRule] = &[
     // DEFAULT-OFF (high-noise): any command substitution regardless of inner
     // command — jQuery `$('#x')` / template `$(var)` false-positive, so this awaits
     // holdout calibration.
-    ShellAstRule {
+    CodeRule {
         key: "rce_ast.cmd_subst_any",
         confidence: 50,
         default_on: false,
     },
 ];
 
-fn rce_ast_rule(key: &str) -> Option<&'static ShellAstRule> {
+fn rce_ast_rule(key: &str) -> Option<&'static CodeRule> {
     RCE_AST_RULES.iter().find(|r| r.key == key)
 }
 
@@ -4147,8 +4350,13 @@ mod tests {
     #[test]
     fn inventory_covers_every_table_exactly_once() {
         let inv = semantic_rule_inventory();
-        let expected: usize = RULE_TABLES.iter().map(|(_, _, t)| t.len()).sum::<usize>() + RCE_AST_RULES.len();
-        assert_eq!(inv.len(), expected, "a rule table is missing from RULE_TABLES");
+        let expected: usize = RULE_TABLES.iter().map(|(_, _, t)| t.len()).sum::<usize>()
+            + CODE_RULE_TABLES.iter().map(|(_, _, t)| t.len()).sum::<usize>();
+        assert_eq!(
+            inv.len(),
+            expected,
+            "a rule table is missing from RULE_TABLES or CODE_RULE_TABLES"
+        );
 
         let unique: BTreeSet<&str> = inv.iter().map(|r| r.key).collect();
         assert_eq!(unique.len(), inv.len(), "duplicate rule key across tables");
@@ -4226,12 +4434,85 @@ mod tests {
             err.contains("rules semantic"),
             "the error must say where to look: {err}"
         );
+    }
 
-        // A key that exists as a finding's `rule_key` but is decided in code
-        // (no `default_on`) is equally not switchable, and must say so rather
-        // than be accepted and ignored.
-        let err = RuleToggles::resolve(&[], &["xss.script_tag".to_string()]).expect_err("must not resolve");
-        assert!(err.contains("xss.script_tag"), "{err}");
+    /// Every key a code-decided detector can emit is switchable, with the one
+    /// documented exception below. This is the property
+    /// `docs/lane2-latent-pressure.md` found missing: three of the ten benign-corpus
+    /// false positives came from `xss.script_tag` / `xss.event_handler` and no
+    /// config could reach either.
+    #[test]
+    fn code_decided_keys_are_switchable() {
+        for key in [
+            "ast.stacked",
+            "ast.union",
+            "ast.dangerous_fn",
+            "ast.tautology",
+            "ast.subquery",
+            "xss.script_tag",
+            "xss.event_handler",
+            "xss.svg_onload",
+            "xss.iframe_srcdoc",
+            "xss.js_url",
+            "xss.data_html_url",
+            "xss.object_embed",
+            "xss.base_href",
+            "xss.dangling_open_tag",
+            "xss.js_sink",
+            "xss.js_exfil",
+            "deser.py_pickle_reduce_exec",
+            "deser.py_pickle_dangerous_global",
+        ] {
+            let toggles =
+                RuleToggles::resolve(&[], &[key.to_string()]).unwrap_or_else(|e| panic!("{key} must resolve: {e}"));
+            assert_eq!(toggles.forced_off(), vec![key]);
+        }
+    }
+
+    /// The inventory is a namespace, and a key in it twice would make
+    /// `rules semantic` list a rule twice and `--state` count it twice.
+    #[test]
+    fn inventory_keys_are_unique() {
+        let mut seen = BTreeSet::new();
+        for rule in semantic_rule_inventory() {
+            assert!(seen.insert(rule.key), "duplicate inventory key '{}'", rule.key);
+        }
+    }
+
+    /// Every code table's rows must reach the inventory as `Code`, and every regex
+    /// row as `Table` — the column `rules semantic` prints has to mean something.
+    #[test]
+    fn inventory_labels_how_each_rule_decides() {
+        let inv = semantic_rule_inventory();
+        let find = |key: &str| inv.iter().find(|r| r.key == key).map(|r| r.source);
+        assert_eq!(find("sql.union_select"), Some(SemanticRuleSource::Table));
+        assert_eq!(find("ast.union"), Some(SemanticRuleSource::Code));
+        assert_eq!(find("rce_ast.cmd_subst"), Some(SemanticRuleSource::Code));
+        assert_eq!(find("xss.script_tag"), Some(SemanticRuleSource::Code));
+        assert_eq!(find("xss.js_sink"), Some(SemanticRuleSource::Code));
+        assert_eq!(find("deser.py_pickle_reduce_exec"), Some(SemanticRuleSource::Code));
+        assert_eq!(SemanticRuleSource::Table.as_str(), "table");
+        assert_eq!(SemanticRuleSource::Code.as_str(), "code");
+    }
+
+    /// `ast.comment_obfusc` is emitted but is not a rule — it is a label on
+    /// whichever structure already matched, so it has no confidence of its own and
+    /// nothing to switch. Naming it must be refused with that explanation rather
+    /// than with a bare "unknown key" and a guess.
+    #[test]
+    fn the_comment_obfuscation_label_is_refused_with_a_reason() {
+        let err = RuleToggles::resolve(&[], &["ast.comment_obfusc".to_string()]).expect_err("must not resolve");
+        assert!(err.contains("ast.comment_obfusc"), "{err}");
+        assert!(err.contains("not a rule of its own"), "{err}");
+        assert!(
+            err.contains("ast.stacked"),
+            "the refusal must name the switch to use: {err}"
+        );
+        assert!(!err.contains("did you mean"), "a label is not a typo: {err}");
+        assert!(
+            !semantic_rule_inventory().iter().any(|r| r.key == "ast.comment_obfusc"),
+            "the label must not be listed as a switchable rule"
+        );
     }
 
     #[test]
@@ -6209,6 +6490,52 @@ mod tests {
         );
     }
 
+    fn deser_fire_without(off: &[&str], text: &str) -> Option<DetectionFinding> {
+        let keys: Vec<String> = off.iter().map(|k| (*k).to_string()).collect();
+        let toggles = RuleToggles::resolve(&[], &keys).expect("pickle keys are in the inventory");
+        run(&DeserStructuralDetector::with_toggles(&toggles), text)
+    }
+
+    /// The two pickle grades are independent rules, and turning both off is the
+    /// documented way to stop the opcode walker without losing the nine regex
+    /// rows the `deserialization` family is otherwise made of.
+    #[test]
+    fn pickle_grades_switch_independently() {
+        // A protocol-4 stream the regex table is blind to by construction, so
+        // whatever comes back is the walker's verdict and nothing else.
+        let p4 = "gASVIAAAAAAAAACMBXBvc2l4lIwGc3lzdGVtlJOUjAJpZJSFlFKULg==";
+        assert_eq!(
+            deser_fire(p4).expect("shipped posture detects it").rule_key,
+            "deser.py_pickle_reduce_exec"
+        );
+        // The reduction grade off: the stream did also *name* a dangerous global,
+        // so the weaker true claim is reported rather than silence.
+        let f = deser_fire_without(&["deser.py_pickle_reduce_exec"], p4).expect("the named grade still applies");
+        assert_eq!(f.rule_key, "deser.py_pickle_dangerous_global");
+        assert_eq!(f.confidence, 85);
+        // The named grade off on its own changes nothing here — this stream reduced.
+        assert_eq!(
+            deser_fire_without(&["deser.py_pickle_dangerous_global"], p4)
+                .expect("the reduction grade is untouched")
+                .rule_key,
+            "deser.py_pickle_reduce_exec"
+        );
+        // Both off: the walker is silent, and the regex rows keep working.
+        assert!(
+            deser_fire_without(&["deser.py_pickle_reduce_exec", "deser.py_pickle_dangerous_global"], p4).is_none(),
+            "with both grades off the pickle walker must report nothing"
+        );
+        assert_eq!(
+            deser_fire_without(
+                &["deser.py_pickle_reduce_exec", "deser.py_pickle_dangerous_global"],
+                "file=phar://evil.phar/x",
+            )
+            .expect("the regex table is unaffected")
+            .rule_key,
+            "deser.php_phar"
+        );
+    }
+
     #[test]
     fn deser_pickle_walker_detail_never_echoes_the_payload() {
         let f = deser_fire("cos\nsystem\n(S'secret-argument-value'\ntR.").expect("fires");
@@ -6386,6 +6713,79 @@ mod tests {
 
     fn ast_fire(text: &str) -> Option<DetectionFinding> {
         run(&AstSqlDetector::new(), text)
+    }
+
+    fn ast_fire_without(off: &[&str], text: &str) -> Option<DetectionFinding> {
+        let keys: Vec<String> = off.iter().map(|k| (*k).to_string()).collect();
+        let toggles = RuleToggles::resolve(&[], &keys).expect("ast keys are in the inventory");
+        run(&AstSqlDetector::with_toggles(&toggles), text)
+    }
+
+    /// Switching one structure off silences that structure and **only** that
+    /// structure: the classification carries on past it, so an input carrying a
+    /// second structure still reports the second one.
+    #[test]
+    fn ast_structures_switch_off_one_at_a_time() {
+        assert!(
+            ast_fire_without(&["ast.union"], "1 union select null,null,null from users").is_none(),
+            "the union structure must go quiet"
+        );
+        assert_eq!(
+            ast_fire_without(&["ast.union"], "1;drop table x")
+                .expect("a stacked query is untouched by the union switch")
+                .rule_key,
+            "ast.stacked"
+        );
+        assert!(
+            ast_fire_without(&["ast.stacked"], "1;drop table x").is_none(),
+            "with the stacked structure off, the first statement is an ordinary value"
+        );
+        // `1 and sleep(5) and 2=2` carries a dangerous function AND a tautology.
+        // Today it reports the stronger one; with that one off it must report the
+        // weaker one rather than nothing.
+        let both = "1 and sleep(5) and 2=2";
+        assert_eq!(
+            ast_fire(both).expect("dangerous fn must fire").rule_key,
+            "ast.dangerous_fn"
+        );
+        assert_eq!(
+            ast_fire_without(&["ast.dangerous_fn"], both)
+                .expect("the tautology is still there")
+                .rule_key,
+            "ast.tautology"
+        );
+    }
+
+    /// Disabling all five is the only way to stop the AST layer from config, and
+    /// it must actually stop it — including the comment-obfuscation label, which
+    /// has no existence apart from a structure that matched.
+    #[test]
+    fn ast_detector_goes_silent_when_every_structure_is_off() {
+        let all: Vec<&str> = AST_RULES.iter().map(|r| r.key).collect();
+        for payload in [
+            "1 union select null,null,null from users",
+            "1;drop table x",
+            "1' or '1'='1",
+            "1/**/or/**/1=1",
+            "1 and sleep(5)",
+            "1 = (select password from users limit 1)",
+        ] {
+            assert!(
+                ast_fire_without(&all, payload).is_none(),
+                "payload {payload:?} must produce no AST signal"
+            );
+        }
+    }
+
+    /// The comment-obfuscation label rides on the structure underneath it, so the
+    /// structure's switch is the one that reaches it.
+    #[test]
+    fn disabling_the_structure_also_silences_its_comment_obfuscated_form() {
+        assert_eq!(
+            ast_fire("1/**/or/**/1=1").expect("must fire").rule_key,
+            "ast.comment_obfusc"
+        );
+        assert!(ast_fire_without(&["ast.tautology"], "1/**/or/**/1=1").is_none());
     }
 
     #[test]
