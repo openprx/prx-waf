@@ -2118,6 +2118,48 @@ const DESER_RULES: &[RuleRow] = &[
     ),
 ];
 
+/// One verdict grade of the pickle opcode walker.
+///
+/// These two are **not** rows of [`DESER_RULES`]: the verdict comes from
+/// [`super::pickle::scan_view_text`] walking an opcode stream, not from a regex
+/// over view text, so there is no pattern to compile. They keep the same
+/// `(rule_key, confidence)` shape the regex rows use so the scorer, the shadow
+/// event log and the per-rule corpus report see one uniform rule vocabulary.
+struct PickleRule {
+    rule_key: &'static str,
+    confidence: u8,
+}
+
+/// A dangerous callable that a **reduction opcode actually consumed** — `REDUCE`
+/// / `INST` / `OBJ` / `NEWOBJ` / `NEWOBJ_EX` applied to a global the walker's
+/// closed table names. This is not "the payload looks like an attack", it is
+/// "this byte stream, if unpickled, calls `posix.system`", which is why it is
+/// rated above every regex row in the table.
+///
+/// **DEFAULT-ON**, and the false-positive argument is structural rather than
+/// statistical: the stream must parse as a well-formed pickle *and* resolve a
+/// global against a closed deny list of execution primitives. Every global that
+/// ordinary serialized data is built from — `collections.OrderedDict`,
+/// `copy_reg._reconstructor`, `_codecs.encode`, `datetime.datetime`,
+/// `decimal.Decimal`, `builtins.set` — is outside that list and produces
+/// nothing. Measured: 0 hits across the 220-row benign corpus, and 0 across 58
+/// real `CPython` pickles of benign objects taken at every protocol.
+const PICKLE_REDUCE_RULE: PickleRule = PickleRule {
+    rule_key: "deser.py_pickle_reduce_exec",
+    confidence: 92,
+};
+
+/// A dangerous callable **named** by `GLOBAL` / `STACK_GLOBAL` but not seen
+/// being applied. Rated below the reduction grade because the walker's stack
+/// model, not the payload, may be the reason no reduction was observed (an
+/// `EXT`-registry callable, a memo path we decline to model). **DEFAULT-ON**: it
+/// requires the same closed deny list, so it adds no false-positive surface the
+/// grade above does not already carry.
+const PICKLE_NAMED_RULE: PickleRule = PickleRule {
+    rule_key: "deser.py_pickle_dangerous_global",
+    confidence: 85,
+};
+
 /// Structural unsafe-deserialization detector (plan T2-F).
 ///
 /// Registered in the `Deserialization` attack family; matches on the normalised
@@ -2126,9 +2168,18 @@ const DESER_RULES: &[RuleRow] = &[
 /// Single-detector family — no corroboration partner — so FP control is by narrow
 /// default-on rules (serialization magic + known exploit gadget class / dangerous
 /// opcode) plus default-off high-noise generic markers, per the plan §四.3 invariant.
-/// Runs **no** deserializer and **no** parser: a pure bounded-regex scan over a
-/// backtracking-free automaton, so no recursion, no `ReDoS`, no stack-overflow
-/// surface.
+///
+/// Two layers, and only the first is regex:
+///
+/// * the **rule table** ([`DESER_RULES`]) — a pure bounded-regex scan over a
+///   backtracking-free automaton, so no recursion, no `ReDoS`, no stack-overflow
+///   surface;
+/// * the **pickle opcode walker** ([`super::pickle`]) — the one place in this
+///   detector that reads structure rather than text, because the shipped
+///   `deser.py_pickle_global_exec` regex matches the *text* `GLOBAL` opcode and
+///   `pickle.dumps` has emitted `STACK_GLOBAL` by default since Python 3.8. The
+///   walker constructs nothing, imports nothing and does not recurse; see the
+///   module docs for the boundary it holds.
 pub struct DeserStructuralDetector {
     rules: Vec<CompiledRule>,
 }
@@ -2178,11 +2229,50 @@ impl SemanticDetector for DeserStructuralDetector {
         &self,
         view: &View<'_>,
         _ctx: &PreprocessCtx<'_>,
-        _state: &mut ContentInspectionState,
+        state: &mut ContentInspectionState,
     ) -> Option<DetectionFinding> {
-        let rule = best_match(&self.rules, view.lower_trunc.as_str())?;
-        Some(finding_for(rule, AttackKind::Deserialization, "deserialization"))
+        // The regex table runs on the lowercased normalisation; the pickle walk
+        // runs on `view.text`, because base64 is case-significant and the
+        // lowercased form destroys the very token it has to decode.
+        let regex_hit = best_match(&self.rules, view.lower_trunc.as_str())
+            .map(|rule| finding_for(rule, AttackKind::Deserialization, "deserialization"));
+        let pickle_hit = pickle_finding(view.text.as_ref(), state);
+        match (regex_hit, pickle_hit) {
+            (Some(regex), Some(pickle)) => {
+                // Same tie-break the regex table itself uses: strongest wins.
+                Some(if pickle.confidence > regex.confidence {
+                    pickle
+                } else {
+                    regex
+                })
+            }
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
     }
+}
+
+/// Walk `text` for a pickle and turn a hit into a finding.
+///
+/// The reported `module` / `callable` are compile-time constants from the
+/// walker's own table — never bytes copied out of the request — so `detail` stays
+/// de-identified exactly like [`finding_for`]'s.
+fn pickle_finding(text: &str, state: &mut ContentInspectionState) -> Option<DetectionFinding> {
+    let hit = super::pickle::scan_view_text(text, state)?;
+    let (rule, grade) = if hit.reduced {
+        (&PICKLE_REDUCE_RULE, "reduced by")
+    } else {
+        (&PICKLE_NAMED_RULE, "names")
+    };
+    Some(DetectionFinding {
+        attack: AttackKind::Deserialization,
+        confidence: Confidence::saturating(rule.confidence),
+        rule_key: rule.rule_key,
+        detail: Cow::Owned(format!(
+            "pickle opcode walk: stream {grade} {}.{} (rule '{}', confidence {})",
+            hit.module, hit.callable, rule.rule_key, rule.confidence
+        )),
+    })
 }
 
 // ── AST SQLi detector (sqlparser-rs true parse, plan §11, P2) ─────────────────
@@ -5946,9 +6036,12 @@ mod tests {
             ),
             // PHP phar wrapper.
             ("file=phar://evil.phar/x", "deser.php_phar"),
-            // Python pickle GLOBAL opcode reducing os.system (newlines collapse to
-            // spaces at the view surface).
-            ("cos\nsystem\n(S'id'\ntR.", "deser.py_pickle_global_exec"),
+            // Python pickle GLOBAL opcode reducing os.system. Both layers see this
+            // one — the regex on the collapsed view text and the opcode walker on the
+            // raw bytes — and the walker's verdict wins on confidence, because it is
+            // the stronger claim: not "this text looks like a pickle GLOBAL" but
+            // "this stream reduces `os.system`".
+            ("cos\nsystem\n(S'id'\ntR.", "deser.py_pickle_reduce_exec"),
             // .NET BinaryFormatter serialized base64 header.
             ("AAEAAAD/////AAAAAA", "deser.dotnet_binaryformatter_b64"),
             // .NET ysoserial.net gadget marker.
@@ -5987,8 +6080,53 @@ mod tests {
         let decoded = "cos\nsystem\n(S'whoami'\ntR.";
         assert_eq!(
             deser_fire(decoded).expect("decoded pickle fires").rule_key,
-            "deser.py_pickle_global_exec"
+            "deser.py_pickle_reduce_exec"
         );
+    }
+
+    #[test]
+    fn deser_pickle_walker_closes_the_protocol_4_blind_spot() {
+        // The finding this whole layer exists for. `deser-009` from
+        // tests/lane2/corpus/attack-t2.jsonl, verbatim: a protocol-4 pickle
+        // (`pickle.DEFAULT_PROTOCOL` since Python 3.8) base64-wrapped in a JSON
+        // string. The regex table is blind to it by construction — protocol 4
+        // emits STACK_GLOBAL, not the text `GLOBAL` opcode, and the framing bytes
+        // reach the view surface as U+FFFD.
+        let body = r#"{"blob":"gASVIAAAAAAAAACMBXBvc2l4lIwGc3lzdGVtlJOUjAJpZJSFlFKULg=="}"#;
+        let f = deser_fire(body).expect("protocol-4 pickle must be detected");
+        assert_eq!(f.rule_key, "deser.py_pickle_reduce_exec");
+        assert_eq!(f.attack, AttackKind::Deserialization);
+        assert_eq!(f.confidence, 92);
+        // The extracted JSON leaf reaches the detector as its own field too.
+        assert_eq!(
+            deser_fire("gASVIAAAAAAAAACMBXBvc2l4lIwGc3lzdGVtlJOUjAJpZJSFlFKULg==")
+                .expect("bare base64 leaf must be detected")
+                .rule_key,
+            "deser.py_pickle_reduce_exec"
+        );
+    }
+
+    #[test]
+    fn deser_pickle_walker_detail_never_echoes_the_payload() {
+        let f = deser_fire("cos\nsystem\n(S'secret-argument-value'\ntR.").expect("fires");
+        assert!(!f.detail.contains("secret-argument-value"));
+        assert!(f.detail.contains("os.system"));
+    }
+
+    #[test]
+    fn deser_pickle_walker_stays_quiet_on_benign_base64() {
+        // Shapes the benign corpus is full of: JWTs, session cookies, avatar
+        // blobs, and base64 of ordinary prose. None of them parses as a pickle
+        // that resolves an execution primitive.
+        for clean in [
+            "token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ",
+            "avatar=iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk",
+            "note=aGVsbG8gd29ybGQsIHRoaXMgaXMgYSBwZXJmZWN0bHkgb3JkaW5hcnkgc2VudGVuY2Uu",
+            "_ga=GA1.2.1234567890.1234567890",
+            "state=eyJyZXR1cm5UbyI6Ii9kYXNoYm9hcmQiLCJub25jZSI6ImFiYzEyMyJ9",
+        ] {
+            assert!(deser_fire(clean).is_none(), "benign base64 must stay quiet: {clean}");
+        }
     }
 
     #[test]
@@ -6094,7 +6232,7 @@ mod tests {
             deser_fire("cos\nsystem\n(S'id'\ntR.")
                 .expect("real pickle GLOBAL opcode fires")
                 .rule_key,
-            "deser.py_pickle_global_exec",
+            "deser.py_pickle_reduce_exec",
         );
     }
 

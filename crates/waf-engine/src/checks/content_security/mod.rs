@@ -46,6 +46,7 @@ pub mod budget;
 pub mod canary;
 pub mod config;
 pub mod detectors;
+mod pickle;
 pub mod preprocess;
 pub mod scoring;
 mod struct_extract;
