@@ -176,9 +176,9 @@ contributor and not the cause.
 | `content-031` | 79 | `rce.cmd_subst`, `rce_ast.cmd_subst`, `traversal.sensitive_abs` | 68 / 68 / 79 — **no single removal clears it** |
 | `content-029` | 78 | `rce.piped_shell`, `rce_ast.cmd_subst` | 39 / 39 — **either removal clears it**, to sub-threshold |
 | `content-059` | 68 | `sql.union_null`, `traversal.sensitive_abs`, `xss.script_tag` | 68 / 45 / n-a — **no single removal clears it** |
-| `content-005` | 45 | `xss.script_tag` | not switchable — see below |
-| `content-010` | 45 | `xss.script_tag` | not switchable — see below |
-| `content-011` | 43 | `xss.event_handler` | not switchable — see below |
+| `content-005` | 45 | `xss.script_tag` | not switchable by this run's binary — see below |
+| `content-010` | 45 | `xss.script_tag` | not switchable by this run's binary — see below |
+| `content-011` | 43 | `xss.event_handler` | not switchable by this run's binary — see below |
 | `content-033` | 41 | `rce.shell_exec_flag` | **clean** — sole cause |
 | `content-044` | 36 | `sql.union_select` | **clean** — sole cause |
 

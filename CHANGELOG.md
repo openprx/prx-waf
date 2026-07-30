@@ -139,9 +139,10 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   gives it — with `--family`, `--state on|off|overridden` and `--format json`.
   It is the only way to read the vocabulary `rules_enabled` / `rules_disabled`
   accept, and it resolves the switches leniently so it still runs against the
-  config whose typo just refused to start. It also states what it does not
-  cover: the AST SQLi detector and both XSS detectors decide in code rather than
-  from a keyed table and expose no switchable rule.
+  config whose typo just refused to start. (When this shipped it also stated what
+  it did not cover — the AST SQLi detector and both XSS detectors decided in code
+  and exposed no switchable rule. That gap is closed above; the command now prints
+  a DECIDES column instead.)
 - **The deserialization detector reads pickle opcodes.** The shipped
   `deser.py_pickle_global_exec` rule matches the *text* `GLOBAL` opcode,
   `c<module>\n<callable>`. `save_global` stops emitting that at protocol 4, and
