@@ -632,11 +632,12 @@ impl ProxyHttp for WafProxy {
         };
 
         // The detectors must not see a different request depending on the wire
-        // protocol: a CRS rule that reads the `Host` header — 920280 refuses a
-        // request that has none — has to see the same value on h2, where it
-        // arrived as `:authority`. `entry` rather than `insert` so a
-        // client-sent `Host`, already proven byte-equal above, stays exactly as
-        // it was received. HTTP/1.1 always takes the `or_insert` no-op branch.
+        // protocol: CRS-920350 reads the `Host` header to flag a numeric-IP
+        // vhost, and it has to see the same value on h2, where that value
+        // arrived as `:authority` and no `Host` field exists at all. `entry`
+        // rather than `insert` so a client-sent `Host`, already proven
+        // byte-equal above, stays exactly as it was received. HTTP/1.1 always
+        // takes the `or_insert` no-op branch.
         if !host_header.is_empty() {
             headers.entry("host".to_string()).or_insert_with(|| host_header.clone());
         }
