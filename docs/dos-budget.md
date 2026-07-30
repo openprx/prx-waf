@@ -972,6 +972,7 @@ cardinality budget and the rest of what is exported.
 | `MAX_HEADER_VALUES_PER_NAME` (431) | reject | `request_headers` | `values_per_name` |
 | `MAX_FOLDED_HEADER_BYTES` (431) | reject | `request_headers` | `folded_bytes` |
 | Duplicate `Host` (400) | reject | `request_headers` | `duplicate_host` |
+| Authority contradicts `Host` (400) | reject | `request_headers` | `contradicted_authority` |
 | `MAX_INSPECTED_BODY_BYTES`, `OVERFLOW=reject` (413) | reject | `request_body` | `inspect_ceiling_reject` |
 | `MAX_INSPECTED_BODY_BYTES`, `OVERFLOW=log` | **skip** | `request_body` | `inspect_ceiling_forward` |
 | `MAX_H3_REQUEST_BODY` (413) | reject | `http3_body` | `buffer_ceiling` |

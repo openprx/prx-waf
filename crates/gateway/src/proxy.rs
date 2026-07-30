@@ -14,6 +14,7 @@ use waf_common::{HostConfig, RequestCtx, WafAction};
 use waf_engine::WafEngine;
 use waf_engine::checks::ResponseCheckSet;
 
+use crate::authority::{RouteAuthority, route_authority};
 use crate::cache::ResponseCache;
 use crate::context::{
     CACHE_BODY_LIMIT, FoldedHeaders, GatewayCtx, MAX_HEADER_VALUES_PER_NAME, body_inspection_policy,
@@ -588,14 +589,57 @@ impl ProxyHttp for WafProxy {
                 .await?;
             return Ok(true);
         }
-        let FoldedHeaders { headers, .. } = folded;
+        let FoldedHeaders { mut headers, .. } = folded;
 
-        // ── Host routing (moved here from upstream_peer, C-1) ─────────────────
-        let host_header = session
-            .get_header("host")
-            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-            .unwrap_or("")
-            .to_string();
+        // ── Routing authority (moved here from upstream_peer, C-1) ────────────
+        // `route_authority` rather than `get_header("host")`, because this call
+        // site now serves h2 as well: an h2 request carries its authority in
+        // `:authority`, which Pingora leaves in `RequestHeader::uri` with the
+        // field map untouched, so reading the `Host` field alone routed every
+        // compliant h2 request on the empty string. On HTTP/1.1 the resolver
+        // reads the same `Host` field it always did — Pingora's request targets
+        // never carry an authority (see `crate::authority`).
+        let resolved = {
+            let head = session.req_header();
+            match route_authority(&head.uri, &head.headers) {
+                RouteAuthority::Found(a) => Some(a.to_string()),
+                // Unroutable. Routed with an empty authority so this lands on
+                // exactly the same 404 as an unknown host — never a default
+                // config, never a forward.
+                RouteAuthority::Missing => Some(String::new()),
+                RouteAuthority::Contradicted => None,
+            }
+        };
+        let Some(host_header) = resolved else {
+            // Which site this request addressed is unknowable, and picking a
+            // side is the desync itself: this WAF would apply the policy of one
+            // authority while the origin resolved its vhost from the other.
+            // Deliberately not attributed to either candidate, so neither
+            // site's block rate carries the other's traffic.
+            metrics::record_budget_event(BudgetEvent::ContradictedAuthority);
+            ctx.metric_action = Some(RequestAction::Block);
+            warn!(
+                action = RequestAction::Block.label(),
+                "Rejecting request whose Host disagrees with the request authority: ip={}",
+                self.extract_client_ip(session)
+            );
+            let response = pingora_http::ResponseHeader::build(400, None)?;
+            session.write_response_header(Box::new(response), false).await?;
+            session
+                .write_response_body(Some(Bytes::from_static(b"Bad Request")), true)
+                .await?;
+            return Ok(true);
+        };
+
+        // The detectors must not see a different request depending on the wire
+        // protocol: a CRS rule that reads the `Host` header — 920280 refuses a
+        // request that has none — has to see the same value on h2, where it
+        // arrived as `:authority`. `entry` rather than `insert` so a
+        // client-sent `Host`, already proven byte-equal above, stays exactly as
+        // it was received. HTTP/1.1 always takes the `or_insert` no-op branch.
+        if !host_header.is_empty() {
+            headers.entry("host".to_string()).or_insert_with(|| host_header.clone());
+        }
 
         debug!("Routing request for host: {}", host_header);
 

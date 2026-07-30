@@ -53,11 +53,12 @@ outcome writes.
 | **site administratively closed → 503** | `requests_total{action="block"}` (`proxy.rs:620`) | `proxy.rs:619` `"Site closed for host: …"` | **NO**, same |
 | **duplicate `Host` → 400** | `requests_total{action="block"}` (`proxy.rs:544`) + `budget_events_total{subsystem="request_headers",limit="duplicate_host"}` (`:543`) | `proxy.rs:545` `"Rejecting request with duplicate Host headers: ip=…"` | **NO** — "rejecting", not "block" |
 | **header fold over limit → 431** | `requests_total{action="block"}` (`proxy.rs:570`) + `{subsystem="request_headers", limit="values_per_name"\|"folded_bytes"}` (`:563-569`) | `proxy.rs:571` `"Rejecting request: header '…' exceeds the fold limits: ip=…"` | **NO**, and the log cannot distinguish the two limits the metric splits |
+| **authority contradicts `Host` → 400** | `requests_total{action="block"}` (`proxy.rs:620`) + `budget_events_total{subsystem="request_headers",limit="contradicted_authority"}` (`:619`) | `proxy.rs:621` `"Rejecting request whose Host disagrees with the request authority: ip=…"` | **YES** — added after the fix below, so it carries `action = "block"` as a field from the start |
 | **body over inspection ceiling → 413** | `requests_total{action="block"}` (`proxy.rs:756`) + `{subsystem="request_body",limit="inspect_ceiling_reject"}` (`:755`) | `proxy.rs:762` `"WAF rejected request body over the N byte inspection ceiling: …"` | **NO** — "rejected" |
 | clean request forwarded | `requests_total{action="allow"}` — the default at `proxy.rs:1054` | `proxy.rs:1103` DEBUG `"Request completed: …"` | **partial** — DEBUG-only and carries no action word; acceptable, since an allow is the absence of a decision |
 
 **The finding.** The word *block* appears in the log for exactly one of the
-seven paths that increment `action="block"`. An operator who sees the block rate
+eight paths that increment `action="block"`. An operator who sees the block rate
 step up and greps the log for `block` sees the detection blocks and misses every
 routing, framing and budget refusal — which is precisely the population that
 steps up when someone points a scanner at an unrouted vhost.
@@ -140,6 +141,7 @@ folded hosts stays out of both surfaces. See [§7.3](#73-announce-the-host-fold-
 | `request_body` / `inspect_ceiling_forward` | `"Request body exceeds the N byte inspection ceiling; remaining bytes are forwarded UNINSPECTED (PRXWAF_BODY_INSPECT_OVERFLOW=log)"` | `proxy.rs:782` / `:784-792` | words differ, meaning matches; the env var makes it findable |
 | `request_body` / `inspect_ceiling_reject` | see §1 | `proxy.rs:755` / `:762` | see §1 |
 | `request_headers` / `duplicate_host` | see §1 | `proxy.rs:543` / `:545` | see §1 |
+| `request_headers` / `contradicted_authority` | see §1 | `proxy.rs:619` / `:621` | see §1 |
 | `request_headers` / `values_per_name` \| `folded_bytes` | one log line covers **both** metric values | `proxy.rs:563-569` / `:571` | **partial** — the metric splits what the log conflates |
 | `http3_body` / `buffer_ceiling` | `"H3 request body exceeds N byte limit: …"` | `http3.rs:729` / `:733` | words differ, meaning matches |
 | `response_cache` / `entry_bytes` | DEBUG `"skipping cache: entry exceeds the per-entry size cap"` on the `put` path only | metric `cache.rs:314` + `cache.rs:224`, log `cache.rs:308` | **partial** — `note_oversize_reject` (`cache.rs:223-226`) is the path the proxy actually takes for a streamed oversize body, and it has no log at all |

@@ -315,6 +315,14 @@ pub enum BudgetEvent {
     HeaderFoldBytesExceeded,
     /// More than one `Host` line — 400, request refused as unroutable.
     DuplicateHost,
+    /// A request target's authority disagreed with its `Host` field — 400,
+    /// request refused as unroutable. Reachable on h2, where the client sends
+    /// `:authority` and may send a `Host` beside it and neither `h2` nor
+    /// Pingora compares the two; not reachable on HTTP/1.1, whose request
+    /// targets never carry an authority. **Any non-zero value is an attempted
+    /// request desync**, not a tuning signal: the sender asked this WAF and the
+    /// origin to disagree about which site the request addressed.
+    ContradictedAuthority,
     /// Request body over the inspection ceiling with the default
     /// `PRXWAF_BODY_INSPECT_OVERFLOW=reject` — 413.
     RequestBodyRejected,
@@ -491,6 +499,7 @@ impl BudgetEvent {
         Self::HeaderValueCountExceeded,
         Self::HeaderFoldBytesExceeded,
         Self::DuplicateHost,
+        Self::ContradictedAuthority,
         Self::RequestBodyRejected,
         Self::RequestBodyForwardedUninspected,
         Self::Http3BodyRejected,
@@ -566,6 +575,7 @@ impl BudgetEvent {
             Self::HeaderValueCountExceeded => ("request_headers", "values_per_name"),
             Self::HeaderFoldBytesExceeded => ("request_headers", "folded_bytes"),
             Self::DuplicateHost => ("request_headers", "duplicate_host"),
+            Self::ContradictedAuthority => ("request_headers", "contradicted_authority"),
             Self::RequestBodyRejected => ("request_body", "inspect_ceiling_reject"),
             Self::RequestBodyForwardedUninspected => ("request_body", "inspect_ceiling_forward"),
             Self::Http3BodyRejected => ("http3_body", "buffer_ceiling"),
