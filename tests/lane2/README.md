@@ -126,7 +126,7 @@ with one default-off rule switched on and nothing else changed, and
 resulting bill for all 38. The short version: the four NoSQL operator rules are
 free and take that row from 40.0% to 86.7%, the bare SSTI delimiters flag benign
 content at the same score as the attack they catch, and `xpath.bare_double_slash`
-starts scoring 42% of the benign corpus while catching nothing.
+fires on 94 of the 220 benign rows while catching nothing.
 
 ## What is measured
 

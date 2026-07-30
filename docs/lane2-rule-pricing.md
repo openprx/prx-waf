@@ -226,8 +226,8 @@ traffic that the FP column cannot see:
 | `ldap.paren_adjacency` | 25 | 1 | 25 |
 
 `xpath.bare_double_slash` takes the benign `sub-threshold` bucket from 3 rows to
-94 — **42% of the benign corpus starts carrying a score** — and detects not one
-attack. `ldap.bare_logical` does the same to 68 rows. These are the rules the
+94 — **91 benign rows, 41% of the corpus, start carrying a score** — and detects
+not one attack. `ldap.bare_logical` does the same to 68 rows. These are the rules the
 `default_on = false` literal was protecting against, and the measurement is
 unambiguous: on this corpus they are pure noise with no upside whatsoever.
 
@@ -306,7 +306,7 @@ support; the decision is not this document's.
 Thirty-eight rules, 39 corpus replays in each of two modes. Fourteen rules
 recover at least one attack; twenty-four recover none. Seven are free and
 recover eleven cases. Eight cost false positives. Eleven fire on benign traffic
-while recovering nothing, one of them on 42% of the benign corpus. Eleven do
+while recovering nothing, one of them on 94 of the 220 benign rows. Eleven do
 nothing at all and are therefore unmeasured rather than safe. **Not one rule of
 the thirty-eight produced a blocking false positive**, so `fp_block` stays at 2
 throughout and no rule in this set is an obstacle to `rollout_bps` — and **only
