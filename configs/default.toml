@@ -33,6 +33,14 @@ listen_addr = "0.0.0.0:80"
 # RENEWAL NEEDS A RESTART. The certificate is read once, while the listener is
 # built. ACME renewal updates the database and cannot reach a running listener.
 # `prx-waf run --upgrade` picks up the new one without dropping connections.
+#
+# HTTP/2 AND HTTP/1.1, IN THAT ORDER. ALPN offers `h2` first, so a client that
+# speaks both negotiates HTTP/2 and one that speaks only HTTP/1.1 is still
+# served. Both versions run the same routing, the same detectors and the same
+# body inspection; there is no knob because there is no difference in policy
+# between them. An h2 request addresses its site with `:authority`, and one that
+# also carries a `Host` naming a different site is refused with 400 rather than
+# routed under one name and served under the other.
 listen_addr_tls = "0.0.0.0:443"
 
 # Serve a certificate from files instead of from the database. Both or neither;
