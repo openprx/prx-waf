@@ -1238,12 +1238,33 @@ xpath_struct = 1.0                    # structural XPath-injection detector (T2-
 # the SAME normalised view text as the other structural detectors, INCLUDING the
 # base64/hex DECODED views the preprocessor already produces (serialized payloads
 # are routinely base64-wrapped: `rO0AB…` and `AAEAAAD/////` hit the raw view
-# directly, a wrapped pickle hits its decoded view). It invokes NO deserializer
-# and has NO parser at all: every rule is a single bounded-regex scan over a
-# backtracking-free automaton (linear time regardless of input), so there is no
-# recursion, no catastrophic-backtracking (ReDoS) and thus NO parse-time
-# stack-overflow / DoS surface (the P0 depth-bound red-line targets recursive
-# parsers; a pure-regex detector has none). HONEST BOUNDARY (RASP ceiling): a
+# directly, a wrapped pickle hits its decoded view). Every rule above is a single
+# bounded-regex scan over a backtracking-free automaton (linear time regardless
+# of input), so no recursion, no catastrophic backtracking (ReDoS) and no
+# parse-time stack-overflow surface.
+#
+# ONE EXCEPTION, and it is deliberate: the Python-pickle rules
+# `deser.py_pickle_reduce_exec` (92) and `deser.py_pickle_dangerous_global` (85)
+# come from an OPCODE WALKER, not a regex. They exist because the regex above
+# matches the TEXT `GLOBAL` opcode `c<module>\n<callable>`, which `save_global`
+# stops emitting at protocol 4 — and protocol 4 has been `pickle.DEFAULT_PROTOCOL`
+# since Python 3.8. From protocol 4 the module and callable are two
+# length-prefixed strings joined by the one-byte `STACK_GLOBAL` (`\x93`), wrapped
+# in non-UTF-8 framing that reaches any text view as `U+FFFD`, so no regex can
+# see them adjacent. The walker reads the byte stream and NOTHING ELSE: it
+# constructs no object, imports no module, instantiates no class, and does not
+# recurse (a pickle stream is flat; a pickle nested in another's `BINBYTES`
+# payload is skipped as opaque bytes rather than re-entered). A module/callable
+# pair is compared byte-wise against a CLOSED table of execution primitives
+# (`os`/`posix`/`nt` process+filesystem calls, `subprocess`, `builtins.eval|exec|
+# compile|open`, `pty.spawn`, `ctypes`, …) and a hit reports the TABLE's strings,
+# never the payload's. Every argument length is validated against the remaining
+# buffer before the read; input is capped at 4 KiB and metered on
+# `budget.max_ast_input_bytes_total`, so exhaustion marks `degraded` like any
+# other parse. Everything ordinary serialized data is built from —
+# `collections.OrderedDict`, `copy_reg._reconstructor`, `_codecs.encode`,
+# `datetime`, `Decimal`, `set`/`frozenset` — is outside the table and produces
+# nothing. HONEST BOUNDARY (RASP ceiling): a
 # reverse proxy sees only the payload and can never confirm the backend actually
 # DESERIALIZES it — a magic, gadget name or pickle opcode could sit inertly in a
 # log line or a base64 attachment; these rules judge whether a payload PRESENTS a

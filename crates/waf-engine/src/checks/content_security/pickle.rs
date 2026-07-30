@@ -934,6 +934,14 @@ const fn is_b64_byte(b: u8) -> bool {
 ///
 /// Bounded by [`MAX_B64_CANDIDATES`] decodes per view, each into one reused
 /// buffer, and by the parse-byte budget inside [`walk_stream`].
+///
+/// The whole-request cost is bounded without needing a budget of its own. The
+/// candidates in one view are disjoint substrings of it, so the decode input per
+/// view is at most the view's own length; and the sum of every view's length is
+/// already capped by `max_preprocess_output_bytes_total` (512 KiB by default),
+/// which the preprocessor charges as it produces them. A request therefore
+/// cannot drive more than that many bytes of base64 decode here, whatever shape
+/// it takes.
 pub(super) fn scan_view_text(text: &str, state: &mut ContentInspectionState) -> Option<PickleHit> {
     if let Some(hit) = walk_stream(text.as_bytes(), state) {
         return Some(hit);

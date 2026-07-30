@@ -48,6 +48,23 @@ xpath_break="'] | //"
 deser_java="rO0AB"
 deser_php="O:8:\"Exploit\":1:{"
 deser_pickle="cos\x0asystem\x0a"
+# Binary pickle opcodes, for the opcode walker. The protocol-2 and protocol-4
+# headers are what pickle.dumps() actually emits (4 is the default since Python
+# 3.8); STACK_GLOBAL, the length-prefixed string opcodes and the 8-byte FRAME /
+# BINUNICODE8 length fields are the pieces a mutator has to combine to reach a
+# resolver, and the lengths are where a lying prefix would land.
+deser_pickle_proto2="\x80\x02"
+deser_pickle_proto4="\x80\x04\x95"
+deser_pickle_proto5="\x80\x05\x95"
+deser_pickle_stack_global="\x93"
+deser_pickle_memoize="\x94"
+deser_pickle_short_binunicode="\x8c\x05posix"
+deser_pickle_short_binunicode2="\x8c\x06system"
+deser_pickle_binunicode8="\x8d\xff\xff\xff\xff\xff\xff\xff\xff"
+deser_pickle_reduce="R"
+deser_pickle_newobj_ex="\x92"
+deser_pickle_stop="."
+deser_pickle_b64_proto4="gASV"
 traversal="../../../etc/passwd"
 traversal_enc="%2e%2e%2f"
 url_pct="%25"

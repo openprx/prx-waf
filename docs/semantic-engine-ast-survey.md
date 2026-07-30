@@ -15,6 +15,13 @@ price attached:
 This tree has already paid that bill twice, in both directions, and both receipts
 are quoted below.
 
+> **Status note (2026-07-30).** Recommendation 1 — the pickle opcode walker — is
+> implemented and wired: `crates/waf-engine/src/checks/content_security/pickle.rs`,
+> reached from `DeserStructuralDetector::detect`. It is the only recommendation
+> in this document that has been acted on; everything else below still reads as
+> written. The rest of this document is the measurement as taken on 2026-07-29
+> and is deliberately not rewritten around that change.
+
 ## Where the tree actually stands
 
 The common summary — "only SQLi and RCE parse, the other eight are regex" — is
@@ -445,6 +452,41 @@ the pickle stream *is* the program, not a hint about one.
 **Verdict: should, and the candidate is ~200 lines of our own code with zero new
 dependencies.**
 
+**Done (2026-07-30).** `content_security/pickle.rs`. The four judgement calls the
+verdict above left open, and how they were settled:
+
+* **stack depth.** A bounded stack *is* maintained — `STACK_GLOBAL` cannot be
+  associated with its two operands without one — plus a bounded memo, so a
+  `PUT`/`GET`-recalled module name still resolves. The bound is set **equal to
+  the input-byte bound** (4 KiB) rather than to some smaller number: every
+  pushing opcode costs at least one input byte, so the ceiling is unreachable by
+  construction, and a smaller stack would have been a free evasion (pad with
+  `NONE` until the walker gives up, then reduce). The check remains as defence in
+  depth.
+* **the deny list.** A closed table of execution primitives, not a heuristic:
+  `os`/`posix`/`nt` process and filesystem calls, `subprocess` (and `commands`,
+  which is what `_compat_pickle` rewrites `subprocess` to below protocol 3),
+  `builtins`/`__builtin__` `eval|exec|compile|open|__import__|getattr`,
+  `_posixsubprocess.fork_exec`, `pty.spawn`, `ctypes`, `shutil.rmtree`,
+  `socket.socket`, `runpy`, `webbrowser`. Everything ordinary serialized data is
+  made of is outside it and resolves to nothing, which is the entire
+  false-positive argument and is asserted against 58 real CPython pickles of
+  benign objects taken at every protocol.
+* **nesting.** No recursion at all. A pickle inside another pickle's `BINBYTES`
+  payload is skipped as opaque bytes — declined, not re-entered — which is the
+  same call `struct_extract` makes with `MAX_VALUE_NODES`.
+* **where it attaches.** Inside the existing `DeserStructuralDetector`, so the
+  family stays single-detector at weight 1.0 and no scoring, weight or
+  `DetectorId` changes. It decodes base64 **for itself**, from `view.text`: the
+  preprocessor's blind gate requires ≥ 85 % printable ASCII in the decoded bytes
+  and a protocol-4 pickle fails that by construction, and `view.lower_trunc`
+  destroys the case a base64 token depends on.
+
+The parse is metered on `max_ast_input_bytes_total` — the shared parse-input
+budget, which marks `degraded` on exhaustion — rather than on the six-per-request
+`max_ast_attempts_per_request`, which the SQL and shell layers registered earlier
+would otherwise consume first.
+
 ### LDAP — the small-grammar intuition is wrong, and it was measured
 
 RFC 4515 is a tiny grammar, so the intuition is that this is the best
@@ -690,7 +732,9 @@ gap lives.**
 
 If one thing is done, in order:
 
-1. **Deserialization — pickle opcode walker.** The only place a parse produces a
+1. **Deserialization — pickle opcode walker. DONE (2026-07-30**, `pickle.rs`;
+   see the section above for the four judgement calls and how they were
+   settled**).** The only place a parse produces a
    structurally certain verdict rather than a resemblance judgment, and the only
    family with a blind spot no regex can close: the default-on rule matches the
    text `GLOBAL` opcode, and protocol 4 — `pickle.DEFAULT_PROTOCOL` since Python
