@@ -1008,9 +1008,12 @@ fn print_semantic_rules(
                  tests/lane2/."
             );
             println!(
-                "Not listed: the AST SQLi detector and both XSS detectors decide in code rather \
-                 than from a keyed table, so they expose no switchable rule and are unaffected by \
-                 these keys."
+                "Not listed, and not switchable: the AST SQLi detector, both XSS detectors, and \
+                 the pickle opcode walker (deser.py_pickle_reduce_exec, \
+                 deser.py_pickle_dangerous_global) decide in code rather than from a keyed table. \
+                 Naming one of those in rules_enabled or rules_disabled is refused at startup like \
+                 any other unknown key — to turn the pickle walker off, disable the \
+                 deserialization family."
             );
         }
         other => anyhow::bail!("--format must be table or json, got '{other}'"),

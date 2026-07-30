@@ -243,7 +243,8 @@ impl RuleToggles {
                 return Err(format!(
                     "content_security.{field} references '{key}', which is not a switchable \
                      rule key{}. `prx-waf rules semantic` lists every key that can be switched \
-                     (the AST SQLi and XSS detectors decide in code and expose none)",
+                     (the AST SQLi detector, both XSS detectors and the pickle opcode walker \
+                     decide in code and expose none)",
                     Self::did_you_mean(key, known)
                 ));
             };
