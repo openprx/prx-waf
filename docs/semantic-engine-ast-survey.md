@@ -82,8 +82,48 @@ the recorded 5 — which is close enough to trust the identity of the individual
 misses. Every "currently missed" payload named below is a real committed corpus
 row, quoted verbatim.
 
-Two candidate detectors were additionally prototyped end-to-end against the whole
-corpus (LDAP, below). Neither prototype is in the tree; this is a survey.
+Five further experiments were run, none of which left code in the tree:
+
+* two LDAP detector prototypes, replayed against all 390 rows — a paren-balance
+  heuristic and a real RFC 4515 recursive-descent parser;
+* the same parser reused as a *suppressor* on top of the shipped regexes, to test
+  whether it retracts the one benign Block;
+* the shipped `AstSqlDetector` wrapping logic, compiled against `sqlparser` 0.62
+  and run over the XPath and LDAP corpus values, to find out which families the
+  parser already in the tree is silently covering;
+* `sxd-xpath` compiled and run on the two XPath misses, to check whether its
+  expression parser is usable without an XML document;
+* `pickletools` over `os.system("id")` at every pickle protocol, to establish
+  which protocols the shipped deserialization rule can actually see.
+
+Where an experiment contradicted the hypothesis it was testing, the result is
+reported as the finding. Two did.
+
+### "Default-off" does not mean "a config flip away"
+
+This document repeatedly finds that a miss is covered by a rule that ships
+default-off. That is a weaker consolation than it first sounds, and
+[`lane2-blind-spots.md`](lane2-blind-spots.md) establishes why — its
+classification of the same 40 blind rows is the companion to this one, and the
+two agree wherever they overlap:
+
+* **none of the 40 blind rows is budget-caused.** Opening all ten budget keys
+  leaves detection at 127/170 and the blind set identical. No amount of tuning
+  recovers any row, which is what makes the detector-level question in this
+  document the only one left;
+* **15 of the 40 are "the rule exists but is compiled off"** — the population
+  this survey keeps landing in;
+* **23 need genuinely new detection capability.**
+
+And `default_on` is a `bool` literal in the rule table, consumed by
+`compile_table(table, all, who)` where `all` is `false` from `new()` and `true`
+only from a `#[cfg(test)]` constructor (`detectors.rs:67`). **There is no
+per-rule configuration surface anywhere in the tree.** So "turn on
+`xxe.doctype_external`" is a code change and a release, not an operator action —
+and, more awkwardly, nobody can currently measure what flipping a rule would cost
+without editing Rust. Wherever this document says a miss is "covered by a
+default-off rule", read it as *the detection logic already exists and the work is
+a rule-scoping decision*, never as *someone can switch it on this afternoon*.
 
 ## Decision table
 
@@ -94,7 +134,7 @@ corpus (LDAP, below). Neither prototype is in the tree; this is a survey.
 | XXE | DTD/prolog regex, no parser (`detectors.rs:720`) | `quick-xml` (already in tree) | nothing; all 3 misses are config + one regex row | entity expansion, if you ever use a validating parser | — | **do not** |
 | Traversal | encoding regexes (`detectors.rs:582`) | `typed-path` | nothing; both misses are default-off rules | small | small | **do not** |
 | SSTI | delimiter+sink co-occurrence (`detectors.rs:1141`) | none — six incompatible grammars | would need 6 parsers for ~6 rows | six template parsers | high | **do not** — no parser exists that covers the family |
-| LDAP | filter-break regexes (`detectors.rs:1342`) | none exists; ~120 lines of our own | +1 attack, benign firings 1 → 6 (measured) | small (tiny grammar) | negligible | **do not** — measured, not assumed |
+| LDAP | filter-break regexes (`detectors.rs:1342`) | yes — `ldap3::parse_filter`, `ldap-types` (neither depth-limited) | +1 attack, benign firings 1 → 6 (measured) | small (tiny grammar) | negligible | **do not** — measured, not assumed |
 | XPath | structural regexes (`detectors.rs:1536`) | `sxd-xpath` — usable, but unmaintained since 2018 | nothing: its one catchable miss is already caught by the SQL AST | recursive-descent expression parser | small | **do not** — the parse is already paid for |
 | Deserialization | format-magic + gadget regexes (`detectors.rs:1787`) | pickle: our own ~200-line opcode walker | **protocol ≥4 pickles — i.e. the `pickle.dumps` default since Python 3.8** | near-zero on parse, but see the stack-VM caveat | negligible | **should, and the candidate is ours to write** |
 | XSS-JS | token scan of extracted handler bodies (`xss_js.rs`) | `boa_parser` / `oxc_parser` / `swc_ecma_parser` | see below | **the largest in the survey** | high | see below |
@@ -160,11 +200,9 @@ xxe-006  <foo xmlns:xi="…/XInclude"><xi:include parse="text" href="file:///etc
 ```
 
 * `xxe-004` is exactly `xxe.doctype_external`, a written rule that is
-  default-off because legitimate XHTML ships `<!DOCTYPE html PUBLIC …>`. A
-  configuration flip, gated on route scope.
+  default-off because legitimate XHTML ships `<!DOCTYPE html PUBLIC …>`.
 * `xxe-005` is exactly `xxe.entity_expansion`, `RuleKind::Count(3)`, also
-  default-off. The payload declares three entities; the rule would fire. Another
-  configuration flip.
+  default-off. The payload declares three entities; the rule would fire.
 * `xxe-006` has no rule at all — and needs a regex, not a parser. `xi:include`
   with an `href` naming `file://` or `http://` is a flat two-token co-occurrence.
   A parser would tell you it is an element in the XInclude namespace, which is
@@ -356,10 +394,28 @@ resolver opcodes are only ever *read as names*, and that property has to be
 enforced by construction and by test, not inherited from a dependency whose job
 description is to turn pickles into values.
 
-That is also the argument against `serde-pickle`, which is otherwise a perfectly
-reasonable crate (1.2.0, 2024-11-22, MIT/Apache-2.0, ~6.9 M downloads). It
-deserialises into a `Value` tree — strictly more machinery than naming a callable
-requires, and a much larger surface to audit for the one property that matters.
+`serde-pickle` (1.2.0, 2024-11-22, MIT/Apache-2.0, 8 transitive, no C) turns out
+to hold that property already, and the first draft of this document was wrong to
+imply otherwise. Its `GLOBAL` / `STACK_GLOBAL` handling resolves against a
+**hard-coded seven-symbol whitelist** (`de.rs:987-1100` — `set`, `frozenset`,
+`bytearray`, `list`, `int`, `_codecs.encode`, `copy_reg._reconstructor`), and
+`INST` / `OBJ` / `NEWOBJ` / `BUILD` discard the class reference without
+instantiating anything (`de.rs:486-539`). It does not execute.
+
+It is nevertheless the wrong tool, for the opposite reason — it is *too* safe:
+
+```rust
+enum Global {          // de.rs:36 — private, not re-exported
+    Set, Frozenset, Bytearray, List, Int, Encode, Reconst,
+    Other,             // anything else (may be a classobj that is later discarded)
+}
+```
+
+`Other` is a **unit variant carrying no data**, on a **private** enum. Every
+global outside those seven — which is every global a WAF cares about — collapses
+to an anonymous placeholder that has thrown away the module and callable strings.
+`serde-pickle` can tell you a payload references *some* global; it structurally
+cannot tell you the global was `posix.system`. That is the entire detection.
 
 Given that boundary, the walker this needs is unusually cheap and unusually safe:
 
@@ -650,12 +706,19 @@ If one thing is done, in order:
    body is unreachable no matter which rules are on. Extractor work, not detector
    work; it also makes the already-written default-off rules effective on the day
    they are calibrated.
-4. **Everything else — configuration and rule rows, not parsers.** Two XXE flips
-   plus an XInclude row; five SSTI engine signatures; `\xNN` decoding in the
-   shared preprocessor; two traversal flips gated on route scope.
+4. **Everything else — rule scoping and rule rows, not parsers.** Two XXE rules
+   and two traversal rules to bring on-by-default under route scope; an XInclude
+   row; five SSTI engine signatures; `\xNN` decoding in the shared preprocessor.
+   All of it code, because there is no per-rule config surface — see above.
 
 Nothing above requires a new parser dependency. That is the survey's conclusion,
 not an accident of ordering.
+
+A fifth item belongs on the list but is not this document's to make: **give
+`default_on` a configuration surface.** Fifteen of the forty blind rows are
+rules that already exist and are compiled out, and today no one can price
+switching one on without editing Rust and cutting a release. Every "default-off"
+consolation in this survey is worth less than it looks until that changes.
 
 ## Appendix — candidate crate diligence
 
@@ -680,15 +743,27 @@ RustSec database (1173 advisories loaded); licences checked against
 | `minijinja` | 2.21.0 | 2026-06-17 | very active | none | Apache-2.0 | — | no |
 | `handlebars` | 6.4.3 | 2026-07-12 | very active | none | MIT | — | no |
 | `jaded` | 0.5.0 | 2024-10-01 | yes | none | MIT | — | no |
+| `ldap3` | 0.12.1 | 2025-09-18 | yes | none | MIT/Apache-2.0 | — | no |
+| `ldap-types` | — | — | yes | none | — | — | no |
+| `askama_parser` | 0.16.0 | 2026-04-29 | very active | none | MIT OR Apache-2.0 | — | no |
+| `ldap` (meta-crate) | — | **2017** | **dead** | **18 unmaintained + 1 unsound** (tokio-0.1 stack) | — | — | — |
 
 Notes that changed a conclusion:
 
-* **`ldap-filter` does not exist on crates.io.** There is no crate that parses an
-  RFC 4515 filter *string* into an AST. `ldap3` (0.12.1, 2025-09-18) is a client
-  and does not expose a filter parser as public API; `rasn-ldap` handles the
-  ASN.1/BER *wire* encoding, which is a different language from the textual
-  filter syntax. The LDAP prototype above is therefore ~120 lines of our own,
-  which is what it was measured as.
+* **`ldap-filter` does not exist on crates.io** (404, checked twice), but the
+  stronger claim in this document's first draft — that *no* crate parses an RFC
+  4515 filter string — was wrong. Two do:
+  `ldap3::parse_filter` (nom-based; marked `#[doc(hidden)]` but genuinely
+  `pub use`d from the crate root) and `ldap-types::filter::search_filter_parser`
+  (chumsky-based, ordinary public API, exposes an `LDAPSearchFilter` AST).
+  **Neither offers a depth limit.** `rasn-ldap` is not a candidate — it handles
+  the ASN.1/BER *wire* encoding, a different language from the textual filter
+  syntax. The `ldap` meta-crate advertising an `ldap_rfc4515` module is a hard
+  no: last release 2017, dragging in the dead tokio-0.1 stack (18 unmaintained
+  advisories plus one genuine unsoundness).
+  This does not change the LDAP verdict, which rests on the measured false-positive
+  increase and not on availability — but the verdict is "the measurement says no",
+  not "there was nothing to use".
 * **`unicode-ident` reports `(MIT OR Apache-2.0) AND Unicode-3.0`.** All three
   are on the allowlist, so it passes; a naive SPDX splitter flags it, and it is
   already in this tree via `syn` regardless.
@@ -696,9 +771,30 @@ Notes that changed a conclusion:
   through `stacker`/`psm` — the exact pair `crates/waf-engine/Cargo.toml:36`
   deliberately dropped by taking `sqlparser` with `default-features = false`.
 
-Unverified: `sxd-xpath`, `roxmltree`, `minijinja`, `handlebars` and `jaded` were
-not fuzz-audited, and upstream `fuzz/` directories were not surveyed for any
-candidate. Since the recommendation adds no crate, this was not pursued further.
+* **Depth limits are near-universally absent.** Of everything examined, exactly
+  one candidate ships one: `askama_parser` (`MAX_DEPTH = 128`, plus a dedicated
+  parser fuzz target) — and it is in the group this survey rejects on other
+  grounds. `serde-pickle`, `sxd-xpath`, `ldap3::parse_filter`, `ldap-types`,
+  `oxc_parser`, `boa_parser`, `ressa` and `rslint_parser` all recurse without a
+  configurable bound. Any adoption would carry a pre-parse guard written by us,
+  as `ast_structural_depth_ok` already is for `sqlparser`. `typed-path` is the
+  exception that proves the point: it has no syntactic recursion at all, folding
+  path components lexically.
+* **The XML candidates are all XXE-safe.** `quick-xml` 0.41 (the version already
+  pinned here), `roxmltree` and `xml` 1.3.0 each decline to fetch an external
+  `SYSTEM` URI. This is a point in favour of the existing design rather than a
+  reason to change it: the safety comes from *not resolving entities*, which is
+  precisely what the current parser-free XXE detector achieves without a parser.
+* **`tera` split between major versions.** 1.x exposed a public AST; the 2.x that
+  `cargo add tera` resolves to today made parsing private. Any survey of template
+  parsers that predates that split is stale.
+
+Unverified, and stated as such: `ldap-types`' exact version, release date and
+licence were not confirmed; upstream `fuzz/` directories were not surveyed for
+any candidate except `askama_parser`; no compile-time or binary-size measurement
+was taken for any crate. Since the recommendation adds no dependency, none of
+this was pursued further — but nothing above should be quoted as diligence
+sufficient to *adopt* a crate, only as sufficient to decline one.
 
 ## What this survey did not settle
 
