@@ -192,14 +192,32 @@ impl ContentSecuritySubsystem {
         // rule set, the code-decided ones hold it and consult it where the
         // judgement names a construct.
         let toggles = &config.rule_toggles;
+        // How each switched rule decides, so the WARN below can describe what was
+        // actually done to it. Built once: the inventory is a hundred-odd rows and
+        // the loop under it is at most a handful.
+        let inventory = detectors::semantic_rule_inventory();
         for key in config.rule_toggles.forced_off() {
             // A rule an operator switched off is a detection this process no
             // longer performs. Same reason `lane1.max_body_bytes = 0` warns:
             // deliberate is not the same as invisible.
+            //
+            // The two halves of the sentence are not interchangeable. A regex row
+            // really is compiled out and its detector will never look at that
+            // pattern again; a code-decided rule's detector keeps running and
+            // merely stops naming that construct, which is why the next-strongest
+            // one can still be reported on the same request. Saying "compiled out"
+            // of the second kind would misdescribe what the operator just did.
+            let how = match inventory.iter().find(|r| r.key == key).map(|r| r.source) {
+                Some(detectors::SemanticRuleSource::Code) => {
+                    "its detector still runs and still reports its other rules, but will not name \
+                     this one"
+                }
+                _ => "it is compiled out of its detector and can never match",
+            };
             tracing::warn!(
                 rule_key = key,
-                "Lane 2 rule DISABLED by content_security.rules_disabled: it is compiled out of its \
-                 detector and can never fire, whatever its family's mode or thresholds say"
+                "Lane 2 rule DISABLED by content_security.rules_disabled: {how}, whatever its \
+                 family's mode or thresholds say"
             );
         }
         for key in config.rule_toggles.forced_on() {
