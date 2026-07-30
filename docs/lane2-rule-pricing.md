@@ -1,4 +1,7 @@
-# What the default-off Lane 2 rules cost
+# What the Lane 2 rules cost
+
+Started as the bill for the rules that ship disabled, and grew the two sections
+at the end as the switchable surface did.
 
 Thirty-eight of Lane 2's rules ship disabled. `docs/lane2-blind-spots.md` §4
 says fifteen corpus attacks are "recoverable by enabling an existing rule" and
@@ -16,11 +19,22 @@ run — prices the sixty-six rules that were already running, and is in
 together: this one says what the off rules would cost, that one says what the on
 rules are costing.
 
+> **Two things happened after the sweep below, and both are priced further
+> down.** `v0.2.188` turned seven of the thirty-eight on, which moved the
+> baseline every price here was read against from shadow 128 to shadow **139**.
+> `v0.2.192` put the eighteen rules that decide in code on the switchable
+> surface, so the inventory is **115 keys, 81 on and 34 off** rather than 97/66/31
+> and eighteen rules that had never been measured could be. The two sections that
+> answer for them are
+> [the eighteen that decide in code](#the-eighteen-rules-that-decide-in-code)
+> and [what the seven flips did to the other thirty-one prices](#what-the-seven-flips-did-to-the-other-thirty-one-prices).
+
 ## How to reproduce
 
 ```bash
-tests/lane2/price-rules.sh                          # all 38, one at a time
+tests/lane2/price-rules.sh                          # all 34 default-off, one at a time
 tests/lane2/price-rules.sh nosql.expr_operator      # or just some
+DIRECTION=disable tests/lane2/price-rules.sh        # or all 81 default-on
 python3 tests/lane2/price-rules.py --dir "$WORK/pricing"
 ```
 
@@ -32,7 +46,9 @@ union names no rule to leave off.
 
 **The baseline run reproduces `tests/lane2/baseline.json` exactly** — shadow
 128 detected / 10 false positives / 2 blocking false positives, enforce 75
-blocked / 2 / 2. Every delta below is read against those numbers.
+blocked / 2 / 2. Every delta below is read against those numbers, which are the
+`v0.2.181` baseline and **not** the shipped one: `baseline.json` records shadow
+139 since `v0.2.188`. The later sections state their own baseline.
 
 **Recorded from `9df9c045` (`v0.2.181`)**, release build, `configs/default.toml`
 unmodified except for the one `rules_enabled` line each run substitutes, 2×39
@@ -74,7 +90,7 @@ this document exists to check.
 | `deser.php_object_injection` | `deserialization` | 60 | **+2** | 0 | 0 | 0 | 0 | **default on** |
 | `traversal.sensitive_abs_ops` | `traversal` | 55 | **+1** | 0 | 0 | 0 | 0 | **default on** |
 | `xxe.entity_expansion` | `xxe` | 65 (×3) | **+1** | 0 | 0 | 0 | 0 | **default on** |
-| `traversal.plain_dotdot` | `traversal` | 50 | +2 | **+2** | 0 | 0 | 2 | keep off |
+| `traversal.plain_dotdot` | `traversal` | 50 | +2 → **+1** | **+2** | 0 | 0 | 2 | keep off |
 | `ssti.jinja_arith_probe` | `ssti` | 45 | +1 | **+1** | 0 | 0 | 1 | keep off |
 | `ssti.template_directive` | `ssti` | 45 | +1 | **+1** | 0 | 0 | 1 | keep off |
 | `xxe.doctype_external` | `xxe` | 60 | +1 | **+1** | 0 | 0 | 1 | keep off |
@@ -90,7 +106,7 @@ Which rows moved:
 | `deser.php_object_injection` | `deser-006` `deser-015` | — |
 | `traversal.sensitive_abs_ops` | `trav-005` | — |
 | `xxe.entity_expansion` | `xxe-005` | — |
-| `traversal.plain_dotdot` | `trav-005` `trav-016` | `content-064` `content-109` |
+| `traversal.plain_dotdot` | `trav-005` `trav-016` (`trav-005` no longer — see [below](#the-one-price-that-moved)) | `content-064` `content-109` |
 | `ssti.jinja_arith_probe` | `ssti-001` | `content-026` |
 | `ssti.template_directive` | `ssti-006` | `content-025` |
 | `xxe.doctype_external` | `xxe-004` | `content-003` |
@@ -348,33 +364,428 @@ blocking lever.
 
 ---
 
-## What this document does not establish
+# The eighteen rules that decide in code
 
-* **Exactly one combination was measured.** Every other number is one rule
-  against the baseline, and rows must not be added up: `sql.stacked` produced a
-  block by corroborating with two rules already on, and `rce.backtick_cmd`
-  produced three false positives by corroborating four rows from 39 to 78. Any
-  set proposed for shipping needs its own run (`COMBO=` in `price-rules.sh`);
-  the seven-rule set above has one and no other set does.
-* **The prices were taken with no `default_on` changed.** Every number above was
-  measured through `rules_enabled` on an unmodified rule table. `v0.2.187` then
-  changed seven of them, and re-ran the corpus to confirm the flip lands where
-  the sweep said — see the section above for the one coupling that made the
-  re-run necessary rather than ceremonial. The other thirty-one prices have not
-  been re-measured against the new default-on set, and corroboration is exactly
-  what this document shows to be non-additive.
+Everything above is about rules that are a row in a regex table. Eighteen more
+are not: the five SQL-AST structures, the nine XSS DOM constructs, the two XSS
+JS token classes and the two pickle opcode grades decide from *parsed structure*,
+so there was no pattern to leave out of a compile step and no key
+`rules_enabled` would accept. `v0.2.192` gave them one. This is their price, and
+it is the first time any of them has had one.
+
+**Recorded from `c5b507f1` (`v0.2.192`)**, release build, 2×16 corpus replays
+in the disable direction plus 2×5 in the enable direction, ports `184xx`,
+Postgres on `15808`. The baseline run in both directions reproduces
+`tests/lane2/baseline.json` exactly — shadow **139 / 10 / 2**, enforce
+**75 / 2 / 2** — and every number below is read against it. `configs/default.toml`,
+the corpus, `baseline.json` and every rule's `default_on` are untouched: the
+sweep points `SRC` at a symlink mirror whose only real directory is `configs/`.
+
+Fifteen of the eighteen ship **on**, so they are priced the way
+[`lane2-latent-pressure.md`](lane2-latent-pressure.md) prices a running rule —
+taken away one at a time, `DIRECTION=disable`, every column reading as what the
+rule does when it is on. Three ship **off** and are priced by the enable sweep
+like any other default-off rule.
+
+## The fifteen that ship on
+
+| rule_key | family | detector | conf | det | FP | blocked | FPblk | touched | attack rows it fires on |
+|---|---|---|--:|--:|--:|--:|--:|--:|--:|
+| `xss.script_tag` | `xss` | `xss_dom` | 90 | **+8** | **+2** | +0 | 0 | **3** | 8 |
+| `xss.event_handler` | `xss` | `xss_dom` | 85 | **+4** | **+1** | +1 | 0 | **1** | 5 |
+| `ast.tautology` | `sql_injection` | `ast` | 80 | +3 | 0 | +0 | 0 | 0 | 9 |
+| `ast.stacked` | `sql_injection` | `ast` | 90 | +1 | 0 | +1 | 0 | 0 | 2 |
+| `ast.subquery` | `sql_injection` | `ast` | 78 | +1 | 0 | +0 | 0 | 0 | 1 |
+| `xss.svg_onload` | `xss` | `xss_dom` | 88 | +1 | 0 | +2 | 0 | 0 | 3 |
+| `xss.iframe_srcdoc` | `xss` | `xss_dom` | 85 | +1 | 0 | +0 | 0 | 0 | 1 |
+| `xss.js_url` | `xss` | `xss_dom` | 85 | +1 | 0 | +0 | 0 | 0 | 1 |
+| `ast.union` | `sql_injection` | `ast` | 85 | +0 | 0 | +2 | 0 | 0 | 4 |
+| `ast.dangerous_fn` | `sql_injection` | `ast` | 85 | +0 | 0 | +2 | 0 | 0 | 3 |
+| `xss.js_exfil` | `xss` | `xss_js` | 88 | +0 | 0 | +2 | 0 | 0 | 2 |
+| `xss.js_sink` | `xss` | `xss_js` | 85 | +0 | 0 | +1 | 0 | 0 | 1 |
+| `deser.py_pickle_reduce_exec` | `deserialization` | `deser_struct` | 92 | +0 | 0 | +0 | 0 | 0 | 2 |
+| `xss.data_html_url` | `xss` | `xss_dom` | 82 | +0 | 0 | +0 | 0 | 0 | **0** |
+| `deser.py_pickle_dangerous_global` | `deserialization` | `deser_struct` | 85 | +0 | 0 | +0 | 0 | 0 | **0** |
+
+Which rows move when the rule is taken away:
+
+| rule | detections it is carrying | blocks it is carrying | benign rows it fires on |
+|---|---|---|---|
+| `xss.script_tag` | `xss-001` `xss-006` `xss-009` `xss-010` `xss-011` `xss-014` `xss-017` `xss-019` | — | `content-005` `content-010` (both false positives) + `content-059` |
+| `xss.event_handler` | `xss-002` `xss-008` `xss-012` `xss-020` | `xss-013` | `content-011` (a false positive) |
+| `ast.tautology` | `sqli-001` `sqli-005` `sqli-018` | — | — |
+| `ast.stacked` | `sqli-003` | `sqli-010` | — |
+| `ast.subquery` | `sqli-012` | — | — |
+| `ast.union` | — | `sqli-014` `sqli-015` | — |
+| `ast.dangerous_fn` | — | `sqli-004` `sqli-006` | — |
+| `xss.svg_onload` | `xss-003` | `xss-016` `xss-018` | — |
+| `xss.iframe_srcdoc` | `xss-005` | — | — |
+| `xss.js_url` | `xss-007` | — | — |
+| `xss.js_exfil` | — | `xss-016` `xss-018` | — |
+| `xss.js_sink` | — | `xss-013` | — |
+| `deser.py_pickle_reduce_exec` | — | — | — |
+
+### `xss.script_tag` is the most expensive rule in Lane 2, and the most valuable
+
+It is the only rule anywhere in the inventory that carries eight detections and
+two false positives at once. Both readings are true and neither is the whole
+story:
+
+* **Take it away and two of the ten false positives go.** `content-005` is a
+  knowledge-base article about output escaping that quotes
+  `&lt;script&gt;alert(1)&lt;/script&gt;` inside a `<code>` block; `content-010`
+  is a single-page-app shell saved by a site template editor, whose
+  `<script src="assets/main.js" defer>` is the application. Both score 45 — the
+  DOM detector alone at weight 0.5 — and both go to `clean`.
+* **The same removal costs eight real XSS detections**, a quarter of the whole
+  XSS family's shadow number, and takes shadow detection from 139 to 131.
+
+There is no threshold between them: 45 is the score on the attack rows and 45
+is the score on the two benign rows, for the same reason the SSTI probe rules
+have no threshold — a `<script>` element in a stored HTML field is the same
+parse whether the field is an attack or a page template.
+
+It also fires on `content-059` without being the reason that row is a false
+positive; the log-shipper row is carried to 68 by `sql.union_null` and
+`traversal.sensitive_abs` and stays there when the XSS signal goes.
+
+### The two XSS DOM rules that produce false positives, taken away together
+
+Three of the ten false positives come from `xss.script_tag` and
+`xss.event_handler`. That makes "switch off the two noisy DOM constructs" an
+obvious operator move, and it is worth having the number rather than the
+adjective. Measured as its own run (`COMBO=xssdomfp:…`) rather than summed:
+
+| | shadow detected | shadow FP | shadow FP-block | enforce blocked | enforce FP-block |
+|---|---|---|---|---|---|
+| shipped | 139 (81.76%) | 10 | 2 | 75 | 2 |
+| both off | **127 (74.71%)** | **7** | 2 | **74** | 2 |
+
+**Twelve detections and one block, for three false positives.** This combination
+*is* the sum of its parts — 8 + 4 detections, 2 + 1 false positives, 0 + 1
+blocks, no interaction in either direction — which is worth stating because
+`sql.stacked` and `rce.backtick_cmd` are the standing proof that a combination
+need not be. The trade is 4.55% → 3.18% on the benign half against 81.76% →
+74.71% on the attack half, and the blocking false-positive column does not move
+because neither rule was ever behind one.
+
+### The AST rules block more than they detect, and that is the design
+
+Five rules, four detections and seven blocks between them. `sqlparser-rs` runs
+at weight 0.5 in a two-detector family, so an AST structure on its own scores 39
+to 45 and mostly rides along with the regex rule that already logged the row —
+which is why `ast.union` and `ast.dangerous_fn` carry no detection at all and
+still carry two blocks each. **The blocks are the whole of their value**: they
+are the corroborating half of `0.5·c_struct + 0.5·c_ast ≥ 80`, and without them
+`sqli-004` `sqli-006` `sqli-010` `sqli-014` `sqli-015` are logged and not
+blocked. Read against `docs/lane2-blind-spots.md`, this is the measured version
+of "the AST layer is doing real work": seven of the seventy-five blocks in the
+whole corpus need one of these five rules to exist.
+
+`ast.tautology` is the exception in the other direction — three detections, no
+blocks, and contact with **nine** attack rows, six of which are XPath. A quote
+tautology is a quote tautology whichever grammar it was aimed at, and on those
+six rows the XPath family scores higher and wins the roll-up, so the SQL signal
+is present and invisible. That is the same bookkeeping effect
+`xpath.bare_logical` produces from the other side.
+
+### Two rules fire on nothing at all, for two different reasons
+
+`xss.data_html_url` (conf 82) and `deser.py_pickle_dangerous_global` (conf 85)
+produce **no signal on any of the 390 rows**, in either direction, in either
+mode. They are the only two of the eighteen that do, and the corpus is not
+silent about the shapes they are for:
+
+* **`xss.data_html_url` has a corpus row and still does not fire.** `xss-010` is
+  `url=data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==` and is
+  detected — by `xss.script_tag`, on the base64-decoded view, because the rule
+  wants a `data:text/html` URL **in a real URL attribute of parsed HTML** and
+  `xss-010` puts it in a query parameter. The gap is the delivery shape, not the
+  scheme classifier. A row that stores `<a href="data:text/html,…">` in a rich
+  text field would price it; the corpus has no such row.
+* **`deser.py_pickle_dangerous_global` has never been observed firing**, and
+  putting it where the sweep could price it was the stated reason it entered the
+  inventory. The sweep now says the same thing the code comment said, with a
+  measurement behind it: the grade below the one that fires carries nothing on
+  this corpus. That is **no information, not a clean bill** — the 220 benign
+  rows contain no pickle at all, so this measurement cannot distinguish "the
+  stack model never declines to model a reduction" from "the corpus never asked
+  it to".
+
+`deser.py_pickle_reduce_exec` is a third kind of zero and should not be read as
+the other two. It **does** fire — `deser-007` and `deser-009`, at confidence 92,
+the strongest signal on either row — and taking it away costs nothing, because
+`deser.java_serial_b64` and the rest of the regex table already carry both rows
+over `block_threshold`. The opcode walker is redundant on this corpus rather
+than idle on it, which is a much better place for a parser to be than the
+reverse.
+
+## The three that ship off
+
+`xss.object_embed`, `xss.base_href` and `xss.dangling_open_tag` were reachable
+only from a `#[cfg(test)]` constructor until `v0.2.192`. This is the first time
+they have run against real corpus rows.
+
+| rule_key | conf | det +N | FP +M | blocked +K | FPblk | touched | verdict |
+|---|--:|--:|--:|--:|--:|--:|---|
+| `xss.object_embed` | 80 | +0 | **+1** | 0 | 0 | 1 | **keep off** — cost with no benefit |
+| `xss.base_href` | 80 | +0 | +0 | 0 | 0 | **0** | masked, not free — see below |
+| `xss.dangling_open_tag` | 50 | +0 | +0 | 0 | 0 | 1 | no detection, one benign row under the line |
+
+**`xss.object_embed` costs exactly what the code comment predicted.** The
+`FP-4` note on the constant says legitimate PDF and media embeds hit it 3/3 in a
+fire drill; the corpus has one such row and it hits it 1/1. `content-009` is a
+CMS page embedding a hosted safety data sheet —
+`<object data="…/4471.pdf" type="application/pdf"><embed src="…" /></object>` —
+and it scores 40 against `xss.log_threshold = 40`, landing exactly on the line
+as a new `fp-log`. It recovers no attack. On this corpus the rule is pure cost
+and the eleventh false positive.
+
+**`xss.base_href`'s zero is masking, not absence, and the corpus proves it.**
+The rule fires on nothing in the shipped posture, but `content-010` *is* the
+`base-href` trap: `<base href="/app/">` in a saved SPA shell, exactly the shape
+the constant's comment says hits it unconditionally. The reason it reads as zero
+is `keep_stronger` — `xss.script_tag` (90) is also on that field and outranks
+`xss.base_href` (80), so the DOM walk never names the weaker construct. Taking
+the masking rule away settles it:
+
+```toml
+[content_security]
+rules_enabled  = ["xss.base_href", "xss.object_embed", "xss.dangling_open_tag"]
+rules_disabled = ["xss.script_tag"]
+```
+
+`content-010` comes back as an `fp-log` at score 40 under `xss.base_href`, and
+`content-009` is an `fp-log` at 40 under `xss.object_embed`. So the honest
+statement is not "`xss.base_href` is free"; it is **"`xss.base_href` would flag
+the one row in this corpus that carries its shape, and that row is already a
+false positive for another reason, so switching it on adds nothing *to a posture
+that still runs `xss.script_tag`*"**. An operator who silences `xss.script_tag`
+to clear `content-010` and enables `xss.base_href` in the same change has not
+cleared it.
+
+**`xss.dangling_open_tag` is the one with genuine latent contact.** At
+confidence 50 in a 0.5-weight family it scores 25, well under
+`log_threshold = 40`, and it fires on `content-012` — a tenant theme settings
+row storing a base64 `data:image/svg+xml` favicon. One benign row under the
+line, no detection, no cost today. It is also masked on `xss-012` the same way
+`xss.base_href` is masked on `content-010`: with `xss.script_tag` off it names
+that attack row too, alongside `xss.event_handler`. Its `+0` detection is
+therefore "adds nothing the stronger constructs are not already saying", not
+"sees nothing".
+
+## What the eighteen change about the two earlier documents
+
+`docs/lane2-latent-pressure.md` said three of the ten false positives came from
+keys "no amount of sweeping the switchable inventory will ever show". They are
+switchable now and the sweep has shown them: `content-005` and `content-010`
+belong to `xss.script_tag`, `content-011` to `xss.event_handler`, and each has a
+named price for removing it. The `touched`/`over` classification that document
+applies to the sixty-six extends to these fifteen unchanged: **none of them has
+latent pressure.** Every benign row any of them fires on — four rows across two
+rules — is already over a threshold and already counted. The classification of
+the running set is now **70 clean, 0 latent, 11 already in the FP count**, across
+81 rules rather than 66.
+
+---
+
+# What the seven flips did to the other thirty-one prices
+
+`v0.2.188` turned seven default-off rules on. Every price in the batches above
+was taken against a baseline that did not have them, and this document's own
+evidence — `sql.stacked` reaching a block only by corroborating, and
+`rce.backtick_cmd` turning four sub-threshold rows into false positives — is the
+reason a price cannot be assumed to survive a baseline change. So the other
+thirty-one carry a stale premise until something says otherwise.
+
+Re-running all thirty-one would answer it and would mostly be thirty-one replays
+producing the numbers already written down. What follows is the argument for
+which of them *can* have moved, and the measurement that checks the argument
+rather than trusting it.
+
+## What actually changed between the two baselines
+
+Two things, and only two.
+
+**One: the seven rules' own signals.** Read straight out of the shipped baseline
+report — every signal's `rule_key` is in `semantic_observations`, including
+signals on rows that scored below every threshold — the seven fire on **twelve
+attack rows and zero benign rows**:
+
+| rule | rows |
+|---|---|
+| `nosql.comparison_operator` | `nosql-001` `nosql-004` `nosql-006` |
+| `nosql.regex_operator` | `nosql-003` `nosql-011` |
+| `nosql.logical_operator` | `nosql-005` `nosql-006` |
+| `nosql.expr_operator` | `nosql-007` |
+| `deser.php_object_injection` | `deser-006` `deser-015` |
+| `traversal.sensitive_abs_ops` | `trav-005` `trav-020` |
+| `xxe.entity_expansion` | `xxe-005` |
+
+Eleven are the rows the flip recovered; `trav-020` is the twelfth, already
+detected at 75 and unchanged by the extra signal.
+
+**Two: the widened synthetic-view gate.** Flipping `traversal.sensitive_abs_ops`
+also widened `NORMALISED_STRONG_STRUCTURE`, and unlike the seven signals that
+widening is not confined to rows the seven fire on: a view that did not exist
+before can hand *any* rule new text. Its reach is still bounded, and tightly.
+The gate admits a synthetic view only when a default-on RCE or traversal pattern
+matches it, so the only views the flip added are the ones matching the one
+pattern the flip added —
+`/etc/hosts\b|/proc/self\b|/proc/version\b|/proc/[0-9]+/`. A row that gains a
+view therefore necessarily gains a `traversal.sensitive_abs_ops` signal, and
+that signal is in the table above: `trav-005` and `trav-020`, both already in
+the twelve.
+
+Checked independently against the corpus text rather than inferred from the
+gate: across all 390 rows, in raw, percent-decoded, base64-decoded and
+hex-decoded form, exactly **two** carry a string matching that pattern, and they
+are `trav-005` and `trav-020`.
+
+**So the two baselines are identical on 378 of the 390 rows.**
+
+## Why nothing on those twelve rows can corroborate either
+
+A price could still move on the twelve — but only in one direction, and the
+scoring model says which. `canonical(scope, field, attack, detector)` is an
+**arg-max** over views, the per-family sum runs over *detectors*, and the
+request roll-up across families is **max, not sum**. Two rules can therefore
+only add up when they are in the same family and different detectors.
+
+Every one of the thirty-one is either in a family none of the seven belongs to —
+in which case the roll-up takes a max and no sum is possible — or in
+`traversal`, `xxe`, `deserialization` or `nosql_injection`, which are
+**single-detector families** (`traversal = 1.0`, `xxe_struct = 1.0`,
+`deser_struct = 1.0`, `nosql_struct = 1.0`), which puts it in the same detector
+as the newly-on rule and back under the arg-max.
+
+There is no pair anywhere that can sum. The consequence is that no benign
+column, no enforce column and no `touched` count can move at all, and the only
+column that can is shadow `det` — downward, on a row a rule used to recover from
+`blind` and that the baseline now recovers by itself.
+
+## The measurement that checks it
+
+Seven runs, not thirty-one. Each enables a group of default-off rules chosen so
+that **no two members share a detector**, which is the condition under which
+`best_match` cannot mask one member with another, so the per-row set difference
+of `rule_keys_fired` against the baseline names exactly the group members that
+fired. Nine detectors carry the thirty-one; the largest holds seven rules
+(`ssti_struct`); seven groups cover all of them.
+
+Two things fall out:
+
+**Every one of the thirty-one reproduces its recorded benign contact, exactly.**
+All thirty-one counts — from `xpath.bare_double_slash`'s 94 rows down to the
+eleven rules at zero — match the numbers taken at `v0.2.181` on the nose, 31 of
+31. That is the empirical form of the argument above, and it is the strongest
+check available on the widened gate: had the widening handed any of them a new
+view on any benign row, a count would have moved.
+
+**Only four of the thirty-one touch any of the twelve rows at all:**
+
+| rule | conf | rows in the twelve it fires on | the family already scoring those rows |
+|---|--:|---|---|
+| `xpath.bare_predicate` | 15 | `nosql-005` `nosql-006` `nosql-007` `xxe-005` | 45 / 55 / 75 / 65 |
+| `xpath.bare_logical` | 20 | `nosql-005` `nosql-006` | 45 / 55 |
+| `ldap.bare_wildcard` | 20 | `nosql-003` | 60 |
+| `ldap.bare_logical` | 20 | `xxe-005` | 65 |
+
+All four are cross-family — an XPath predicate rule firing on a Mongo operator,
+an LDAP wildcard rule firing on a regex operator — at confidences of 15 to 20
+against rows the expected family already scores at 45 to 75. The roll-up takes
+the max, so none of them named the winning family before the flip and none of
+them does now. None of the four recovered any of the twelve in the original
+sweep (their recorded detection deltas are `+1` on `xpath-007` and `+0`, `+0`,
+`+0`), so there is no detection for the new baseline to take away.
+
+The group runs also reproduce every recorded bucket delta with no residue.
+`combo-g1` recovers `sqli-019` `trav-016` `xxe-004` and flags `content-003`
+`content-043` `content-047` `content-064` `content-109` and blocks `sqli-003` —
+the exact union of `sql.stacked`, `traversal.plain_dotdot` and
+`xxe.doctype_external` as recorded, minus `trav-005`. `combo-g2` recovers
+`ssti-006` and `xpath-007` and flags `content-025` `content-046` `content-048`;
+`combo-g3` recovers `rce-005` and `ssti-001` and flags `content-026`
+`content-030` `content-038` `content-040`; `combo-g4` through `combo-g7` move
+nothing, as their members' recorded prices say they should not.
+
+## The one price that moved
+
+**`traversal.plain_dotdot`, re-measured on its own against the shipped
+baseline:**
+
+| | det | FP | blocked | FPblk | touched | attacks recovered | benign flagged |
+|---|--:|--:|--:|--:|--:|---|---|
+| at `v0.2.181` | +2 | +2 | 0 | 0 | 2 | `trav-005` `trav-016` | `content-064` `content-109` |
+| at `v0.2.192` | **+1** | +2 | 0 | 0 | 2 | `trav-016` | `content-064` `content-109` |
+
+The batch-1 text already said its unique contribution was `trav-016` alone,
+because `traversal.sensitive_abs_ops` recovers `trav-005` for free. That is now
+the arithmetic as well as the prose: `traversal.sensitive_abs_ops` ships on, so
+`trav-005` is in the baseline, and the rule buys **one attack for two false
+positives**. It was the worst bargain of the four costly batch-1 rules when it
+read `+2/+2`; at `+1/+2` it is the only rule in the whole default-off set whose
+detections are outnumbered by its false positives.
+
+Nothing else moved. Thirty of the thirty-one prices above stand as recorded.
+
+---
+
+# What this document does not establish
+
+* **Three combinations were measured, out of every set anyone might ship.**
+  Every other number is one rule against the baseline, and rows must not be
+  added up: `sql.stacked` produced a block by corroborating with two rules
+  already on, and `rce.backtick_cmd` produced three false positives by
+  corroborating four rows from 39 to 78. Any set proposed for shipping needs its
+  own run (`COMBO=` in `price-rules.sh`). The seven-rule free set, the two-rule
+  XSS DOM set and the seven detector-disjoint groups have one; no other set does.
+* **The prices in the first two batches were taken with no `default_on`
+  changed**, through `rules_enabled` on an unmodified rule table at `v0.2.181`.
+  `v0.2.187` changed seven of them and re-ran the corpus;
+  [the section on the thirty-one](#what-the-seven-flips-did-to-the-other-thirty-one-prices)
+  is the account of what that did to the rest, and it re-measured one rule and
+  argued the other thirty from what the two baselines differ by. That argument
+  rests on the scoring model — arg-max inside a detector, weighted sum across
+  detectors of one family, max across families — and on `rules_enabled` being the
+  only thing the group runs varied. A change to any of the three would invalidate
+  it, and the seven group runs are what would have to be re-run.
 * **220 benign rows are not a holdout.** They are a corpus of shapes this
   product has been burned by, which makes a false positive in it strong evidence
   and makes zero false positives in it weak evidence. `touched = 0` is the
   better reading of "found nothing to fire on" and it is still 220 requests, not
-  a traffic sample. For the eleven rules that moved no column at all it is the
-  whole of what is known about them.
+  a traffic sample. For the eleven default-off rules and the two code-decided
+  rules that moved no column at all it is the whole of what is known about them.
+* **A `touched = 0` can also be a masked rule, not an absent one.** Every
+  detector reports one construct per view — the strongest one enabled — so a
+  weaker rule that matches the same field as a stronger one is invisible in the
+  shipped posture. `xss.base_href` reads as zero on a corpus that contains its
+  exact shape, and only an experiment with the masking rule switched off says so.
+  The three XSS constructs are the ones this was checked for; **no equivalent
+  unmasking run was done for any other rule in the inventory**, so any other
+  zero in this document may be masking as well.
 * **No threshold, weight or scope change was measured.** Several verdicts above
   say a rule would be worth having under a different threshold or on a narrower
   route. None of those alternatives was run; each carries its own cost to the
   detections the current setting is buying.
 * **The corpus carries no binary bodies** (`tests/lane2/README.md`), so any rule
   whose shape lives in non-UTF-8 bytes is under-measured here by construction.
+  The pickle rules are the clearest case: the benign half contains no pickle at
+  all, so `deser.py_pickle_dangerous_global`'s zero says nothing about its
+  false-positive surface.
+* **Nine corpus rows exhaust the Lane 2 work budget** and are marked `degraded`
+  — `content-031` `content-033` `content-059` `rce-017` `rce-020` `xpath-002`
+  `xpath-015` `xxe-009` `xxe-013` — so on those rows detection stops early and a
+  rule that would have fired later in the budget is not counted. Some group runs
+  add up to three more (`app-021` `app-024` `content-012` `content-025`
+  `content-076` `sqli-019`). None of the twelve rows the seven flips reach is
+  degraded in any run, which is why the thirty-one argument does not depend on
+  this; nothing else is protected from it.
 * **Detector weights were not varied.** Every number is at the shipped weights,
   so a rule in a 0.5-weight family is priced at half its confidence and would
   read differently in a family scored at 1.0.
+* **`ast.comment_obfusc` is still outside every sweep.** It is a label rather
+  than a rule and has no key, so the five AST prices above are prices for the
+  structure *and* its relabelling together — `sqli-004` reports
+  `ast.comment_obfusc`, and it is `ast.dangerous_fn` being taken away that makes
+  the row stop blocking.

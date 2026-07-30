@@ -11,6 +11,51 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The eighteen code-decided Lane 2 rules have prices.** `docs/lane2-rule-pricing.md`
+  gains a section for them: fifteen priced by taking each away from the shipped
+  posture, three by switching each on. Baseline shadow 139/10/2, enforce 75/2/2,
+  reproduced in both directions.
+
+  `xss.script_tag` is the most expensive rule in the inventory and the most
+  valuable — **eight detections and two false positives**, at an identical score
+  of 45 on both, so no threshold separates them. `xss.event_handler` carries four
+  detections, a block and the third false positive. Taking both away is measured
+  as its own run rather than summed: shadow 139 → **127**, false positives 10 →
+  **7**, one block lost, blocking false positives unmoved. The five SQL-AST
+  structures carry seven of the corpus's seventy-five blocks and only four
+  detections, which is the corroborating half of a two-detector family doing
+  exactly what it is weighted to do.
+
+  Of the three that shipped off behind a `#[cfg(test)]` constructor,
+  `xss.object_embed` costs the eleventh false positive — a CMS page embedding a
+  hosted PDF — for no detection. `xss.base_href` reads as free and is not: the
+  corpus carries its shape, and `xss.script_tag` outranks it on the same field,
+  so with the masking rule switched off it flags that row at 40.
+  `xss.dangling_open_tag` scores one benign row under the line and nothing else.
+
+  Two rules fire on nothing in either half: `xss.data_html_url`, because the one
+  corpus row with a `data:text/html` payload delivers it in a query parameter
+  rather than a URL attribute, and `deser.py_pickle_dangerous_global`, which has
+  still never been observed firing. Both are recorded as no information rather
+  than as clean.
+
+- **The thirty-one default-off prices are reconciled with the post-`v0.2.188`
+  baseline.** Those prices were taken before seven rules went default-on, so they
+  carried a stale premise. The two baselines differ on **twelve attack rows and
+  no benign row**, and the widened synthetic-view gate cannot reach further —
+  only two corpus rows carry the pattern that widening added, in raw, percent-,
+  base64- or hex-decoded form, and both are already among the twelve. Seven
+  detector-disjoint group runs check the argument instead of trusting it: all
+  thirty-one reproduce their recorded benign contact exactly, and only four touch
+  any of the twelve rows, all cross-family and all far below the score the
+  expected family already carries there.
+
+  **One price moved.** `traversal.plain_dotdot` is `+1` detection for two false
+  positives, not `+2`: `traversal.sensitive_abs_ops` now recovers `trav-005` in
+  the baseline, so `trav-016` is the whole of what the rule buys. It is the only
+  rule in the default-off set whose detections are outnumbered by its false
+  positives. Nothing was switched.
+
 - **The rules that decide in code are switchable.** `[content_security]
   rules_enabled` / `rules_disabled` reached 97 rule keys and refused 18 more that
   the engine emits: the five SQL-AST structures, the nine XSS DOM constructs, the
