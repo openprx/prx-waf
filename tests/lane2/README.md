@@ -120,6 +120,14 @@ those rules on is the obvious way to move these rows — and the single most
 likely way to move the FP column. Pricing that trade is what this harness is
 for; do not read 33.3% as "the SSTI detector is bad".
 
+That trade is now priced. `price-rules.sh` runs the whole corpus in both modes
+with one default-off rule switched on and nothing else changed, and
+[`docs/lane2-rule-pricing.md`](../../docs/lane2-rule-pricing.md) is the
+resulting bill for all 38. The short version: the four NoSQL operator rules are
+free and take that row from 40.0% to 86.7%, the bare SSTI delimiters flag benign
+content at the same score as the attack they catch, and `xpath.bare_double_slash`
+starts scoring 42% of the benign corpus while catching nothing.
+
 ## What is measured
 
 **Lane 2 and nothing else.** The generated host turns off every Lane 1 detector
