@@ -15,9 +15,10 @@ tears everything down again.
 
 ## Why this exists
 
-Lane 2 is 16,571 lines, 351 unit tests, 13 detectors across 10 attack families,
-with two real parsers (`sqlparser` for SQL, `brush-parser` for shell) and
-`html5ever` for WHATWG DOM semantics. **It has never blocked anything.** It
+Lane 2 is 13 detectors across 10 attack families, with two third-party parsers
+(`sqlparser` for SQL, `brush-parser` for shell), `html5ever` for WHATWG DOM
+semantics, and one parser of its own (a bounded pickle opcode walker).
+**It has never blocked anything.** It
 ships `enabled = true`, `enforcement_mode = "log_only"`, `rollout_bps = 0`, and
 even flipped to `enforce` the canary bucket is empty, so not one request would
 change.
@@ -29,7 +30,7 @@ deliberately; this is the same instrument pointed at the other lane.
 
 ## Where we stand
 
-Recorded on 2026-07-28 from the corpus in `corpus/`, at the shipped
+Recorded on 2026-07-30 from the corpus in `corpus/`, at the shipped
 `configs/default.toml` posture. The same numbers are the CI gate in
 `baseline.json`, which is the authority — this table is transcribed from it.
 
@@ -42,12 +43,12 @@ The shipped `log_only` posture, verbatim. Verdicts come from the
 
 | | attack (170) | benign (220) |
 |---|---|---|
-| **detected / false positive** | **127 (74.71%)** | **10 (4.55%)** |
+| **detected / false positive** | **128 (75.29%)** | **10 (4.55%)** |
 | of which would block | — | **2 (0.91%)** |
 | clean | — | 207 |
 | sub-threshold | 1 | 3 |
 | misattributed / wrong-family | 2 / 2 | — |
-| blind | 40 | — |
+| blind | 39 | — |
 
 ### enforce mode — the blocking decision
 
@@ -56,8 +57,8 @@ codes. This is what actually happens to traffic.
 
 | | attack (170) | benign (220) |
 |---|---|---|
-| **blocked** | **74 (43.53%)** | **2 (0.91%)** |
-| passed | 96 | 217 |
+| **blocked** | **75 (44.12%)** | **2 (0.91%)** |
+| passed | 95 | 217 |
 | harness | 0 | 1 |
 
 ### By family
@@ -73,9 +74,9 @@ codes. This is what actually happens to traffic.
 | `ssti` | 15 | 5 (33.3%) | 5 (33.3%) | 0 | 0 |
 | `ldap_injection` | 15 | 12 (80.0%) | 12 (80.0%) | 1 | **1** |
 | `xpath_injection` | 15 | 13 (86.7%) | 13 (86.7%) | 1 | **1** |
-| `deserialization` | 15 | 12 (80.0%) | 12 (80.0%) | 0 | 0 |
+| `deserialization` | 15 | 13 (86.7%) | 13 (86.7%) | 0 | 0 |
 
-Detection is flat across difficulty — canonical 73.9%, evasive 79.2%, hard
+Detection is flat across difficulty — canonical 73.9%, evasive 81.3%, hard
 70.6% — which is not the shape a keyword matcher produces and is the clearest
 single piece of evidence that the AST layers are doing real work. The corpus was
 written blind (see [Independence](#independence)), so the evasive and hard tiers
@@ -83,8 +84,8 @@ were not tuned to what the engine happens to catch.
 
 ## The three things this measurement says
 
-**1. Detected and blocked are two very different numbers.** 74.71% versus
-43.53%. The gap is entirely in the two-detector families: `block_threshold = 80`
+**1. Detected and blocked are two very different numbers.** 75.29% versus
+44.12%. The gap is entirely in the two-detector families: `block_threshold = 80`
 with two 0.5 weights needs *both* detectors to agree on the same field, and the
 A2 blind guard holds back a Block carried only by a decoded view. So SQLi drops
 75% → 35%, RCE 80% → 10%, traversal 90% → 10%, XSS 90% → 15%, while every

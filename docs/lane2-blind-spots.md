@@ -22,6 +22,12 @@ neither is caused by one. Every one of the 40 is a detection gap.
 This document is the per-case evidence for that claim, the family roll-up, and
 a fix list ordered by what it would recover.
 
+> **Since this was measured (2026-07-30).** Fix 6 is done: `deser-009` is
+> detected and the blind set is **39**, not 40 (shadow detection 128 of 170).
+> The counts and tables below are the measurement as taken on `7357d9fd` and are
+> deliberately left as recorded — the two places the change lands are annotated
+> in place, in §3 and in §5.
+
 ---
 
 ## 1. How this was measured
@@ -238,7 +244,7 @@ rule. Two never produce a leaf at all.
 |---|---|---|---|---|---|
 | `deser-006` | `O:8:"stdClass":1:{…}` | no | – | rule default-off | `deser.php_object_injection` (60) default-off; `stdClass` is not in the gadget-class list the default-on rule requires. |
 | `deser-015` | `a:2:{…O:4:"Evil":1:{…}}` | no | – | rule default-off | Same rule. *probe*: renaming the class to `Monolog` scores 88 via `deser.php_object_gadget`. |
-| `deser-009` | base64 pickle, **protocol 4**, in a JSON string | no | – | detector gap | *probe*: the same payload at **protocol 0** (`cos\nsystem…`, base64, same JSON field) scores 90 on the `blind_decoded` view. The base64 chain works; `deser.py_pickle_global_exec` only matches the protocol-0 `GLOBAL` opcode spelling, and protocol ≥ 2 uses `SHORT_BINUNICODE` + `STACK_GLOBAL`, which carries no `c`-prefixed module token. |
+| `deser-009` | base64 pickle, **protocol 4**, in a JSON string | no | – | detector gap — **fixed 2026-07-30** | *probe*: the same payload at **protocol 0** (`cos\nsystem…`, base64, same JSON field) scores 90 on the `blind_decoded` view. The base64 chain works; `deser.py_pickle_global_exec` only matches the protocol-0 `GLOBAL` opcode spelling, and protocol ≥ 2 uses `SHORT_BINUNICODE` + `STACK_GLOBAL`, which carries no `c`-prefixed module token. **Now detected** at confidence 92 by `deser.py_pickle_reduce_exec` — an opcode walker (`content_security/pickle.rs`), not a rule. The diagnosis above was right about the cause and wrong about the remedy: the analysis assumed the blind-decode chain would deliver the bytes, but the preprocessor's blind gate requires ≥ 85 % printable ASCII in the decoded form, which a protocol-4 pickle fails, so the walker decodes for itself. |
 
 ---
 
@@ -347,7 +353,7 @@ the Handlebars and the Pug/Nunjucks payloads. Note `ssti-013` also trips a
 per-detector input cap, which no config change reaches — a rule that only
 matches on the whole-view text would still see it.
 
-### 6 — pickle protocol ≥ 2. 1 case, one careful rule
+### 6 — pickle protocol ≥ 2. 1 case, one careful rule — **DONE (2026-07-30)**
 
 `deser-009`.
 
@@ -358,6 +364,28 @@ become U+FFFD under `from_utf8_lossy`, so the rule has to match on the module
 and callable tokens surviving around the replacement characters, and
 `posix system` as a bare token pair is far noisier than `cos system`. Worth
 doing, worth doing slowly.
+
+**Done, and not as a rule.** `content_security/pickle.rs` walks the opcode
+stream instead — protocols 0 through 5, `GLOBAL` / `STACK_GLOBAL` / `REDUCE` /
+`INST` / `OBJ` / `NEWOBJ` / `NEWOBJ_EX` — and resolves the module/callable pair
+against a closed table of execution primitives. `deser-009` scores 92 on
+`deser.py_pickle_reduce_exec`; the benign corpus is unchanged at 10 FP / 2
+block-FP, the same ten rows by name.
+
+Two corrections to the paragraph above, both worth recording because both were
+wrong in the same direction — they assumed the existing text machinery could be
+made to reach the payload:
+
+* **the blind-decode chain does not deliver this pickle.** `looks_structural`
+  requires the decoded bytes to be ≥ 85 % printable ASCII before it will emit a
+  `BlindDecoded` view, and a protocol-4 pickle is not. The protocol-0 probe
+  passes that gate because protocol 0 is text; protocol 4 never would have. The
+  walker decodes base64 (and hex) for itself, from `view.text`;
+* **matching around the replacement characters was the wrong shape entirely.**
+  `from_utf8_lossy` is lossy in both directions — distinct byte sequences
+  collapse to the same `U+FFFD` — so a rule written against the lossy view could
+  not have distinguished a real `STACK_GLOBAL` from any other non-UTF-8 filler.
+  The bytes had to be read as bytes.
 
 ### 7 — LDAP filter-break widening. 2 cases, one pattern
 

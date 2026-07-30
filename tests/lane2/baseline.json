@@ -30,7 +30,7 @@
   "enforce — enforcement_mode = enforce, rollout_bps = 10000, i.e. the far end",
   "          of the rollout dial. Verdicts come from HTTP status codes. This is",
   "          what actually happens to traffic, and the two numbers are very far",
-  "          apart: 74.71% of the attack corpus is DETECTED, 43.53% would be",
+  "          apart: 75.29% of the attack corpus is DETECTED, 44.12% would be",
   "          BLOCKED. The gap is the two-detector corroboration requirement",
   "          (block_threshold = 80 with two 0.5 weights needs both detectors to",
   "          agree) plus the A2 blind guard. It is not a defect; it is the",
@@ -63,8 +63,8 @@
   "the single most likely way to move the FP column — which is exactly the",
   "trade this harness exists to price."
  ],
- "recorded_at": "2026-07-28",
- "recorded_from": "eee23d61 — the two RCE obfuscation fixes: fdd4da34 admits ${IFS} to shell de-obfuscation, eee23d61 reads a command-side brace expansion. Measured on that tree with configs/default.toml unmodified. First recorded at c644606; the only rows that moved are rce-011 and rce-013, wrong-family to detected in shadow, and every enforce number is unchanged.",
+ "recorded_at": "2026-07-30",
+ "recorded_from": "2de0ac90 — the pickle opcode walker (content_security/pickle.rs), reached from DeserStructuralDetector. Measured on that tree with configs/default.toml unmodified, both modes, twice, identical. Exactly one row moved: deser-009, a protocol-4 pickle base64-wrapped in a JSON field, blind -> detected in shadow (rule deser.py_pickle_reduce_exec, confidence 92) and not-blocked -> blocked in enforce. Every benign number is unchanged, including the named fp-log and fp-block lists. Commits after 2de0ac90 on this branch touch documentation, this file and one lint attribute only, so they cannot move a number. Previously eee23d61 (127/74), before that c644606.",
  "corpus": {
   "attack": 170,
   "benign": 220,
@@ -80,14 +80,14 @@
    "_comment": "Shipped log_only posture; verdicts from semantic_observations joined by client_ip.",
    "attack": {
     "n": 170,
-    "detected": 127,
-    "detection_rate": 74.71,
+    "detected": 128,
+    "detection_rate": 75.29,
     "buckets": {
-     "detected": 125,
+     "detected": 126,
      "misattributed": 2,
      "sub-threshold": 1,
      "wrong-family": 2,
-     "blind": 40,
+     "blind": 39,
      "harness": 0
     },
     "by_family": {
@@ -100,7 +100,7 @@
      "ssti": {"n": 15, "detected": 5},
      "ldap_injection": {"n": 15, "detected": 12},
      "xpath_injection": {"n": 15, "detected": 13},
-     "deserialization": {"n": 15, "detected": 12}
+     "deserialization": {"n": 15, "detected": 13}
     }
    },
    "benign": {
@@ -135,9 +135,9 @@
    "_comment": "enforcement_mode = enforce, rollout_bps = 10000; verdicts from HTTP status codes.",
    "attack": {
     "n": 170,
-    "detected": 74,
-    "detection_rate": 43.53,
-    "buckets": {"blocked": 74, "not-blocked": 96, "harness": 0},
+    "detected": 75,
+    "detection_rate": 44.12,
+    "buckets": {"blocked": 75, "not-blocked": 95, "harness": 0},
     "by_family": {
      "sql_injection": {"n": 20, "detected": 7},
      "rce": {"n": 20, "detected": 2},
@@ -148,7 +148,7 @@
      "ssti": {"n": 15, "detected": 5},
      "ldap_injection": {"n": 15, "detected": 12},
      "xpath_injection": {"n": 15, "detected": 13},
-     "deserialization": {"n": 15, "detected": 12}
+     "deserialization": {"n": 15, "detected": 13}
     }
    },
    "benign": {

@@ -635,7 +635,6 @@ impl<'a> Walk<'a> {
     }
 
     /// Pure stack / memo shuffling. `None` when `op` is not in this group.
-    #[allow(clippy::cognitive_complexity)]
     fn step_stack(&mut self, op: u8) -> Option<Step> {
         // Memo writes (`PUT` family) and reads (`GET` family).
         let put = match op {
