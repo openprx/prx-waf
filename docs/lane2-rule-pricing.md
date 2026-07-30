@@ -10,6 +10,12 @@ flipped.
 `v0.2.175` added `[content_security] rules_enabled` / `rules_disabled`. This
 document is the measurement that replaces the arithmetic.
 
+The same sweep pointed the other way — one default-**on** rule taken away per
+run — prices the sixty-six rules that were already running, and is in
+[`docs/lane2-latent-pressure.md`](lane2-latent-pressure.md). Read the two
+together: this one says what the off rules would cost, that one says what the on
+rules are costing.
+
 ## How to reproduce
 
 ```bash
