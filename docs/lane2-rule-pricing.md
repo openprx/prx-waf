@@ -373,13 +373,18 @@ so there was no pattern to leave out of a compile step and no key
 `rules_enabled` would accept. `v0.2.192` gave them one. This is their price, and
 it is the first time any of them has had one.
 
-**Recorded from `c5b507f1` (`v0.2.192`)**, release build, 2×16 corpus replays
-in the disable direction plus 2×5 in the enable direction, ports `184xx`,
-Postgres on `15808`. The baseline run in both directions reproduces
-`tests/lane2/baseline.json` exactly — shadow **139 / 10 / 2**, enforce
-**75 / 2 / 2** — and every number below is read against it. `configs/default.toml`,
-the corpus, `baseline.json` and every rule's `default_on` are untouched: the
-sweep points `SRC` at a symlink mirror whose only real directory is `configs/`.
+**Recorded from `c5b507f1` (`v0.2.192`)**, release build, ports `184xx`,
+Postgres on `15808`. This section and
+[the one after it](#what-the-seven-flips-did-to-the-other-thirty-one-prices)
+share one measurement: 17 disable-direction runs (baseline, fifteen rules, one
+combination) and 12 enable-direction runs (baseline, four rules, seven
+combinations) in both modes, plus one shadow-only run that switches a rule off
+and three on at once, which `price-rules.sh` cannot express. The baseline run
+in both directions reproduces `tests/lane2/baseline.json` exactly — shadow
+**139 / 10 / 2**, enforce **75 / 2 / 2** — and every number below is read
+against it. `configs/default.toml`, the corpus, `baseline.json` and every rule's
+`default_on` are untouched: the sweep points `SRC` at a symlink mirror whose only
+real directory is `configs/`.
 
 Fifteen of the eighteen ship **on**, so they are priced the way
 [`lane2-latent-pressure.md`](lane2-latent-pressure.md) prices a running rule —

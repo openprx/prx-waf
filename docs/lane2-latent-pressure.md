@@ -1,7 +1,8 @@
 # What the Lane 2 rules that are already on are touching
 
 [`docs/lane2-rule-pricing.md`](lane2-rule-pricing.md) priced the thirty-one Lane
-2 rules that ship off, and its most useful column was the widest one. `touched`
+2 rules that shipped off at the time, and its most useful column was the widest
+one. `touched`
 counts benign corpus rows a rule fires on **whatever bucket they end in**, and it
 found something no other column could: eleven default-off rules that recover no
 attack, produce no false positive, and fire on benign traffic anyway — the
@@ -12,6 +13,19 @@ free — they are one weight change away from expensive.
 That measurement was about rules nobody had ever run. This one asks the same
 question about the sixty-six that have been running all along.
 
+> **The inventory grew after this run and the answer did not change.**
+> `v0.2.192` put the eighteen rules that decide in code on the switchable
+> surface, so `rules semantic` lists **115 keys, 81 on and 34 off** rather than
+> 97/66/31, and the fifteen of those eighteen that ship on now have prices of
+> their own — including the two this document could name as false-positive
+> sources and could not switch. Their `touched`/`over` classification is in
+> [`lane2-rule-pricing.md`](lane2-rule-pricing.md#the-eighteen-rules-that-decide-in-code)
+> and it lands where this one does: **none of the fifteen has latent pressure
+> either.** Across all 81 running rules the split is 70 clean, 0 latent, 11
+> already in the false-positive count. Every number in this document is a
+> measurement of the sixty-six and is unchanged; the paragraphs the growth
+> falsified are marked where they stand.
+
 It cannot be asked in the shipped posture. A default-on rule is already firing,
 so nothing moves when you look at it: no bucket delta, no FP count, no
 fp-block count. A rule quietly in contact with a third of the benign corpus and
@@ -21,7 +35,7 @@ them apart is to take the rule away and see what stops.
 ## How to reproduce
 
 ```bash
-DIRECTION=disable tests/lane2/price-rules.sh                  # all 66, one at a time
+DIRECTION=disable tests/lane2/price-rules.sh                  # all 66 then, all 81 now
 DIRECTION=disable tests/lane2/price-rules.sh rce_ast.cmd_subst
 python3 tests/lane2/price-rules.py --dir "$WORK/pricing" --direction disable
 ```
@@ -60,11 +74,16 @@ a threshold and already counted in the ten false positives. The entire hidden
 population — benign contact that no existing number can see — is **three rows on
 one rule**.
 
-| classification | rules |
-|---|--:|
-| **clean** — fires on no benign row | 57 |
-| **latent pressure** — fires on benign rows, crosses nothing | **0** |
-| **already in the FP count** — at least one benign row over a threshold | 9 |
+| classification | rules | + the fifteen code-decided (`v0.2.192`) |
+|---|--:|--:|
+| **clean** — fires on no benign row | 57 | 70 |
+| **latent pressure** — fires on benign rows, crosses nothing | **0** | **0** |
+| **already in the FP count** — at least one benign row over a threshold | 9 | 11 |
+
+The third column is the same classification over the whole running set of 81
+once the code-decided rules could be swept. The two rules it adds to the bottom
+row are `xss.script_tag` (three benign rows, all over a threshold) and
+`xss.event_handler` (one, over). The middle row stays empty.
 
 Compare the same three buckets on the default-off set, where eleven rules land
 in the middle row and one of them carries 94 rows. The default-on set does not
@@ -176,9 +195,9 @@ contributor and not the cause.
 | `content-031` | 79 | `rce.cmd_subst`, `rce_ast.cmd_subst`, `traversal.sensitive_abs` | 68 / 68 / 79 — **no single removal clears it** |
 | `content-029` | 78 | `rce.piped_shell`, `rce_ast.cmd_subst` | 39 / 39 — **either removal clears it**, to sub-threshold |
 | `content-059` | 68 | `sql.union_null`, `traversal.sensitive_abs`, `xss.script_tag` | 68 / 45 / n-a — **no single removal clears it** |
-| `content-005` | 45 | `xss.script_tag` | not switchable by this run's binary — see below |
-| `content-010` | 45 | `xss.script_tag` | not switchable by this run's binary — see below |
-| `content-011` | 43 | `xss.event_handler` | not switchable by this run's binary — see below |
+| `content-005` | 45 | `xss.script_tag` | not switchable by this run's binary — **clean**, measured at `v0.2.192` |
+| `content-010` | 45 | `xss.script_tag` | not switchable by this run's binary — **clean**, measured at `v0.2.192` |
+| `content-011` | 43 | `xss.event_handler` | not switchable by this run's binary — **clean**, measured at `v0.2.192` |
 | `content-033` | 41 | `rce.shell_exec_flag` | **clean** — sole cause |
 | `content-044` | 36 | `sql.union_select` | **clean** — sole cause |
 
@@ -187,8 +206,20 @@ Five of the ten have a single named rule whose removal returns the row to
 clear it, because the RCE family needs both its detectors to reach 78 and
 removing either leaves 39. Two (`content-031`, `content-059`) are carried by
 more than one rule independently and no single switch fixes them. Three
-(`content-005`, `-010`, `-011`) come from rules this config surface does not
+(`content-005`, `-010`, `-011`) came from rules this config surface did not
 reach.
+
+> **The last three are answered now.** `v0.2.192` made both keys switchable and
+> the sweep in
+> [`lane2-rule-pricing.md`](lane2-rule-pricing.md#xssscript_tag-is-the-most-expensive-rule-in-lane-2-and-the-most-valuable)
+> ran them: removing `xss.script_tag` returns `content-005` and `content-010` to
+> `clean`, and removing `xss.event_handler` returns `content-011` to `clean`. So
+> **eight of the ten false positives have a single switch that clears them**, not
+> five. The price of using those two switches is eight and four detections
+> respectively, which is the largest detection cost attached to any false
+> positive in this table. `content-059` also loses its `xss.script_tag` signal
+> and stays a false positive at 68 on the other two rules, exactly as the `n-a`
+> in its row anticipated.
 
 ### The rules this table cannot include
 
@@ -211,14 +242,26 @@ that. `xss.script_tag` fires on three benign rows and eight attack rows,
 `xss.event_handler` on one benign row and five attack rows. Turning either off
 meant turning off the XSS family.
 
-> **Superseded in `v0.2.192`.** Thirteen of those fourteen keys are switchable
-> now, along with five more the corpus never reached, so the inventory is 115
-> keys rather than 97 and every sweep in this document can be pointed at them.
-> The measurements above are unchanged — the default posture is byte-identical,
-> and this section describes what could be *reached*, not what fired. The one key
-> still outside the surface is `ast.comment_obfusc`, which is a label the AST
-> detector puts on whichever structure it already matched rather than a rule with
-> a confidence of its own; disabling the structure reaches it.
+> **Superseded in `v0.2.192`, and priced since.** Thirteen of those fourteen keys
+> are switchable now, along with five more the corpus never reached, so the
+> inventory is 115 keys rather than 97 and every sweep in this document can be
+> pointed at them. The measurements above are unchanged — the default posture is
+> byte-identical, and this section describes what could be *reached*, not what
+> fired.
+>
+> The sentence "no amount of sweeping the switchable inventory will ever show
+> that" is the one this document got wrong, and it was wrong the moment the keys
+> got a switch. The sweep exists:
+> [`lane2-rule-pricing.md`](lane2-rule-pricing.md#the-eighteen-rules-that-decide-in-code)
+> prices all eighteen. It confirms the two counts stated above — `xss.script_tag`
+> on three benign and eight attack rows, `xss.event_handler` on one benign and
+> five attack rows — and adds what "turning either off" now actually costs, which
+> is twelve detections and one block for the two together and not the whole XSS
+> family.
+>
+> The one key still outside the surface is `ast.comment_obfusc`, which is a label
+> the AST detector puts on whichever structure it already matched rather than a
+> rule with a confidence of its own; disabling the structure reaches it.
 
 ## The five rules with the most benign contact
 
@@ -339,7 +382,15 @@ Two limits on the `touched` numbers specifically:
   rows are the switchable set and not the whole engine at the time of this run.
   On the benign half those keys contribute four rows of contact, three of which
   are false positives. Thirteen of the fourteen entered the inventory in
-  `v0.2.192` and a later sweep can price them; this run predates that.
+  `v0.2.192`; the later sweep exists and is
+  [`lane2-rule-pricing.md`](lane2-rule-pricing.md#the-eighteen-rules-that-decide-in-code),
+  which prices those thirteen and five more the corpus had never reached. It
+  reports the same four rows of benign contact this run saw from outside, so the
+  two agree, and it adds one classification this document could not: **a rule can
+  read as zero because a stronger construct on the same field outranks it, not
+  because it found nothing.** `xss.base_href` is the worked example. Nothing in
+  the sixty-six rows above was checked for that, so any `touched = 0` in this
+  document's table carries the same ambiguity.
 
 `docs/lane2-blind-spots.md` remains the attack-side companion; this document
 says nothing about what Lane 2 misses.
