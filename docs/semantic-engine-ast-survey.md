@@ -114,8 +114,8 @@ are `$ne` / `$gt` / `$or` / `$regex` / `$expr`, every one of which has a written
 rule that ships **default-off** pending holdout calibration. A parser adds
 nothing to a rule that is switched off.
 
-The remaining two are the interesting ones, and they are extractor bugs, not
-detector bugs:
+The remaining two are the interesting ones, and they expose a systematic blind
+class rather than a tuning gap:
 
 ```
 nosql-009  POST /login   application/x-www-form-urlencoded
@@ -125,13 +125,29 @@ nosql-010  GET  /api/users?user%5B%24ne%5D=admin&pw%5B%24ne%5D=x
 
 PHP, Rails, Express (`qs`) and Fastify all expand `password[$ne]=x` into the
 nested object `{"password": {"$ne": "x"}}` before it reaches the database driver.
-That is how this bypass works in the wild. Lane 2 never surfaces `$ne` as an
-operator leaf here because the form-parameter splitter does not implement bracket
-notation. The fix is in `struct_extract`, and it would make the *existing*
-default-off rules effective the day they are calibrated.
+That is how this bypass is delivered in the wild.
 
-**Verdict: already equivalent to an AST. Do not add a parser; teach the extractor
-bracket notation.**
+Neither row can be detected at all in the current shape, and the reason is the
+same for both. `NOSQL_RULES` are **anchored** (`^\$(where|function|accumulator)$`)
+— deliberately, because anchoring to a whole leaf is what buys the precision that
+lets the rule ship default-on. An anchored rule only ever matches a view whose
+*entire* text is the operator, which means it can only match a leaf that
+`extract_body_fields` produced. And:
+
+* a `x-www-form-urlencoded` body produces **no leaves at all** — the whole body
+  is the only view (`struct_extract.rs:1008`,
+  `form_urlencoded_body_is_not_extracted`);
+* a query string is **one field**, not one per parameter
+  (`preprocess.rs:1057`) — `user[$ne]=admin&pw[$ne]=x` is a single view.
+
+So the family's operator detection is reachable only through JSON, XML, GraphQL
+and multipart bodies. Every MongoDB operator injection arriving as a form
+parameter or a query parameter is structurally invisible, regardless of which
+rules are switched on. That is a real gap and it is entirely in the extractor.
+
+**Verdict: already equivalent to an AST — the tree is `serde_json`'s. Do not add
+a parser. Surface form and query parameters as leaves, with bracket-notation
+expansion, so the anchored rules can reach them.**
 
 ### XXE — the deliberate refusal is still correct
 
@@ -530,10 +546,12 @@ If one thing is done, in order:
    all; it is the missing few lines that keep four corpus rows, three of them
    carrying `document.cookie`, permanently below the Block threshold. Zero new
    surface. Ranked second only because it fixes enforcement, not detection.
-3. **NoSQL — bracket notation in the form-parameter extractor.** `password[$ne]=x`
-   is how this bypass is actually delivered, and `qs` / Rails / PHP all expand it.
-   Extractor work, not detector work; it makes the already-written default-off
-   rules effective on the day they are calibrated.
+3. **NoSQL — surface form and query parameters as leaves.** The operator rules
+   are anchored to a whole leaf, form bodies produce no leaves, and a query
+   string is one field, so every operator injection outside a JSON/XML/GraphQL
+   body is unreachable no matter which rules are on. Extractor work, not detector
+   work; it also makes the already-written default-off rules effective on the day
+   they are calibrated.
 4. **Everything else — configuration and rule rows, not parsers.** Two XXE flips
    plus an XInclude row; five SSTI engine signatures; `\xNN` decoding in the
    shared preprocessor; two traversal flips gated on route scope.
