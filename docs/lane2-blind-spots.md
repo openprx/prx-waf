@@ -19,7 +19,8 @@ config file and the remedy for a detector that cannot see a shape is code.
 **The answer is that none of the 40 is a budget miss.** Two of them touch a cap;
 neither is caused by one. Every one of the 40 is a detection gap.
 
-This document is the per-case evidence for that claim.
+This document is the per-case evidence for that claim, the family roll-up, and
+a fix list ordered by what it would recover.
 
 ---
 
@@ -240,3 +241,197 @@ rule. Two never produce a leaf at all.
 | `deser-009` | base64 pickle, **protocol 4**, in a JSON string | no | – | detector gap | *probe*: the same payload at **protocol 0** (`cos\nsystem…`, base64, same JSON field) scores 90 on the `blind_decoded` view. The base64 chain works; `deser.py_pickle_global_exec` only matches the protocol-0 `GLOBAL` opcode spelling, and protocol ≥ 2 uses `SHORT_BINUNICODE` + `STACK_GLOBAL`, which carries no `c`-prefixed module token. |
 
 ---
+
+## 4. By family
+
+| family | blind | budget-caused | recoverable by enabling an existing rule | needs new detection | not a detector question |
+|---|---|---|---|---|---|
+| `nosql_injection` | 9 | 0 | 7 | 2 | 0 |
+| `ssti` | 10 | 0 | 2 | 7 | 1 (off-surface) |
+| `sql_injection` | 5 | 0 | 0 | 5 | 0 |
+| `ldap_injection` | 3 | 0 | 0 | 3 | 0 |
+| `rce` | 3 | 0 | 0 | 3 | 0 |
+| `deserialization` | 3 | 0 | 2 | 1 | 0 |
+| `traversal` | 2 | 0 | 2 | 0 | 0 |
+| `xss` | 2 | 0 | 0 | 1 | 1 (corpus artefact) |
+| `xxe` | 2 | 0 | 2 | 0 | 0 |
+| `xpath_injection` | 1 | 0 | 0 | 1 | 0 |
+| **total** | **40** | **0** | **15** | **23** | **2** |
+
+"Recoverable by enabling an existing rule" is **arithmetic, not measurement**:
+the rule's confidence times its family's detector weight is compared against
+that family's `log_threshold`. It is counted only where the rule's pattern
+demonstrably matches the payload and the product clears the threshold — so
+`ssti.jinja_delim` (30) and `ldap.bare_wildcard` (20) are excluded even though
+they match, and `rce.cmd_sep_common` (45 × 0.5 weight = 22) is excluded for the
+same reason.
+
+It could not be measured, because **`default_on` is a compile-time bool with no
+config surface**. `[content_security.attacks.*]` can set thresholds, weights
+and a hard-veto allowlist, but there is no per-rule enable key. Measuring the
+15 requires either that key or a throwaway build, and the number it would
+produce on the *benign* half is the one that actually matters — `README.md`
+says as much: turning these on "would also be the single most likely way to
+move the FP column".
+
+---
+
+## 5. Fix list
+
+Ordered by cases recovered per unit of work. Every entry's FP cost is
+unmeasured; `tests/lane2/` is the instrument that would price it, and no entry
+below should land without a before/after run of both halves of the corpus.
+
+### 1 — a per-rule enable key. 15 cases, one config surface
+
+`nosql-001/003/004/005/006/007/011`, `ssti-001/006`, `trav-005/016`,
+`xxe-004/005`, `deser-006/015`.
+
+Every one of these is a rule that already exists, already has a confidence that
+clears its threshold, and is switched off in a Rust literal. The work is not
+detection work: add `rules_enabled` / `rules_disabled` to
+`[content_security.attacks.*]`, thread it through `compile_table`, and the 15
+become a measurement instead of an argument. That measurement is the whole
+point — these rules are default-off because nobody has priced their FPs, and
+this corpus is the price list.
+
+Do this first even if the answer turns out to be "leave them off", because
+today the question cannot be asked.
+
+### 2 — NoSQL operators in form and query parameters. 2 cases, one extractor
+
+`nosql-009`, `nosql-010`.
+
+`extract_body_fields` handles multipart, JSON, GraphQL and XML, and drops
+`application/x-www-form-urlencoded` on the floor; query parameters are never
+split into name/value at all. The NoSQL rules are anchored to a whole leaf, so
+bracket notation (`password[$ne]=x`) is invisible **at any rule setting** —
+proved by probe with `$where`, which is default-on. Surfacing a
+`name[$op]`-shaped parameter key as an operator leaf reuses the allowlist and
+the existing detector.
+
+Bounded and self-contained, and it compounds with item 1.
+
+### 3 — a third SQL AST framing for unbalanced breakouts. up to 3 cases
+
+`sqli-009`, `sqli-013`, `sqli-017`.
+
+Both framings — `c = {s}` and `c = '{s}'` — need the fragment to be quote- and
+paren-balanced, which a breakout payload never is. A framing that treats the
+input's first quote as *closing* an already-open literal (`c = '` + `{s}`)
+parses `1' OR 1=1` into the tautology the AST already knows how to classify.
+`sqli-009` additionally needs a structural quote-then-comment rule; `sqli-017`
+needs the same treatment for parens.
+
+The FP surface is real and is already in the corpus: `benign-content.jsonl`
+carries SQL in content fields. Measure before believing.
+
+### 4 — `_self.` in `ssti.jinja_sink`. 1 case, one alternation
+
+`ssti-009`.
+
+`ssti.jinja_statement_sink` lists `_self.` and `ssti.jinja_sink` does not; the
+same Twig sink is covered behind `{% %}` and uncovered behind `{{ }}`. Probed
+both ways: 85 and 0. Cheapest single-case fix in this document, and it needs
+its own FP check rather than a same-day edit — `_self.` inside `{{ }}` is a
+Twig internal, rare in benign traffic, but "rare" is a claim this corpus can
+test.
+
+### 5 — a Node template-RCE rule. 2 cases, one rule
+
+`ssti-013`, `ssti-015`.
+
+`require('child_process')` and `.execSync(` appear in both, and in neither is
+there anything else to match. One co-occurrence rule in the SSTI table covers
+the Handlebars and the Pug/Nunjucks payloads. Note `ssti-013` also trips a
+per-detector input cap, which no config change reaches — a rule that only
+matches on the whole-view text would still see it.
+
+### 6 — pickle protocol ≥ 2. 1 case, one careful rule
+
+`deser-009`.
+
+The blind-decode chain already delivers the decoded pickle (proved: the
+protocol-0 payload scores 90 through exactly this path). Only the opcode
+spelling differs. This is harder than it looks: protocol ≥ 2 framing bytes
+become U+FFFD under `from_utf8_lossy`, so the rule has to match on the module
+and callable tokens surviving around the replacement characters, and
+`posix system` as a bare token pair is far noisier than `cos system`. Worth
+doing, worth doing slowly.
+
+### 7 — LDAP filter-break widening. 2 cases, one pattern
+
+`ldap-007`, `ldap-015`.
+
+`ldap.filter_break_known_attr` requires `)` `(` `attr` `=` adjacently.
+`ldap-007` puts a boolean-group open between them, `ldap-015` an `&`. Both are
+small pattern widenings — and `ldap.filter_break_known_attr` is one of the two
+rules responsible for the corpus's only two blocking false positives
+(`content-099`). This one is last on the list for a reason: it is the family
+with the least headroom.
+
+### Not worth fixing
+
+**`xss-015` — fix the corpus row, not the engine.** The payload
+`<img/src=x/onerror=alert(1)>` has no `onerror` attribute: an unquoted HTML5
+attribute value runs to whitespace or `>`, so `src` is `x/onerror=alert(1)`.
+`html5ever` is right, a browser would agree, and the quoted variant the corpus
+could have used scores 43. Any rule written to "catch" this row is a rule that
+fires on a `src` value containing a slash. Quote the row or leave it as a
+documented known-miss.
+
+**`ssti-011` — a surface decision, not a detector defect.** The payload is in
+`X-Api-Version`, outside `SEMANTIC_HEADERS`. Widening the header scope to every
+header multiplies the per-request field count on all traffic to catch a header
+name no framework reads; if the scope should grow, that is a budget-and-coverage
+argument made against real traffic, not a fix for one corpus row.
+`classify.py` already reports it separately for this reason.
+
+**`ldap-005` (`user=*&pw=*`) — no rule can carry this.** The entire signal is a
+`*` in two form fields. `ldap.bare_wildcard` exists, is default-off, and at
+conf 20 cannot reach `log_threshold = 40` even switched on — which is the right
+outcome. A rule that fires here fires on every wildcard search box.
+
+**`rce-002` (`&& id`) — the design already answered this.** `rce.cmd_sep_common`
+matches at 45, and RCE is a two-detector family at 0.5 weight, so it scores 22.
+Raising the weight or the confidence to make one weak separator rule log on its
+own discards the corroboration requirement that keeps `rce_ast.cmd_subst` from
+blocking five documentation pages — see the FP breakdown in
+`tests/lane2/README.md`.
+
+**`sqli-008` (`ORDER BY 8--`) — it is a valid query.** Adding an `ORDER BY` arm
+to the AST classifier means firing on every listing endpoint that takes a sort
+column. The column-count probe is only distinguishable from a sort parameter by
+rate, and rate is Lane 1's job.
+
+**`ssti-012` / `ssti-014` — payloads built to have no literal to match.** One
+hex-escapes the dunder, the other splits it across parameters so it arrives
+without its leading dot. Catching them means matching `attr(` or a hex escape,
+whose FP surface is any page of templating documentation. These are the `hard`
+tier doing what the `hard` tier is for.
+
+---
+
+## 6. What this document does not establish
+
+* **The 15 "recoverable by enabling an existing rule" are arithmetic.** Nothing
+  was flipped and re-measured, because there is no config key to flip. The
+  number is confidence × weight vs `log_threshold` with the pattern checked by
+  eye against the payload. Item 1 of the fix list exists to turn it into a
+  measurement.
+* **No FP cost in this document is measured except the budget one.** The only
+  measured FP movement is `max_ast_attempts_per_request` 6 → 64 taking
+  `content-033` from `fp-log` to `fp-block` (0.91% → 1.36% of the benign half).
+* **The per-case budget attribution depends on a serial replay.** Scraping
+  counters either side of one request is exact only because nothing else was in
+  flight. The same method under load would attribute another request's
+  exhaustion to whichever probe happened to bracket it.
+* **`degraded` remains unreadable per-request for a blind row.** The metrics
+  scrape is a workaround, not a fix: a request that produces no signal writes no
+  observation, so the flag added in `v0.2.146` cannot be read back for exactly
+  the population it was added to describe. Whether an observation should be
+  persisted for a degraded-but-signal-free request is a real question and is
+  deliberately not answered here.
+* **Two `wrong-family`, one `sub-threshold` and two `misattributed` rows were
+  not examined.** This document covers the 40 `blind` rows only; the other three
+  misses have different causes and a different fix shape.
