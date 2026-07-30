@@ -11,6 +11,32 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The TLS listener speaks HTTP/2.** ALPN now advertises `h2` ahead of
+  `http/1.1`, so a browser negotiates HTTP/2 and a client that only speaks
+  HTTP/1.1 is still served. Nothing else about the endpoint changes: the same
+  routing, the same detectors, the same body inspection, and the same
+  certificate.
+
+  It could not be switched on before, because routing read the `Host` header
+  and Pingora's h2 server does not write one — it delivers `:authority` in the
+  request URI and passes the field map through untouched, so every compliant h2
+  request would have routed on the empty string and got a 404. That is the same
+  defect HTTP/3 shipped with, and it now has one fix rather than three:
+  `gateway::authority::route_authority` decides which site a request addressed,
+  for all three protocols. HTTP/1.1 is unaffected by construction — Pingora
+  refuses the two request-target forms that carry an authority, so that path
+  reads the `Host` field it always read.
+
+- **A request whose authority contradicts its `Host` is refused with 400**, and
+  counted as
+  `prxwaf_budget_events_total{subsystem="request_headers",limit="contradicted_authority"}`.
+  Reachable on h2, where a client may send both and neither `h2` nor Pingora
+  compares them; not reachable on HTTP/1.1, whose request targets carry no
+  authority. Picking a side would be the desync itself — this proxy would apply
+  one site's policy to a request the origin resolves as another's — so the
+  request is refused instead. Any non-zero value on that counter is an
+  attempted request desync, not a tuning signal.
+
 - **`upstream_ssl` splits "the site is TLS" from "the origin is TLS".** `ssl`
   was answering both questions with one bit. It is the flag ACME issues a
   certificate against — a statement about what clients speak to the site — and
