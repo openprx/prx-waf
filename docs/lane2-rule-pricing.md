@@ -28,6 +28,12 @@ union names no rule to leave off.
 128 detected / 10 false positives / 2 blocking false positives, enforce 75
 blocked / 2 / 2. Every delta below is read against those numbers.
 
+**Recorded from `9df9c045` (`v0.2.181`)**, release build, `configs/default.toml`
+unmodified except for the one `rules_enabled` line each run substitutes, 2×39
+corpus replays plus one combination. `baseline.json`, the corpus and every
+rule's `default_on` are untouched by this work: the sweep points `SRC` at a
+symlink mirror of the tree whose only real directory is `configs/`.
+
 ## How to read the columns
 
 | column | meaning |
