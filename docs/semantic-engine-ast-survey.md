@@ -824,3 +824,14 @@ sufficient to *adopt* a crate, only as sufficient to decline one.
 * **`xxe-005` is asserted, not run.** `RuleKind::Count(3)` should fire on a
   payload declaring three entities; the counting semantics (per view? per
   request?) were read, not exercised.
+* **Three claims in this document's own first draft were wrong**, and each was
+  caught by going and checking rather than by reasoning harder: that
+  `serde-pickle` resolves globals into callables (it does not — it whitelists
+  seven and discards the rest); that no crate parses an RFC 4515 filter string
+  (two do); and that `sxd-xpath`'s parser could not be used without an XML
+  document (`Factory::build` does exactly that). A fourth, the pickle protocol
+  boundary, was off by two protocol versions. The pattern is consistent enough to
+  be worth naming: **every error was an availability or capability claim made
+  from memory, and every measured claim held.** Treat the unmeasured assertions
+  that remain — the PHP `serialize()` reasoning, the CPU column — with the
+  matching suspicion.
