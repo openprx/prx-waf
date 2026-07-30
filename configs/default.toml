@@ -37,8 +37,10 @@ listen_addr = "0.0.0.0:80"
 # HTTP/2 AND HTTP/1.1, IN THAT ORDER. ALPN offers `h2` first, so a client that
 # speaks both negotiates HTTP/2 and one that speaks only HTTP/1.1 is still
 # served. Both versions run the same routing, the same detectors and the same
-# body inspection; there is no knob because there is no difference in policy
-# between them. An h2 request addresses its site with `:authority`, and one that
+# body inspection; there is no detection-policy knob because there is no
+# difference in policy between them (HTTP/2's own frame-layer DoS limits live in
+# [proxy.http2] further down). An h2 request addresses its site with
+# `:authority`, and one that
 # also carries a `Host` naming a different site is refused with 400 rather than
 # routed under one name and served under the other.
 listen_addr_tls = "0.0.0.0:443"
@@ -97,6 +99,31 @@ drain_timeout_secs = 30
 # identically in the config both processes read.
 #
 # upgrade_sock = "/run/prx-waf/upgrade.sock"
+
+# ── HTTP/2 frame-layer limits (TLS listener, ALPN h2) ─────────────────────────
+# These bound the HTTP/2 denial-of-service surface — Rapid Reset
+# (CVE-2023-44487), the CONTINUATION flood (CVE-2024-27316), and control-frame
+# floods. They are h2-crate ceilings, enforced inside the connection accept loop
+# before a request reaches any detector, NOT a detection-policy knob (h2 and
+# HTTP/1.1 still run the identical policy). The defaults below are exactly what
+# the listener ran with before this section existed, so leaving it out changes
+# nothing; the reason to set it is to TIGHTEN a ceiling. Every value is
+# validated at startup and a wedging value (0 streams, 0 resets, a header
+# ceiling under 1 KiB) is a hard error. See docs/http2-attack-surface.md for the
+# measured behaviour behind each one.
+#
+# [proxy.http2]
+# The most request streams one connection may keep open at once
+# (SETTINGS_MAX_CONCURRENT_STREAMS). Lower to cap per-connection fan-out.
+# max_concurrent_streams = 100
+# The decoded header-list byte ceiling (SETTINGS_MAX_HEADER_LIST_SIZE), enforced
+# by h2 DURING accumulation, so it also bounds a CONTINUATION flood.
+# max_header_list_size_bytes = 65536
+# How many streams a client may reset before this server has accepted them
+# before the whole connection is failed with GOAWAY(ENHANCE_YOUR_CALM). This is
+# the Rapid-Reset ceiling; a handful covers the polite cancellations real
+# clients send, and lowering it kills a reset flood sooner.
+# max_pending_accept_reset_streams = 20
 
 # ── Worker threads — the size of the proxy data plane ─────────────────────────
 # How many threads accept, inspect and relay requests. This is the one knob that

@@ -16,8 +16,8 @@ use gateway::{
 use waf_api::notify_runtime::{MonitoredPool, NotifyRuntime};
 use waf_api::{AppState, start_api_server};
 use waf_common::config::{
-    ApiConfig, AppConfig, ConfigError, SecurityConfig, WorkerThreadPlan, WorkerThreadSource, apply_env_overrides,
-    load_config,
+    ApiConfig, AppConfig, ConfigError, Http2Config, SecurityConfig, WorkerThreadPlan, WorkerThreadSource,
+    apply_env_overrides, load_config,
 };
 use waf_common::metrics::MetricsConfig;
 use waf_engine::checks::ResponseCheckSet;
@@ -2289,6 +2289,21 @@ fn run_server(config: &AppConfig, taking_over: bool) -> anyhow::Result<()> {
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
     proxy_service.add_tcp(&config.proxy.listen_addr);
     add_tls_endpoint(&mut proxy_service, &tls_listener);
+    // HTTP/2 is only reachable over the TLS listener's ALPN, so its frame-layer
+    // limits are only worth setting — and only worth announcing — when that
+    // listener actually bound. The options themselves are harmless otherwise;
+    // the guard keeps the log honest about which requests they can govern.
+    if matches!(tls_listener, TlsListener::Ready { .. })
+        && let Some(app) = proxy_service.app_logic_mut()
+    {
+        let h2 = &config.proxy.http2;
+        app.h2_options = Some(build_h2_options(h2));
+        info!(
+            "HTTP/2 limits: max_concurrent_streams={}, max_header_list_size={}B, \
+             max_pending_accept_reset_streams={} (h2 Rapid-Reset ceiling; GOAWAY ENHANCE_YOUR_CALM past it)",
+            h2.max_concurrent_streams, h2.max_header_list_size_bytes, h2.max_pending_accept_reset_streams
+        );
+    }
     server.add_service(proxy_service);
 
     info!("Proxy listening on {}", config.proxy.listen_addr);
@@ -2518,6 +2533,24 @@ fn add_tls_endpoint<SV>(service: &mut pingora_core::services::listening::Service
             "TLS listener on {addr} could not be created from {cert} / {key}: {e}. The plaintext listener is unaffected."
         ),
     }
+}
+
+/// Build the `h2` server options for the TLS listener from configuration.
+///
+/// Starts from Pingora's `default_h2_options()` — which already pins the
+/// concurrent-stream and header-list ceilings — then applies the configured
+/// values over all three knobs, including the pending-accept reset ceiling that
+/// `default_h2_options()` leaves at `h2`'s compiled-in default. Setting it
+/// explicitly means a future `h2` upgrade that changes that default cannot
+/// silently move this proxy's Rapid-Reset (CVE-2023-44487) defense. With the
+/// shipped config every value equals what the listener ran with before, so this
+/// changes nothing until an operator tightens it.
+fn build_h2_options(cfg: &Http2Config) -> pingora_core::protocols::http::v2::server::H2Options {
+    let mut options = pingora_core::protocols::http::v2::server::default_h2_options();
+    options.max_concurrent_streams(cfg.max_concurrent_streams);
+    options.max_header_list_size(cfg.max_header_list_size_bytes);
+    options.max_pending_accept_reset_streams(cfg.max_pending_accept_reset_streams as usize);
+    options
 }
 
 /// Render a family list for the broadcast: `a, b, c`, or `none` when empty.

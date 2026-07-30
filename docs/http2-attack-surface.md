@@ -152,12 +152,98 @@ loop, its ceiling is the client's own bandwidth, identical to any other traffic
 the connection carries. There is no per-connection amplification to close, so
 nothing here is exposed as a knob.
 
+## Measured behaviour
+
+A raw HTTP/2 client (literal HPACK, no polite library would send these frames)
+was driven at a debug build of the real proxy over TLS, on a private port, with
+a plaintext origin behind it. The data-plane process's CPU (jiffies from
+`/proc/<pid>/stat`) and RSS were sampled around each flood. The host was under
+concurrent build load throughout (`load1` 2.2–6.9), which only makes the near-zero
+attack costs below more conservative.
+
+### Rapid Reset
+
+A single connection blasting 500 `HEADERS`+`RST_STREAM` pairs, sent as one
+burst with no reads in between:
+
+```
+ALPN=h2
+SENT_STREAMS=500
+GOAWAY_CODE=11            # ENHANCE_YOUR_CALM
+GOAWAY_DEBUG=too_many_resets
+GOAWAY_LAST_STREAM=41     # stream 41 == the 21st stream: killed one past the ceiling of 20
+PEER_CLOSED=yes
+DP_CPU_TICKS_DELTA=1      # ~10 ms of server CPU for the whole burst
+```
+
+Daemon log, same run: `h2::proto::streams::recv: recv_reset;
+remotely-reset pending-accept streams reached limit (20)`. The origin was hit
+zero times by the 500 reset streams (only the one legitimate baseline GET
+reached it) — so the WAF ran no detection on any reset stream.
+
+Sustained, to show it holds under a real storm: 80 sequential connections ×
+500 streams = **40,000 rapid-reset streams**. Every connection was cut with
+`GOAWAY(11)`; the data plane spent **36 jiffies (~0.36 s) of CPU total** across
+all 40,000 — roughly half of what a single first request costs in TLS+warmup —
+and RSS grew 8 KiB with no leak. The listener stayed up and served a normal
+request immediately afterwards (`DATA=ORIGIN-REACHED`). Throughput of rejection
+reached ~15,000 streams/s. This is the definition of holding: the attacker pays
+a full round trip per stream and the server pays microseconds.
+
+### CONTINUATION flood
+
+One connection opening a header block and never closing it, then a run of
+`CONTINUATION` frames each padded with a throwaway header:
+
+```
+ALPN=h2
+SENT_CONTINUATIONS=163   # the client's own send buffer broke before it finished
+GOAWAY_CODE=11           # ENHANCE_YOUR_CALM
+GOAWAY_DEBUG=too_many_continuations
+PEER_CLOSED=yes
+DP_CPU_TICKS_DELTA=0
+```
+
+`h2` refused the block mid-flight, at the frame-count ceiling, for no measurable
+CPU. The request never completed, so no detector ever saw it.
+
+### Control-frame floods
+
+Confirmed by construction (see section 3); no unbounded buffer exists to grow,
+so there is nothing to measure beyond the per-frame CPU the socket read loop
+already bounds.
+
 ## Disposition
 
 The `h2` crate already answers every surface HTTP/2 adds here, with defaults
 that are the crate authors' own CVE responses, and Pingora keeps those defaults.
-The honest conclusion for all three is **covered upstream** — so no counter or
-guard is added in this repository that would merely duplicate one that already
-fires earlier and closer to the frames.
+The conclusion for all three is **covered upstream** — no counter or guard is
+added in this repository that would merely duplicate one that already fires
+earlier and closer to the frames.
 
-<!-- Measured behaviour is appended after the empirical run. -->
+Two things were done, neither of which is a duplicate guard:
+
+1. **The three ceilings are exposed as optional config** (`[proxy.http2]`:
+   `max_concurrent_streams`, `max_header_list_size_bytes`,
+   `max_pending_accept_reset_streams`), each defaulting to the value the
+   listener already ran with. This gives an operator a hardening lever and, for
+   the reset ceiling, **pins a value that Pingora's `default_h2_options()`
+   otherwise leaves floating** at whatever `h2` version is compiled in — so a
+   future `cargo update` cannot silently weaken the Rapid-Reset defense. Wiring
+   is `crates/prx-waf/src/main.rs` (`build_h2_options`, applied to the proxy
+   service when the TLS listener binds); config and validation are in
+   `crates/waf-common/src/config.rs` (`Http2Config`).
+
+2. **The knobs are proven to bite.** With `[proxy.http2]
+   max_pending_accept_reset_streams = 3`, the same Rapid-Reset burst was cut at
+   `GOAWAY_LAST_STREAM=7` — the 4th stream — instead of the 21st, and the
+   server's advertised SETTINGS changed from `MAX_CONCURRENT_STREAMS=100 /
+   MAX_HEADER_LIST_SIZE=65536` to the configured `10 / 8192`. Tightening the
+   ceiling demonstrably moves the kill earlier; that is the whole point of the
+   lever. A wedging value (0 streams, 0 resets, a sub-1-KiB header ceiling) is
+   rejected at startup rather than served.
+
+What was **not** done, and why: no WAF-layer reset accounting, no request-cost
+metering on cancelled streams, no CONTINUATION counter. All three would sit
+behind `h2`'s guards, fire later, and cost more — the anti-pattern this
+investigation was meant to avoid.

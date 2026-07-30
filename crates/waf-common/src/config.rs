@@ -187,7 +187,32 @@ impl AppConfig {
         self.content_security.validate()?;
         self.owasp.validate()?;
         self.notifications.validate()?;
+        self.proxy.http2.validate()?;
         self.audit_log.validate()
+    }
+}
+
+impl Http2Config {
+    /// Reject values that would wedge the HTTP/2 listener rather than harden it.
+    ///
+    /// Zero concurrent streams or zero pending-accept resets would refuse every
+    /// client; a header-list ceiling below what a bare request's pseudo-headers
+    /// need would 431 all traffic. These are bounds against a footgun, not a
+    /// policy — any value at or above them is the operator's to choose.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_concurrent_streams == 0 {
+            return Err("[proxy.http2] max_concurrent_streams must be at least 1".to_string());
+        }
+        if self.max_pending_accept_reset_streams == 0 {
+            return Err("[proxy.http2] max_pending_accept_reset_streams must be at least 1".to_string());
+        }
+        if self.max_header_list_size_bytes < 1024 {
+            return Err(format!(
+                "[proxy.http2] max_header_list_size_bytes must be at least 1024, got {}",
+                self.max_header_list_size_bytes
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -848,6 +873,11 @@ pub struct ProxyConfig {
     /// anything still running.
     #[serde(default = "default_drain_timeout_secs")]
     pub drain_timeout_secs: u64,
+    /// HTTP/2 frame-layer limits for the TLS listener. Every field defaults to
+    /// the value the listener already ran with, so leaving this table out
+    /// changes nothing — see [`Http2Config`].
+    #[serde(default)]
+    pub http2: Http2Config,
 }
 
 /// See [`ProxyConfig::drain_timeout_secs`].
@@ -869,6 +899,73 @@ impl Default for ProxyConfig {
             upstream_timeouts: UpstreamTimeoutConfig::default(),
             upgrade_sock: None,
             drain_timeout_secs: default_drain_timeout_secs(),
+            http2: Http2Config::default(),
+        }
+    }
+}
+
+/// HTTP/2 frame-layer limits for the TLS listener (ALPN `h2`).
+///
+/// These are `h2`-crate knobs, not anything this proxy implements. `h2` 0.4.15
+/// already answers the HTTP/2 denial-of-service surface — Rapid Reset
+/// (CVE-2023-44487), the CONTINUATION flood (CVE-2024-27316), and the
+/// control-frame floods — inside `conn.accept()`, before a request ever reaches
+/// WAF detection. The defaults here reproduce exactly what the listener ran
+/// with before this table existed, so an operator who sets nothing gets the
+/// same, proven behaviour; the point of the table is to let one *tighten* those
+/// ceilings for extra hardening, and to pin the reset ceiling that Pingora's
+/// `default_h2_options()` otherwise leaves floating at whatever `h2` version is
+/// compiled in. See `docs/http2-attack-surface.md` for the evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Http2Config {
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` advertised to clients: the most
+    /// request streams one connection may have open at once. Default 100
+    /// (`pingora-core-0.8.1`'s `default_h2_options`). Lower it to cap the
+    /// per-connection fan-out an attacker can hold; too low throttles
+    /// legitimate multiplexing clients.
+    #[serde(default = "default_h2_max_concurrent_streams")]
+    pub max_concurrent_streams: u32,
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE`: the decoded header-list byte ceiling,
+    /// enforced by `h2` *during* header accumulation, not only at the end — so
+    /// it also bounds a CONTINUATION flood. Default 65536 (64 KiB).
+    #[serde(default = "default_h2_max_header_list_size")]
+    pub max_header_list_size_bytes: u32,
+    /// How many streams a client may reset *before this server has accepted
+    /// them* before the whole connection is failed with
+    /// `GOAWAY(ENHANCE_YOUR_CALM)`. This is `h2`'s Rapid-Reset
+    /// (CVE-2023-44487) ceiling. Default 20 (`h2`'s
+    /// `DEFAULT_REMOTE_RESET_STREAM_MAX`). Lower it to kill a reset flood
+    /// sooner; a handful is enough for the polite cancellations real clients
+    /// send.
+    #[serde(default = "default_h2_max_pending_accept_reset_streams")]
+    pub max_pending_accept_reset_streams: u32,
+}
+
+/// See [`Http2Config::max_concurrent_streams`]. Matches
+/// `pingora-core-0.8.1/src/protocols/http/v2/server.rs`'s
+/// `DEFAULT_MAX_CONCURRENT_STREAMS`.
+const fn default_h2_max_concurrent_streams() -> u32 {
+    100
+}
+
+/// See [`Http2Config::max_header_list_size_bytes`]. Matches
+/// `pingora-core-0.8.1`'s `DEFAULT_MAX_HEADER_LIST_SIZE`.
+const fn default_h2_max_header_list_size() -> u32 {
+    64 * 1024
+}
+
+/// See [`Http2Config::max_pending_accept_reset_streams`]. Matches `h2`
+/// 0.4.15's `DEFAULT_REMOTE_RESET_STREAM_MAX`.
+const fn default_h2_max_pending_accept_reset_streams() -> u32 {
+    20
+}
+
+impl Default for Http2Config {
+    fn default() -> Self {
+        Self {
+            max_concurrent_streams: default_h2_max_concurrent_streams(),
+            max_header_list_size_bytes: default_h2_max_header_list_size(),
+            max_pending_accept_reset_streams: default_h2_max_pending_accept_reset_streams(),
         }
     }
 }
@@ -2539,5 +2636,75 @@ mod env_override_tests {
         let err = apply_env_overrides_from(&mut cfg, getter(&[("PRXWAF_TRUST_PROXY_HEADERS", "notabool")]))
             .expect_err("invalid bool must error");
         assert!(err.to_string().contains("PRXWAF_TRUST_PROXY_HEADERS"));
+    }
+}
+
+#[cfg(test)]
+mod http2_config_tests {
+    use super::*;
+
+    /// The shipped defaults must reproduce exactly what the listener ran with
+    /// before this table existed — the values pinned in
+    /// `pingora-core`'s `default_h2_options` and `h2`'s reset ceiling — so that
+    /// leaving `[proxy.http2]` out is a genuine no-op.
+    #[test]
+    fn defaults_match_the_pre_existing_listener() {
+        let h2 = Http2Config::default();
+        assert_eq!(h2.max_concurrent_streams, 100);
+        assert_eq!(h2.max_header_list_size_bytes, 64 * 1024);
+        assert_eq!(h2.max_pending_accept_reset_streams, 20);
+        h2.validate().expect("the shipped defaults must validate");
+    }
+
+    /// An omitted table deserialises to those same defaults, and a table that
+    /// sets only one field leaves the rest at their defaults.
+    #[test]
+    fn partial_table_keeps_other_defaults() {
+        let none: ProxyConfig = toml::from_str("listen_addr = \"0.0.0.0:80\"\nlisten_addr_tls = \"\"")
+            .expect("minimal proxy config parses");
+        assert_eq!(none.http2.max_pending_accept_reset_streams, 20);
+
+        let partial: ProxyConfig = toml::from_str(
+            "listen_addr = \"0.0.0.0:80\"\nlisten_addr_tls = \"\"\n\
+             [http2]\nmax_pending_accept_reset_streams = 3",
+        )
+        .expect("partial http2 table parses");
+        assert_eq!(partial.http2.max_pending_accept_reset_streams, 3);
+        assert_eq!(partial.http2.max_concurrent_streams, 100);
+        assert_eq!(partial.http2.max_header_list_size_bytes, 64 * 1024);
+    }
+
+    /// Values that would wedge the listener are rejected rather than served.
+    #[test]
+    fn wedging_values_are_rejected() {
+        let zero_streams = Http2Config {
+            max_concurrent_streams: 0,
+            ..Http2Config::default()
+        };
+        assert!(zero_streams.validate().is_err());
+
+        let zero_resets = Http2Config {
+            max_pending_accept_reset_streams: 0,
+            ..Http2Config::default()
+        };
+        assert!(zero_resets.validate().is_err());
+
+        let tiny_headers = Http2Config {
+            max_header_list_size_bytes: 512,
+            ..Http2Config::default()
+        };
+        assert!(tiny_headers.validate().is_err());
+    }
+
+    /// A tightened-but-sane configuration validates: hardening is the operator's
+    /// to choose above the footgun floor.
+    #[test]
+    fn tightened_but_sane_config_validates() {
+        let hardened = Http2Config {
+            max_concurrent_streams: 10,
+            max_header_list_size_bytes: 8 * 1024,
+            max_pending_accept_reset_streams: 3,
+        };
+        hardened.validate().expect("a tightened config must be allowed");
     }
 }
