@@ -795,10 +795,12 @@ impl SemanticDetector for RceStructuralDetector {
 /// `/etc/passwd` literal never appears raw, is invisible to Lane 1 but surfaces
 /// here after the semantic preprocessor decodes it.
 ///
-/// The plain-`../` rule is **default-off**: relative paths / JS imports
-/// (`import x from '../util'`) make a bare `../` far too noisy to run by default
-/// (P1b FP discipline). The encoded / overlong / sensitive-absolute rules are
-/// default-on: those forms are almost never legitimate.
+/// The plain-`../` rule is the one that stays **default-off**: relative paths /
+/// JS imports (`import x from '../util'`) make a bare `../` far too noisy to run
+/// by default (P1b FP discipline), and the pricing sweep charged it two false
+/// positives for one attack the sensitive-absolute rules already recover. The
+/// encoded / overlong / sensitive-absolute rules are default-on: those forms are
+/// almost never legitimate.
 const TRAVERSAL_RULES: &[RuleRow] = &[
     // Overlong / invalid-UTF-8 encodings of `../` — always malicious.
     (
@@ -864,16 +866,20 @@ const TRAVERSAL_RULES: &[RuleRow] = &[
         RuleKind::Presence,
         true,
     ),
-    // DEFAULT-OFF (codex A-4): high-frequency legitimate absolute paths that are
+    // DEFAULT-ON since v0.2.187: high-frequency legitimate absolute paths that are
     // only weak traversal evidence on their own — `/etc/hosts`, `/proc/self`,
     // `/proc/<pid>/`. A reader command in front of them still fires the default-on
-    // `rce.sensitive_read` rule; this bare-path form awaits holdout calibration.
+    // `rce.sensitive_read` rule. It shipped off pending "holdout calibration"; the
+    // calibration happened (`docs/lane2-rule-pricing.md`) and priced it at +1
+    // detection (`trav-005`) for zero false positives and zero contact with any of
+    // the 220 benign rows — so the confidence stays at 55, below `block_threshold`,
+    // and the rule buys a shadow event and nothing else.
     (
         "traversal.sensitive_abs_ops",
         55,
         r"/etc/hosts\b|/proc/self\b|/proc/version\b|/proc/[0-9]+/",
         RuleKind::Presence,
-        false,
+        true,
     ),
     // DEFAULT-OFF (high-noise): a plain decoded `../` / `..\`. Also catches the
     // `....//` double-write bypass (it contains `../` as a substring). Relative
@@ -888,8 +894,9 @@ pub struct TraversalStructuralDetector {
 }
 
 impl TraversalStructuralDetector {
-    /// Compile the **default-on** rules (the noisy plain-`../` rule awaits
-    /// holdout calibration and is not compiled).
+    /// Compile the **default-on** rules (the noisy plain-`../` rule is priced at
+    /// two false positives for nothing the rest of the table misses, and is not
+    /// compiled).
     /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
@@ -958,11 +965,12 @@ impl SemanticDetector for TraversalStructuralDetector {
 /// expansion.
 ///
 /// FP discipline mirrors the other families: the strong, essentially-never-benign
-/// structures (external entity declaration, parameter-entity definition) ship
-/// **default-on**; the noisy structures that also occur in legitimate XML
-/// (external `<!DOCTYPE … PUBLIC "…//DTD…" "http://…">` as used by every XHTML
-/// page, a bare `%name;` reference, a handful of internal entity declarations)
-/// ship **default-off** and await holdout calibration.
+/// structures (external entity declaration, parameter-entity definition, and —
+/// since v0.2.187 — three or more internal entity declarations in one document)
+/// ship **default-on**; the structures that also occur in legitimate XML with a
+/// single occurrence (external `<!DOCTYPE … PUBLIC "…//DTD…" "http://…">` as used
+/// by every XHTML page, a bare `%name;` reference) stay **default-off**, each
+/// having been priced at one false positive for one attack.
 ///
 /// `(rule_key, confidence, pattern, kind, default_on)`.
 const XXE_RULES: &[RuleRow] = &[
@@ -1016,11 +1024,14 @@ const XXE_RULES: &[RuleRow] = &[
     // Internal-entity expansion (billion-laughs family): several `<!ENTITY …>`
     // declarations in one document. A bounded frequency COUNT — the linear,
     // parse-free billion-laughs indicator (each declaration is counted, nothing is
-    // expanded). DEFAULT-OFF: a legitimate DTD may declare a few entities, so this
-    // needs holdout calibration before it runs. Note the external / parameter
-    // variants are already caught default-on above; this catches the purely
-    // internal `<!ENTITY lolN "&lolM;…">` recursion.
-    ("xxe.entity_expansion", 65, r"<!entity\b", RuleKind::Count(3), false),
+    // expanded). Note the external / parameter variants are already caught
+    // default-on above; this catches the purely internal `<!ENTITY lolN "&lolM;…">`
+    // recursion. DEFAULT-ON since v0.2.187: the worry was that a legitimate DTD
+    // declares a few entities, and the COUNT(3) threshold turns out to be enough —
+    // priced at +1 detection (`xxe-005`) and zero contact with the benign corpus,
+    // unlike its default-off sibling `xxe.doctype_external`, which costs
+    // `content-003` because one XHTML doctype is one doctype.
+    ("xxe.entity_expansion", 65, r"<!entity\b", RuleKind::Count(3), true),
 ];
 
 /// Structural XXE (XML external entity) detector (plan T2-A).
@@ -1034,8 +1045,8 @@ pub struct XxeStructuralDetector {
 
 impl XxeStructuralDetector {
     /// Compile the **default-on** rules (external entity / parameter-entity
-    /// definition). The noisy external-DOCTYPE, bare-`%name;` and internal-entity
-    /// -expansion rules await holdout calibration and are not compiled.
+    /// definition / internal-entity expansion). The noisy external-DOCTYPE and
+    /// bare-`%name;` rules each cost a false positive and are not compiled.
     /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
@@ -1097,18 +1108,19 @@ impl SemanticDetector for XxeStructuralDetector {
 ///
 /// The signal is honestly weak for a reverse proxy — a pure proxy cannot know the
 /// backend is `MongoDB`, and comparison operators (`$ne` / `$gt` …) recur in perfectly
-/// legitimate JSON query APIs — so this is the family's whole FP story (plan §四.3,
-/// single-detector families narrow with default-off high-noise rules):
-///   * **DEFAULT-ON, high confidence** — only the operators that execute
-///     server-side JavaScript (`$where` / `$function` / `$accumulator`). A
-///     legitimate client-facing JSON API essentially never lets the *user* place
-///     one of these in a query, so a user-controlled occurrence is strong evidence.
-///   * **DEFAULT-OFF** — `$expr`, the comparison, `$regex` and logical operators,
-///     which a benign filter API uses constantly. `$expr` evaluates an aggregation
-///     expression but does **not** run arbitrary server-side JS, and is a common,
-///     legitimate `MongoDB` operator, so it is not default-on evidence; it ships
-///     disabled pending holdout calibration alongside the comparison / regex /
-///     logical operators. A single one alone is not worth even a shadow log.
+/// legitimate JSON query APIs — so confidence, not enablement, is the family's FP
+/// story (plan §四.3):
+///   * **90** — the operators that execute server-side JavaScript (`$where` /
+///     `$function` / `$accumulator`). A legitimate client-facing JSON API
+///     essentially never lets the *user* place one of these in a query, so a
+///     user-controlled occurrence is strong evidence.
+///   * **75 / 60 / 55 / 45** — `$expr`, `$regex`, the comparison and the logical
+///     operators, which a benign filter API uses constantly. All four were
+///     default-off until v0.2.187 on the theory that they would flood the lane;
+///     the pricing sweep (`docs/lane2-rule-pricing.md`) measured them at seven
+///     recovered attacks and zero benign rows touched, so they now run. Their
+///     confidences keep every one of them under `block_threshold`: this family's
+///     weak operators buy a shadow observation and can never block alone.
 ///
 /// It runs no query engine and adds no parse surface: the operators are already
 /// isolated leaves bounded by the JSON walk's depth / node / field budgets, so every
@@ -1127,36 +1139,52 @@ const NOSQL_RULES: &[RuleRow] = &[
         RuleKind::Presence,
         true,
     ),
-    // `$expr`: evaluates an aggregation expression inside a query filter. Unlike the
-    // JS operators above it does NOT execute arbitrary server-side JavaScript, and
-    // it is a common, legitimate MongoDB operator (`{"$match":{"$expr":…}}`), so it
-    // is DEFAULT-OFF pending holdout calibration rather than default-on evidence.
-    ("nosql.expr_operator", 75, r"^\$expr$", RuleKind::Presence, false),
+    // ── the four operator rules, DEFAULT-ON since v0.2.187 ───────────────────
+    // All four shipped off on the theory that a filter API's ordinary vocabulary
+    // would drown the lane in shadow events. The pricing sweep
+    // (`docs/lane2-rule-pricing.md`) says the opposite on the corpus that exists:
+    // between them they recover seven attacks and fire on **none** of the 220
+    // benign rows — not "fired and stayed under threshold", but never fired. The
+    // reason is where they look, not what they match: `struct_extract` surfaces a
+    // `$`-key only as an OPERATOR LEAF of a request body, so a filter API that
+    // takes its query in a documented parameter never reaches these rules, and
+    // prose that merely mentions `$ne` is not a JSON object key.
+    //
+    // None of the four can block on its own — 75, 60, 55 and 45 are all under
+    // `block_threshold = 80` at the family's detector weight — so the whole of
+    // what an operator buys here is a Log-level observation.
+    //
+    // `$expr` evaluates an aggregation expression inside a query filter; unlike the
+    // JS operators above it does NOT execute arbitrary server-side JavaScript,
+    // which is why it is priced separately from `nosql.query_operator` and carries
+    // 75 rather than 90.
+    ("nosql.expr_operator", 75, r"^\$expr$", RuleKind::Presence, true),
     // `$regex`: attacker-supplied regex → ReDoS / auth-filter bypass. Real APIs do
-    // expose regex search, so DEFAULT-OFF pending calibration.
-    ("nosql.regex_operator", 60, r"^\$regex$", RuleKind::Presence, false),
+    // expose regex search, hence 60 rather than a blocking confidence.
+    ("nosql.regex_operator", 60, r"^\$regex$", RuleKind::Presence, true),
     // Comparison operators — the classic `{"pw":{"$ne":null}}` auth bypass, but also
-    // the bread-and-butter of every legitimate filter API. DEFAULT-OFF: far too
-    // noisy to fire (even to Log) on its own before holdout calibration.
+    // the bread-and-butter of every legitimate filter API, hence the low 55.
     (
         "nosql.comparison_operator",
         55,
         r"^\$(ne|gt|gte|lt|lte|in|nin)$",
         RuleKind::Presence,
-        false,
+        true,
     ),
-    // Logical combinators. Ubiquitous in benign queries; DEFAULT-OFF.
+    // Logical combinators. Ubiquitous in benign queries, so the weakest of the
+    // four at 45 — corroboration fodder, not evidence on its own.
     (
         "nosql.logical_operator",
         45,
         r"^\$(or|and|nor)$",
         RuleKind::Presence,
-        false,
+        true,
     ),
 ];
 
 /// Extraction allowlist: every `$`-prefixed `MongoDB` operator key that any
-/// [`NOSQL_RULES`] rule can match — the **default-off rules included**.
+/// [`NOSQL_RULES`] rule can match — the **default-off rules included** (there are
+/// none today, and the invariant is written to survive the next one).
 ///
 /// The body field-extractor ([`super::struct_extract::extract_body_fields`]) surfaces
 /// a `$`-prefixed JSON object key as an operator leaf **only** when it is in this
@@ -1171,14 +1199,14 @@ const NOSQL_RULES: &[RuleRow] = &[
 /// surface is invisible the moment that rule is enabled. The
 /// `nosql_operator_allowlist_matches_rule_operators` test guards the invariant.
 pub(super) const NOSQL_OPERATOR_KEYS: &[&str] = &[
-    // JS execution (default-on) + `$expr` (default-off).
+    // JS execution (conf 90) + `$expr` (conf 75).
     "$where",
     "$function",
     "$accumulator",
     "$expr",
-    // regex (default-off).
+    // regex (conf 60).
     "$regex",
-    // comparison (default-off).
+    // comparison (conf 55).
     "$ne",
     "$gt",
     "$gte",
@@ -1186,7 +1214,7 @@ pub(super) const NOSQL_OPERATOR_KEYS: &[&str] = &[
     "$lte",
     "$in",
     "$nin",
-    // logical (default-off).
+    // logical (conf 45).
     "$or",
     "$and",
     "$nor",
@@ -1204,9 +1232,8 @@ pub struct NoSqlStructuralDetector {
 }
 
 impl NoSqlStructuralDetector {
-    /// Compile the **default-on** rules (JS/expression operators only). The noisy
-    /// comparison / `$regex` / logical rules await holdout calibration and are not
-    /// compiled.
+    /// Compile the **default-on** rules — since v0.2.187 that is the whole table;
+    /// the family's FP control is its confidence spread, not enablement.
     /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
@@ -2018,8 +2045,8 @@ const DESER_RULES: &[RuleRow] = &[
     // Guzzle, Symfony, Doctrine, Laravel, Zend, SwiftMailer, ThinkPHP, Yii, phpseclib,
     // Imagick. A typed object with one of these class roots is essentially never benign
     // request data. The generic `O:<len>:"<any-class>":` header (which matches ordinary
-    // `stdClass` session/cookie payloads) ships default-off below. The class char class
-    // is a single bounded repetition (no nesting → linear). DEFAULT-ON.
+    // `stdClass` session/cookie payloads) runs below at a much lower confidence. The
+    // class char class is a single bounded repetition (no nesting → linear). DEFAULT-ON.
     (
         "deser.php_object_gadget",
         88,
@@ -2074,20 +2101,24 @@ const DESER_RULES: &[RuleRow] = &[
         RuleKind::Presence,
         true,
     ),
-    // ── default-off (high-noise, holdout calibration pending) ────────────────
     // Generic PHP `serialize()` OBJECT header `O:<len>:"<any-class>":<n>:{` — the
     // structural object-injection primitive, but it also matches the ordinary
     // `O:8:"stdClass"` objects that legitimate apps carry in cookies / hidden fields /
-    // caches (WP, Laravel). Only fires with the gadget-class narrowing default-on above;
-    // the class-agnostic form is DEFAULT-OFF until holdout-calibrated. The class char
+    // caches (WP, Laravel). DEFAULT-ON since v0.2.187: the predicted collision with
+    // ordinary `O:8:"stdClass"` session payloads did not materialise on the benign
+    // corpus — zero rows touched — while the rule recovers `deser-006` and
+    // `deser-015`, so the class-agnostic form now runs alongside the gadget-class
+    // narrowing default-on above. Its 60 is under `block_threshold`, so a benign
+    // serialized object that does turn up is logged, not blocked. The class char
     // class is a single bounded repetition (no nesting → linear).
     (
         "deser.php_object_injection",
         60,
         r#"o:\d+:"[a-z0-9_\\]{1,120}":\d+:\{"#,
         RuleKind::Presence,
-        false,
+        true,
     ),
+    // ── default-off (high-noise, holdout calibration pending) ────────────────
     // Bare .NET serializer TYPE names `BinaryFormatter` / `LosFormatter` — legitimate
     // framework type names that recur in .NET source, docs, code-review and security
     // discussion; not exploit gadgets on their own (the ysoserial.net gadget markers
@@ -4802,14 +4833,16 @@ mod tests {
     fn traversal_default_on_excludes_plain_dotdot() {
         let det = TraversalStructuralDetector::new();
         let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
-        for off in ["traversal.plain_dotdot", "traversal.sensitive_abs_ops"] {
-            assert!(!on.contains(off), "{off} must be default-off");
-        }
+        assert!(
+            !on.contains("traversal.plain_dotdot"),
+            "traversal.plain_dotdot must be default-off"
+        );
         for onk in [
             "traversal.overlong",
             "traversal.encoded_dotdot",
             "traversal.sensitive_abs",
             "traversal.sensitive_abs_brace",
+            "traversal.sensitive_abs_ops",
         ] {
             assert!(on.contains(onk), "{onk} must be default-on");
         }
@@ -4942,24 +4975,47 @@ mod tests {
             "../relative/import/path",
             "photo..2024.jpg",
             r#"{"path":"a/b/c","v":"3.4.5"}"#,
-            // codex A-4: high-frequency legitimate ops/container paths are now
-            // default-off — a bare mention must not fire on the production set.
+            "file=photo%252e%252ejpg&album=trip",
+        ] {
+            assert!(trav_fire(clean).is_none(), "clean traversal negative fired: {clean:?}");
+        }
+    }
+
+    /// The price of `traversal.sensitive_abs_ops` going default-on in v0.2.187,
+    /// written down where it can be seen rather than left implicit.
+    ///
+    /// The rule matches a bare `/etc/hosts` / `/proc/self` / `/proc/<pid>/`, so a
+    /// sentence that merely MENTIONS one of those paths now produces a shadow
+    /// observation. `docs/lane2-rule-pricing.md` measured the rule against 220
+    /// benign corpus rows and it touched none of them, which is why it was worth
+    /// enabling — but "no benign row in that corpus says `/etc/hosts`" is a
+    /// different claim from "no benign traffic ever will", and these five strings
+    /// are what the second claim would have to survive.
+    ///
+    /// It costs a Log-level event and nothing more: confidence 55 against a
+    /// `block_threshold` of 80, with no traversal partner to corroborate a bare
+    /// path. An operator who disagrees turns it off by rule key —
+    /// `rules_disabled = ["traversal.sensitive_abs_ops"]`.
+    #[test]
+    fn traversal_sensitive_abs_ops_now_fires_on_bare_ops_paths() {
+        for ops in [
             "resolver reads /etc/hosts for name lookups",
             "cgroup path is /proc/self/cgroup on this host",
             "healthcheck greps /proc/version for the kernel",
             "GET /proc/1/status returns process state",
             r#"{"mounts":["/etc/hosts","/etc/resolv.conf"]}"#,
-            "file=photo%252e%252ejpg&album=trip",
         ] {
-            assert!(trav_fire(clean).is_none(), "clean traversal negative fired: {clean:?}");
+            let f = trav_fire(ops).unwrap_or_else(|| panic!("ops path must now fire: {ops:?}"));
+            assert_eq!(f.rule_key, "traversal.sensitive_abs_ops", "{ops:?}");
+            assert_eq!(f.confidence, 55, "below block_threshold — a log, not a block");
         }
-        // The ops paths DO fire under the full rule set (proof they moved to the
-        // default-off `traversal.sensitive_abs_ops`, not deleted).
-        assert_eq!(
-            trav_fire_all("cat /proc/self/environ")
-                .expect("ops path fires with all rules")
-                .rule_key,
-            "traversal.sensitive_abs_ops"
+        // Turning the key off restores the pre-v0.2.187 silence exactly.
+        let toggles = RuleToggles::resolve(&[], &["traversal.sensitive_abs_ops".to_string()])
+            .expect("the rule key is in the inventory");
+        let off = TraversalStructuralDetector::with_toggles(&toggles);
+        assert!(
+            run(&off, "resolver reads /etc/hosts for name lookups").is_none(),
+            "rules_disabled must be able to take the rule back out"
         );
     }
 
@@ -4992,10 +5048,10 @@ mod tests {
     fn xxe_default_on_excludes_high_noise_rules() {
         let det = XxeStructuralDetector::new();
         let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
-        for off in ["xxe.doctype_external", "xxe.param_entity_ref", "xxe.entity_expansion"] {
+        for off in ["xxe.doctype_external", "xxe.param_entity_ref"] {
             assert!(!on.contains(off), "{off} must be default-off");
         }
-        for onk in ["xxe.entity_external", "xxe.param_entity_def"] {
+        for onk in ["xxe.entity_external", "xxe.param_entity_def", "xxe.entity_expansion"] {
             assert!(on.contains(onk), "{onk} must be default-on");
         }
     }
@@ -5027,18 +5083,29 @@ mod tests {
     }
 
     #[test]
-    fn xxe_billion_laughs_fires_only_with_expansion_rule() {
+    fn xxe_billion_laughs_fires_on_the_count_rule() {
         // Purely-internal billion-laughs: no SYSTEM/PUBLIC, no parameter entity, so
-        // the default-on rules stay silent (proving no false certainty) and only
-        // the default-off `entity_expansion` COUNT rule catches it — a parse-free,
-        // bounded frequency count, never an entity expansion.
+        // neither entity rule sees an external identifier and only `entity_expansion`
+        // catches it — a parse-free, bounded frequency count, never an expansion.
+        // Default-ON since v0.2.187; this is the `xxe-005` row the pricing sweep
+        // recovered for zero benign contact.
         let bomb = r#"<!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;"><!ENTITY lol3 "&lol2;&lol2;&lol2;">]>"#;
-        assert!(
-            xxe_fire(bomb).is_none(),
-            "no default-on rule fires on internal-only bomb"
-        );
-        let f = xxe_fire_all(bomb).expect("expansion rule fires under full rule set");
+        let f = xxe_fire(bomb).expect("internal-only bomb must fire the count rule");
         assert_eq!(f.rule_key, "xxe.entity_expansion");
+        assert_eq!(f.confidence, 65, "below block_threshold — a log, not a block");
+    }
+
+    #[test]
+    fn xxe_entity_expansion_needs_three_declarations() {
+        // What keeps the now-default-on COUNT rule off legitimate XML: a DTD that
+        // declares one or two entities is under the Count(3) threshold and stays
+        // silent. Only the third declaration in one document is the signal.
+        for quiet in [
+            r#"<!DOCTYPE d [<!ENTITY brand "acme">]>"#,
+            r#"<!DOCTYPE d [<!ENTITY brand "acme"><!ENTITY year "2026">]>"#,
+        ] {
+            assert!(xxe_fire(quiet).is_none(), "under the count threshold: {quiet}");
+        }
     }
 
     #[test]
@@ -5126,28 +5193,47 @@ mod tests {
     }
 
     #[test]
-    fn nosql_default_on_is_js_expression_operators_only() {
+    fn nosql_default_on_is_the_whole_table() {
+        // v0.2.187: the four operator rules stopped being default-off. The family's
+        // FP control is now entirely the confidence spread — 90 for the JS operators
+        // down to 45 for the logical ones — and enablement carries none of it.
         let det = NoSqlStructuralDetector::new();
         let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
-        assert!(
-            on.contains("nosql.query_operator"),
-            "JS/expr operators must be default-on"
-        );
-        for off in [
+        for onk in [
+            "nosql.query_operator",
             "nosql.expr_operator",
             "nosql.regex_operator",
             "nosql.comparison_operator",
             "nosql.logical_operator",
         ] {
-            assert!(!on.contains(off), "{off} must be default-off");
+            assert!(on.contains(onk), "{onk} must be default-on");
+        }
+        assert_eq!(on.len(), NOSQL_RULES.len(), "no NoSQL rule may be left disabled");
+    }
+
+    #[test]
+    fn nosql_no_operator_rule_can_block_alone() {
+        // The reason enabling all four was cheap: every one of them is under the
+        // 80 `block_threshold`, so the widest of them buys a shadow observation and
+        // cannot reach a blocking decision without a corroborating detector.
+        for (op, conf) in [
+            ("$where", 90u8),
+            ("$expr", 75),
+            ("$regex", 60),
+            ("$ne", 55),
+            ("$or", 45),
+        ] {
+            let f = nosql_fire(op).unwrap_or_else(|| panic!("{op} must fire default-on"));
+            assert_eq!(f.attack, AttackKind::NoSqlInjection);
+            assert_eq!(f.confidence.get(), conf, "{op}");
         }
     }
 
     #[test]
-    fn nosql_js_expression_operators_fire_default_on() {
-        // Only the operators that execute server-side JS are the default-on signal.
-        // `$expr` is NOT here (F2: it does not run JS, ships default-off). Each
-        // arrives as its own `$op` leaf.
+    fn nosql_js_expression_operators_fire_at_the_top_confidence() {
+        // The operators that execute server-side JS are the family's strongest
+        // signal and the only ones at 90; `$expr` runs too but is priced lower
+        // because it evaluates an aggregation expression rather than arbitrary JS.
         for op in ["$where", "$function", "$accumulator"] {
             let f = nosql_fire(op).unwrap_or_else(|| panic!("{op} must fire default-on"));
             assert_eq!(f.attack, AttackKind::NoSqlInjection);
@@ -5157,12 +5243,10 @@ mod tests {
     }
 
     #[test]
-    fn nosql_expr_operator_is_default_off() {
+    fn nosql_expr_operator_fires_at_its_own_lower_confidence() {
         // F2: `$expr` is a common, legitimate aggregation operator that does not run
-        // server-side JS, so it must NOT produce a default-on finding. It still fires
-        // under the full rule set as its own dedicated rule.
-        assert!(nosql_fire("$expr").is_none(), "$expr must be default-off");
-        let f = nosql_fire_all("$expr").expect("$expr fires under the full rule set");
+        // server-side JS, so it is its own rule at 75 rather than part of the 90.
+        let f = nosql_fire("$expr").expect("$expr must fire default-on");
         assert_eq!(f.rule_key, "nosql.expr_operator");
         assert_eq!(f.attack, AttackKind::NoSqlInjection);
         assert_eq!(f.confidence.get(), 75);
@@ -5204,32 +5288,50 @@ mod tests {
     }
 
     #[test]
-    fn nosql_comparison_operators_are_default_off() {
-        // `$ne`/`$gt`/… are the classic auth-bypass but far too common in benign
-        // filter APIs to fire on their own before calibration: default-off.
+    fn nosql_comparison_operators_fire_default_on() {
+        // `$ne`/`$gt`/… are the classic auth-bypass and also the vocabulary of every
+        // legitimate filter API — which is why they carry 55 and not 90, and why the
+        // pricing sweep had to run before they could be turned on.
         for op in ["$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin"] {
-            assert!(nosql_fire(op).is_none(), "{op} must be default-off");
-            let f = nosql_fire_all(op).unwrap_or_else(|| panic!("{op} fires under full rule set"));
+            let f = nosql_fire(op).unwrap_or_else(|| panic!("{op} must fire default-on"));
             assert_eq!(f.rule_key, "nosql.comparison_operator");
         }
     }
 
     #[test]
-    fn nosql_regex_and_logical_operators_are_default_off() {
-        assert!(nosql_fire("$regex").is_none(), "$regex is default-off");
+    fn nosql_regex_and_logical_operators_fire_default_on() {
         assert_eq!(
-            nosql_fire_all("$regex")
-                .expect("$regex fires under full rules")
-                .rule_key,
+            nosql_fire("$regex").expect("$regex must fire default-on").rule_key,
             "nosql.regex_operator"
         );
         for op in ["$or", "$and", "$nor"] {
-            assert!(nosql_fire(op).is_none(), "{op} is default-off");
             assert_eq!(
-                nosql_fire_all(op).unwrap_or_else(|| panic!("{op} fires")).rule_key,
+                nosql_fire(op).unwrap_or_else(|| panic!("{op} fires")).rule_key,
                 "nosql.logical_operator"
             );
         }
+    }
+
+    #[test]
+    fn nosql_operator_rules_can_all_be_switched_back_off() {
+        // The escape hatch for an operator whose filter API does put `$`-operators
+        // in a request body: every one of the four is addressable by rule key.
+        let disabled: Vec<String> = [
+            "nosql.expr_operator",
+            "nosql.regex_operator",
+            "nosql.comparison_operator",
+            "nosql.logical_operator",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let toggles = RuleToggles::resolve(&[], &disabled).expect("all four keys are in the inventory");
+        let det = NoSqlStructuralDetector::with_toggles(&toggles);
+        for op in ["$expr", "$regex", "$ne", "$or"] {
+            assert!(run(&det, op).is_none(), "{op} must go quiet again when disabled");
+        }
+        // …without taking the JS operators with them.
+        assert!(run(&det, "$where").is_some(), "the strong rule stays on");
     }
 
     #[test]
@@ -5993,9 +6095,7 @@ mod tests {
             "deser.php_array",
             "deser.py_reduce",
             "deser.java_pkg_generic",
-            // F-E / F-F: the class-agnostic PHP object header and the bare .NET
-            // formatter type names are demoted to default-off (FP-prone).
-            "deser.php_object_injection",
+            // F-F: the bare .NET formatter type names stay default-off (FP-prone).
             "deser.dotnet_formatter_name",
         ] {
             assert!(!on.contains(off), "{off} must be default-off");
@@ -6004,8 +6104,10 @@ mod tests {
             "deser.java_serial_b64",
             "deser.java_hex_magic",
             "deser.java_gadget_class",
-            // F-E: the gadget-class-narrowed PHP object rule replaces the generic one.
+            // F-E: the gadget-class-narrowed PHP object rule, and — since v0.2.187 —
+            // the class-agnostic generic one alongside it at a lower confidence.
             "deser.php_object_gadget",
+            "deser.php_object_injection",
             "deser.php_phar",
             "deser.py_pickle_global_exec",
             "deser.dotnet_binaryformatter_b64",
@@ -6141,12 +6243,6 @@ mod tests {
                 "dependency: org.apache.commons.collections:3.2.1",
                 "deser.java_pkg_generic",
             ),
-            // F-E: a legit `stdClass` object serialization (WP/Laravel cookie/cache)
-            // matches only the class-agnostic, now default-off generic rule.
-            (
-                r#"O:8:"stdClass":1:{s:4:"name";s:3:"joe";}"#,
-                "deser.php_object_injection",
-            ),
             // F-F: the bare .NET formatter type name in prose / code review is
             // default-off; only the true ysoserial.net gadget markers fire default-on.
             (
@@ -6164,25 +6260,28 @@ mod tests {
     }
 
     #[test]
-    fn deser_php_gadget_fires_but_benign_stdclass_does_not() {
-        // F-E: the gadget-class-narrowed PHP object rule catches a real PHPGGC chain
-        // (Monolog/Guzzle/Symfony/… class root) default-on, while an ordinary
-        // `O:8:"stdClass"` typed object — normal PHP session/cookie serialization —
-        // does NOT fire under the default set.
+    fn deser_php_object_rules_separate_by_confidence_not_by_enablement() {
+        // F-E: a real PHPGGC chain (Monolog/Guzzle/Symfony/… class root) wins the
+        // gadget rule at 88. Since v0.2.187 an ordinary `O:8:"stdClass"` typed
+        // object — normal PHP session/cookie serialization — also fires, but on the
+        // class-agnostic rule at 60, and the distance between the two confidences is
+        // now the whole of the separation. That was the trade: the pricing sweep
+        // recovered `deser-006` and `deser-015` and touched no benign corpus row,
+        // and 60 is under `block_threshold`, so an app that really does put
+        // serialized objects in a cookie gets logged rather than broken.
         assert_eq!(
             deser_fire(r#"O:39:"GuzzleHttp\Psr7\FnStream":2:{s:7:"methods";}"#)
                 .expect("guzzle gadget object fires")
                 .rule_key,
             "deser.php_object_gadget",
         );
-        for benign in [
+        for generic in [
             r#"O:8:"stdClass":1:{s:4:"name";s:3:"joe";}"#,
             r#"O:4:"User":2:{s:2:"id";i:7;s:4:"name";s:3:"amy";}"#,
         ] {
-            assert!(
-                deser_fire(benign).is_none(),
-                "benign PHP object serialization must not fire default-on: {benign}"
-            );
+            let f = deser_fire(generic).unwrap_or_else(|| panic!("generic object now fires: {generic}"));
+            assert_eq!(f.rule_key, "deser.php_object_injection", "{generic}");
+            assert_eq!(f.confidence.get(), 60, "a log, not a block");
         }
     }
 

