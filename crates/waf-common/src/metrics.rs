@@ -495,7 +495,7 @@ impl BudgetEvent {
     /// Every variant, in declaration order. The exposition walks this, so a new
     /// variant appears in `/metrics` (at zero) the moment it is added — a
     /// counter an operator has never seen fire still has to be graphable.
-    const ALL: [Self; 50] = [
+    const ALL: [Self; 51] = [
         Self::HeaderValueCountExceeded,
         Self::HeaderFoldBytesExceeded,
         Self::DuplicateHost,
