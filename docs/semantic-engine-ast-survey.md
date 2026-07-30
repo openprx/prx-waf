@@ -95,7 +95,7 @@ corpus (LDAP, below). Neither prototype is in the tree; this is a survey.
 | Traversal | encoding regexes (`detectors.rs:582`) | `typed-path` | nothing; both misses are default-off rules | small | small | **do not** |
 | SSTI | delimiter+sink co-occurrence (`detectors.rs:1141`) | none — six incompatible grammars | would need 6 parsers for ~6 rows | six template parsers | high | **do not** — no parser exists that covers the family |
 | LDAP | filter-break regexes (`detectors.rs:1342`) | none usable; ~120 lines of our own | +1 attack, 3× benign FPs (measured) | small (tiny grammar) | negligible | **do not** — measured, not assumed |
-| XPath | structural regexes (`detectors.rs:1536`) | `sxd-xpath` (parser not cleanly separable) | 1 row (`' or 1=1 or ''='`) | recursive-descent expression parser | small | **do not** at family level; see SQL-AST reuse note |
+| XPath | structural regexes (`detectors.rs:1536`) | `sxd-xpath` — usable, but unmaintained since 2018 | nothing: its one catchable miss is already caught by the SQL AST | recursive-descent expression parser | small | **do not** — the parse is already paid for |
 | Deserialization | format-magic + gadget regexes (`detectors.rs:1787`) | pickle: our own ~200-line opcode walker | **protocol ≥2 pickles, which are every real pickle** | ~zero — a flat opcode loop, no recursion, no unpickling | negligible | **should, and the candidate is ours to write** |
 | XSS-JS | token scan of extracted handler bodies (`xss_js.rs`) | `boa_parser` / `oxc_parser` / `swc_ecma_parser` | see below | **the largest in the survey** | high | see below |
 
@@ -495,10 +495,31 @@ So the XPath family's *measured* deficit against a parser is: one XQuery row tha
 an XPath parser could not have caught either. A second recursive-descent
 expression parser would be added to catch nothing.
 
+This is *not* a "no usable parser exists" verdict, and the first draft of this
+document wrongly said it was. `sxd-xpath` exposes standalone expression parsing —
+`Factory::build(&str)`, no XML document required — and it was compiled and run
+against the two rows to check rather than assumed:
+
+```
+xpath-007 substituted   //user[name='' or 1=1 or ''='']                     -> Ok(parsed)
+xpath-013 raw           x' return //user/password] for $x in //user ...     -> Err(ExtraUnparsedTokens)
+benign                  /root/child[@id='3']                                -> Ok(parsed)
+```
+
+So an XPath AST detector is buildable, and it would confirm `xpath-013` is not
+XPath at all. Its diligence is clean on every axis except the one that matters
+most: `sxd-xpath` 0.4.2 was released **2018-10-31**, four transitive crates
+(`sxd-document`, `peresil`, `quick-error`, `typed-arena` 1.x — all of comparable
+age), MIT/Apache-2.0, no C toolchain, no advisories in `cargo audit`.
+
+It is still the wrong call, because it would be a **second** recursive-descent
+parser, adopted from a package with no releases in seven and a half years, to
+catch a row the tree already catches with a parser it already maintains.
+
 The real XPath finding is a **reporting** one, not a detection one: a tautology
-that both families can see is attributed to whichever detector reports it, and
-the family-level recall table understates XPath as a result. That is worth a note
-in the corpus report; it is not worth `sxd-xpath`.
+both families can see is attributed to whichever detector reports it, and the
+family-level recall table understates XPath as a result. That is worth a note in
+the corpus report; it is not worth a dependency.
 
 **Verdict: do not.**
 
@@ -628,6 +649,49 @@ If one thing is done, in order:
 
 Nothing above requires a new parser dependency. That is the survey's conclusion,
 not an accident of ordering.
+
+## Appendix — candidate crate diligence
+
+Every crate named anywhere above, checked on the axes `deny.toml` actually gates.
+Versions and dates from the crates.io API; trees from a scratch project resolved
+against the live index; advisories from `cargo audit` with a freshly fetched
+RustSec database (1173 advisories loaded); licences checked against
+`[licenses] allow` in `deny.toml`.
+
+| crate | latest | released | maintained | RUSTSEC | licence | transitive | C toolchain |
+|---|---|---|---|---|---|---|---|
+| `typed-path` | 0.12.3 | 2026-02-11 | yes | none | MIT OR Apache-2.0 | **0** | no |
+| `serde-pickle` | 1.2.0 | 2024-11-22 | yes | none | MIT/Apache-2.0 | 7 | no |
+| `sxd-xpath` | 0.4.2 | **2018-10-31** | **no — 7.5 y** | none | MIT/Apache-2.0 | 4 | no |
+| `oxc_parser` | 0.142.0 | 2026-07-27 | very active | none | MIT | 76 | no |
+| `swc_ecma_parser` | 43.0.0 | 2026-07-29 | very active | none | Apache-2.0 | 116 | **yes** (`stacker`→`psm`→`cc`) |
+| `boa_parser` | 0.21.1 | 2026-03-29 | active | RUSTSEC-2024-0436 (`paste`, transitive, unmaintained) | Unlicense OR MIT | 75 | no |
+| `ressa` | 0.9.0-alpha.3 | 2023-06-11 | stale | 4× unmaintained (`unic-*`) | MIT | 24 | no |
+| `rslint_parser` | 0.3.1 | 2021-10-06 | **dead** (superseded by Biome) | RUSTSEC-2023-0055, RUSTSEC-2023-0086 (both unsound), RUSTSEC-2021-0145 (`atty`) | MIT | 41 | no |
+| `roxmltree` | 0.21.1 | 2025-10-12 | yes | none | MIT OR Apache-2.0 | — | no |
+| `quick-xml` | 0.41.0 | 2026-06-29 | yes | none (0.41 fixes RUSTSEC-2026-0194/0195) | MIT | — | no — **already in the tree** |
+| `minijinja` | 2.21.0 | 2026-06-17 | very active | none | Apache-2.0 | — | no |
+| `handlebars` | 6.4.3 | 2026-07-12 | very active | none | MIT | — | no |
+| `jaded` | 0.5.0 | 2024-10-01 | yes | none | MIT | — | no |
+
+Notes that changed a conclusion:
+
+* **`ldap-filter` does not exist on crates.io.** There is no crate that parses an
+  RFC 4515 filter *string* into an AST. `ldap3` (0.12.1, 2025-09-18) is a client
+  and does not expose a filter parser as public API; `rasn-ldap` handles the
+  ASN.1/BER *wire* encoding, which is a different language from the textual
+  filter syntax. The LDAP prototype above is therefore ~120 lines of our own,
+  which is what it was measured as.
+* **`unicode-ident` reports `(MIT OR Apache-2.0) AND Unicode-3.0`.** All three
+  are on the allowlist, so it passes; a naive SPDX splitter flags it, and it is
+  already in this tree via `syn` regardless.
+* **`swc_ecma_parser` is the only C dependency in the survey**, and it arrives
+  through `stacker`/`psm` — the exact pair `crates/waf-engine/Cargo.toml:36`
+  deliberately dropped by taking `sqlparser` with `default-features = false`.
+
+Unverified: `sxd-xpath`, `roxmltree`, `minijinja`, `handlebars` and `jaded` were
+not fuzz-audited, and upstream `fuzz/` directories were not surveyed for any
+candidate. Since the recommendation adds no crate, this was not pursued further.
 
 ## What this survey did not settle
 
