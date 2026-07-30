@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.154"
+version = "0.2.155"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -57,7 +57,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
 
-# Database - PostgreSQL (default-features = false to exclude mysql/sqlite which pull in rsa RUSTSEC-2023-0071)
+# Database - PostgreSQL. `default-features = false` is a supply-chain guard, not
+# a size optimisation: the mysql driver depends on `rsa`, which carries
+# RUSTSEC-2023-0071 (Marvin) with no fixed release. Turning it on here would put
+# that crate back in the graph — the jsonwebtoken backend below is the other
+# half of keeping it out.
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "chrono", "uuid", "json"] }
 
 # Utilities

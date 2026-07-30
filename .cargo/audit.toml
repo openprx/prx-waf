@@ -19,14 +19,12 @@
 # Re-verified against the live tree on 2026-07-25 with cargo-audit 0.22.1 and
 # cargo-deny 0.20.2 (the version pinned by cargo-deny-action@v2).
 #
+# RUSTSEC-2023-0071 (rsa 0.9.10, Marvin timing sidechannel) was dropped from
+# this list on 2026-07-30: jsonwebtoken now uses its `aws_lc_rs` backend rather
+# than `rust_crypto`, which was the sole path to the crate, and `cargo tree -i
+# rsa` no longer matches anything. There is nothing left to exempt.
+#
 # Current entries — full reasoning in deny.toml:
-#   RUSTSEC-2023-0071  rsa 0.9.10 Marvin timing sidechannel. Compiled via
-#                      jsonwebtoken(rust_crypto) -> waf-api, but waf-api signs
-#                      and verifies JWTs only with HMAC/HS256, so the RSA
-#                      private-key path is never invoked. No upstream fix
-#                      (patched = []). jsonwebtoken 11.0.0 still declares
-#                      `rsa ^0.9.6` under rust_crypto, so upgrading it does not
-#                      remove the crate.
 #   RUSTSEC-2024-0437  protobuf 2.28.0 recursive-parsing crash, via
 #                      pingora-core -> prometheus 0.13 -> protobuf v2.
 #   RUSTSEC-2025-0069  daemonize 0.5.0 unmaintained, via pingora-core.
@@ -41,7 +39,6 @@
 #                      bans by name.
 [advisories]
 ignore = [
-    "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0437",
     "RUSTSEC-2025-0069",
     "RUSTSEC-2024-0388",
