@@ -11,7 +11,6 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-<<<<<<< HEAD
 - **Lane 2 rules can be switched on and off from config.** `[content_security]`
   takes `rules_enabled` and `rules_disabled`, two lists of rule keys that amend
   the state each detector rule ships in. Both are empty by default and the
@@ -53,7 +52,6 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   config whose typo just refused to start. It also states what it does not
   cover: the AST SQLi detector and both XSS detectors decide in code rather than
   from a keyed table and expose no switchable rule.
-=======
 - **The deserialization detector reads pickle opcodes.** The shipped
   `deser.py_pickle_global_exec` rule matches the *text* `GLOBAL` opcode,
   `c<module>\n<callable>`. `save_global` stops emitting that at protocol 4, and
@@ -91,7 +89,6 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   `blind` to detected), enforce blocking **74 → 75**, and the benign half is
   unchanged — the same **10** false positives and the same **2** blocking false
   positives, by name.
->>>>>>> 3cf96040 (Record the corpus measurement the walker moved)
 
 - **The TLS listener speaks HTTP/2.** ALPN now advertises `h2` ahead of
   `http/1.1`, so a browser negotiates HTTP/2 and a client that only speaks
