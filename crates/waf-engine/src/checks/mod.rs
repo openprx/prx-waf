@@ -21,7 +21,8 @@ pub use bot::{
 pub use cc::CcCheck;
 pub use content_security::{
     AttackKind, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict, EnforcementMode, InspectionScope,
-    RuntimeContentSecurityConfig, SemanticAction, SemanticVerdict,
+    RuleToggles, RuntimeContentSecurityConfig, SemanticAction, SemanticRuleInfo, SemanticVerdict,
+    semantic_rule_inventory,
 };
 pub use dir_traversal::DirTraversalCheck;
 // `Lane1BodyBudget` is defined in this module (see below) and re-exported by

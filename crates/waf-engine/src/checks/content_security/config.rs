@@ -14,6 +14,7 @@ use crate::checks::Lane1BodyBudget;
 
 use super::budget::Budget;
 use super::canary::BreakerConfig;
+use super::detectors::RuleToggles;
 use super::scoring::RuntimeScoringConfig;
 use super::types::AttackKind;
 
@@ -72,6 +73,10 @@ pub struct RuntimeContentSecurityConfig {
     pub lane1_body_budget: Lane1BodyBudget,
     pub breaker: BreakerConfig,
     pub scoring: RuntimeScoringConfig,
+    /// Per-rule amendment to the detectors' compiled-in `default_on` states,
+    /// resolved from `rules_enabled` / `rules_disabled`. Empty by default, in
+    /// which case every detector compiles exactly the rule set it always did.
+    pub rule_toggles: RuleToggles,
 }
 
 impl Default for RuntimeContentSecurityConfig {
@@ -92,6 +97,7 @@ impl Default for RuntimeContentSecurityConfig {
             lane1_body_budget: Lane1BodyBudget::DEFAULT,
             breaker: BreakerConfig::default(),
             scoring: RuntimeScoringConfig::default(),
+            rule_toggles: RuleToggles::default(),
         }
     }
 }
@@ -137,6 +143,11 @@ impl RuntimeContentSecurityConfig {
             lane1_body_budget: Lane1BodyBudget::from_bytes(cfg.lane1.max_body_bytes),
             breaker: BreakerConfig::from_config(&cfg.breaker),
             scoring: RuntimeScoringConfig::compile(cfg)?,
+            // Resolved here, against the engine's rule inventory, for the same
+            // reason the detector ids are: `waf-common` must not learn what rules
+            // exist. An unknown key returns `Err` and the caller (`main.rs`)
+            // turns that into a refused startup.
+            rule_toggles: RuleToggles::resolve(&cfg.rules_enabled, &cfg.rules_disabled)?,
         })
     }
 }
@@ -223,6 +234,43 @@ mod tests {
                 "{fam:?} hard-veto allowlist must be empty pre-holdout"
             );
         }
+    }
+
+    #[test]
+    fn compile_resolves_rule_toggles() {
+        let cfg = ContentSecurityConfig {
+            rules_enabled: vec!["nosql.comparison_operator".to_string()],
+            rules_disabled: vec!["sql.union_select".to_string()],
+            ..ContentSecurityConfig::default()
+        };
+        let rt = RuntimeContentSecurityConfig::compile(&cfg).expect("known keys compile");
+        assert_eq!(rt.rule_toggles.forced_on(), vec!["nosql.comparison_operator"]);
+        assert_eq!(rt.rule_toggles.forced_off(), vec!["sql.union_select"]);
+    }
+
+    #[test]
+    fn compile_refuses_an_unknown_rule_key() {
+        // The whole point of resolving here rather than warning at first use:
+        // startup stops, so a typo cannot masquerade as a rule that does nothing.
+        let cfg = ContentSecurityConfig {
+            rules_enabled: vec!["nosql.comparison_operatr".to_string()],
+            ..ContentSecurityConfig::default()
+        };
+        let err = RuntimeContentSecurityConfig::compile(&cfg).expect_err("must not compile");
+        assert!(err.contains("nosql.comparison_operatr"), "{err}");
+    }
+
+    #[test]
+    fn shipped_default_toml_amends_no_rule() {
+        // The shipped config documents the switches with two empty lists. If it
+        // ever ships a non-empty one, every recorded detection baseline in the
+        // repository is measuring a different rule set than it claims to.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/default.toml");
+        let app = waf_common::config::load_config(path).expect("shipped default.toml must load + validate");
+        assert!(app.content_security.rules_enabled.is_empty());
+        assert!(app.content_security.rules_disabled.is_empty());
+        let rt = RuntimeContentSecurityConfig::compile(&app.content_security).expect("compiles");
+        assert!(rt.rule_toggles.is_empty());
     }
 
     #[test]

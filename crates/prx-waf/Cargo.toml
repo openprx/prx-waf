@@ -23,6 +23,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 ipnet = { workspace = true }
+# `rules semantic --format json` emits the Lane 2 rule inventory for a script to
+# diff. Already in the tree via waf-common/waf-engine, so this is a link, not a
+# new supply-chain edge.
+serde_json = { workspace = true }
 rustls = { workspace = true }
 nix = { workspace = true }
 

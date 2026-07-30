@@ -15,6 +15,7 @@
 //! log_only`, so a match is at most logged + persisted, never a Block.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::LazyLock;
 
@@ -55,19 +56,19 @@ struct CompiledRule {
 ///
 /// `default_on = false` marks a rule that ships **disabled** by default: a
 /// high-noise pattern that requires holdout calibration before it may run in
-/// production (plan v2.2). [`compile_table`] compiles only the `default_on`
-/// subset unless `all` is set (test-only).
+/// production (plan v2.2). [`compile_table`] compiles the `default_on` subset as
+/// amended by the operator's [`RuleToggles`].
 type RuleRow = (&'static str, u8, &'static str, RuleKind, bool);
 
-/// Compile a rule table, keeping either the default-on subset or every row.
+/// Compile a rule table, keeping the rows [`RuleToggles`] resolves to enabled.
 ///
 /// A pattern that fails to compile (a bug — the patterns are constants) is
 /// logged and skipped rather than panicking, so a detector degrades to a smaller
 /// rule set instead of aborting startup (iron rule: no panic in production).
-fn compile_table(table: &[RuleRow], all: bool, who: &str) -> Vec<CompiledRule> {
+fn compile_table(table: &[RuleRow], toggles: &RuleToggles, who: &str) -> Vec<CompiledRule> {
     let mut rules = Vec::with_capacity(table.len());
     for (rule_key, confidence, pattern, kind, default_on) in table {
-        if !all && !*default_on {
+        if !toggles.is_enabled(rule_key, *default_on) {
             continue;
         }
         match Regex::new(pattern) {
@@ -84,6 +85,233 @@ fn compile_table(table: &[RuleRow], all: bool, who: &str) -> Vec<CompiledRule> {
         }
     }
     rules
+}
+
+// ── Per-rule enable / disable surface ─────────────────────────────────────────
+//
+// `default_on` used to be the last word: a `bool` literal in a rule table, read
+// by `compile_table`, with `all = true` reachable only from `#[cfg(test)]`
+// constructors. A rule that shipped off could not be switched on without editing
+// Rust and cutting a release, so "the rule exists but is default-off" was a
+// statement about the source tree and not about anything an operator could do —
+// and the fifteen blind corpus rows that `docs/lane2-blind-spots.md` attributes
+// to default-off rules were an arithmetic estimate rather than a measurement,
+// because the experiment could not be run.
+//
+// The two types below are what makes the question askable. [`SemanticRuleInfo`]
+// is the inventory — every rule this build carries, with the state it ships in —
+// and [`RuleToggles`] is the operator's amendment to it, resolved from
+// `[content_security] rules_enabled / rules_disabled` **against** that inventory,
+// so a key that names no rule is a startup failure rather than a line in a config
+// file that silently does nothing.
+
+/// One rule in the compiled-in Lane 2 inventory: what it is, which family and
+/// detector own it, and the state it ships in.
+///
+/// This is the introspection surface behind `prx-waf rules semantic`. It carries
+/// no pattern: the regex is an implementation detail and printing it would invite
+/// operators to reason about the text instead of the rule key, which is the only
+/// stable identifier (the same reason a [`DetectionFinding`] names `rule_key` and
+/// never echoes the payload).
+#[derive(Debug, Clone, Copy)]
+pub struct SemanticRuleInfo {
+    /// Stable matching key — the spelling `rules_enabled` / `rules_disabled` and
+    /// the per-family `hard_veto_allowlist` both use.
+    pub key: &'static str,
+    /// The attack family that scores this rule.
+    pub family: AttackKind,
+    /// The detector that owns the rule, i.e. which `weights` entry its confidence
+    /// is multiplied by.
+    pub detector: DetectorId,
+    /// Graded confidence `0..=100` contributed on a match.
+    pub confidence: u8,
+    /// `1` for a presence rule; `n` for a density rule that needs `n` matches.
+    pub min_matches: usize,
+    /// Whether the rule is compiled in with no operator amendment.
+    pub default_on: bool,
+}
+
+/// Every regex rule table, with the family and detector that own it. The single
+/// place that knows which table belongs to whom, so the inventory, the CLI and
+/// the toggle validation cannot disagree about it.
+const RULE_TABLES: &[(AttackKind, DetectorId, &[RuleRow])] = &[
+    (AttackKind::SqlInjection, DetectorId::StructRule, RULES),
+    (AttackKind::Rce, DetectorId::Rce, RCE_RULES),
+    (AttackKind::Traversal, DetectorId::Traversal, TRAVERSAL_RULES),
+    (AttackKind::Xxe, DetectorId::XxeStruct, XXE_RULES),
+    (AttackKind::NoSqlInjection, DetectorId::NoSqlStruct, NOSQL_RULES),
+    (AttackKind::Ssti, DetectorId::SstiStruct, SSTI_RULES),
+    (AttackKind::LdapInjection, DetectorId::LdapStruct, LDAP_RULES),
+    (AttackKind::XpathInjection, DetectorId::XpathStruct, XPATH_RULES),
+    (AttackKind::Deserialization, DetectorId::DeserStruct, DESER_RULES),
+];
+
+/// Every keyed rule this build carries, in table order.
+///
+/// Completeness is load-bearing twice over: [`RuleToggles::resolve`] rejects any
+/// key not listed here, and [`RuleToggles::all`] is what the `with_all_rules`
+/// test constructors compile from — so a rule table that is not listed above
+/// would fail this module's existing `*_all_rules_compile` tests rather than
+/// quietly become unreachable from config.
+#[must_use]
+pub fn semantic_rule_inventory() -> Vec<SemanticRuleInfo> {
+    let mut out = Vec::new();
+    for (family, detector, table) in RULE_TABLES {
+        for (key, confidence, _pattern, kind, default_on) in *table {
+            out.push(SemanticRuleInfo {
+                key,
+                family: *family,
+                detector: *detector,
+                confidence: *confidence,
+                min_matches: match kind {
+                    RuleKind::Presence => 1,
+                    RuleKind::Count(n) => *n,
+                },
+                default_on: *default_on,
+            });
+        }
+    }
+    // The shell-AST RCE rules are keyed the same way but carry no regex, so they
+    // live in their own table shape. They belong in the inventory all the same:
+    // `rce_ast.cmd_subst_any` is a default-off rule an operator may want to price.
+    for rule in RCE_AST_RULES {
+        out.push(SemanticRuleInfo {
+            key: rule.key,
+            family: AttackKind::Rce,
+            detector: DetectorId::RceAst,
+            confidence: rule.confidence,
+            min_matches: 1,
+            default_on: rule.default_on,
+        });
+    }
+    out
+}
+
+/// The operator's per-rule amendment to the shipped `default_on` states.
+///
+/// Empty is the shipped posture: [`Self::is_enabled`] then returns `default_on`
+/// unchanged, so a config that mentions no rule produces byte-identical detector
+/// sets. Every key held here was resolved against [`semantic_rule_inventory`],
+/// which is why the fields are `&'static str` — a key that reached this struct
+/// provably names a rule that exists.
+#[derive(Debug, Clone, Default)]
+pub struct RuleToggles {
+    on: BTreeSet<&'static str>,
+    off: BTreeSet<&'static str>,
+}
+
+impl RuleToggles {
+    /// Resolve `rules_enabled` / `rules_disabled` against the inventory.
+    ///
+    /// An unknown key is an error, not a warning: this repository has repeatedly
+    /// shipped config keys that parsed, validated and were never read by anything
+    /// (`start_status`, `max_list_items`, `listen_addr_tls`), and every one of
+    /// them cost more to discover than a refused startup would have. A rule
+    /// switch that silently does nothing is the same defect wearing a security
+    /// label, so a typo stops the process at boot with the key quoted back.
+    ///
+    /// Listing the same key in both directions is also an error rather than a
+    /// precedence puzzle — there is no reading of that config that is obviously
+    /// what its author meant.
+    pub fn resolve(enable: &[String], disable: &[String]) -> Result<Self, String> {
+        let inventory = semantic_rule_inventory();
+        let known: BTreeSet<&'static str> = inventory.iter().map(|r| r.key).collect();
+
+        let on = Self::resolve_side(enable, &known, "rules_enabled")?;
+        let off = Self::resolve_side(disable, &known, "rules_disabled")?;
+
+        let mut both: Vec<&str> = on.intersection(&off).copied().collect();
+        if !both.is_empty() {
+            both.sort_unstable();
+            return Err(format!(
+                "content_security.rules_enabled and rules_disabled both list {} — pick one direction per rule",
+                both.join(", ")
+            ));
+        }
+        Ok(Self { on, off })
+    }
+
+    /// Resolve one direction's keys against the inventory.
+    fn resolve_side(
+        keys: &[String],
+        known: &BTreeSet<&'static str>,
+        field: &str,
+    ) -> Result<BTreeSet<&'static str>, String> {
+        let mut out = BTreeSet::new();
+        for key in keys {
+            let Some(resolved) = known.get(key.as_str()) else {
+                return Err(format!(
+                    "content_security.{field} references '{key}', which is not a switchable \
+                     rule key{}. `prx-waf rules semantic` lists every key that can be switched \
+                     (the AST SQLi and XSS detectors decide in code and expose none)",
+                    Self::did_you_mean(key, known)
+                ));
+            };
+            out.insert(*resolved);
+        }
+        Ok(out)
+    }
+
+    /// A single unambiguous near-miss, or nothing. Deliberately narrow: a wrong
+    /// suggestion is worse than none when the message's job is to end a search.
+    fn did_you_mean(key: &str, known: &BTreeSet<&'static str>) -> String {
+        let mut hits = known.iter().filter(|k| k.eq_ignore_ascii_case(key));
+        if let (Some(hit), None) = (hits.next(), hits.next()) {
+            return format!(" (did you mean '{hit}'?)");
+        }
+        let mut hits = known.iter().filter(|k| k.contains(key));
+        if let (Some(hit), None) = (hits.next(), hits.next()) {
+            return format!(" (did you mean '{hit}'?)");
+        }
+        String::new()
+    }
+
+    /// Turn on every rule in the inventory. Test-only: production reaches the
+    /// same rules through `rules_enabled`, one priced key at a time.
+    #[cfg(test)]
+    #[must_use]
+    pub fn all() -> Self {
+        Self {
+            on: semantic_rule_inventory().iter().map(|r| r.key).collect(),
+            off: BTreeSet::new(),
+        }
+    }
+
+    /// Whether `key` runs, given the state it ships in.
+    ///
+    /// A key in neither set keeps `default_on`. `resolve` rejects a key in both,
+    /// so the precedence below is unreachable from a config file; it prefers
+    /// `off` for a struct built any other way, because an operator who disables a
+    /// rule is usually reacting to a live false positive and keeping it on would
+    /// be the more damaging way to be wrong.
+    #[must_use]
+    pub fn is_enabled(&self, key: &str, default_on: bool) -> bool {
+        if self.off.contains(key) {
+            false
+        } else if self.on.contains(key) {
+            true
+        } else {
+            default_on
+        }
+    }
+
+    /// The keys forced on, in sorted order — for the startup broadcast.
+    #[must_use]
+    pub fn forced_on(&self) -> Vec<&'static str> {
+        self.on.iter().copied().collect()
+    }
+
+    /// The keys forced off, in sorted order — for the startup broadcast.
+    #[must_use]
+    pub fn forced_off(&self) -> Vec<&'static str> {
+        self.off.iter().copied().collect()
+    }
+
+    /// Whether the operator amended anything at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.on.is_empty() && self.off.is_empty()
+    }
 }
 
 /// Return the strongest firing rule (highest confidence) over the haystack, or
@@ -209,9 +437,11 @@ impl StructuralSqlDetector {
     /// The high-noise stacked / chr / hex / `information_schema` rules are
     /// `default_on = false` (plan v2.2) and are **not** compiled here; they await
     /// holdout calibration before they may run in production.
+    ///
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
-        Self::compile(false)
+        Self::with_toggles(&RuleToggles::default())
     }
 
     /// Test-only constructor that compiles **every** rule in the table, including
@@ -219,14 +449,16 @@ impl StructuralSqlDetector {
     #[cfg(test)]
     #[must_use]
     pub fn with_all_rules() -> Self {
-        Self::compile(true)
+        Self::with_toggles(&RuleToggles::all())
     }
 
-    /// Compile the rule table, keeping either the default-on subset or all rules.
+    /// Compile the rules the operator's [`RuleToggles`] leaves enabled — the
+    /// shipped `default_on` subset as amended by `[content_security]`
+    /// `rules_enabled` / `rules_disabled`.
     #[must_use]
-    fn compile(all: bool) -> Self {
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
-            rules: compile_table(RULES, all, "StructuralSqlDetector"),
+            rules: compile_table(RULES, toggles, "StructuralSqlDetector"),
         }
     }
 }
@@ -441,10 +673,19 @@ pub struct RceStructuralDetector {
 impl RceStructuralDetector {
     /// Compile the **default-on** rules (the high-noise `cmd_sep_common` /
     /// `backtick_any` rules await holdout calibration and are not compiled).
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_toggles(&RuleToggles::default())
+    }
+
+    /// Compile the rules the operator's [`RuleToggles`] leaves enabled — the
+    /// shipped `default_on` subset as amended by `[content_security]`
+    /// `rules_enabled` / `rules_disabled`.
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
-            rules: compile_table(RCE_RULES, false, "RceStructuralDetector"),
+            rules: compile_table(RCE_RULES, toggles, "RceStructuralDetector"),
         }
     }
 
@@ -452,9 +693,7 @@ impl RceStructuralDetector {
     #[cfg(test)]
     #[must_use]
     pub fn with_all_rules() -> Self {
-        Self {
-            rules: compile_table(RCE_RULES, true, "RceStructuralDetector"),
-        }
+        Self::with_toggles(&RuleToggles::all())
     }
 }
 
@@ -586,10 +825,19 @@ pub struct TraversalStructuralDetector {
 impl TraversalStructuralDetector {
     /// Compile the **default-on** rules (the noisy plain-`../` rule awaits
     /// holdout calibration and is not compiled).
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_toggles(&RuleToggles::default())
+    }
+
+    /// Compile the rules the operator's [`RuleToggles`] leaves enabled — the
+    /// shipped `default_on` subset as amended by `[content_security]`
+    /// `rules_enabled` / `rules_disabled`.
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
-            rules: compile_table(TRAVERSAL_RULES, false, "TraversalStructuralDetector"),
+            rules: compile_table(TRAVERSAL_RULES, toggles, "TraversalStructuralDetector"),
         }
     }
 
@@ -597,9 +845,7 @@ impl TraversalStructuralDetector {
     #[cfg(test)]
     #[must_use]
     pub fn with_all_rules() -> Self {
-        Self {
-            rules: compile_table(TRAVERSAL_RULES, true, "TraversalStructuralDetector"),
-        }
+        Self::with_toggles(&RuleToggles::all())
     }
 }
 
@@ -725,10 +971,19 @@ impl XxeStructuralDetector {
     /// Compile the **default-on** rules (external entity / parameter-entity
     /// definition). The noisy external-DOCTYPE, bare-`%name;` and internal-entity
     /// -expansion rules await holdout calibration and are not compiled.
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_toggles(&RuleToggles::default())
+    }
+
+    /// Compile the rules the operator's [`RuleToggles`] leaves enabled — the
+    /// shipped `default_on` subset as amended by `[content_security]`
+    /// `rules_enabled` / `rules_disabled`.
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
-            rules: compile_table(XXE_RULES, false, "XxeStructuralDetector"),
+            rules: compile_table(XXE_RULES, toggles, "XxeStructuralDetector"),
         }
     }
 
@@ -736,9 +991,7 @@ impl XxeStructuralDetector {
     #[cfg(test)]
     #[must_use]
     pub fn with_all_rules() -> Self {
-        Self {
-            rules: compile_table(XXE_RULES, true, "XxeStructuralDetector"),
-        }
+        Self::with_toggles(&RuleToggles::all())
     }
 }
 
@@ -889,10 +1142,19 @@ impl NoSqlStructuralDetector {
     /// Compile the **default-on** rules (JS/expression operators only). The noisy
     /// comparison / `$regex` / logical rules await holdout calibration and are not
     /// compiled.
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_toggles(&RuleToggles::default())
+    }
+
+    /// Compile the rules the operator's [`RuleToggles`] leaves enabled — the
+    /// shipped `default_on` subset as amended by `[content_security]`
+    /// `rules_enabled` / `rules_disabled`.
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
-            rules: compile_table(NOSQL_RULES, false, "NoSqlStructuralDetector"),
+            rules: compile_table(NOSQL_RULES, toggles, "NoSqlStructuralDetector"),
         }
     }
 
@@ -900,9 +1162,7 @@ impl NoSqlStructuralDetector {
     #[cfg(test)]
     #[must_use]
     pub fn with_all_rules() -> Self {
-        Self {
-            rules: compile_table(NOSQL_RULES, true, "NoSqlStructuralDetector"),
-        }
+        Self::with_toggles(&RuleToggles::all())
     }
 }
 
@@ -1147,10 +1407,19 @@ impl SstiStructuralDetector {
     /// delimiter-gated co-occurrence rules). The high-noise bare-delimiter,
     /// arithmetic-probe, lone-`getClass(`, lone-`.__class__` and bare-directive
     /// rules await holdout calibration and are not compiled.
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_toggles(&RuleToggles::default())
+    }
+
+    /// Compile the rules the operator's [`RuleToggles`] leaves enabled — the
+    /// shipped `default_on` subset as amended by `[content_security]`
+    /// `rules_enabled` / `rules_disabled`.
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
-            rules: compile_table(SSTI_RULES, false, "SstiStructuralDetector"),
+            rules: compile_table(SSTI_RULES, toggles, "SstiStructuralDetector"),
         }
     }
 
@@ -1158,9 +1427,7 @@ impl SstiStructuralDetector {
     #[cfg(test)]
     #[must_use]
     pub fn with_all_rules() -> Self {
-        Self {
-            rules: compile_table(SSTI_RULES, true, "SstiStructuralDetector"),
-        }
+        Self::with_toggles(&RuleToggles::all())
     }
 }
 
@@ -1348,10 +1615,19 @@ impl LdapStructuralDetector {
     /// auth-bypass, hex-escape and null-byte signatures). The high-noise generic
     /// break, bare-group and lone-metacharacter rules await holdout calibration and
     /// are not compiled.
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_toggles(&RuleToggles::default())
+    }
+
+    /// Compile the rules the operator's [`RuleToggles`] leaves enabled — the
+    /// shipped `default_on` subset as amended by `[content_security]`
+    /// `rules_enabled` / `rules_disabled`.
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
-            rules: compile_table(LDAP_RULES, false, "LdapStructuralDetector"),
+            rules: compile_table(LDAP_RULES, toggles, "LdapStructuralDetector"),
         }
     }
 
@@ -1359,9 +1635,7 @@ impl LdapStructuralDetector {
     #[cfg(test)]
     #[must_use]
     pub fn with_all_rules() -> Self {
-        Self {
-            rules: compile_table(LDAP_RULES, true, "LdapStructuralDetector"),
-        }
+        Self::with_toggles(&RuleToggles::all())
     }
 }
 
@@ -1542,10 +1816,19 @@ impl XpathStructuralDetector {
     /// close-then-logic, auth-bypass-function, function-axis and axis-predicate
     /// signatures). The high-noise bare-token rules await holdout calibration and
     /// are not compiled.
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_toggles(&RuleToggles::default())
+    }
+
+    /// Compile the rules the operator's [`RuleToggles`] leaves enabled — the
+    /// shipped `default_on` subset as amended by `[content_security]`
+    /// `rules_enabled` / `rules_disabled`.
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
-            rules: compile_table(XPATH_RULES, false, "XpathStructuralDetector"),
+            rules: compile_table(XPATH_RULES, toggles, "XpathStructuralDetector"),
         }
     }
 
@@ -1553,9 +1836,7 @@ impl XpathStructuralDetector {
     #[cfg(test)]
     #[must_use]
     pub fn with_all_rules() -> Self {
-        Self {
-            rules: compile_table(XPATH_RULES, true, "XpathStructuralDetector"),
-        }
+        Self::with_toggles(&RuleToggles::all())
     }
 }
 
@@ -1794,10 +2075,19 @@ impl DeserStructuralDetector {
     /// .NET `BinaryFormatter` base64 + gadget markers). The high-noise generic markers
     /// (PHP array header, bare `__reduce__`, generic Commons-Collections package) await
     /// holdout calibration and are not compiled.
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_toggles(&RuleToggles::default())
+    }
+
+    /// Compile the rules the operator's [`RuleToggles`] leaves enabled — the
+    /// shipped `default_on` subset as amended by `[content_security]`
+    /// `rules_enabled` / `rules_disabled`.
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
-            rules: compile_table(DESER_RULES, false, "DeserStructuralDetector"),
+            rules: compile_table(DESER_RULES, toggles, "DeserStructuralDetector"),
         }
     }
 
@@ -1805,9 +2095,7 @@ impl DeserStructuralDetector {
     #[cfg(test)]
     #[must_use]
     pub fn with_all_rules() -> Self {
-        Self {
-            rules: compile_table(DESER_RULES, true, "DeserStructuralDetector"),
-        }
+        Self::with_toggles(&RuleToggles::all())
     }
 }
 
@@ -2981,26 +3269,37 @@ impl ShellWalk<'_> {
 /// bodies; those forms are out of scope for T1-A.
 pub struct RceAstDetector {
     opts: ParserOptions,
-    all_rules: bool,
+    toggles: RuleToggles,
 }
 
 impl RceAstDetector {
     /// Production detector — only the default-on rules may fire.
+    ///
+    /// Equivalent to [`Self::with_toggles`] with no operator amendment.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            opts: ParserOptions::default(),
-            all_rules: false,
-        }
+        Self::with_toggles(&RuleToggles::default())
     }
 
     /// Test-only: allow every rule (including the default-off `cmd_subst_any`) to fire.
     #[cfg(test)]
     #[must_use]
     pub fn with_all_rules() -> Self {
+        Self::with_toggles(&RuleToggles::all())
+    }
+
+    /// Let the rules the operator's [`RuleToggles`] leaves enabled fire — the
+    /// shipped `default_on` subset as amended by `[content_security]`
+    /// `rules_enabled` / `rules_disabled`.
+    ///
+    /// The toggles are held rather than pre-filtered into a rule set: this
+    /// detector does not compile anything, it walks a shell AST and consults
+    /// [`rce_ast_rule`] for whatever fired.
+    #[must_use]
+    pub fn with_toggles(toggles: &RuleToggles) -> Self {
         Self {
             opts: ParserOptions::default(),
-            all_rules: true,
+            toggles: toggles.clone(),
         }
     }
 
@@ -3125,13 +3424,13 @@ impl SemanticDetector for RceAstDetector {
         };
         walk_program(&program, &mut walk);
 
-        // Pick the strongest ENABLED fired rule (default-on only in production).
-        let all = self.all_rules;
+        // Pick the strongest ENABLED fired rule (default-on only in production,
+        // as amended by the operator's per-rule toggles).
         let best = walk
             .fired
             .iter()
             .filter_map(|k| rce_ast_rule(k))
-            .filter(|r| all || r.default_on)
+            .filter(|r| self.toggles.is_enabled(r.key, r.default_on))
             .max_by_key(|r| r.confidence)?;
 
         Some(DetectionFinding {
@@ -3630,21 +3929,6 @@ mod tests {
     use crate::checks::content_security::scoring::SHARED_CONSTRUCT_RULES;
     use crate::checks::content_security::types::{InspectionScope, Provenance};
 
-    /// Every regex rule table in this module, for the whole-module invariants
-    /// below. Not the shell-AST table — its keys are a different type and none of
-    /// the invariants here apply to them.
-    const ALL_RULE_TABLES: &[&[RuleRow]] = &[
-        RULES,
-        RCE_RULES,
-        TRAVERSAL_RULES,
-        XXE_RULES,
-        NOSQL_RULES,
-        SSTI_RULES,
-        LDAP_RULES,
-        XPATH_RULES,
-        DESER_RULES,
-    ];
-
     /// The scoring module's cross-family shared-construct list names rules by a
     /// string key, and a string key is exactly the kind of reference that rots
     /// silently: rename `traversal.sensitive_abs` and the entry stops matching
@@ -3657,10 +3941,7 @@ mod tests {
     /// are the other way a hand-maintained table goes wrong.
     #[test]
     fn shared_construct_rules_all_name_a_live_rule() {
-        let live: std::collections::HashSet<&str> = ALL_RULE_TABLES
-            .iter()
-            .flat_map(|t| t.iter().map(|&(key, ..)| key))
-            .collect();
+        let live: std::collections::HashSet<&str> = semantic_rule_inventory().iter().map(|r| r.key).collect();
         for key in SHARED_CONSTRUCT_RULES {
             assert!(
                 live.contains(key),
@@ -3670,6 +3951,127 @@ mod tests {
         }
         let unique: std::collections::HashSet<&&str> = SHARED_CONSTRUCT_RULES.iter().collect();
         assert_eq!(unique.len(), SHARED_CONSTRUCT_RULES.len(), "duplicate entry");
+    }
+
+    // ── The per-rule switch surface ──────────────────────────────────────────
+
+    /// The inventory is the config vocabulary: a rule missing from it cannot be
+    /// switched, and a duplicate key would make `rules_enabled` ambiguous about
+    /// which rule it named.
+    #[test]
+    fn inventory_covers_every_table_exactly_once() {
+        let inv = semantic_rule_inventory();
+        let expected: usize = RULE_TABLES.iter().map(|(_, _, t)| t.len()).sum::<usize>() + RCE_AST_RULES.len();
+        assert_eq!(inv.len(), expected, "a rule table is missing from RULE_TABLES");
+
+        let unique: BTreeSet<&str> = inv.iter().map(|r| r.key).collect();
+        assert_eq!(unique.len(), inv.len(), "duplicate rule key across tables");
+
+        // The family a rule is scored in must agree with the family its detector
+        // is registered under; a mismatch would price a rule against the wrong
+        // thresholds in `rules semantic`.
+        for row in &inv {
+            assert!(row.confidence <= 100, "{} has a confidence outside 0..=100", row.key);
+            assert!(row.min_matches >= 1, "{} needs at least one match", row.key);
+        }
+    }
+
+    /// The shipped posture: no amendment, no change. This is the invariant the
+    /// whole feature is built around — every detection baseline in the repository
+    /// depends on it.
+    #[test]
+    fn empty_toggles_reproduce_the_default_sets() {
+        let toggles = RuleToggles::default();
+        assert!(toggles.is_empty());
+        for row in semantic_rule_inventory() {
+            assert_eq!(
+                toggles.is_enabled(row.key, row.default_on),
+                row.default_on,
+                "{} changed state with no config",
+                row.key
+            );
+        }
+        let det = StructuralSqlDetector::with_toggles(&toggles);
+        let plain = StructuralSqlDetector::new();
+        assert_eq!(det.rules.len(), plain.rules.len());
+    }
+
+    #[test]
+    fn enabling_a_default_off_rule_compiles_it_in() {
+        let toggles = RuleToggles::resolve(&["sql.info_schema".to_string()], &[]).expect("known key resolves");
+        let det = StructuralSqlDetector::with_toggles(&toggles);
+        let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
+        assert!(on.contains("sql.info_schema"), "the enabled rule must be compiled in");
+        assert!(
+            !on.contains("sql.stacked"),
+            "no other default-off rule may come along with it"
+        );
+        assert_eq!(
+            det.rules.len(),
+            StructuralSqlDetector::new().rules.len() + 1,
+            "exactly one rule was added"
+        );
+    }
+
+    #[test]
+    fn disabling_a_default_on_rule_compiles_it_out() {
+        let toggles = RuleToggles::resolve(&[], &["sql.union_select".to_string()]).expect("known key resolves");
+        let det = StructuralSqlDetector::with_toggles(&toggles);
+        let on: std::collections::HashSet<&str> = det.rules.iter().map(|r| r.rule_key).collect();
+        assert!(!on.contains("sql.union_select"));
+        assert_eq!(det.rules.len(), StructuralSqlDetector::new().rules.len() - 1);
+    }
+
+    /// The shell-AST RCE rules are keyed the same way but live outside the regex
+    /// tables, so they get their own coverage — the toggle reaches them through
+    /// the walk's rule lookup rather than through `compile_table`.
+    #[test]
+    fn toggles_reach_the_shell_ast_rules() {
+        let toggles = RuleToggles::resolve(&[], &["rce_ast.reverse_shell".to_string()]).expect("known key resolves");
+        assert!(!toggles.is_enabled("rce_ast.reverse_shell", true));
+        assert!(toggles.is_enabled("rce_ast.heredoc_interp", true));
+    }
+
+    #[test]
+    fn unknown_rule_key_is_refused() {
+        let err = RuleToggles::resolve(&["sql.no_such_rule".to_string()], &[]).expect_err("must not resolve");
+        assert!(err.contains("sql.no_such_rule"), "{err}");
+        assert!(
+            err.contains("rules semantic"),
+            "the error must say where to look: {err}"
+        );
+
+        // A key that exists as a finding's `rule_key` but is decided in code
+        // (no `default_on`) is equally not switchable, and must say so rather
+        // than be accepted and ignored.
+        let err = RuleToggles::resolve(&[], &["xss.script_tag".to_string()]).expect_err("must not resolve");
+        assert!(err.contains("xss.script_tag"), "{err}");
+    }
+
+    #[test]
+    fn near_miss_is_suggested() {
+        let err = RuleToggles::resolve(&["SQL.INFO_SCHEMA".to_string()], &[]).expect_err("must not resolve");
+        assert!(err.contains("did you mean 'sql.info_schema'"), "{err}");
+    }
+
+    #[test]
+    fn contradicting_lists_are_refused() {
+        let err = RuleToggles::resolve(&["sql.info_schema".to_string()], &["sql.info_schema".to_string()])
+            .expect_err("must not resolve");
+        assert!(err.contains("sql.info_schema"), "{err}");
+        assert!(err.contains("pick one direction"), "{err}");
+    }
+
+    #[test]
+    fn forced_lists_are_reported_for_the_broadcast() {
+        let toggles = RuleToggles::resolve(
+            &["sql.info_schema".to_string(), "sql.stacked".to_string()],
+            &["sql.union_select".to_string()],
+        )
+        .expect("known keys resolve");
+        assert_eq!(toggles.forced_on(), vec!["sql.info_schema", "sql.stacked"]);
+        assert_eq!(toggles.forced_off(), vec!["sql.union_select"]);
+        assert!(!toggles.is_empty());
     }
 
     fn view(text: &str) -> View<'static> {

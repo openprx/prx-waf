@@ -75,6 +75,43 @@ pub struct ContentSecurityConfig {
     /// `log_only`. These are independent of the per-host Lane 1 legacy toggles —
     /// see the A3 contract note in `configs/default.toml`.
     pub enforcement_overrides: BTreeMap<String, String>,
+    /// Rule keys to switch **on** regardless of the state they ship in.
+    ///
+    /// Every Lane 2 detector rule carries a compiled-in `default_on` flag; the
+    /// high-noise ones ship off pending calibration. Until this key existed that
+    /// flag was the last word — turning one on meant editing Rust and cutting a
+    /// release — so "the rule exists but is default-off" described the source
+    /// tree and nothing an operator could act on. Listing a key here is how a
+    /// default-off rule gets priced against real traffic
+    /// (`tests/lane2/` is the instrument, `docs/lane2-blind-spots.md` §5 the
+    /// question).
+    ///
+    /// A key here that is already on is a no-op that pins the rule on across a
+    /// future default flip. A key that names no rule stops startup — see
+    /// [`Self::rules_disabled`].
+    ///
+    /// Empty by default: the shipped detector set is exactly its `default_on`
+    /// subset, unchanged.
+    pub rules_enabled: Vec<String>,
+    /// Rule keys to switch **off** regardless of the state they ship in.
+    ///
+    /// The switch is deliberately two-directional. A default-on rule that
+    /// misfires on one deployment's traffic can otherwise only be silenced by
+    /// turning off its whole family (`enforcement_overrides`) or the whole lane,
+    /// and reaching for a bigger hammer costs more detection than the rule was
+    /// producing. `prx-waf rules disable` has offered exactly this for CRS rules
+    /// since long before Lane 2 existed.
+    ///
+    /// It is still a detection this WAF stops performing, so every key listed
+    /// here is named in a startup `WARN`.
+    ///
+    /// An unknown key — in either list — fails startup rather than being ignored.
+    /// A rule switch that silently does nothing would be indistinguishable from
+    /// one that works, and this repository has shipped that defect before
+    /// (`start_status`, `max_list_items`, `listen_addr_tls`). `prx-waf rules
+    /// semantic` lists every valid key. Listing one key in both directions is
+    /// likewise refused rather than resolved by precedence.
+    pub rules_disabled: Vec<String>,
 }
 
 /// Per-attack-family scoring configuration (plan §6.2).
@@ -243,6 +280,8 @@ impl Default for ContentSecurityConfig {
             breaker: SemanticBreakerConfig::default(),
             attacks: BTreeMap::new(),
             enforcement_overrides: BTreeMap::new(),
+            rules_enabled: Vec::new(),
+            rules_disabled: Vec::new(),
         }
     }
 }

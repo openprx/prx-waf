@@ -67,8 +67,8 @@ pub use canary::{BreakerState, CircuitBreaker, canary_bucket, in_canary};
 pub use config::{Dialect, EnforcementMode, RuntimeContentSecurityConfig};
 pub use detectors::{
     AstSqlDetector, DeserStructuralDetector, LdapStructuralDetector, NoSqlStructuralDetector, RceAstDetector,
-    RceStructuralDetector, SstiStructuralDetector, StructuralSqlDetector, TraversalStructuralDetector,
-    XpathStructuralDetector, XxeStructuralDetector,
+    RceStructuralDetector, RuleToggles, SemanticRuleInfo, SstiStructuralDetector, StructuralSqlDetector,
+    TraversalStructuralDetector, XpathStructuralDetector, XxeStructuralDetector, semantic_rule_inventory,
 };
 pub use preprocess::{PreprocessCtx, SemanticDetector, View, semantic_preprocessor};
 pub use scoring::{RuntimeAttackConfig, RuntimeScoringConfig, score};
@@ -181,6 +181,30 @@ impl ContentSecuritySubsystem {
         ];
         let now = Instant::now();
         let breaker = Mutex::new(CircuitBreaker::new(config.breaker, now));
+        // The operator's per-rule amendment, already resolved against the rule
+        // inventory by `RuntimeContentSecurityConfig::compile` — so every key in
+        // it names a rule that exists, and an empty one (the shipped posture)
+        // reproduces the compiled-in `default_on` sets byte for byte. Detectors
+        // whose rules are decided in code rather than a keyed table (the AST SQLi
+        // detector, both XSS detectors) take no toggles and are unaffected.
+        let toggles = &config.rule_toggles;
+        for key in config.rule_toggles.forced_off() {
+            // A rule an operator switched off is a detection this process no
+            // longer performs. Same reason `lane1.max_body_bytes = 0` warns:
+            // deliberate is not the same as invisible.
+            tracing::warn!(
+                rule_key = key,
+                "Lane 2 rule DISABLED by content_security.rules_disabled: it is compiled out of its \
+                 detector and can never fire, whatever its family's mode or thresholds say"
+            );
+        }
+        for key in config.rule_toggles.forced_on() {
+            tracing::info!(
+                rule_key = key,
+                "Lane 2 rule ENABLED by content_security.rules_enabled: it runs regardless of the \
+                 state it ships in"
+            );
+        }
         // Production Lane 2 detectors: the structural SQLi detector (P1b) and the
         // sqlparser AST SQLi detector (P2, the second `SqlInjection`-family
         // detector), plus the RCE (shell command injection) and Traversal T1
@@ -195,18 +219,18 @@ impl ContentSecuritySubsystem {
         // corroboration (see `xss_dom` / `xss_js`). The DOM detector overwrites the
         // stash on every view, so no earlier view can leak forward.
         let detectors: Vec<Box<dyn SemanticDetector>> = vec![
-            Box::new(detectors::StructuralSqlDetector::new()),
+            Box::new(detectors::StructuralSqlDetector::with_toggles(toggles)),
             Box::new(detectors::AstSqlDetector::new()),
-            Box::new(detectors::RceStructuralDetector::new()),
-            Box::new(detectors::RceAstDetector::new()),
-            Box::new(detectors::TraversalStructuralDetector::new()),
+            Box::new(detectors::RceStructuralDetector::with_toggles(toggles)),
+            Box::new(detectors::RceAstDetector::with_toggles(toggles)),
+            Box::new(detectors::TraversalStructuralDetector::with_toggles(toggles)),
             Box::new(xss_dom::XssDomDetector::new()),
             Box::new(xss_js::XssJsTokenDetector::new()),
             // T2-A: structural XXE detector (single-detector `xxe` family). Runs no
             // XML parser, so it adds no parse-time DoS surface; matches DTD/prolog
             // markers on the same normalised view text as the other structural
             // detectors. Shadow (log_only) like every other family.
-            Box::new(detectors::XxeStructuralDetector::new()),
+            Box::new(detectors::XxeStructuralDetector::with_toggles(toggles)),
             // T2-B: structural NoSQL detector (single-detector `nosql_injection`
             // family). Consumes the `$`-prefixed JSON object keys that
             // `struct_extract` surfaces as leaves (a MongoDB operator injection lives
@@ -214,7 +238,7 @@ impl ContentSecuritySubsystem {
             // surface beyond the already-bounded JSON walk. Only the JS/expression
             // operators are default-on; comparison / regex / logical are default-off
             // to hold FPs down. Shadow (log_only) like every other family.
-            Box::new(detectors::NoSqlStructuralDetector::new()),
+            Box::new(detectors::NoSqlStructuralDetector::with_toggles(toggles)),
             // T2-C: structural SSTI detector (single-detector `ssti` family). Runs
             // no template parser — a pure bounded-regex scan (no recursion, so no
             // stack-overflow / template-expansion DoS surface) over the same
@@ -224,7 +248,7 @@ impl ContentSecuritySubsystem {
             // the worst FP family). Honest boundary: input-side only, it cannot
             // confirm the backend actually evaluates the template. Shadow (log_only)
             // like every other family.
-            Box::new(detectors::SstiStructuralDetector::new()),
+            Box::new(detectors::SstiStructuralDetector::with_toggles(toggles)),
             // T2-D: structural LDAP-injection detector (single-detector
             // `ldap_injection` family). Runs no LDAP parser — a pure bounded-regex
             // scan over a backtracking-free automaton (no recursion, no ReDoS, so no
@@ -236,7 +260,7 @@ impl ContentSecuritySubsystem {
             // everywhere). Honest boundary: input-side only, it cannot confirm the
             // backend actually issues an LDAP search. Shadow (log_only) like every
             // other family.
-            Box::new(detectors::LdapStructuralDetector::new()),
+            Box::new(detectors::LdapStructuralDetector::with_toggles(toggles)),
             // T2-E: structural XPath-injection detector (single-detector
             // `xpath_injection` family). Runs no XPath parser — a pure bounded-regex
             // scan over a backtracking-free automaton (no recursion, no ReDoS, so no
@@ -249,7 +273,7 @@ impl ContentSecuritySubsystem {
             // (XPath tokens recur everywhere). Honest boundary: input-side only, it
             // cannot confirm the backend actually evaluates an XPath query. Shadow
             // (log_only) like every other family.
-            Box::new(detectors::XpathStructuralDetector::new()),
+            Box::new(detectors::XpathStructuralDetector::with_toggles(toggles)),
             // T2-F: structural unsafe-deserialization detector (single-detector
             // `deserialization` family). Runs no deserializer and no parser — a pure
             // bounded-regex scan over a backtracking-free automaton (no recursion, no
@@ -265,7 +289,7 @@ impl ContentSecuritySubsystem {
             // legitimate data). Honest boundary: input-side only, it cannot confirm the
             // backend actually deserializes the payload. Shadow (log_only) like every
             // other family.
-            Box::new(detectors::DeserStructuralDetector::new()),
+            Box::new(detectors::DeserStructuralDetector::with_toggles(toggles)),
         ];
         Self {
             legacy_checkers,

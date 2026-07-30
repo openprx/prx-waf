@@ -19,8 +19,8 @@ pub use checks::{
     BotPatternLoadReport, BuiltinBotRule, ContentInspectionState, ContentSecuritySubsystem, ContentVerdict,
     EnforcementMode, GeoCheck, GeoRule, GeoRuleMode, InspectionScope, Lane1BodyBudget, MAX_USER_PATTERN_LEN,
     MAX_USER_PATTERNS, OWASPCheck, OverrideLoadReport, RuleDescriptor, RuleOverrideError, RuleOverrideSpec, RuleState,
-    RuntimeContentSecurityConfig, SemanticAction, SemanticVerdict, SensitiveCheck, UserBotPattern, lane1_body_skips,
-    user_rule_id, validate_user_pattern,
+    RuleToggles, RuntimeContentSecurityConfig, SemanticAction, SemanticRuleInfo, SemanticVerdict, SensitiveCheck,
+    UserBotPattern, lane1_body_skips, semantic_rule_inventory, user_rule_id, validate_user_pattern,
 };
 pub use community::{
     CommunityChecker, CommunityClient, CommunityComponents, CommunityConfig, CommunityReporter, RequestInfo,

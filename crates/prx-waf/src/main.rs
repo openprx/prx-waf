@@ -24,9 +24,9 @@ use waf_engine::checks::ResponseCheckSet;
 use waf_engine::{
     BUILTIN_BAD_BOTS, BUILTIN_GOOD_BOTS, BotAction, BotCheck, CrowdSecClient, CrowdSecConfig, EnforcementMode,
     ExportFormat, GeoIpService, IpFeedFormat, IpFeedSource, MAX_USER_PATTERNS, OWASPCheck, RuleDescriptor, RuleManager,
-    RuleOverrideSpec, RuleState, RuntimeContentSecurityConfig, UserBotPattern, WafEngine, WafEngineConfig, XdbUpdater,
-    cache_policy_from_str, export_registry, init_community, init_crowdsec, spawn_auto_updater, spawn_ip_feed_sync,
-    validate_user_pattern,
+    RuleOverrideSpec, RuleState, RuleToggles, RuntimeContentSecurityConfig, UserBotPattern, WafEngine, WafEngineConfig,
+    XdbUpdater, cache_policy_from_str, export_registry, init_community, init_crowdsec, semantic_rule_inventory,
+    spawn_auto_updater, spawn_ip_feed_sync, validate_user_pattern,
 };
 use waf_storage::Database;
 
@@ -279,6 +279,19 @@ enum RulesCommands {
         #[arg(long)]
         host: Option<String>,
     },
+    /// List the Lane 2 semantic rules and whether the loaded config runs them —
+    /// the keys `[content_security] rules_enabled / rules_disabled` accept
+    Semantic {
+        /// Filter by attack family (`sql_injection`, `rce`, `nosql_injection`, …)
+        #[arg(long)]
+        family: Option<String>,
+        /// Filter by effective state: on | off | overridden
+        #[arg(long)]
+        state: Option<String>,
+        /// Output format: table (default) or json
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
 }
 
 // ── Sources sub-commands ──────────────────────────────────────────────────────
@@ -392,7 +405,9 @@ fn main() -> anyhow::Result<()> {
     // interleaved into it would make `rules export > rules.json` produce a file
     // that does not parse, so this one command's logs join its summary on
     // stderr. Every other command keeps logging to stdout.
-    if matches!(&cli.command, Commands::Rules(RulesCommands::Export { .. })) {
+    if matches!(&cli.command, Commands::Rules(RulesCommands::Export { .. }))
+        || matches!(&cli.command, Commands::Rules(RulesCommands::Semantic { format, .. }) if format.trim().eq_ignore_ascii_case("json"))
+    {
         tracing_subscriber::registry()
             .with(
                 fmt::layer()
@@ -885,8 +900,128 @@ async fn run_rules_cmd(cmd: RulesCommands, config: &AppConfig) -> anyhow::Result
                 println!("{note}");
             }
         }
+
+        RulesCommands::Semantic { family, state, format } => {
+            print_semantic_rules(config, family.as_deref(), state.as_deref(), &format)?;
+        }
     }
 
+    Ok(())
+}
+
+// ── Lane 2 semantic rule inventory ────────────────────────────────────────────
+
+/// Print the Lane 2 rule inventory with the state the loaded config gives each
+/// rule.
+///
+/// This exists because `[content_security] rules_enabled / rules_disabled` is
+/// useless without it: the keys it accepts are compiled into the engine's rule
+/// tables, an operator has no other way to read them, and a config surface whose
+/// vocabulary is undocumented is a config surface nobody can use.
+///
+/// The toggles are resolved leniently here — a config carrying a bad key refuses
+/// to *start*, and this is the command that says which key was meant, so it must
+/// still run. The bad key is reported and the shipped states are shown.
+fn print_semantic_rules(
+    config: &AppConfig,
+    family: Option<&str>,
+    state: Option<&str>,
+    format: &str,
+) -> anyhow::Result<()> {
+    let cs = &config.content_security;
+    let (toggles, toggle_error) = match RuleToggles::resolve(&cs.rules_enabled, &cs.rules_disabled) {
+        Ok(t) => (t, None),
+        Err(e) => (RuleToggles::default(), Some(e)),
+    };
+
+    let mut rules = semantic_rule_inventory();
+    if let Some(want) = family {
+        let want = want.trim().to_ascii_lowercase();
+        rules.retain(|r| r.family.as_config_key() == want);
+    }
+    if let Some(want) = state {
+        let want = want.trim().to_ascii_lowercase();
+        match want.as_str() {
+            "on" => rules.retain(|r| toggles.is_enabled(r.key, r.default_on)),
+            "off" => rules.retain(|r| !toggles.is_enabled(r.key, r.default_on)),
+            "overridden" => rules.retain(|r| toggles.is_enabled(r.key, r.default_on) != r.default_on),
+            other => anyhow::bail!("--state must be one of on/off/overridden, got '{other}'"),
+        }
+    }
+
+    match format.trim().to_ascii_lowercase().as_str() {
+        "json" => {
+            let rows: Vec<serde_json::Value> = rules
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "rule_key": r.key,
+                        "family": r.family.as_config_key(),
+                        "detector": r.detector.as_config_str(),
+                        "confidence": r.confidence,
+                        "min_matches": r.min_matches,
+                        "default_on": r.default_on,
+                        "enabled": toggles.is_enabled(r.key, r.default_on),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        }
+        "table" => {
+            println!(
+                "{:<36} {:<16} {:<13} {:<5} {:<8} {:<9} Effective",
+                "RULE KEY", "FAMILY", "DETECTOR", "CONF", "MATCHES", "SHIPPED"
+            );
+            println!("{}", "-".repeat(110));
+            for r in &rules {
+                let on = toggles.is_enabled(r.key, r.default_on);
+                let effective = match (on, on == r.default_on) {
+                    (true, true) => "on",
+                    (false, true) => "off",
+                    (true, false) => "on (rules_enabled)",
+                    (false, false) => "off (rules_disabled)",
+                };
+                println!(
+                    "{:<36} {:<16} {:<13} {:<5} {:<8} {:<9} {effective}",
+                    truncate(r.key, 35),
+                    truncate(r.family.as_config_key(), 15),
+                    truncate(r.detector.as_config_str(), 12),
+                    r.confidence,
+                    r.min_matches,
+                    if r.default_on { "on" } else { "off" },
+                );
+            }
+            let on = rules.iter().filter(|r| toggles.is_enabled(r.key, r.default_on)).count();
+            let overridden = rules
+                .iter()
+                .filter(|r| toggles.is_enabled(r.key, r.default_on) != r.default_on)
+                .count();
+            println!(
+                "\n{} rule(s) listed — {on} run, {} do not, {overridden} overridden by \
+                 [content_security] rules_enabled / rules_disabled.",
+                rules.len(),
+                rules.len() - on,
+            );
+            println!(
+                "A rule that does not run cannot fire whatever its family's thresholds say. \
+                 Switch one on with `rules_enabled = [\"<key>\"]` and measure the cost with \
+                 tests/lane2/."
+            );
+            println!(
+                "Not listed: the AST SQLi detector and both XSS detectors decide in code rather \
+                 than from a keyed table, so they expose no switchable rule and are unaffected by \
+                 these keys."
+            );
+        }
+        other => anyhow::bail!("--format must be table or json, got '{other}'"),
+    }
+
+    if let Some(err) = toggle_error {
+        println!(
+            "\nWARNING: the loaded config's rule switches do not resolve, so the states above are \
+             the shipped ones and this config will NOT start:\n  {err}"
+        );
+    }
     Ok(())
 }
 
@@ -2662,6 +2797,28 @@ fn content_security_startup_broadcast(
             render_family_list(&disabled)
         )));
     }
+    // Per-rule switches. Silent when nobody used them, because the shipped
+    // posture is "no amendment" and a line saying so every boot would be noise.
+    // A disabled rule is a WARN for the same reason `rules stats` calls a
+    // disabled CRS rule "a detection this WAF no longer performs".
+    if !rt.rule_toggles.is_empty() {
+        let on = rt.rule_toggles.forced_on();
+        let off = rt.rule_toggles.forced_off();
+        let text = format!(
+            "Lane 2 per-rule switches: {} forced ON by rules_enabled ({}), {} forced OFF by rules_disabled ({}). \
+             `prx-waf rules semantic` prints the resulting state of every rule.",
+            on.len(),
+            render_family_list(&on),
+            off.len(),
+            render_family_list(&off),
+        );
+        lines.push(if off.is_empty() {
+            BroadcastLine::info(text)
+        } else {
+            BroadcastLine::warn(text)
+        });
+    }
+
     lines.push(BroadcastLine::info(format!(
         "Lane 2 block gates: rollout_bps={}/10000 (~{rollout_pct:.2}% of client IPs, canary bucketed by client IP), restart warmup latch={warmup_secs}s from process start, breaker window={warmup_secs}s min_samples={} anomaly_rate_threshold={} cooldown={}s",
         rt.rollout_bps,
@@ -3935,6 +4092,39 @@ mod tests {
             lines.iter().all(|l| l.level == BroadcastLevel::Info),
             "the shipped shadow posture must not warn"
         );
+    }
+
+    #[test]
+    fn rule_switches_are_broadcast_and_a_disable_warns() {
+        // Silent when unused — asserted by `shipped_default_broadcast_...` above,
+        // which requires every shipped line to be Info and would fail if this
+        // line appeared unprompted.
+        let mut cfg = shipped_content_security();
+        cfg.rules_enabled = vec!["nosql.comparison_operator".to_string()];
+        let lines = broadcast(&cfg);
+        let switch = lines
+            .iter()
+            .find(|l| l.text.contains("per-rule switches"))
+            .expect("an amended config must say so");
+        assert_eq!(
+            switch.level,
+            BroadcastLevel::Info,
+            "turning a rule on adds detection; that is not a warning"
+        );
+        assert!(switch.text.contains("nosql.comparison_operator"), "{}", switch.text);
+
+        cfg.rules_disabled = vec!["sql.union_select".to_string()];
+        let lines = broadcast(&cfg);
+        let switch = lines
+            .iter()
+            .find(|l| l.text.contains("per-rule switches"))
+            .expect("an amended config must say so");
+        assert_eq!(
+            switch.level,
+            BroadcastLevel::Warn,
+            "a disabled rule is a detection this WAF stopped performing"
+        );
+        assert!(switch.text.contains("sql.union_select"), "{}", switch.text);
     }
 
     #[test]

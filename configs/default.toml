@@ -837,6 +837,39 @@ hpp = false                           # HTTP-parameter-pollution synthetic views
 rollout_bps = 0                       # canary width in basis points (0..10000); 0 → enforce blocks nothing
 rollout_salt = ""                     # stable salt for deterministic canary bucketing
 
+# ── Per-rule switches ─────────────────────────────────────────────────────────
+# Every Lane 2 detector rule ships either on or off. The ones that ship off are
+# high-noise patterns nobody has priced against real traffic yet — they are not
+# broken, they are unmeasured. These two lists are how a rule's state is changed
+# without editing Rust and cutting a release.
+#
+#   rules_enabled  = ["nosql.comparison_operator", "xxe.entity_expansion"]
+#   rules_disabled = ["sql.union_select"]
+#
+# Both are EMPTY by default, which is exactly the compiled-in posture: no rule
+# changes state, and the detector sets are byte for byte what they always were.
+#
+#   * `prx-waf rules semantic` lists every key these accept, what it costs in
+#     confidence, and whether the loaded config runs it. There is no other way to
+#     read the vocabulary — the rules live in the engine's tables.
+#   * A key that names no rule REFUSES STARTUP. It is not ignored and it is not
+#     warned about: a rule switch that silently does nothing is indistinguishable
+#     from one that works, which is the most expensive kind of config bug this
+#     repository has shipped.
+#   * The same key in both lists refuses startup too. There is no precedence
+#     rule, because there is no obvious reading of that config.
+#   * `rules_disabled` is a detection this WAF stops performing. Every key in it
+#     is named in a startup WARN. It exists because the alternative — silencing a
+#     misfiring rule by turning off its whole family or the whole lane — costs
+#     more detection than the rule was producing.
+#   * Turning a rule on changes what gets DETECTED, not what gets BLOCKED. The
+#     enforcement gates below (mode, thresholds, rollout, breaker) still apply,
+#     and in the shipped `log_only` posture nothing blocks either way. Measure a
+#     newly enabled rule against BOTH halves of `tests/lane2/` before believing
+#     it is free: the false-positive column is the reason it shipped off.
+rules_enabled = []
+rules_disabled = []
+
 # Per-family enforcement overrides (E0). Each key is an attack family
 # (sql_injection / rce / xss / traversal); each value is off | log_only | enforce
 # and overrides `enforcement_mode` for THAT family only. A family not listed here
