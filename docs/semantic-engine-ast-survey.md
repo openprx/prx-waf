@@ -310,22 +310,53 @@ Disassembled — a pure structural walk that executes nothing:
 That is an unambiguous `posix.system("id")` reduction. The shipped rule cannot
 see it, and not by a near miss:
 
-* the rule is `\bc(?:os|posix|nt)\s+system\b` — it matches the **protocol-0 text
-  `GLOBAL` opcode**, `c<module>\n<callable>`;
-* pickle protocol ≥ 2 does not emit `c` at all. It pushes two strings and joins
-  them with `STACK_GLOBAL` (`\x93`). There is no `c`, and there is no newline;
-* protocol 2 has been available since Python 2.3, protocol 4 is the *default*
-  since Python 3.8, and `pickle.dumps` has never defaulted to protocol 0 in
-  Python 3.
+* the rule is `\bc(?:os|posix|nt)\s+system\b` — it matches the text `GLOBAL`
+  opcode, `c<module>\n<callable>`, which the preprocessor's newline collapse
+  turns into `cposix system`;
+* **protocol 4 and later do not emit `c` at all.** `save_global` switches to
+  `STACK_GLOBAL` (`\x93`): the module and the callable are pushed as two separate
+  length-prefixed strings and joined by an opcode byte. There is no `c` and there
+  is no newline;
+* **protocol 4 is `pickle.DEFAULT_PROTOCOL`** — since Python 3.8, and still on
+  3.13.
 
-So the default-on pickle rule catches the textbook demonstration payload and
-misses everything a real toolchain emits. That is not a tuning gap, it is a
+Measured on Python 3.13.5, pickling `os.system("id")` via `__reduce__` at each
+protocol:
+
+```
+proto 0  len= 34  text GLOBAL form present: True
+proto 1  len= 33  text GLOBAL form present: True
+proto 2  len= 34  text GLOBAL form present: True
+proto 3  len= 34  text GLOBAL form present: True
+proto 4  len= 40  text GLOBAL form present: False   <- pickle.dumps() default
+proto 5  len= 40  text GLOBAL form present: False
+```
+
+So the default-on pickle rule catches an attacker who explicitly asked for an
+obsolete protocol, and misses every payload a bare `pickle.dumps` has produced
+for the last seven years. That is not a tuning gap, it is a
 structural blind spot, and no additional regex closes it: the framing bytes are
 non-UTF-8 and arrive on the view surface as `U+FFFD` (verified — the lossy view
 of this payload is `'�\x04� \x00…�\x05posix��\x06system…'`),
 so the module and callable are not adjacent tokens in any view the detector sees.
 
-The parser this needs is unusually cheap and unusually safe:
+**The one thing that must not be glossed.** Pickle is not a data format, it is a
+**stack virtual machine**, and `GLOBAL` / `STACK_GLOBAL` / `REDUCE` / `INST` /
+`NEWOBJ` are its arbitrary-code-execution primitives. The distance between
+"walking these opcodes" and "running these opcodes" is one function call. Every
+other family in this survey risks a parser *crashing*; this one risks a parser
+*executing the payload*. That asymmetry is the reason the recommendation below is
+"write ~200 lines" rather than "add a crate": the safety property is that the
+resolver opcodes are only ever *read as names*, and that property has to be
+enforced by construction and by test, not inherited from a dependency whose job
+description is to turn pickles into values.
+
+That is also the argument against `serde-pickle`, which is otherwise a perfectly
+reasonable crate (1.2.0, 2024-11-22, MIT/Apache-2.0, ~6.9 M downloads). It
+deserialises into a `Value` tree — strictly more machinery than naming a callable
+requires, and a much larger surface to audit for the one property that matters.
+
+Given that boundary, the walker this needs is unusually cheap and unusually safe:
 
 * **it is not a deserializer.** `pickletools.genops` semantics: read an opcode
   byte, read its fixed or length-prefixed argument, advance. Nothing is
@@ -336,11 +367,11 @@ The parser this needs is unusually cheap and unusually safe:
 * **it is bounded by construction.** Every opcode's argument length is either
   fixed or read from an explicit length field that can be validated against the
   remaining buffer before the read;
-* **there is no dependency.** `serde-pickle` is the obvious crate, but it
-  deserializes into a value tree — more machinery than needed and a broader
-  surface. Roughly 200 lines of opcode table plus a stack-tracking walk covers
-  every `GLOBAL` / `STACK_GLOBAL` / `REDUCE` / `INST` / `OBJ` / `NEWOBJ` shape,
-  with no new supply chain at all.
+* **there is no dependency.** Roughly 200 lines of opcode table plus a
+  stack-tracking walk covers every `GLOBAL` / `STACK_GLOBAL` / `REDUCE` / `INST` /
+  `OBJ` / `NEWOBJ` shape, with no new supply chain at all — and, per the boundary
+  above, with the "names only, never resolves" property written as a test rather
+  than assumed.
 
 The detection it buys is the thing every other family in this survey cannot
 offer: a **structurally certain** verdict. `STACK_GLOBAL` naming `posix.system`
@@ -576,9 +607,10 @@ If one thing is done, in order:
 
 1. **Deserialization — pickle opcode walker.** The only place a parse produces a
    structurally certain verdict rather than a resemblance judgment, and the only
-   family with a blind spot no regex can close: the default-on rule matches
-   protocol-0 text `GLOBAL`, and every pickle a modern Python emits uses
-   `STACK_GLOBAL`. ~200 lines, no dependency, flat and non-recursive, executes
+   family with a blind spot no regex can close: the default-on rule matches the
+   text `GLOBAL` opcode, and protocol 4 — `pickle.DEFAULT_PROTOCOL` since Python
+   3.8 — emits `STACK_GLOBAL` instead. ~200 lines, no dependency, flat and
+   non-recursive, executes
    nothing. Best ratio in the survey by a wide margin.
 2. **XSS — collect `<script>` text into `js_contexts`.** Not a parser change at
    all; it is the missing few lines that keep four corpus rows, three of them
