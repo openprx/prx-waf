@@ -43,12 +43,12 @@ The shipped `log_only` posture, verbatim. Verdicts come from the
 
 | | attack (170) | benign (220) |
 |---|---|---|
-| **detected / false positive** | **128 (75.29%)** | **10 (4.55%)** |
+| **detected / false positive** | **139 (81.76%)** | **10 (4.55%)** |
 | of which would block | — | **2 (0.91%)** |
 | clean | — | 207 |
 | sub-threshold | 1 | 3 |
 | misattributed / wrong-family | 2 / 2 | — |
-| blind | 39 | — |
+| blind | 28 | — |
 
 ### enforce mode — the blocking decision
 
@@ -67,31 +67,35 @@ codes. This is what actually happens to traffic.
 |---|---|---|---|---|---|
 | `sql_injection` | 20 | 15 (75.0%) | 7 (35.0%) | 2 | 0 |
 | `rce` | 20 | 16 (80.0%) | 2 (10.0%) | 6 | 0 |
-| `traversal` | 20 | 18 (90.0%) | 2 (10.0%) | 2 | 0 |
+| `traversal` | 20 | 19 (95.0%) | 2 (10.0%) | 2 | 0 |
 | `xss` | 20 | 18 (90.0%) | 3 (15.0%) | 4 | 0 |
-| `xxe` | 15 | 12 (80.0%) | 12 (80.0%) | 0 | 0 |
-| `nosql_injection` | 15 | 6 (40.0%) | 6 (40.0%) | 0 | 0 |
+| `xxe` | 15 | 13 (86.7%) | 12 (80.0%) | 0 | 0 |
+| `nosql_injection` | 15 | 13 (86.7%) | 6 (40.0%) | 0 | 0 |
 | `ssti` | 15 | 5 (33.3%) | 5 (33.3%) | 0 | 0 |
 | `ldap_injection` | 15 | 12 (80.0%) | 12 (80.0%) | 1 | **1** |
 | `xpath_injection` | 15 | 13 (86.7%) | 13 (86.7%) | 1 | **1** |
-| `deserialization` | 15 | 13 (86.7%) | 13 (86.7%) | 0 | 0 |
+| `deserialization` | 15 | 15 (100%) | 13 (86.7%) | 0 | 0 |
 
-Detection is flat across difficulty — canonical 73.9%, evasive 81.3%, hard
-70.6% — which is not the shape a keyword matcher produces and is the clearest
+Detection is flat across difficulty — canonical 84.1%, evasive 83.3%, hard
+73.5% — which is not the shape a keyword matcher produces and is the clearest
 single piece of evidence that the AST layers are doing real work. The corpus was
 written blind (see [Independence](#independence)), so the evasive and hard tiers
 were not tuned to what the engine happens to catch.
 
 ## The three things this measurement says
 
-**1. Detected and blocked are two very different numbers.** 75.29% versus
-44.12%. The gap is entirely in the two-detector families: `block_threshold = 80`
+**1. Detected and blocked are two very different numbers.** 81.76% versus
+44.12%. Most of the gap is the two-detector families: `block_threshold = 80`
 with two 0.5 weights needs *both* detectors to agree on the same field, and the
 A2 blind guard holds back a Block carried only by a decoded view. So SQLi drops
-75% → 35%, RCE 80% → 10%, traversal 90% → 10%, XSS 90% → 15%, while every
-single-detector family (weight 1.0, so score = confidence) blocks at exactly its
-shadow rate. That is the shipped design working as written — and this is the
-first time it has been priced.
+75% → 35%, RCE 80% → 10%, traversal 95% → 10%, XSS 90% → 15%.
+
+The rest of the gap is confidence. A single-detector family runs at weight 1.0,
+so its request score *is* the winning rule's confidence, and it blocks at its
+shadow rate only while every rule that fires is over 80. Since v0.2.187 that is
+no longer true of three of them: NoSQL 86.7% → 40.0%, deserialization 100% →
+86.7%, XXE 86.7% → 80.0%, because the rules turned on in that release carry 45
+to 75. Those rows are detections that are deliberately not blocks.
 
 **2. The two families most ready to enforce are the only two that produce
 blocking false positives.** `ldap_injection` (80.0% / 1 FP) and
@@ -108,25 +112,26 @@ Both are tools whose *declared input language is the attack grammar*. No
 detector improvement fixes that; it is a deployment-scope question (which routes
 accept filter syntax), and `enforcement_overrides` is where the answer goes.
 
-**3. The low families are a configuration choice, not a capability gap.**
-`nosql_injection` 40.0% and `ssti` 33.3% look like the weakest detectors in the
-set. They are not. Both ship their high-noise rules **default-off** pending
-holdout calibration, exactly as the `[content_security.attacks.*]` comments in
-`configs/default.toml` say: NoSQL runs only `$where` / `$function` /
-`$accumulator`, so every `$ne` / `$gt` / `$or` / `$regex` bypass in the corpus is
-out of scope by configuration; SSTI holds back the bare `{{ }}` / `${ }` /
-`#{ }` delimiters, so a plain `{{7*7}}` probe is invisible on purpose. Turning
-those rules on is the obvious way to move these rows — and the single most
-likely way to move the FP column. Pricing that trade is what this harness is
-for; do not read 33.3% as "the SSTI detector is bad".
+**3. The low families were a configuration choice, and one of the two is fixed.**
+`nosql_injection` and `ssti` used to sit at 40.0% and 33.3% and look like the
+weakest detectors in the set. They were not: both held their high-noise rules
+**default-off** pending a calibration nobody could run, so a `$ne` auth bypass
+and a `{{7*7}}` probe were out of scope by configuration rather than missed.
 
-That trade is now priced. `price-rules.sh` runs the whole corpus in both modes
-with one default-off rule switched on and nothing else changed, and
-[`docs/lane2-rule-pricing.md`](../../docs/lane2-rule-pricing.md) is the
-resulting bill for all 38. The short version: the four NoSQL operator rules are
-free and take that row from 40.0% to 86.7%, the bare SSTI delimiters flag benign
-content at the same score as the attack they catch, and `xpath.bare_double_slash`
-fires on 94 of the 220 benign rows while catching nothing.
+`price-rules.sh` runs the whole corpus in both modes with one default-off rule
+switched on and nothing else changed, and
+[`docs/lane2-rule-pricing.md`](../../docs/lane2-rule-pricing.md) is the resulting
+bill for all 38. It says the trade is not one trade. The four NoSQL operator
+rules touch **zero** of the 220 benign rows, so v0.2.187 ships them on and that
+row is now 86.7%. The bare SSTI delimiters flag benign content at the *same
+score* as the attack they catch — `{{7*7}}` and a security article explaining
+`{{7*7}}` both score 45 — so no threshold separates them, they stay off, and
+33.3% is what SSTI costs to keep the FP column at 10. And
+`xpath.bare_double_slash` fires on 94 of the 220 benign rows while catching
+nothing at all.
+
+Read `ssti` 33.3% as a price that has been paid deliberately, not as "the SSTI
+detector is bad".
 
 ## What is measured
 

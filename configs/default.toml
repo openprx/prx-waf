@@ -838,10 +838,18 @@ rollout_bps = 0                       # canary width in basis points (0..10000);
 rollout_salt = ""                     # stable salt for deterministic canary bucketing
 
 # ── Per-rule switches ─────────────────────────────────────────────────────────
-# Every Lane 2 detector rule ships either on or off. The ones that ship off are
-# high-noise patterns nobody has priced against real traffic yet — they are not
-# broken, they are unmeasured. These two lists are how a rule's state is changed
-# without editing Rust and cutting a release.
+# Every Lane 2 detector rule ships either on or off. These two lists are how a
+# rule's state is changed without editing Rust and cutting a release.
+#
+# The thirty-one that ship off are no longer "unmeasured": `docs/lane2-rule-pricing.md`
+# priced all thirty-eight of the then-default-off rules one at a time against the
+# `tests/lane2/` corpus, and `v0.2.187` shipped the seven that cost nothing on.
+# What is left off is off for a reason the document names per rule — most of them
+# recover no attack at all, several fire on benign traffic while recovering
+# nothing, and the interesting ones score their false positive identically to the
+# attack they catch, so no threshold separates the two. Eleven of the thirty-one
+# matched nothing in either direction on 390 rows, which is no information rather
+# than a clean bill.
 #
 #   rules_enabled  = ["nosql.comparison_operator", "xxe.entity_expansion"]
 #   rules_disabled = ["sql.union_select"]
@@ -864,9 +872,14 @@ rollout_salt = ""                     # stable salt for deterministic canary buc
 #     more detection than the rule was producing.
 #   * Turning a rule on changes what gets DETECTED, not what gets BLOCKED. The
 #     enforcement gates below (mode, thresholds, rollout, breaker) still apply,
-#     and in the shipped `log_only` posture nothing blocks either way. Measure a
-#     newly enabled rule against BOTH halves of `tests/lane2/` before believing
-#     it is free: the false-positive column is the reason it shipped off.
+#     and in the shipped `log_only` posture nothing blocks either way. Measured
+#     across all thirty-eight, exactly ONE rule (`sql.stacked`) changed a blocking
+#     decision at all, and it did so by corroborating two rules already on.
+#   * Measure a newly enabled rule against BOTH halves of `tests/lane2/` before
+#     believing it is free, and read the `touched` column rather than the FP
+#     column: a rule that fires on twenty benign rows and pushes none of them over
+#     a threshold shows up as zero false positives and is one weight change away
+#     from being a lot of them.
 rules_enabled = []
 rules_disabled = []
 
@@ -1077,9 +1090,9 @@ xss_js = 0.5                          # lightweight JS-token detector (P-XSS-2)
 
 # XXE (XML external entity) — T2-A single-detector structural family. Matches the
 # DTD / prolog markers of an XML-external-entity attack (external
-# `<!ENTITY … SYSTEM/PUBLIC>`, parameter-entity `<!ENTITY % …>` definitions, and —
-# default-off — external `<!DOCTYPE … SYSTEM/PUBLIC>`, bare `%name;` references,
-# internal-entity expansion / billion-laughs) on the SAME normalised view text as
+# `<!ENTITY … SYSTEM/PUBLIC>`, parameter-entity `<!ENTITY % …>` definitions,
+# internal-entity expansion / billion-laughs, and — default-off — external
+# `<!DOCTYPE … SYSTEM/PUBLIC>` and bare `%name;` references) on the SAME normalised view text as
 # the other structural detectors. It runs NO XML parser: the XXE grammar is a set
 # of textual markers, and not parsing removes the entire parse-time DoS surface
 # (billion-laughs entity expansion / deep nesting / oversized entities) — the
@@ -1087,10 +1100,13 @@ xss_js = 0.5                          # lightweight JS-token detector (P-XSS-2)
 # is a bounded linear scan and the billion-laughs indicator is a bounded frequency
 # count, never an expansion. Single detector → weight 1.0; FP control is by narrow
 # default-on rules (external entity decl / parameter-entity def, essentially never
-# benign) + default-off high-noise rules (external DOCTYPE as used by every XHTML
-# page, bare `%name;`, a few internal entity decls). Shadow (log_only): a single
-# default-on hit scores its confidence (entity_external 90, param_entity_def 80)
-# and is recorded/logged, never blocked. hard_veto_allowlist empty until holdout.
+# benign; three-or-more internal entity decls, priced at zero benign contact in
+# v0.2.187) + default-off high-noise rules (external DOCTYPE as used by every XHTML
+# page, which costs one corpus false positive, and bare `%name;`). Shadow
+# (log_only): a single default-on hit scores its confidence (entity_external 90,
+# param_entity_def 80, entity_expansion 65 — the last of which is under
+# block_threshold and can therefore only ever log) and is recorded, never blocked.
+# hard_veto_allowlist empty until holdout.
 [content_security.attacks.xxe]
 enabled = true
 log_threshold = 40
@@ -1109,13 +1125,16 @@ xxe_struct = 1.0                      # structural XXE detector (T2-A)
 # JSON body is declined by the same guard the value extraction uses. FP honesty: a
 # reverse proxy cannot know the backend is MongoDB and comparison operators recur in
 # legitimate JSON APIs, so this is a FP-prone family. Single detector → weight 1.0;
-# FP control is by a narrow DEFAULT-ON rule (only `$where`/`$function`/`$accumulator`,
-# the server-side-JS-execution operators a client API essentially never lets a user
-# control, confidence 90) + DEFAULT-OFF high-noise rules (`$expr`, which evaluates an
-# aggregation expression but does not run arbitrary JS and is a common legitimate
-# operator; `$regex`; comparison `$ne`/`$gt`/…; logical `$or`/`$and`/`$nor`) held back
-# until holdout calibration. Shadow (log_only): a default-on hit is recorded/logged,
-# never blocked.
+# FP control is the CONFIDENCE SPREAD, not enablement: `$where`/`$function`/
+# `$accumulator` (the server-side-JS-execution operators a client API essentially
+# never lets a user control) at 90, then `$expr` at 75 (it evaluates an aggregation
+# expression but does not run arbitrary JS), `$regex` at 60, comparison
+# `$ne`/`$gt`/… at 55, logical `$or`/`$and`/`$nor` at 45. The four weak ones shipped
+# default-off until v0.2.187, when the pricing sweep found they touch none of the
+# 220 benign corpus rows — they look only at `$`-prefixed JSON object KEYS, which a
+# filter API taking its query in a documented parameter never produces. All four sit
+# under block_threshold, so they can log and never block. Shadow (log_only): a hit is
+# recorded/logged, never blocked.
 # hard_veto_allowlist empty until holdout.
 [content_security.attacks.nosql_injection]
 enabled = true
@@ -1270,10 +1289,13 @@ xpath_struct = 1.0                    # structural XPath-injection detector (T2-
 # log line or a base64 attachment; these rules judge whether a payload PRESENTS a
 # known unsafe-deserialization format / gadget signature, not whether it was
 # deserialized. FP honesty: a bare base64 blob, a lone class-name substring and a
-# PHP array header `a:\d+:{` recur in legitimate traffic, so DEFAULT-ON ships ONLY
-# serialization magic + known exploit gadget/opcode; the generic markers (PHP
-# array header, bare `__reduce__`, generic `org.apache.commons.collections`
-# package) are DEFAULT-OFF until holdout calibration. Single detector → weight 1.0.
+# PHP array header `a:\d+:{` recur in legitimate traffic, so DEFAULT-ON ships
+# serialization magic + known exploit gadget/opcode at 85-95, plus the generic PHP
+# object header `O:<len>:"<class>":` at 60 since v0.2.187 (priced at zero benign
+# contact, and under block_threshold, so an app that really does serialize objects
+# into a cookie gets logged rather than broken); the remaining generic markers (PHP
+# array header, bare `__reduce__`, bare .NET formatter type names, generic
+# `org.apache.commons.collections` package) are DEFAULT-OFF. Single detector → weight 1.0.
 # Shadow (log_only): a default-on hit is recorded/logged, never blocked.
 # hard_veto_allowlist empty until holdout.
 [content_security.attacks.deserialization]

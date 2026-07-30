@@ -266,22 +266,26 @@ different answer from "no cost".
 
 ---
 
-## The set that is worth shipping on
+## The set that is worth shipping on — and now ships on
 
 Seven rules, all from batch 1, recover eleven attacks between them and touch not
 one benign row:
 
+* `nosql.comparison_operator`
+* `nosql.regex_operator`
+* `nosql.logical_operator`
+* `nosql.expr_operator`
+* `deser.php_object_injection`
+* `traversal.sensitive_abs_ops`
+* `xxe.entity_expansion`
+
+**`v0.2.187` flipped all seven `default_on` to `true`**, so this is the shipped
+posture and no config is needed to get it. An operator who disagrees with any of
+them takes it back out by key:
+
 ```toml
 [content_security]
-rules_enabled = [
-  "nosql.comparison_operator",
-  "nosql.regex_operator",
-  "nosql.logical_operator",
-  "nosql.expr_operator",
-  "deser.php_object_injection",
-  "traversal.sensitive_abs_ops",
-  "xxe.entity_expansion",
-]
+rules_disabled = ["traversal.sensitive_abs_ops"]
 ```
 
 **Measured as a set, not added up.** The combination was run as its own
@@ -302,8 +306,24 @@ Family effect: `nosql_injection` 40.0% → 86.7%, and `README.md`'s claim that
 its low rate is a configuration choice rather than a capability gap is now
 measured rather than asserted.
 
-Nothing in this section changes any `default_on`. It is what the numbers
-support; the decision is not this document's.
+### What the flip did that the sweep could not measure
+
+The sweep enabled rules through `rules_enabled`, which is a **runtime**
+amendment. `default_on` is **compiled in**, and one thing reads it directly:
+`detectors::default_on_rce_traversal_patterns`, the single source of truth
+behind `NORMALISED_STRONG_STRUCTURE` — the gate that decides whether a
+shell-normalised or blind base64/hex view is worth emitting at all. Flipping
+`traversal.sensitive_abs_ops` therefore widens that gate, so a payload that
+*decodes* to `/etc/hosts` or `/proc/self` now earns a synthetic view where it
+previously did not. That is the gate's stated invariant working as designed — it
+must never reject a structure a default-on detector would accept — but it is a
+behaviour change the `rules_enabled` runs could not have produced.
+
+So the flip was re-measured rather than inferred, and the widening moved nothing
+on this corpus: `trav-020` picked up a second traversal rule at an unchanged
+score of 75, no benign row gained a signal, and `tests/lane2/baseline.json`
+records shadow 139 / 10 / 2 and enforce 75 / 2 / 2 — the combination row above,
+reproduced from the shipped posture with both rule lists empty.
 
 ---
 
@@ -330,8 +350,13 @@ blocking lever.
   produced three false positives by corroborating four rows from 39 to 78. Any
   set proposed for shipping needs its own run (`COMBO=` in `price-rules.sh`);
   the seven-rule set above has one and no other set does.
-* **No `default_on` was changed.** This is a price list. Which rules ship on is
-  a decision the price list informs and does not make.
+* **The prices were taken with no `default_on` changed.** Every number above was
+  measured through `rules_enabled` on an unmodified rule table. `v0.2.187` then
+  changed seven of them, and re-ran the corpus to confirm the flip lands where
+  the sweep said — see the section above for the one coupling that made the
+  re-run necessary rather than ceremonial. The other thirty-one prices have not
+  been re-measured against the new default-on set, and corroboration is exactly
+  what this document shows to be non-additive.
 * **220 benign rows are not a holdout.** They are a corpus of shapes this
   product has been burned by, which makes a false positive in it strong evidence
   and makes zero false positives in it weak evidence. `touched = 0` is the

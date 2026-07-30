@@ -27,6 +27,17 @@ a fix list ordered by what it would recover.
 > The counts and tables below are the measurement as taken on `7357d9fd` and are
 > deliberately left as recorded — the two places the change lands are annotated
 > in place, in §3 and in §5.
+>
+> **And then §5 item 1 was cashed in.** `docs/lane2-rule-pricing.md` measured
+> every default-off rule instead of estimating it, and `v0.2.187` shipped the
+> seven that cost nothing. Eleven of the fifteen cases item 1 names are no longer
+> blind: `nosql-001/003/004/005/006/007/011`, `trav-005`, `xxe-005`, `deser-006`,
+> `deser-015`. The blind set is **28** and shadow detection is 139 of 170. The
+> other four — `ssti-001`, `ssti-006`, `trav-016`, `xxe-004` — are still blind on
+> purpose: each needs a rule that scores a benign corpus row identically to the
+> attack, so no threshold separates them and enabling one buys a detection for a
+> false positive. §4's arithmetic was right about all fifteen and silent about
+> which of them were affordable.
 
 ---
 
