@@ -232,8 +232,19 @@ The nine misses split cleanly:
 | `ssti-014` | payload split across query args | cross-field, no detector sees it |
 | `ssti-015` | `#{global.process.mainModule.require(…)}` | no Pug/Nunjucks row |
 
-Five of nine are a **missing signature for a template engine nobody wrote a row
-for**. That is a rule-authoring task measured in an afternoon. A parser cannot
+A tenth row, `ssti-011`, is worth naming because it explains the one place the
+simulation disagreed with the recorded baseline. The payload is
+`${T(java.lang.Runtime).getRuntime().exec('id')}` in an `X-Api-Version` header —
+a rule matches it, but Lane 2 never sees it: the header scope inspects path,
+query, cookie and exactly seven curated headers (`SEMANTIC_HEADERS`,
+`preprocess.rs:580` — `user-agent`, `referer`, `x-forwarded-for`, `x-real-ip`,
+`x-original-url`, `x-forwarded-host`, `forwarded`). An injection in any other
+header is invisible to the whole lane, in every family. That is a scope decision,
+not a parsing one, and it is the difference between the simulated 6 and the
+recorded 5.
+
+Of the nine genuine misses, five are a **missing signature for a template engine
+nobody wrote a row for**. That is a rule-authoring task measured in an afternoon. A parser cannot
 substitute for it, because there is no such parser: Jinja2, Twig, Velocity,
 FreeMarker, Smarty, Handlebars, Pug and ERB have mutually incompatible grammars
 and no shared AST. Covering the family by parsing means shipping six parsers, and
@@ -512,17 +523,44 @@ None of these is in the corpus. `xss-019` is the closest — `window['al'+'ert']
 tables, because a benign handler pops dialogs and `alert` is evidence of "this is
 JS", not of an attack. Folding it changes nothing.
 
-Against that, the cost is the largest in the survey:
+Against that, the cost is the largest in the survey. Five candidate crates were
+measured (metadata from the crates.io API, advisories from a refreshed
+`cargo audit` database, trees from scratch projects):
 
-* every candidate (`boa_parser`, `oxc_parser`, `swc_ecma_parser`) is a
-  recursive-descent parser over a grammar far larger than SQL's. The
-  stack-overflow guard would have to over-approximate ECMAScript's recursion
-  drivers the way `ast_structural_depth_ok` over-approximates `sqlparser`'s — a
-  much harder scan to get right, and `contain_parser_panic` cannot help:
-  a stack overflow aborts the process rather than unwinding
+| crate | latest | maintenance | RUSTSEC | licence | transitive crates | C toolchain | expression API | depth limit |
+|---|---|---|---|---|---|---|---|---|
+| `oxc_parser` | 0.142.0, 2026-07-27 | very active | none | MIT | 76 | no | `parse_expression()` | **none** |
+| `swc_ecma_parser` | 43.0.0, 2026-07-29 | very active | none | Apache-2.0 | 116 | **yes — `stacker`→`psm`→`cc`** | `parse_expr()` | `stacker` auto-grow, statements only |
+| `boa_parser` | 0.21.1, 2026-03-29 | active | RUSTSEC-2024-0436 (`paste`, unmaintained, transitive) | `Unlicense OR MIT` | 75 | no | none | **none** |
+| `ressa` | 0.9.0-alpha.3, 2023-06-11 | stale ~2 y | 4× unmaintained (`unic-*`) | MIT | 24 | no | none | **none** |
+| `rslint_parser` | 0.3.1, 2021-10-06 | **dead**, superseded by Biome | **2 unsound**: RUSTSEC-2023-0055, RUSTSEC-2023-0086; + `atty` RUSTSEC-2021-0145 | MIT | 41 | no | `parse_expr()` | **none**; open FIXME on infinite recursion |
+
+Every tree resolves inside `deny.toml`'s licence allowlist, `boa_parser` via the
+`OR MIT` branch. Three findings decide it:
+
+* **not one of the five offers a configurable recursion depth.** The mitigation
+  would have to be ours, and it would have to over-approximate ECMAScript's
+  recursion drivers the way `ast_structural_depth_ok` over-approximates
+  `sqlparser`'s — over a far larger grammar. `contain_parser_panic` cannot
+  substitute: a stack overflow aborts rather than unwinds
   (`detectors.rs:2321`);
+* **`swc_ecma_parser` pulls `psm` through `stacker`, which builds C.** This tree
+  already made that exact call in the other direction: `sqlparser` is taken with
+  `default-features = false` specifically to drop `recursive-protection` and its
+  `psm` dependency, "keeping the supply chain zero-C/zero-unsafe"
+  (`crates/waf-engine/Cargo.toml:36`). Taking `psm` back for XSS would reverse a
+  decision made deliberately for SQL. And `stacker` is wired into swc's statement
+  parser, not its expression parser — the surface a handler body actually hits;
+* **`oxc_parser`, the strongest candidate, carries ~208 `unsafe` occurrences** for
+  lexer and cursor performance, in a workspace whose own lint table is
+  `unsafe_code = "deny"`.
+
+The remaining costs are structural:
+
 * they are large, fast-moving dependencies whose panic discipline we would be
-  adopting, which is the `brush-parser` lesson verbatim;
+  adopting — `oxc_parser` and `swc_ecma_parser` both ship weekly, and
+  `swc_ecma_parser` is on major version 43 — which is the `brush-parser` lesson
+  verbatim, at ten times the size;
 * and the RASP ceiling is untouched. XSS truth is a browser-behaviour question —
   parse-differential and mutation-XSS are physical false-negative sources that
   `xss_dom.rs` already names in its own module docs. A correct JS parse tells you
@@ -566,11 +604,13 @@ not an accident of ordering.
   The corpus's own README says the same about `rollout_bps`.
 * **The default-on rule tables were re-implemented in Python** to identify the
   blind rows the baseline only counts. It reproduces the recorded per-family
-  numbers to within one row (SSTI 6 simulated vs 5 recorded), so at least one
-  attribution below is probably wrong. The decode-chain model is an
-  approximation: form-parameter splitting, JSON leaf extraction and blind base64
-  are modelled; multipart, GraphQL, hex and `lower_trunc` token truncation are
-  not.
+  numbers exactly except for SSTI, where it says 6 and the baseline says 5; that
+  one row is `ssti-011`, accounted for above (an uncurated header). The
+  decode-chain model is an approximation: form-parameter splitting, JSON leaf
+  extraction and blind base64 are modelled; multipart, GraphQL, hex and
+  `lower_trunc` token truncation are not, and the model splits form parameters
+  the real preprocessor does not — so it is optimistic about what the engine
+  sees, which biases the "currently missed" list towards being too *short*.
 * **No CPU numbers were measured.** The cost column is reasoned from parser shape
   (flat opcode walk vs recursive descent) and from the prefilter/budget machinery
   the tree already applies, not from a benchmark. `tests/perf/` was deliberately
