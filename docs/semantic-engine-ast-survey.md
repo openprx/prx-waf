@@ -223,10 +223,11 @@ predefined entities (`resolve_predefined_entity`, line 330), with a pre-parse
 entity resolution, and it is already shipping. There is no further structure to
 extract that the DTD grammar does not hand you as text.
 
-**Verdict: do not. Current design is optimal. Flip two rules and add one row for
+**Verdict: do not. The current design is optimal. Bring `xxe.doctype_external`
+and `xxe.entity_expansion` on by default under route scope, and add one row for
 XInclude.**
 
-### Traversal — the misses are config, and normalization does not fix the blocker
+### Traversal — both misses are rules already written, and normalization does not fix the blocker
 
 ```
 trav-005  /download?file=../../../../../proc/self/environ
@@ -514,8 +515,8 @@ Fixing `content-099` is a scope question — which routes accept filter syntax,
 answered in `enforcement_overrides` — exactly as `tests/lane2/README.md` already
 concludes. It is not a parsing question.
 
-**Verdict: do not. +1 attack, 6× benign false positives, and it does not fix the
-blocking FP. The shipped regexes are already at 80 % with one FP.**
+**Verdict: do not. +1 attack, benign firings from one to six, and it does not fix
+the blocking FP. The shipped regexes are already at 80 % with one FP.**
 
 ### XPath — the parser that would catch the miss is already in the tree
 
