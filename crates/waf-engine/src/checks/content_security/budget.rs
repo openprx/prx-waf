@@ -21,13 +21,14 @@
 //! per-request `degraded` column. That distinction matters: `degraded` is one
 //! flag for ten different caps, and the remedy for each is a different key.
 //!
-//! Two of those ten — `max_views_per_field` and `max_tokens_per_view` — are
-//! enforced inside the preprocessor's loops rather than by a `try_take_*` here,
-//! because the unit they bound (a field, a view) is not something this
-//! per-request state can see. They report through
-//! [`ContentInspectionState::record_view_cap_miss`] /
-//! [`ContentInspectionState::record_token_cap_miss`] instead, and only when the
-//! loss is demonstrated.
+//! Three of those ten — `max_views_per_field`, `max_tokens_per_view` and
+//! `max_decode_rounds` — are enforced inside the preprocessor's loops rather
+//! than by a `try_take_*` here, because the unit they bound (a field, a view, a
+//! decode round) is not something this per-request state can see. They report
+//! through [`ContentInspectionState::record_view_cap_miss`] /
+//! [`ContentInspectionState::record_token_cap_miss`] /
+//! [`ContentInspectionState::record_decode_round_miss`] instead, and only when
+//! the loss is demonstrated.
 //!
 //! There used to be an eleventh key, `max_list_items`, which was accepted from
 //! the config and enforced nowhere. It is gone; see
@@ -205,6 +206,26 @@ impl ContentInspectionState {
     /// cut made by the whole-view byte ceiling to the token cap.
     pub fn record_token_cap_miss(&mut self) {
         metrics::record_budget_event(BudgetEvent::Lane2TokensPerView);
+        self.degraded = true;
+    }
+
+    /// Record that `max_decode_rounds` stopped the URL-decode chain while a
+    /// further **distinct** decode was still available.
+    ///
+    /// The last of the view-shaped caps to report, and the one whose silence was
+    /// argued for longest: exhausting the rounds leaves the field inspected at
+    /// rounds 0..n rather than uninspected, so the loss was described as a weaker
+    /// view rather than a missing one. It is a missing one. A payload wrapped in
+    /// one more encoding layer than the cap allows produces views that are all
+    /// still encoded, every detector scores it zero, and the verdict comes back
+    /// claiming a complete inspection. That is the same failure the two caps
+    /// above were wired up to stop being able to make.
+    ///
+    /// Same contract as [`Self::record_view_cap_miss`]: the caller must have
+    /// proved the refused round decodes to something new. A field whose encoding
+    /// simply runs out inside the cap lost nothing and must not be marked.
+    pub fn record_decode_round_miss(&mut self) {
+        metrics::record_budget_event(BudgetEvent::Lane2DecodeRounds);
         self.degraded = true;
     }
 

@@ -395,6 +395,14 @@ pub enum BudgetEvent {
     /// behaviour, and attributing it here would blame the token cap for a cut it
     /// did not make.
     Lane2TokensPerView,
+    /// `max_decode_rounds` refused a URL-decode round already proved to differ
+    /// from the round before it, leaving the field inspected with a residual
+    /// encoded layer. **Unit: refusals** — one per field that exhausts its
+    /// rounds with a distinct decode still available.
+    ///
+    /// Not raised when a field simply runs out of encoding inside the cap, which
+    /// is the overwhelmingly common case and cost nothing.
+    Lane2DecodeRounds,
     /// `max_preprocess_output_bytes_total`.
     Lane2PreprocessOutputBytes,
     /// A Lane 2 detector declined a view because it exceeded that detector's
@@ -479,7 +487,7 @@ impl BudgetEvent {
     /// Every variant, in declaration order. The exposition walks this, so a new
     /// variant appears in `/metrics` (at zero) the moment it is added — a
     /// counter an operator has never seen fire still has to be graphable.
-    const ALL: [Self; 49] = [
+    const ALL: [Self; 50] = [
         Self::HeaderValueCountExceeded,
         Self::HeaderFoldBytesExceeded,
         Self::DuplicateHost,
@@ -508,6 +516,7 @@ impl BudgetEvent {
         Self::Lane2HtmlParseInputBytes,
         Self::Lane2ViewsPerField,
         Self::Lane2TokensPerView,
+        Self::Lane2DecodeRounds,
         Self::Lane2PreprocessOutputBytes,
         Self::Lane2DetectorDegrade,
         Self::Lane2ParserPanic,
@@ -582,6 +591,7 @@ impl BudgetEvent {
             Self::Lane2HtmlParseInputBytes => ("lane2_budget", "html_parse_input_bytes"),
             Self::Lane2ViewsPerField => ("lane2_budget", "views_per_field"),
             Self::Lane2TokensPerView => ("lane2_budget", "tokens_per_view"),
+            Self::Lane2DecodeRounds => ("lane2_budget", "decode_rounds"),
             Self::Lane2PreprocessOutputBytes => ("lane2_budget", "preprocess_output_bytes"),
             Self::Lane2DetectorDegrade => ("lane2_detector", "input_cap"),
             Self::Lane2ParserPanic => ("lane2_detector", "parser_panic"),

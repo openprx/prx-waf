@@ -186,7 +186,9 @@ a safety limit wearing a budget's clothes.
 path: after five passes the value is inspected **with a residual encoded layer
 still present**, an acknowledged bypass window
 (`checks/mod.rs:183-188`). Lane 2 uses the tighter, configurable
-`max_decode_rounds = 3`.
+`max_decode_rounds = 3`, which since `v0.2.146` sets `degraded` when it stops the
+chain with a distinct decode still available (§2.1) — the Lane 1 loop does not,
+and cannot without a degradation channel (§8).
 
 ### 1.4 Header inspection coverage
 
@@ -219,45 +221,49 @@ invisible in the metrics.
 | `max_field_input_bytes` | 16 384 | per field, checked before any decode/alloc |
 | `max_decode_rounds` | 3 | decode passes |
 
-Exceed behaviour is **degrade** for nine of the ten keys: the unit of work is
-skipped and `SemanticVerdict::degraded` is set. Crucially, exhaustion does
-**not** retract signals already found — the comment at `budget.rs:33-42`
-explains why: letting exhaustion clear the verdict would hand an attacker a
-one-request kill switch.
+Exceed behaviour is **degrade** for all ten keys: the unit of work is skipped
+and `SemanticVerdict::degraded` is set. Crucially, exhaustion does **not**
+retract signals already found — the comment at `budget.rs:38-45` explains why:
+letting exhaustion clear the verdict would hand an attacker a one-request kill
+switch.
 
-Seven of those nine degrade through the budget's own `try_take_*` accounting
-(`budget.rs:244-341`). The other two — `max_views_per_field` and
-`max_tokens_per_view` — are enforced inside the preprocessor's loops, because
-the unit they bound (a field, a view) is not visible to the per-request budget
-state; they report through `ContentInspectionState::record_view_cap_miss` /
-`record_token_cap_miss` (`budget.rs:206`, `budget.rs:215`) instead. Until
-`v0.2.91` they reported nothing at all, and hitting them narrowed what the lane
-looked at with no flag and no counter.
+Seven of the ten degrade through the budget's own `try_take_*` accounting
+(`budget.rs:256-355`). The other three — `max_views_per_field`,
+`max_tokens_per_view` and `max_decode_rounds` — are enforced inside the
+preprocessor's loops, because the unit they bound (a field, a view, a decode
+round) is not visible to the per-request budget state; they report through
+`ContentInspectionState::record_view_cap_miss` / `record_token_cap_miss` /
+`record_decode_round_miss` (`budget.rs:197`, `budget.rs:206`, `budget.rs:226`)
+instead. Until `v0.2.91` the first two reported nothing at all; the third
+reported nothing until `v0.2.146`, and hitting any of them narrowed what the
+lane looked at with no flag and no counter.
 
-The one key that does **not** degrade is `max_decode_rounds`, which bounds the
-URL-decode chain and stops it without a flag or a counter. It is described
-below. Earlier revisions of this section counted it among the degrading keys; it
-never was.
-
-Both report **work the budget refused**, which is the standard the other eight
-already hold — a refused AST parse is degradation whether or not that parse
-would have found anything. What neither reports is a cap that merely *equals*
-the demand:
+All three report **work the budget refused**, which is the standard the other
+seven already hold — a refused AST parse is degradation whether or not that
+parse would have found anything. What none of them reports is a cap that merely
+*equals* the demand:
 
 * `max_views_per_field` degrades when it refuses a decode round already proved
-  distinct from the round before it (`preprocess.rs:1197`), a transform child
-  already decoded and in hand (`preprocess.rs:1289`, `preprocess.rs:551`), or a
+  distinct from the round before it (`preprocess.rs:1224`), a transform child
+  already decoded and in hand (`preprocess.rs:1321`, `preprocess.rs:551`), or a
   pending transform text it will not let the preprocessor scan
-  (`preprocess.rs:1276`). It does **not** degrade a field that produced exactly
+  (`preprocess.rs:1308`). It does **not** degrade a field that produced exactly
   `max_views_per_field` views and had nothing further to offer. The unit test
   `the_view_cap_flag_turns_on_exactly_where_the_cap_starts_costing_views` pins
   that boundary from both sides on one field: 16 wanted, cap 17 and cap 16
   clean, cap 15 and cap 12 degraded.
 * `max_tokens_per_view` degrades when a view's normalised walk stopped with
-  tokens still unread (`preprocess.rs:938`). It does **not** degrade when the
+  tokens still unread (`preprocess.rs:947`). It does **not** degrade when the
   whole-view byte ceiling (§1.3, `MAX_NORMALISED_VIEW_BYTES`) stopped the walk
   first: that is a separate limit with a separate exceed behaviour, and billing
   the token cap for its cut would flag requests the budget never narrowed.
+* `max_decode_rounds` degrades when the URL-decode chain runs out of rounds with
+  a further **distinct** decode still available (`preprocess.rs:1220`). It does
+  **not** degrade a field whose encoding simply ran out inside the cap, which is
+  the overwhelmingly common case: marking that would make `degraded` a constant
+  for any URL-encoded query. Both sides are pinned by
+  `the_decode_round_flag_turns_on_exactly_where_the_cap_starts_costing_rounds`
+  on one payload: four layers wanted, caps 5 and 4 clean, caps 3 and 1 degraded.
 
 A note on how the first of those nearly went wrong, because the shape recurs.
 The rule was first written as "only report a view you can see being thrown
@@ -279,16 +285,44 @@ walk on attacker-supplied input to make a name come true, with no evidence of
 anything gained. A config file still carrying `max_list_items` continues to load;
 the key is ignored, which is what it always was.
 
-**`max_decode_rounds` is the one budget key that still narrows silently.** The
-URL-decode loop stops at `round <= max_rounds` (`preprocess.rs:1191`); when the
-rounds run out with a further distinct decode still available, that view is
-never produced and nothing is set or counted. It is a smaller hole than the two
-closed in `v0.2.91` — the field is still inspected at rounds 0..3, so this is a
+**`max_decode_rounds` was the last key that narrowed silently**, and until
+`v0.2.146` this section carried the open question of whether it should. The
+argument for leaving it quiet was that rounds 0..3 are still inspected, so
+exhausting the cap costs a residual encoded layer rather than the field — a
 weaker inspection rather than an absent one, which is the same argument §8 makes
-for Lane 1's `MAX_DECODE_PASSES` — but it is the same *shape*, and it is
-recorded here rather than left to be rediscovered. Closing it means deciding
-whether a residual encoded layer counts as coverage loss, which is a judgement
-call this document should not make on its own.
+for Lane 1's `MAX_DECODE_PASSES`.
+
+That argument does not survive a payload. `?q=` carrying
+`1' UNION SELECT NULL,NULL--` percent-encoded byte-by-byte and then wrapped
+three more times, driven through preprocess → detectors → score with the shipped
+`sql_injection` weights:
+
+| encoding layers | rounds = 1 | rounds = 2 | rounds = 3 | rounds = 4 |
+|---|---|---|---|---|
+| 1 | 82 Block | 82 Block | 82 Block | 82 Block |
+| 2 | **0 None** | 82 Block | 82 Block | 82 Block |
+| 3 | **0 None** | **0 None** | 82 Block | 82 Block |
+| 4 | **0 None** | **0 None** | **0 None** | 82 Block |
+
+At the shipped `max_decode_rounds = 3`, the four-layer payload scores **zero**,
+because every view the field produces is still entirely percent-encoded. Nothing
+is weakly inspected — the payload is not inspected at all, and the verdict came
+back with `degraded = false`, which is the exact claim the two caps closed in
+`v0.2.91` were wired up to stop the lane being able to make. The distinction
+between "residual layer" and "missing field" is one an attacker chooses: fully
+encoding every byte makes the residual layer opaque.
+
+So it degrades now, on the same terms as the other two loop-enforced caps, and
+counts through `lane2_budget{limit="decode_rounds"}`. The same table re-measured
+after the change is identical in every score and recommendation — no request
+that was detected stopped being detected — with `degraded` flipping to true in
+exactly the six cells above where the payload was lost. Raising the default is a
+separate decision with a real cost (a fourth round is a fourth normalise pass on
+every encoded field), and the flag is what makes it answerable from traffic
+rather than from taste.
+
+§8's argument for Lane 1's `MAX_DECODE_PASSES = 5` is untouched by this and
+remains as stated there: Lane 1 has no `degraded` channel to report through.
 
 `max_preprocess_output_bytes_total = 512 KiB` is the de-facto cap on Lane 2's
 regex work per request. It is the primary Lane 2 knob if the WAF is CPU-bound —
@@ -991,10 +1025,15 @@ deliberately **not** counted as `degraded`. They are per-view: the lane still
 scores that view from its other detectors, so the request is not blind. It is
 still a view one detector never saw, which previously had no signal of any kind.
 
-`MAX_DECODE_PASSES` (§1.3, decode loops) has **no counter**. Exhausting it does
-not skip anything — the value is inspected with a residual encoded layer still
-present — so there is no coverage event to count, only a weaker one. Stated
-here rather than left as an apparent gap.
+`MAX_DECODE_PASSES` (§1.3, decode loops) has **no counter**. The reason is not
+that exhausting it costs nothing — §2.1 shows on Lane 2 that a payload wrapped
+one layer past the cap is not weakly inspected but wholly missed, and Lane 1's
+loop has the same shape at five passes. The reason is that Lane 1 has no
+`degraded` channel and no per-request budget state to hang one on: its detectors
+return a verdict, not an inspection record. Counting the refusal without being
+able to mark the verdict would produce a number nobody could act on per request.
+Stated here rather than left as an apparent gap; closing it means giving Lane 1
+a degradation channel, which is a larger change than a counter.
 
 `SCANNED_HEADERS` (§1.4) has no counter and cannot have one: it is a permanent
 coverage boundary, not a threshold, so there is no moment at which it "binds".
@@ -1011,25 +1050,28 @@ coverage boundary, not a threshold, so there is no moment at which it "binds".
 | `max_html_parse_input_bytes_total` | `lane2_budget` | `html_parse_input_bytes` |
 | `max_views_per_field` | `lane2_budget` | `views_per_field` |
 | `max_tokens_per_view` | `lane2_budget` | `tokens_per_view` |
+| `max_decode_rounds` | `lane2_budget` | `decode_rounds` |
 | `max_preprocess_output_bytes_total` | `lane2_budget` | `preprocess_output_bytes` |
 | `[content_security.lane1] max_body_bytes` | `lane1_body` | `max_body_bytes` |
 
-The two new `lane2_budget` rows count **events**, not requests: `tokens_per_view`
-counts views truncated, so a field whose four views each lose tokens raises it
-four times, and `views_per_field` counts refusals, so one field can raise it
-several times. Both were added in `v0.2.91`; before that they were the hole this
-table's earlier revision described — enforced in the preprocessor's loops rather
-than through `try_take_*`, so they narrowed inspection without setting `degraded`
-and without a counter. §2.1 states what each one deliberately stays quiet
-about.
+The three loop-enforced `lane2_budget` rows count **events**, not requests:
+`tokens_per_view` counts views truncated, so a field whose four views each lose
+tokens raises it four times; `views_per_field` counts refusals, so one field can
+raise it several times; `decode_rounds` counts refusals too, at most one per
+field that exhausts its rounds. The first two were added in `v0.2.91` and the
+third in `v0.2.146`; before that they were the hole this table's earlier
+revision described — enforced in the preprocessor's loops rather than through
+`try_take_*`, so they narrowed inspection without setting `degraded` and without
+a counter. §2.1 states what each one deliberately stays quiet about.
 
-**One key is still uncounted.** `max_decode_rounds` could be counted, and is
-not: exhausting it leaves the field inspected with a residual encoded layer
-rather than uninspected, which is the argument this section already makes for
-`MAX_DECODE_PASSES` above. §2.1 states the case for revisiting that. The other
-uncounted key this paragraph used to name, `max_list_items`, has been removed
-from the config entirely (§2.1) — a metric could never be added to a limit that
-did not exist.
+**Every configurable Lane 2 key is now counted.** `max_decode_rounds` was the
+last exception, on the argument that exhausting it leaves the field inspected
+with a residual encoded layer rather than uninspected — the argument this section
+still makes for `MAX_DECODE_PASSES` above, which has no `degraded` channel to
+report through in any case. §2.1 has the payload that refutes it for Lane 2. The
+other uncounted key this paragraph used to name, `max_list_items`, has been
+removed from the config entirely (§2.1) — a metric could never be added to a
+limit that did not exist.
 
 Every row above also raises `prxwaf_degraded_requests_total`, which counts
 **requests** while the rows above count **events**. Read the first for "how many

@@ -1182,24 +1182,42 @@ pub fn semantic_preprocessor<'a>(
         // Bounded URL-decode rounds. Each distinct round is a fresh view so a
         // "malicious middle round, benign final round" evasion cannot hide.
         // `views_for_field` starts at 1 (the raw view) and is compared against
-        // the per-field view cap; a `while` loop (not a counted `for`) keeps the
-        // stop condition explicit.
+        // the per-field view cap; an unconditional `loop` with named breaks keeps
+        // every stop reason distinguishable.
         //
-        // The view cap is tested *after* the round has proved it decodes to
-        // something new, not as a loop guard. Testing it up front would leave the
-        // loop unable to say whether it stopped because there was nothing left to
-        // decode or because the cap took a round away from it — and those are the
-        // difference between a complete inspection and a narrowed one. The price
-        // is one extra `url_decode` on the field that hits the cap, of a text the
-        // per-field input cap has already bounded; under the shipped defaults
-        // (12 views, 3 rounds) the branch is unreachable, since this loop can
-        // never push more than four views.
+        // Neither cap is a loop guard. Both are tested *after* the round has
+        // proved it decodes to something new, so the loop can always say whether
+        // it stopped because there was nothing left to decode or because a cap
+        // took a round away from it — the difference between a complete
+        // inspection and a narrowed one. The price is one extra `url_decode` on a
+        // field that exhausts its rounds, of a text the per-field input cap has
+        // already bounded. Under the shipped defaults (12 views, 3 rounds) the
+        // view-cap branch is unreachable, since this loop can never push more than
+        // four views; the round-cap branch is the reachable one.
+        //
+        // `max_decode_rounds` was the last budget key that narrowed silently, and
+        // the argument for leaving it that way — rounds 0..n are still inspected,
+        // so only a residual encoded layer is lost — does not survive contact with
+        // a payload. `?q=` carrying `1' UNION SELECT NULL,NULL--` percent-encoded
+        // byte-by-byte and then wrapped three more times scores 82 (Block) at four
+        // rounds and 0 at the shipped three: every view the field produces is
+        // still encoded, so nothing is weakly inspected — the payload is not
+        // inspected at all, and the verdict used to come back with
+        // `degraded = false`.
         let mut current: Cow<'a, str> = raw;
         let mut views_for_field = 1u32;
-        let mut round = 1u8;
-        while round <= max_rounds {
+        // Wider than `max_rounds` on purpose: this counts one past the cap to
+        // detect the refused round, and `max_decode_rounds` is a `u8`.
+        let mut decode_round = 1u16;
+        loop {
             let decoded = crate::checks::url_decode(current.as_ref());
             if decoded.as_str() == current.as_ref() {
+                // The encoding ran out inside the budget. A cap that merely
+                // equals the demand cost nothing and must not be reported.
+                break;
+            }
+            if decode_round > u16::from(max_rounds) {
+                state.record_decode_round_miss();
                 break;
             }
             if views_for_field >= max_views {
@@ -1215,7 +1233,8 @@ pub fn semantic_preprocessor<'a>(
             }
             views.push(View {
                 location: location.clone(),
-                round,
+                // Bounded by `max_rounds`, a `u8`, by the guard above.
+                round: u8::try_from(decode_round).unwrap_or(u8::MAX),
                 lower_trunc,
                 text: Cow::Owned(decoded.clone()),
                 provenance: Provenance::UrlDecoded,
@@ -1225,8 +1244,12 @@ pub fn semantic_preprocessor<'a>(
             }
             current = Cow::Owned(decoded);
             views_for_field += 1;
-            round += 1;
+            decode_round += 1;
         }
+        // The transform stage numbers its views on from the last decode round.
+        // Saturating rather than wrapping: the counter is a label, and the decode
+        // loop cannot reach 255 under any configured `max_decode_rounds`.
+        let mut round = u8::try_from(decode_round).unwrap_or(u8::MAX);
 
         // ── Additional decode / transform views (plan §7.1, codex A-4) ───────
         // Run on the fully URL-decoded text so a URL-encoded wrapper around a
@@ -1527,6 +1550,93 @@ mod tests {
             "the decoded round is exactly what the cap refused"
         );
         assert!(st.is_degraded(), "the refused round is a view the detectors never got");
+    }
+
+    /// `text` percent-encoded byte-by-byte, `layers` times over. One URL-decode
+    /// round peels exactly one layer.
+    fn wrapped(text: &str, layers: u8) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for b in text.bytes() {
+            let _ = write!(out, "%{b:02X}");
+        }
+        for _ in 1..layers {
+            out = out.replace('%', "%25");
+        }
+        out
+    }
+
+    #[test]
+    fn exhausting_the_decode_rounds_with_a_layer_left_degrades_the_request() {
+        // Three rounds, four layers. The last round's output is still entirely
+        // percent-encoded, so what the detectors get is not a weaker view of the
+        // payload — it is no view of the payload.
+        let budget = Budget {
+            max_decode_rounds: 3,
+            ..Budget::default()
+        };
+        let query = format!("q={}", wrapped("1' UNION SELECT NULL,NULL--", 4));
+        let req = req_with("/a", &query, b"");
+        let mut st = ContentInspectionState::new(budget);
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Header, &req, &mut st);
+        assert!(
+            !views.iter().any(|v| v.text.contains("UNION")),
+            "the fixture is only meaningful while the payload stays hidden: {:?}",
+            views.iter().map(|v| v.text.as_ref()).collect::<Vec<_>>()
+        );
+        assert!(
+            st.is_degraded(),
+            "a refused decode round is inspection that did not happen"
+        );
+    }
+
+    #[test]
+    fn a_field_whose_encoding_runs_out_inside_the_cap_does_not_degrade() {
+        // The other side of the same boundary, and the case that must stay quiet:
+        // three rounds, two layers. The chain ends because there is nothing left
+        // to decode, not because the cap intervened. Marking this would make
+        // `degraded` a constant for any URL-encoded query.
+        let budget = Budget {
+            max_decode_rounds: 3,
+            ..Budget::default()
+        };
+        let query = format!("q={}", wrapped("1' UNION SELECT NULL,NULL--", 2));
+        let req = req_with("/a", &query, b"");
+        let mut st = ContentInspectionState::new(budget);
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Header, &req, &mut st);
+        assert!(
+            views.iter().any(|v| v.text.contains("UNION SELECT")),
+            "the payload must be fully decoded here"
+        );
+        assert!(!st.is_degraded(), "a complete inspection must not claim to be degraded");
+    }
+
+    #[test]
+    fn the_decode_round_flag_turns_on_exactly_where_the_cap_starts_costing_rounds() {
+        // Both sides pinned on one payload, the way the view cap's own boundary
+        // test does it: four layers wants four rounds, so caps of 4 and above are
+        // clean and caps below it are degraded.
+        let degraded_at = |rounds: u8| {
+            let budget = Budget {
+                max_decode_rounds: rounds,
+                ..Budget::default()
+            };
+            let query = format!("q={}", wrapped("1' UNION SELECT NULL,NULL--", 4));
+            let req = req_with("/a", &query, b"");
+            let mut st = ContentInspectionState::new(budget);
+            st.begin_phase();
+            let _ = semantic_preprocessor(InspectionScope::Header, &req, &mut st);
+            st.is_degraded()
+        };
+        assert!(!degraded_at(5), "a cap wider than the demand costs nothing");
+        assert!(!degraded_at(4), "a cap that exactly equals the demand costs nothing");
+        assert!(
+            degraded_at(3),
+            "the shipped default loses the last layer of this payload"
+        );
+        assert!(degraded_at(1));
     }
 
     /// A field engineered to fan out: two comment sites (a join view and a space
