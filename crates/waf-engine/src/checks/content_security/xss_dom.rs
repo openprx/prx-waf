@@ -51,7 +51,9 @@
 //! (re-serialisation surprises) are physical false-negative sources that a WHATWG
 //! reference parser only *minimises*, never eliminates. The default-off
 //! `dangling_open_tag` weak signal (below) keeps a low-confidence trace of the
-//! unclosed-tag case for later shadow calibration; it does not run in production.
+//! unclosed-tag case for shadow calibration; it ships off, and
+//! `rules_enabled = ["xss.dangling_open_tag"]` is how a deployment turns it on to
+//! measure it.
 
 use std::borrow::Cow;
 
