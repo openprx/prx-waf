@@ -832,7 +832,7 @@ fn percent_decode_keep_plus(s: &str) -> String {
 /// Iterated [`percent_decode_keep_plus`], stopping at a fixed point or after
 /// `max_rounds` passes, so a `%252B`-style multi-encoded `+` is unwrapped to the
 /// same depth as the main URL-decode round loop (bounded, never panics).
-fn percent_decode_keep_plus_rounds(s: &str, max_rounds: u8) -> String {
+pub(super) fn percent_decode_keep_plus_rounds(s: &str, max_rounds: u8) -> String {
     let mut current = s.to_string();
     let mut rounds = 0u8;
     while rounds < max_rounds {
@@ -1068,6 +1068,28 @@ fn collect_field_sources<'a>(
                 {
                     fields.push(FieldSource::Text(Cow::Borrowed(*name), value.as_str()));
                 }
+            }
+            // NoSQL operator keys carried by the query string's bracket parameter
+            // syntax (`?user[$ne]=1`, which Express/qs, PHP and Rails all parse into
+            // `{user: {$ne: 1}}`). The whole-query view above cannot see them — its
+            // text is `user[$ne]=1` and the operator rules are anchored `^\$ne$` —
+            // so each operator is surfaced as its own leaf, exactly as the JSON walk
+            // surfaces a `$`-prefixed object key.
+            //
+            // Appended LAST on purpose. Only an allowlisted operator produces a leaf,
+            // so an ordinary request adds nothing here; and when a request does carry
+            // operators, putting them after path/query/cookie/headers means they can
+            // only spend what is left of the field budget rather than displacing a
+            // surface that was already being inspected.
+            let mut ops: Vec<(Cow<'static, str>, String)> = Vec::new();
+            super::struct_extract::extract_urlencoded_nosql_ops(
+                req.query.as_str(),
+                super::struct_extract::QUERY_NOSQL_OP_LABEL,
+                max_extracted,
+                &mut ops,
+            );
+            for (label, value) in ops {
+                fields.push(FieldSource::Extracted(label, value));
             }
         }
         InspectionScope::Body => {
@@ -1437,6 +1459,103 @@ mod tests {
                 .map(|v| (v.location.as_ref(), v.text.as_ref()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn query_bracket_nosql_operator_reaches_the_pipeline_as_its_own_view() {
+        // `?user[$ne]=1` — the query-string form of the operator injection. The
+        // whole-query view's text is `user[$ne]=1`, which no anchored `^\$ne$` rule
+        // can match, so the operator must arrive as its own `query.nosql.op` field.
+        let req = req_with("/api/users", "user%5B%24ne%5D=admin&pw%5B%24ne%5D=x", b"");
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Header, &req, &mut st);
+        let seen = |loc: &str| views.iter().filter(|v| *v.location == *loc).count();
+        assert!(
+            views
+                .iter()
+                .any(|v| *v.location == *"query.nosql.op" && v.text.as_ref() == "$ne"),
+            "the bracket operator must surface as its own view: {:?}",
+            views
+                .iter()
+                .map(|v| (v.location.as_ref(), v.text.as_ref()))
+                .collect::<Vec<_>>()
+        );
+        // Deduplicated: two parameters carrying `$ne` are one signal, one field.
+        assert_eq!(seen("query.nosql.op"), 1);
+        // The whole-query views are untouched — this is additive, like Lane B.
+        assert!(seen("query") > 0, "the whole-query view must still be produced");
+    }
+
+    #[test]
+    fn benign_bracket_query_adds_no_view_at_all() {
+        // The field set every other detector sees must not move for ordinary array /
+        // object parameters. Same request, with and without the bracket syntax:
+        // identical view locations.
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let plain = semantic_preprocessor(
+            InspectionScope::Header,
+            &req_with("/s", "name=bob&page=2", b""),
+            &mut st,
+        )
+        .iter()
+        .map(|v| v.location.to_string())
+        .collect::<Vec<_>>();
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let bracketed = semantic_preprocessor(
+            InspectionScope::Header,
+            &req_with("/s", "filter[name]=bob&items[0]=2", b""),
+            &mut st,
+        )
+        .iter()
+        .map(|v| v.location.to_string())
+        .collect::<Vec<_>>();
+        assert_eq!(plain, bracketed, "a benign bracket query must not add a field");
+    }
+
+    #[test]
+    fn query_operator_leaf_is_appended_after_every_other_header_field() {
+        // Ordering is load-bearing: appended last, an operator leaf can only spend
+        // what is left of the field budget, never displace a surface that was already
+        // being inspected. With a 2-field budget the operator loses, not the cookie.
+        let mut req = req_with("/api", "user[$ne]=1", b"");
+        req.headers.insert("cookie".to_string(), "sid=abc".to_string());
+        let budget = Budget {
+            max_fields_per_phase: 2,
+            ..Budget::default()
+        };
+        let mut st = ContentInspectionState::new(budget);
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Header, &req, &mut st);
+        let locations = views.iter().map(|v| v.location.as_ref()).collect::<Vec<_>>();
+        assert!(
+            locations.contains(&"path") && locations.contains(&"query"),
+            "{locations:?}"
+        );
+        assert!(!locations.contains(&"query.nosql.op"), "{locations:?}");
+    }
+
+    #[test]
+    fn form_urlencoded_body_bracket_operator_reaches_the_pipeline() {
+        // The POST twin: `password[$ne]=x` in a urlencoded body. The whole-body view
+        // is still produced; the operator is added beside it.
+        let req = req_with_body_ct(b"username=admin&password[$ne]=x", "application/x-www-form-urlencoded");
+        let mut st = ContentInspectionState::default();
+        st.begin_phase();
+        let views = semantic_preprocessor(InspectionScope::Body, &req, &mut st);
+        assert!(
+            views
+                .iter()
+                .any(|v| *v.location == *"body.nosql.op" && v.text.as_ref() == "$ne"),
+            "{:?}",
+            views
+                .iter()
+                .map(|v| (v.location.as_ref(), v.text.as_ref()))
+                .collect::<Vec<_>>()
+        );
+        assert!(views.iter().any(|v| *v.location == *"body"));
     }
 
     #[test]

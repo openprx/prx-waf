@@ -664,6 +664,96 @@ mod tests {
         RuntimeContentSecurityConfig::compile(&cfg).expect("valid")
     }
 
+    /// Lane 2 with only the `nosql_injection` family enabled, at the shipped
+    /// single-detector shape (one detector at weight 1.0, log 40 / block 80).
+    fn nosql_only_cfg() -> RuntimeContentSecurityConfig {
+        let mut weights = BTreeMap::new();
+        weights.insert("nosql_struct".to_string(), 1.0);
+        let mut attacks = BTreeMap::new();
+        attacks.insert(
+            "nosql_injection".to_string(),
+            SemanticAttackConfig {
+                enabled: true,
+                weights,
+                log_threshold: 40,
+                block_threshold: 80,
+                hard_veto_allowlist: Vec::new(),
+            },
+        );
+        let cfg = ContentSecurityConfig {
+            enabled: true,
+            attacks,
+            ..ContentSecurityConfig::default()
+        };
+        RuntimeContentSecurityConfig::compile(&cfg).expect("valid")
+    }
+
+    /// The `rule_key`s the whole lane reports for one request, in one scope.
+    fn fired_rule_keys(req: &RequestCtx, scope: InspectionScope) -> Vec<String> {
+        let sub = ContentSecuritySubsystem::with_config(nosql_only_cfg());
+        let mut st = ContentInspectionState::default();
+        match sub.evaluate_scoped(req, scope, &mut st) {
+            ContentVerdict::Semantic(v) => v.signals.iter().map(|s| s.rule_key.to_string()).collect(),
+            ContentVerdict::None => Vec::new(),
+            other @ ContentVerdict::LegacyVeto { .. } => panic!("expected Semantic or None, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_string_bracket_nosql_operator_is_detected_end_to_end() {
+        // `?user[$ne]=1` — the Express/qs bracket syntax the server parses into
+        // `{user: {$ne: 1}}`. Whole-lane check, not a unit test of the extractor:
+        // preprocess → detect → score must name the operator rule.
+        let mut req = ctx();
+        req.method = "GET".to_string();
+        req.path = "/api/users".to_string();
+        req.query = "user%5B%24ne%5D=admin".to_string();
+        assert_eq!(
+            fired_rule_keys(&req, InspectionScope::Header),
+            vec!["nosql.comparison_operator"]
+        );
+
+        req.query = "a%5B%24where%5D=return+true".to_string();
+        assert_eq!(
+            fired_rule_keys(&req, InspectionScope::Header),
+            vec!["nosql.query_operator"]
+        );
+    }
+
+    #[test]
+    fn benign_bracket_query_is_not_detected_end_to_end() {
+        // The counterpart the FP argument rests on: ordinary array / object
+        // parameters must produce no signal at all.
+        let mut req = ctx();
+        req.method = "GET".to_string();
+        req.path = "/search".to_string();
+        for benign in [
+            "filter[name]=bob&filter[age]=30",
+            "items[0]=x&items[1]=y",
+            "user[profile][city]=berlin",
+        ] {
+            req.query = benign.to_string();
+            assert!(
+                fired_rule_keys(&req, InspectionScope::Header).is_empty(),
+                "benign bracket query must not fire: {benign}"
+            );
+        }
+    }
+
+    #[test]
+    fn form_urlencoded_bracket_nosql_operator_is_detected_end_to_end() {
+        let mut req = ctx();
+        req.headers.insert(
+            "content-type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        );
+        req.body_preview = Bytes::from_static(b"username=admin&password[$ne]=x");
+        assert_eq!(
+            fired_rule_keys(&req, InspectionScope::Body),
+            vec!["nosql.comparison_operator"]
+        );
+    }
+
     #[test]
     fn default_subsystem_never_produces_semantic() {
         // No detectors + lane off → evaluate_scoped never returns Semantic.

@@ -18,6 +18,17 @@
 //! cannot starve the field budget. This is the one place a *key* (not a value)
 //! becomes a field.
 //!
+//! The same operator can also arrive through the **bracket parameter syntax** that
+//! Express/`qs`, PHP and Rails parse into a nested object: `?user[$ne]=1` becomes
+//! `{user: {$ne: 1}}` and goes into the query verbatim. That form is a parameter
+//! **name**, so it is neither a body nor a JSON key and neither path above sees it.
+//! [`extract_urlencoded_nosql_ops`] closes it by splitting a urlencoded parameter
+//! name into its bracket key segments and surfacing the segments that are known
+//! operators — same allowlist, same rules. It runs over the query string (label
+//! [`QUERY_NOSQL_OP_LABEL`], called from `super::preprocess`) and over an
+//! `application/x-www-form-urlencoded` body ([`NOSQL_OP_LABEL`]), which carries the
+//! identical syntax.
+//!
 //! It adds **no detector** and changes **no scoring**: it only widens the field
 //! source set the existing pipeline already consumes. The whole-body view is still
 //! produced unchanged (`super::preprocess::collect_field_sources` keeps it), so
@@ -125,6 +136,33 @@ const MULTIPART_LABEL: &str = "body.multipart";
 /// allowlist: it is not surfaced and consumes no field-budget slot.
 pub(super) const NOSQL_OP_LABEL: &str = "body.nosql.op";
 
+/// Label for a `NoSQL` operator key surfaced out of a **query string**'s bracket
+/// parameter syntax (`?user[$ne]=1`).
+///
+/// The JSON path above only sees an operator that arrived as a JSON object key. A
+/// `MongoDB` operator can also arrive through the bracket array/object syntax that
+/// Express/`qs`, PHP and Rails all parse: `?user[$ne]=1` reaches the application as
+/// `{user: {$ne: 1}}` and goes into the query verbatim. On the wire that is a
+/// **parameter name**, not a body, so neither the whole-query view (whose text is
+/// `user[$ne]=1`, and the rules are anchored `^\$ne$`) nor [`extract_body_fields`]
+/// ever presents `$ne` to the detector. [`extract_urlencoded_nosql_ops`] closes that
+/// by splitting the parameter name into its bracket key segments and surfacing the
+/// segments that are known operators, exactly as the JSON walk surfaces an operator
+/// key — same allowlist, same rules, no new detector.
+pub(super) const QUERY_NOSQL_OP_LABEL: &str = "query.nosql.op";
+
+/// Total key segments inspected across one urlencoded surface, over all its
+/// parameters. `split_form_args` already caps the parameter count at
+/// `MAX_FORM_ARGS`; this additionally bounds a single pathological name
+/// (`a[x][x][x]…`) so the segment walk is linear **and** capped.
+const MAX_URLENCODED_KEY_SEGMENTS: usize = 1024;
+
+/// Percent-decode rounds applied to a parameter name before it is split into key
+/// segments, so `user%5B%24ne%5D` and the double-encoded `user%255B%2524ne%255D`
+/// both resolve to `user[$ne]`. Matches the decode depth the preprocessor's own
+/// round loop uses; bounded, never panics.
+const URLENCODED_NAME_DECODE_ROUNDS: u8 = 3;
+
 /// Extract leaf string fields from a structured request body.
 ///
 /// Dispatch is by `Content-Type` (with a cheap first-byte sniff when the header is
@@ -161,6 +199,14 @@ pub(super) fn extract_body_fields(body: &[u8], content_type: Option<&str>, max_f
         extract_graphql(body, max_fields, &mut out);
     } else if ct.contains("xml") {
         extract_xml(body, max_fields, &mut out);
+    } else if waf_common::is_form_urlencoded(content_type) {
+        // A urlencoded body carries the same bracket operator syntax as a query
+        // string (`username=admin&password[$ne]=x`) and reaches the same MongoDB
+        // query through it. Nothing ELSE is extracted from a form body — its values
+        // are already covered by the whole-body view, and splitting them into
+        // fields would change what every other detector sees.
+        let text = String::from_utf8_lossy(body);
+        extract_urlencoded_nosql_ops(&text, NOSQL_OP_LABEL, max_fields, &mut out);
     } else {
         // No decisive content-type: a single cheap first-byte sniff. Only a
         // structured opener triggers a parse; form-urlencoded / plain text is left
@@ -190,6 +236,102 @@ fn is_nosql_operator_key(k: &str) -> bool {
         && super::detectors::NOSQL_OPERATOR_KEYS
             .iter()
             .any(|op| k.eq_ignore_ascii_case(op))
+}
+
+/// Whether `out` already carries this operator under this label. The bracket
+/// syntax invites repetition (`?a[$ne]=1&b[$ne]=2`), and a repeat adds no signal —
+/// the detector's verdict on a view of `$ne` does not change with the second copy —
+/// while each duplicate would spend a field-budget slot. Deduplicating caps the
+/// leaves one surface can produce at the allowlist size (15), which is what makes
+/// it safe to append them without displacing any other field.
+fn has_op_leaf(out: &[Leaf], label: &str, op: &str) -> bool {
+    out.iter()
+        .any(|(l, v)| l.as_ref() == label && v.eq_ignore_ascii_case(op))
+}
+
+/// Surface the known `NoSQL` operator keys carried by a urlencoded surface's
+/// **parameter names** (`user[$ne]=1`, `password[$ne]=x`, a bare `$where=…`).
+///
+/// Used for the query string ([`QUERY_NOSQL_OP_LABEL`]) and for an
+/// `application/x-www-form-urlencoded` body ([`NOSQL_OP_LABEL`]) — the same syntax
+/// reaches the same `MongoDB` query through either. This is the query-string
+/// counterpart of the `$`-key leaf the JSON walk emits: it re-uses
+/// [`is_nosql_operator_key`] and therefore the [`super::detectors::NOSQL_RULES`]
+/// operator allowlist, so it can surface nothing the JSON path could not already
+/// surface, and it adds **no detector and no rule**.
+///
+/// Only an allowlisted operator becomes a leaf. An ordinary bracket parameter —
+/// `?items[0]=x`, `?filter[name]=bob`, `?user[profile][city]=berlin` — produces
+/// nothing at all, which is the whole false-positive argument: the bracket syntax
+/// itself is not a signal, the `$`-prefixed key inside it is.
+///
+/// Bounded on every axis and never panics: the surface is capped at
+/// [`MAX_EXTRACT_INPUT_BYTES`], the parameter count by `split_form_args`, the key
+/// segments by [`MAX_URLENCODED_KEY_SEGMENTS`], the decode by
+/// [`URLENCODED_NAME_DECODE_ROUNDS`], and the leaf count by `max_fields` and the
+/// dedup. A name carrying neither `$` nor `%` cannot hold an operator in any
+/// encoding, so it is skipped before the decode allocates.
+pub(super) fn extract_urlencoded_nosql_ops(surface: &str, label: &'static str, max_fields: usize, out: &mut Vec<Leaf>) {
+    if surface.is_empty() || max_fields == 0 {
+        return;
+    }
+    if surface.len() > MAX_EXTRACT_INPUT_BYTES {
+        metrics::record_budget_event(BudgetEvent::Lane2ExtractInputTooLarge);
+        return;
+    }
+    let mut segments_left = MAX_URLENCODED_KEY_SEGMENTS;
+    for arg in waf_common::split_form_args(surface) {
+        if out.len() >= max_fields || segments_left == 0 {
+            break;
+        }
+        // No `$` and no `%`: the name cannot decode to a `$`-prefixed operator, so
+        // skip it before `percent_decode_keep_plus_rounds` allocates. This is the
+        // path essentially every real request takes.
+        if !arg.name.contains(['$', '%']) {
+            continue;
+        }
+        let name = super::preprocess::percent_decode_keep_plus_rounds(arg.name, URLENCODED_NAME_DECODE_ROUNDS);
+        push_key_segment_ops(&name, label, max_fields, &mut segments_left, out);
+    }
+}
+
+/// Split one decoded parameter name into its key segments and push the segments
+/// that are known `NoSQL` operators.
+///
+/// The segments of `a[b][$where]` are `a`, `b`, `$where` — the head (text before
+/// the first `[`) plus each bracketed group, which is exactly the nesting
+/// Express/`qs`, PHP and Rails build from that name. The head counts: `?$where=…`
+/// is a top-level operator key with no brackets at all. A malformed name
+/// (`a[b`, `a[`) stops the walk at the point it stops being parseable rather than
+/// guessing at a closing bracket.
+fn push_key_segment_ops(
+    name: &str,
+    label: &'static str,
+    max_fields: usize,
+    segments_left: &mut usize,
+    out: &mut Vec<Leaf>,
+) {
+    let (head, mut rest) = name.split_once('[').unwrap_or((name, ""));
+    let mut pending = Some(head);
+    while let Some(seg) = pending {
+        if *segments_left == 0 || out.len() >= max_fields {
+            return;
+        }
+        *segments_left -= 1;
+        if is_nosql_operator_key(seg) && !has_op_leaf(out, label, seg) {
+            push_leaf(out, label, seg);
+        }
+        // Advance: `…]` closes the current group, the next `[` opens the following
+        // one. No closing bracket ends the walk (a malformed tail is not a key).
+        let cur = rest;
+        pending = match cur.split_once(']') {
+            Some((next, tail)) => {
+                rest = tail.split_once('[').map_or("", |(_, after_open)| after_open);
+                Some(next)
+            }
+            None => None,
+        };
+    }
 }
 
 /// Push one non-empty, trimmed leaf. Empty / whitespace-only leaves never become
@@ -1005,12 +1147,178 @@ mod tests {
     }
 
     #[test]
-    fn form_urlencoded_body_is_not_extracted() {
-        // The existing whole-body view already covers form data — no extraction,
-        // no behaviour change.
+    fn form_urlencoded_body_yields_nothing_without_an_operator() {
+        // The whole-body view already covers form VALUES — only a NoSQL operator key
+        // in a parameter NAME is extracted from a form body, and this one has none.
         let body = b"name=alice&role=admin&page=2";
         assert!(extract_body_fields(body, Some("application/x-www-form-urlencoded"), 64).is_empty());
         assert!(extract_body_fields(body, None, 64).is_empty());
+    }
+
+    // ── NoSQL operators in urlencoded bracket parameter names ────────────────────
+
+    /// Query-string surface: the operator leaves a query string produces.
+    fn query_ops(query: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        extract_urlencoded_nosql_ops(query, QUERY_NOSQL_OP_LABEL, 64, &mut out);
+        for (label, _) in &out {
+            assert_eq!(
+                label.as_ref(),
+                QUERY_NOSQL_OP_LABEL,
+                "wrong label: {:?}",
+                labels_values(&out)
+            );
+        }
+        out.into_iter().map(|(_, v)| v).collect()
+    }
+
+    #[test]
+    fn query_bracket_operator_is_surfaced() {
+        // The canonical Express/qs shape: `?user[$ne]=1` reaches the app as
+        // `{user: {$ne: 1}}`. The whole-query view's text is `user[$ne]=1`, which no
+        // anchored `^\$ne$` rule can match, so the operator has to become its own leaf.
+        assert_eq!(query_ops("user[$ne]=1"), vec!["$ne"]);
+        assert_eq!(query_ops("a[$where]=return+true"), vec!["$where"]);
+    }
+
+    #[test]
+    fn query_percent_encoded_brackets_are_decoded() {
+        // How a browser / HTTP client actually sends it, plus the `$` itself encoded,
+        // plus one double-encoding round.
+        assert_eq!(query_ops("user%5B$ne%5D=admin"), vec!["$ne"]);
+        assert_eq!(query_ops("user%5B%24ne%5D=admin"), vec!["$ne"]);
+        assert_eq!(query_ops("user%255B%2524ne%255D=admin"), vec!["$ne"]);
+    }
+
+    #[test]
+    fn query_nested_bracket_operator_is_surfaced() {
+        // Deeper qs nesting: every bracket group is a key segment, so an operator at
+        // any depth is found.
+        assert_eq!(query_ops("filter[profile][$regex]=.*"), vec!["$regex"]);
+        assert_eq!(query_ops("a[b][c][d][$gt]=0"), vec!["$gt"]);
+    }
+
+    #[test]
+    fn query_bare_operator_parameter_name_is_surfaced() {
+        // No brackets at all: `?$where=…` is a top-level operator key to qs and PHP,
+        // so the head segment counts too.
+        assert_eq!(query_ops("$where=this.a==this.b"), vec!["$where"]);
+    }
+
+    #[test]
+    fn query_operator_is_matched_case_insensitively() {
+        // The detector lowercases its view before matching, so the extractor must not
+        // be the thing that drops a mixed-case operator.
+        assert_eq!(query_ops("user[$NE]=1"), vec!["$NE"]);
+    }
+
+    #[test]
+    fn benign_bracket_parameters_produce_nothing() {
+        // The bracket syntax itself is NOT a signal — this is the false-positive
+        // argument for fixing it at the parse layer rather than with a `\[\$\w+\]`
+        // rule. Ordinary array / object / repeated parameters must stay silent.
+        for benign in [
+            "items[0]=x&items[1]=y",
+            "filter[name]=bob&filter[age]=30",
+            "user[profile][city]=berlin",
+            "cart[items][][sku]=abc",
+            "q=price+%3E+%2410&currency=USD",
+            "note=use%20%24ne%20carefully",
+            "a[]=1&a[]=2",
+            "redirect[url]=https%3A%2F%2Fexample.com%2Fa%5Bb%5D",
+        ] {
+            assert!(
+                query_ops(benign).is_empty(),
+                "benign query must not produce an op leaf: {benign}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_non_operator_dollar_segment_is_filtered_by_allowlist() {
+        // Same allowlist as the JSON path: a `$`-prefixed segment that is not a known
+        // Mongo operator is not a leaf and spends no budget slot.
+        assert!(query_ops("a[$schema]=x&b[$ref]=y&c[$k000]=z").is_empty());
+    }
+
+    #[test]
+    fn query_repeated_operator_is_deduplicated() {
+        // `?a[$ne]=1&b[$ne]=2` is one signal, not two: a duplicate would only spend a
+        // field slot. Distinct operators are all kept.
+        assert_eq!(query_ops("a[$ne]=1&b[$ne]=2&c[$ne]=3"), vec!["$ne"]);
+        assert_eq!(query_ops("a[$ne]=1&b[$where]=2"), vec!["$ne", "$where"]);
+    }
+
+    #[test]
+    fn query_malformed_brackets_do_not_panic_and_do_not_over_match() {
+        // Unbalanced / empty groups stop the walk where they stop parsing.
+        assert!(query_ops("a[$ne=1").is_empty());
+        assert!(query_ops("a[=1").is_empty());
+        assert!(query_ops("a[]=1").is_empty());
+        assert!(query_ops("[[[[$=1").is_empty());
+        assert_eq!(query_ops("a[$ne]]]=1"), vec!["$ne"]);
+    }
+
+    #[test]
+    fn query_operator_leaves_are_bounded_by_the_allowlist_and_the_field_cap() {
+        // An attacker cannot spend the field budget on operator leaves: dedup caps the
+        // distinct count at the allowlist size, and `max_fields` caps it below that.
+        let mut query = String::new();
+        for i in 0..500 {
+            let _ = std::fmt::Write::write_fmt(&mut query, format_args!("p{i}[$ne]=1&p{i}b[$gt]=1&"));
+        }
+        assert_eq!(query_ops(&query).len(), 2, "dedup must collapse repeats");
+
+        let mut capped = Vec::new();
+        extract_urlencoded_nosql_ops("a[$ne]=1&b[$gt]=1&c[$where]=1", QUERY_NOSQL_OP_LABEL, 1, &mut capped);
+        assert_eq!(capped.len(), 1, "max_fields must cap the leaf count");
+
+        let mut zero = Vec::new();
+        extract_urlencoded_nosql_ops("a[$ne]=1", QUERY_NOSQL_OP_LABEL, 0, &mut zero);
+        assert!(zero.is_empty());
+    }
+
+    #[test]
+    fn query_oversized_surface_is_declined() {
+        // Same ceiling as the structured extractor: past it nothing is scanned.
+        let huge = format!("{}[$ne]=1", "a".repeat(MAX_EXTRACT_INPUT_BYTES));
+        assert!(query_ops(&huge).is_empty());
+    }
+
+    #[test]
+    fn form_urlencoded_body_bracket_operator_is_surfaced() {
+        // The POST twin of `?user[$ne]=1`. It carries the BODY op label, because that
+        // is where it arrived.
+        let body = b"username=admin&password[$ne]=x";
+        let leaves = extract_body_fields(body, Some("application/x-www-form-urlencoded"), 64);
+        assert_eq!(op_leaves(&leaves), vec!["$ne"], "{:?}", labels_values(&leaves));
+    }
+
+    #[test]
+    fn form_urlencoded_body_values_are_not_split_into_fields() {
+        // Only the operator key is extracted from a form body. Splitting the VALUES
+        // out would change the field set every other detector sees, which is exactly
+        // what this change must not do.
+        let body = b"q=1%27+OR+%271%27%3D%271&password[$ne]=x";
+        let leaves = extract_body_fields(body, Some("application/x-www-form-urlencoded"), 64);
+        assert_eq!(labels_values(&leaves), vec![(NOSQL_OP_LABEL, "$ne")]);
+    }
+
+    #[test]
+    fn form_urlencoded_charset_parameter_still_dispatches() {
+        let body = b"password[$ne]=x";
+        let leaves = extract_body_fields(body, Some("application/x-www-form-urlencoded; charset=utf-8"), 64);
+        assert_eq!(op_leaves(&leaves), vec!["$ne"]);
+    }
+
+    #[test]
+    fn json_body_is_unaffected_by_the_urlencoded_path() {
+        // Regression guard on the dispatch order: a JSON body must still take the JSON
+        // branch and produce its value leaves.
+        let body = br#"{"user":"admin","pw":{"$ne":null}}"#;
+        let leaves = extract_body_fields(body, Some("application/json"), 64);
+        assert!(op_leaves(&leaves).contains(&"$ne"));
+        assert!(any_value_contains(&leaves, "admin"));
     }
 
     #[test]

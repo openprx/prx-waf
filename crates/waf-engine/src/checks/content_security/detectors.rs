@@ -1221,6 +1221,13 @@ impl SemanticDetector for XxeStructuralDetector {
 /// a string value that merely contains `$ne` in prose is a different leaf and never
 /// anchor-matches.
 ///
+/// The same leaf shape reaches the detector from the **bracket parameter syntax**
+/// (`?user[$ne]=1`, `password[$ne]=x` in a urlencoded body), which Express/`qs`, PHP
+/// and Rails parse into the identical nested object. That surface is a parameter
+/// name rather than a body, so `super::struct_extract::extract_urlencoded_nosql_ops`
+/// splits the name into key segments and surfaces the operator segments; the rules
+/// below are unchanged and do not know which surface a leaf came from.
+///
 /// The signal is honestly weak for a reverse proxy — a pure proxy cannot know the
 /// backend is `MongoDB`, and comparison operators (`$ne` / `$gt` …) recur in perfectly
 /// legitimate JSON query APIs — so confidence, not enablement, is the family's FP
