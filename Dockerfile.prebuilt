@@ -10,8 +10,9 @@
 # found (required by ...)" against both libc.so.6 and libm.so.6. That made the
 # documented local-dev path — docker-compose.build.yml, and all four services in
 # docker-compose.cluster.yml — unrunnable on the machines most likely to use it;
-# docker-compose.firedrill.yml had already worked around it by forking its own
-# trixie copy of this file rather than fixing it here.
+# docker-compose.firedrill.yml had met the failure earlier and routed around it
+# with a trixie fork of this file, Dockerfile.firedrill, which the fix here made
+# a byte-for-byte duplicate and which is gone again.
 #
 # trixie-slim is the same base Dockerfile.release uses, for the mirror-image
 # reason: it has to tolerate the glibc of the CI runner that produced the
@@ -47,10 +48,11 @@ EXPOSE 80 443 9527
 # podman is the exception. Its default output is OCI and it discards the
 # instruction out loud ("HEALTHCHECK is not supported for OCI image format and
 # will be ignored"); `podman build --format docker` keeps it. Nothing is lost
-# there either, because every compose file that builds this Dockerfile —
-# docker-compose.build.yml layered over docker-compose.yml, and all three nodes
-# in docker-compose.cluster.yml — declares its own service-level healthcheck
-# against the same /health endpoint.
+# there either, because every long-running service built from this Dockerfile —
+# docker-compose.build.yml layered over docker-compose.yml, all three nodes in
+# docker-compose.cluster.yml, and prx-waf in docker-compose.firedrill.yml —
+# declares its own service-level healthcheck against the same /health endpoint.
+# The one exception, cluster-init, is a one-shot that exits.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:9527/health || exit 1
 

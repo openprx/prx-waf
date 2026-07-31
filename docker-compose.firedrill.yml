@@ -7,6 +7,12 @@ version: "3.9"
 # Topology: prx-waf (reverse proxy, ports 16880/16843/16827) -> backend
 # (dummy httpbin-style origin) ; postgres holds semantic_observations for
 # read-back after the fire drill.
+#
+# The WAF image is the ordinary local-development one, so the same two things
+# Dockerfile.prebuilt needs everywhere else have to exist before `up`:
+#
+#   cargo build --release   # target/release/prx-waf, copied into the image
+#   mkdir -p data           # COPY data/ fails outright on a fresh checkout
 
 services:
   postgres:
@@ -36,11 +42,7 @@ services:
   prx-waf:
     build:
       context: .
-      # This file forked off Dockerfile.prebuilt only to get a trixie-slim base,
-      # because a locally built binary needs glibc newer than bookworm's 2.36.
-      # Dockerfile.prebuilt is on trixie-slim now too, so the two are once again
-      # identical and this one should be folded back into it.
-      dockerfile: Dockerfile.firedrill
+      dockerfile: Dockerfile.prebuilt
     container_name: prx-waf-fd
     restart: unless-stopped
     depends_on:
