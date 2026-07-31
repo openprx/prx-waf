@@ -66,6 +66,22 @@ def load(directory: str, tag: str) -> dict | None:
         return json.load(handle)
 
 
+def degraded_count(directory: str, tag: str) -> int | None:
+    """How many observation rows ran out of Lane 2 budget.
+
+    Read from the raw observations rather than the report: `classify.py` folds
+    `degraded` into its per-case dict but does not serialise it, so the report
+    cannot answer this. It matters here because a degraded row stops detection
+    early, which understates what an isolated rule matches — the one way this
+    sweep could report a false "not masked".
+    """
+    path = os.path.join(directory, tag, "observations-shadow.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        return sum(1 for row in json.load(handle) if row.get("degraded"))
+
+
 def rows_naming(report: dict, key: str, label: str) -> list[str]:
     return sorted(
         case_id
@@ -114,15 +130,13 @@ def main() -> int:
             row[f"lost_{label}"] = sorted(
                 set(row[f"priced_{label}"]) - set(row[f"solo_{label}"])
             )
-        row["degraded"] = sorted(
-            case_id for case_id, case in solo["cases"].items() if case.get("degraded")
-        )
+        row["degraded"] = degraded_count(args.dir, f"solo-{key}")
         rows.append(row)
 
-    base_degraded = sorted(
-        case_id for case_id, case in base["cases"].items() if case.get("degraded")
-    )
-    print(f"{len(rows)} rules swept, baseline degraded rows: {len(base_degraded)}\n")
+    base_degraded = degraded_count(args.dir, "baseline")
+    worst = max((r["degraded"] or 0) for r in rows) if rows else 0
+    print(f"{len(rows)} rules swept; degraded observation rows: baseline "
+          f"{base_degraded}, worst solo run {worst}\n")
 
     header = ("rule", "detector", "conf", "on", "priced", "solo", "hidden", "reading")
     print(f"{header[0]:<34}{header[1]:<13}{header[2]:>5}{header[3]:>4}"

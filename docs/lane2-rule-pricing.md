@@ -910,6 +910,134 @@ sweep points `SRC` at a symlink mirror whose only real directory is `configs/`.
 toggles (`detectors.rs:4314`), so **every run in this sweep sees the same views**
 and the only thing that varies is which rule gets to name one.
 
+## The answer: ten of the hundred and fifteen, and all ten are already priced
+
+**105 of the 115 rules fire on exactly the benign rows they are recorded as
+firing on.** Not one rule lost contact when it was isolated. The ten that gained
+any gained **one row each**:
+
+| rule | conf | recorded | true | the row | the rule that was covering it |
+|---|--:|--:|--:|---|---|
+| `xss.base_href` | 80 | 0 | **1** | `content-010` | `xss.script_tag` (90) |
+| `ldap.filter_break_any_attr` | 60 | 0 | **1** | `content-099` | `ldap.filter_break_known_attr` (88) |
+| `ldap.filter_group` | 35 | 0 | **1** | `content-099` | `ldap.filter_break_known_attr` (88) |
+| `ldap.paren_adjacency` | 25 | 1 | **2** | `content-099` | `ldap.filter_break_known_attr` (88) |
+| `ldap.bare_logical` | 20 | 71 | **72** | `content-099` | `ldap.filter_break_known_attr` (88) |
+| `rce.backtick_cmd` | 78 | 5 | **6** | `content-031` | `rce.cmd_subst` (80) |
+| `rce_ast.cmd_subst_any` | 50 | 14 | **15** | `content-031` | `rce_ast.cmd_subst` (78) |
+| `sql.union_select` | 72 | 1 | **2** | `content-059` | `sql.union_null` (78) |
+| `traversal.plain_dotdot` | 50 | 2 | **3** | `content-059` | `traversal.sensitive_abs` (68) |
+| `xpath.bare_func` | 20 | 3 | **4** | `content-100` | `xpath.func_axis` (88) |
+
+**Every one of the ten lands on a row that is already a false positive.**
+`content-010` (45), `content-031` (79), `content-059` (68), `content-099` (88)
+and `content-100` (88) are five of the ten false positives the baseline already
+counts. **No masked rule touches a clean benign row, and none touches one of the
+three `sub-threshold` rows.** So:
+
+* the false-positive count of 10 cannot move, in either direction, from any of
+  this;
+* no rule's **clean** verdict changes — a rule recorded as touching nothing is
+  touching nothing, in all 105 cases;
+* `lane2-latent-pressure.md`'s classification — 70 clean, **0 latent**, 11
+  already in the false-positive count — survives unchanged. The one default-on
+  rule in the table, `sql.union_select`, was already in the bottom row for
+  `content-044`; `content-059` puts it there twice.
+
+The masking is real and it is uninteresting, which is the useful result. A
+rule hidden under a stronger one is hidden on a row the stronger one has already
+made expensive, so it adds no cost that is not already being paid — and it
+starts costing the instant the rule covering it is switched off. The
+`xss.base_href` warning in the section on the three default-off XSS constructs
+is the general case: **switching off `ldap.filter_break_known_attr` to clear
+`content-099` does not clear it if `ldap.bare_logical` is on**, and the same
+holds for the other four pairs.
+
+## The eleventh, which is not a rule at all
+
+One more zero is masked, and no rule is doing it. **`rce_ast.interp_exec_flag`
+(conf 82, default on) is recorded as touching nothing, and it matches
+`content-033`** — a CI pipeline definition whose job steps are literal shell
+invocations. The solo sweep cannot see it, because what hides it is the Lane 2
+work budget: `content-033` is one of the nine rows that exhaust it, and the
+shell-AST detector never reaches the view.
+
+Measured rather than argued. Disabling the five SQL AST structures — the other
+consumer of the shared AST attempt budget (`detectors.rs:2639` and `3820` take
+from the same counters) — takes the degraded observation rows from **9 to 6**,
+and exactly two rows gain a key:
+
+| row | | gains |
+|---|---|---|
+| `content-033` | benign, already an `fp-log` at 41 | `rce_ast.interp_exec_flag` |
+| `rce-017` | attack, already `detected` at 41 | `rce_ast.interp_exec_flag` |
+
+Freeing every other budget-consuming detector as well (the XSS DOM parse, the
+pickle walker) adds nothing further on the benign half and leaves the degraded
+count at 6, so **on this corpus the budget hides exactly one benign rule-row
+pair**, and the row it hides on is — again — already a false positive.
+
+## The attack half, where masking is pervasive and the prices still hold
+
+**35 of the 115 rules match attack rows they are not named on: 125 rule-row
+pairs across 63 distinct attack rows.** That is a much bigger number than the
+benign half's ten, and it changes nothing about any price. `det` and `blocked`
+are bucket deltas — a row moving into `detected` — and a bucket delta is
+computed correctly whether or not the rule that moved it is the one the report
+names. What the masking does change is the **"attack rows it fires on"** column,
+which is contact and not value, and three claims made in prose:
+
+* **`traversal.plain_dotdot` fires on 17 attack rows, not one.** Its recorded
+  `+1` detection (`trav-016`) stands — everything else it matches is a row the
+  traversal family already scores higher on, `traversal.sensitive_abs` (68) and
+  `traversal.sensitive_abs_brace` (68) both outranking it. Its bill is unchanged
+  and its footprint is fifteen times what the table shows.
+* **`xpath.bare_double_slash` reaches 30 attack rows** (26 recorded) and
+  `ldap.bare_logical` **44** (36 recorded), on top of 94 and 72 benign rows. The
+  verdict "pure noise with no upside whatsoever" is if anything understated.
+* **Five of the eleven rules called "the eleven that do nothing whatsoever" do
+  something.** `ldap.filter_break_any_attr` matches `content-099` and eight LDAP
+  attacks; `ldap.filter_group` matches `content-099` and six; `ssti.py_class`
+  matches `ssti-003`; `deser.java_pkg_generic` matches `deser-013`;
+  `deser.php_array` matches `deser-015`. Every one is outranked by a default-on
+  rule of its own detector on every row, which is why the enable sweep saw
+  nothing. **Six of the eleven really do match nothing**, isolated or not:
+  `deser.dotnet_formatter_name`, `deser.py_reduce`, `rce.mkfifo_revshell`,
+  `sql.chr_freq`, `ssti.getclass`, `ssti.hash_delim`.
+
+`deser.py_pickle_dangerous_global` gets its own correction. The section above
+says it "has never been observed firing" and reads its zero as no information.
+**It fires on `deser-007` and `deser-009`** the moment
+`deser.py_pickle_reduce_exec` is off — which is the fallback
+`pickle_finding` (`detectors.rs:2440`) documents, working exactly as its comment
+says. The honest reading is not "the stack model never declines to model a
+reduction"; it is that on this corpus it never declines *and is never asked to
+report it*, because the stronger grade is always available. Its false-positive
+surface is still unmeasured — the benign half contains no pickle — so the
+"no information" verdict holds for the benign half and is now wrong for the
+attack half.
+
+`xss.data_html_url` goes the other way and is now settled rather than inferred.
+With every other XSS DOM construct switched off it **still fires on nothing**,
+including `xss-010`, which confirms the reading already given: the rule wants a
+`data:text/html` URL in a real URL attribute of parsed HTML, and the corpus puts
+it in a query parameter. That zero is absence, not masking, and it is the only
+one of the eighteen code-decided rules for which that had been argued rather
+than tested.
+
+**Twenty of the 115 rules fire on nothing at all, isolated, on either half** —
+`deser.dotnet_formatter_name`, `deser.php_object_gadget`, `deser.py_reduce`,
+`ldap.null_byte_truncation`, `rce.mkfifo_revshell`, `rce.sensitive_read_brace`,
+`rce_ast.heredoc_interp`, `rce_ast.proc_subst`, `rce_ast.cond_sensitive_path`,
+`rce_ast.param_indirect`, `sql.chr_freq`, `sql.version_comment`,
+`ssti.getclass`, `ssti.hash_delim`, `ssti.java_reflect_forname`,
+`ssti.javax_script_engine`, `ssti.jinja_statement_sink`,
+`traversal.sensitive_abs_brace`, `xpath.predicate_close_logic`,
+`xss.data_html_url`. For those twenty the corpus says nothing, and now says so
+with the masking excluded rather than confounded with it.
+`rce_ast.interp_exec_flag` was the twenty-first until the budget run above took
+it out.
+
 ---
 
 # What this document does not establish
@@ -937,14 +1065,22 @@ and the only thing that varies is which rule gets to name one.
   better reading of "found nothing to fire on" and it is still 220 requests, not
   a traffic sample. For the eleven default-off rules and the two code-decided
   rules that moved no column at all it is the whole of what is known about them.
-* **A `touched = 0` can also be a masked rule, not an absent one.** Every
-  detector reports one construct per view — the strongest one enabled — so a
-  weaker rule that matches the same field as a stronger one is invisible in the
-  shipped posture. `xss.base_href` reads as zero on a corpus that contains its
-  exact shape, and only an experiment with the masking rule switched off says so.
-  The three XSS constructs are the ones this was checked for; **no equivalent
-  unmasking run was done for any other rule in the inventory**, so any other
-  zero in this document may be masking as well.
+* **A `touched = 0` can be a masked rule, and eleven of them are — all of them
+  named.** Every detector reports one construct per view, so a weaker rule
+  matching the same view as a stronger one is invisible in the shipped posture.
+  [Every rule in the inventory has now been run in isolation](#which-zeros-are-masking):
+  105 of 115 reproduce their recorded benign contact exactly, ten gain one
+  already-false-positive row each, and one more (`rce_ast.interp_exec_flag`) is
+  hidden by the work budget rather than by a rule. **Every benign `touched`
+  number in this document and in `lane2-latent-pressure.md` is therefore either
+  confirmed or corrected above**, and no rule recorded as touching nothing turned
+  out to be touching a clean row. What is *not* settled by that sweep is
+  everything a rule switch cannot reach: the `ast.comment_obfusc` relabel, the
+  `SetOperation` arm, the shell walk's `cmd_subst`/`cmd_subst_any` choice, and
+  the four view-and-field construction limits — one blind decode per text, one
+  body extractor per request, the field caps, and the XSS token detector's
+  dependence on the DOM detector. Those apply identically to every number here
+  and are unmeasured by anything in either document.
 * **No threshold, weight or scope change was measured.** Several verdicts above
   say a rule would be worth having under a different threshold or on a narrower
   route. None of those alternatives was run; each carries its own cost to the
