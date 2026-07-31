@@ -568,6 +568,19 @@ pub struct AcmeConfig {
     /// in seconds. Default: 86400 (24h).
     #[serde(default = "default_acme_renewal_interval")]
     pub renewal_check_interval_secs: u64,
+    /// Directory URL of an ACME server other than Let's Encrypt — ZeroSSL,
+    /// Buypass, an in-house step-ca, or a Pebble test server. Set, it overrides
+    /// `staging`, which only chooses between the two Let's Encrypt endpoints.
+    /// Default: unset (Let's Encrypt).
+    #[serde(default)]
+    pub directory_url: Option<String>,
+    /// Path to a PEM file holding the root certificate to trust for the ACME
+    /// server's *own* HTTPS endpoint. Needed only when that server presents a
+    /// certificate the platform trust store does not know, which is the normal
+    /// case for a private CA and never the case for Let's Encrypt. It does not
+    /// influence which certificates get issued. Default: unset.
+    #[serde(default)]
+    pub ca_root_pem: Option<String>,
 }
 
 const fn default_acme_renewal_interval() -> u64 {
@@ -581,6 +594,8 @@ impl Default for AcmeConfig {
             email: String::new(),
             staging: false,
             renewal_check_interval_secs: default_acme_renewal_interval(),
+            directory_url: None,
+            ca_root_pem: None,
         }
     }
 }
