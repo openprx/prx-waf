@@ -210,6 +210,20 @@ const MAX_DERIVED_VIEWS: usize = 48;
 /// makes of a 64 KiB body.
 const MAX_DERIVED_BYTES: usize = 128 * 1024;
 
+/// Decoded texts one field may produce.
+///
+/// The request-level budget alone would let a single decode-rich field spend all
+/// 48 views before the field carrying the payload is reached — and header names
+/// are sorted, so an attacker picks a name that sorts first. This does not close
+/// that door (any request-level budget is exhaustible by padding, which is why
+/// Lane 2 counts its own exhaustion as a degraded verdict rather than pretending
+/// otherwise), but it raises the cost from one padding field to four, and it
+/// keeps one strange header in a real request from blinding the decode walk for
+/// every other header. Matches the Lane 2 preprocessor's `max_views_per_field`
+/// default. **Only decoding is rationed: the raw scan of every field runs
+/// first and is never charged**, so no budget state can hide a plaintext payload.
+const MAX_DERIVED_VIEWS_PER_FIELD: usize = 12;
+
 /// Base64-shaped tokens decoded per text.
 const MAX_BASE64_CANDIDATES_PER_TEXT: usize = 4;
 
@@ -228,8 +242,12 @@ const MAX_BODY_DECODE_BYTES: usize = 8 * 1024;
 
 /// Per-request allowance for derived (decoded) texts.
 struct DecodeBudget {
+    /// Derived texts still allowed for the whole request.
     views_left: usize,
+    /// Derived bytes still allowed for the whole request.
     bytes_left: usize,
+    /// Derived texts still allowed for the field being walked.
+    field_views: usize,
 }
 
 impl DecodeBudget {
@@ -237,20 +255,31 @@ impl DecodeBudget {
         Self {
             views_left: MAX_DERIVED_VIEWS,
             bytes_left: MAX_DERIVED_BYTES,
+            field_views: MAX_DERIVED_VIEWS_PER_FIELD,
         }
     }
 
-    /// Charge one derived text of `len` bytes. `false` when either cap is
+    /// Reset the per-field allowance. Called once per field; the request-level
+    /// counters carry over.
+    const fn begin_field(&mut self) {
+        self.field_views = MAX_DERIVED_VIEWS_PER_FIELD;
+    }
+
+    /// Charge one derived text of `len` bytes. `false` when any cap is
     /// reached, at which point the walk stops rather than continuing to
     /// generate work it cannot pay for.
     const fn admit(&mut self, len: usize) -> bool {
         let Some(views) = self.views_left.checked_sub(1) else {
             return false;
         };
+        let Some(field_views) = self.field_views.checked_sub(1) else {
+            return false;
+        };
         let Some(bytes) = self.bytes_left.checked_sub(len) else {
             return false;
         };
         self.views_left = views;
+        self.field_views = field_views;
         self.bytes_left = bytes;
         true
     }
@@ -275,16 +304,23 @@ impl DecodeBudget {
 /// `Provenance::BlindDecoded` never being hard-veto-capable while
 /// `Provenance::HtmlEntityDecoded` is.
 ///
-/// A transform that produces its input unchanged yields no child, so a field
-/// with nothing to decode costs one comparison and allocates nothing.
+/// A transform that produces its input unchanged yields no child, and each is
+/// gated on a cheap scan for its own marker, so a field with nothing to decode —
+/// which is nearly every header of nearly every request — costs three passes over
+/// the value and allocates nothing.
 fn decode_children(text: &str) -> Vec<(String, PatternTier)> {
     let mut out = Vec::new();
 
     // Percent-decoding, iterated to its fixed point (one layer, see
-    // MAX_DECODE_DEPTH).
-    let url = super::url_decode_recursive(text);
-    if url != text {
-        out.push((url, PatternTier::Full));
+    // MAX_DECODE_DEPTH). `url_decode` allocates unconditionally, so the cheap
+    // "is there anything to decode" test comes first: the overwhelming majority
+    // of header values contain neither `%` nor `+`, and they must not each pay
+    // for a full-length copy of themselves.
+    if text.bytes().any(|b| b == b'%' || b == b'+') {
+        let url = super::url_decode_recursive(text);
+        if url != text {
+            out.push((url, PatternTier::Full));
+        }
     }
 
     // HTML entities. Fires only when an entity actually decoded.
@@ -465,6 +501,7 @@ impl SensitiveCheck {
         if let Some(hit) = self.scan(text, host_code, tier) {
             return Some(hit);
         }
+        budget.begin_field();
 
         let mut pending: Vec<(String, PatternTier)> = decode_children(text)
             .into_iter()
@@ -928,6 +965,21 @@ mod tests {
         // The same payload alone, with the budget intact, is found.
         let ctx = make_ctx_with_headers("/", b"", &[("zzz-payload", &b64(PEM))]);
         assert!(checker.check(&ctx).is_some());
+    }
+
+    #[test]
+    fn one_field_cannot_spend_the_whole_request_decode_budget() {
+        // A decode-rich junk header sorting before the payload must not blind the
+        // walk for the header that follows it.
+        let checker = SensitiveCheck::new();
+        let mut junk = String::new();
+        for i in 0..40 {
+            let _ = write!(junk, "{}&", b64(&format!("filler token number {i} for padding")));
+        }
+        let ctx = make_ctx_with_headers("/", b"", &[("a-junk", &junk), ("zzz-payload", &b64(PEM))]);
+        assert!(checker.check(&ctx).is_some());
+        // And the junk header alone really does hit the per-field cap.
+        const { assert!(MAX_DERIVED_VIEWS_PER_FIELD < MAX_DERIVED_VIEWS) };
     }
 
     #[test]

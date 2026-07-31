@@ -212,6 +212,7 @@ wherever it travels and an exfiltration header is not going to be named
 | `MAX_HEADER_SCAN_BYTES` | 64 KiB | All header bytes inspected per request |
 | `MAX_DECODE_DEPTH` | 3 | Decode layers unwrapped below the field as it arrived |
 | `MAX_DERIVED_VIEWS` | 48 | Decoded texts produced per request, across every field |
+| `MAX_DERIVED_VIEWS_PER_FIELD` | 12 | Decoded texts one field may produce |
 | `MAX_DERIVED_BYTES` | 128 KiB | Decoded bytes produced per request |
 | `MAX_BASE64_CANDIDATES_PER_TEXT` | 4 | Base64-shaped tokens decoded per text |
 | `MAX_BODY_DECODE_BYTES` | 8 KiB | Body preview size at or below which the body is decoded at all |
@@ -228,6 +229,14 @@ The three decoders are all **non-expanding** — percent-decoding turns 3 bytes
 into 1, an entity 4+ into 1, base64 4 into 3 — so no depth here can produce a
 decompression bomb. What grows with depth is the branch count, and that is what
 `MAX_DERIVED_VIEWS` and `MAX_DERIVED_BYTES` bound.
+
+Like every request-level budget in this document, the decode budget is
+exhaustible by padding: enough decode-rich junk fields will spend it before a
+later field is reached, and sorted header order means an attacker can choose to
+sort first. `MAX_DERIVED_VIEWS_PER_FIELD` raises that from one padding field to
+four but does not close it. What it cannot do is hide a plaintext payload — **the
+raw scan of every field runs before any decoding and is never charged against
+this budget**, so an exhausted budget costs decode coverage only.
 
 ---
 
