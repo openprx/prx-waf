@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.2.202"
+version = "0.2.203"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2205,6 +2205,7 @@ dependencies = [
  "hyper-util",
  "rustls",
  "rustls-native-certs 0.8.4",
+ "rustls-platform-verifier",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -2446,24 +2447,28 @@ dependencies = [
 
 [[package]]
 name = "instant-acme"
-version = "0.7.2"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37221e690dcc5d0ea7c1f70decda6ae3495e72e8af06bca15e982193ffdf4fc4"
+checksum = "9f05ad37c421b962354c358d347d4a6130151df9407978372d3ad7f0c8f71a64"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "base64 0.22.1",
  "bytes",
  "http",
  "http-body",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "ring",
+ "rcgen",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
@@ -3737,7 +3742,7 @@ checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "prx-waf"
-version = "0.2.202"
+version = "0.2.203"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3969,6 +3974,7 @@ version = "0.14.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
 dependencies = [
+ "aws-lc-rs",
  "pem",
  "ring",
  "rustls-pki-types",
@@ -5672,7 +5678,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waf-api"
-version = "0.2.202"
+version = "0.2.203"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5713,7 +5719,7 @@ dependencies = [
 
 [[package]]
 name = "waf-cluster"
-version = "0.2.202"
+version = "0.2.203"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5744,7 +5750,7 @@ dependencies = [
 
 [[package]]
 name = "waf-common"
-version = "0.2.202"
+version = "0.2.203"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5763,7 +5769,7 @@ dependencies = [
 
 [[package]]
 name = "waf-engine"
-version = "0.2.202"
+version = "0.2.203"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5808,7 +5814,7 @@ dependencies = [
 
 [[package]]
 name = "waf-storage"
-version = "0.2.202"
+version = "0.2.203"
 dependencies = [
  "chrono",
  "parking_lot",
@@ -6494,6 +6500,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
 dependencies = [
  "asn1-rs 0.7.2",
+ "aws-lc-rs",
  "data-encoding",
  "der-parser 10.0.0",
  "lazy_static",

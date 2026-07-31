@@ -118,40 +118,51 @@ impl SslManager {
         Ok(cert.id)
     }
 
+    /// The ACME directory URL this manager issues against.
+    ///
+    /// Split out of `request_certificate` so the staging/production choice can
+    /// be asserted without a database or a network round trip. Getting it
+    /// backwards is not a cosmetic mistake: it spends Let's Encrypt production
+    /// rate limits on what was meant to be a rehearsal.
+    const fn acme_directory_url(staging: bool) -> &'static str {
+        if staging {
+            instant_acme::LetsEncrypt::Staging.url()
+        } else {
+            instant_acme::LetsEncrypt::Production.url()
+        }
+    }
+
     /// Request a new certificate via ACME HTTP-01 for `domain`.
     ///
     /// Stores challenge tokens so the gateway can serve them, then waits for
     /// ACME validation and stores the issued certificate in `PostgreSQL`.
     pub async fn request_certificate(self: Arc<Self>, host_code: &str, domain: &str) -> anyhow::Result<Uuid> {
-        use instant_acme::{Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus};
+        use instant_acme::{
+            Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+        };
         use rcgen::{CertificateParams, KeyPair};
 
         info!("Requesting ACME certificate for domain: {}", domain);
 
         // Create or restore ACME account
-        let server_url = if self.acme_staging {
-            LetsEncrypt::Staging.url()
-        } else {
-            LetsEncrypt::Production.url()
-        };
+        let server_url = Self::acme_directory_url(self.acme_staging);
 
-        let (account, _credentials) = Account::create(
-            &NewAccount {
-                contact: &[&format!("mailto:{}", self.acme_email)],
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            server_url,
-            None,
-        )
-        .await?;
+        let contact = format!("mailto:{}", self.acme_email);
+        let (account, _credentials) = Account::builder()?
+            .create(
+                &NewAccount {
+                    contact: &[&contact],
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                server_url.to_owned(),
+                None,
+            )
+            .await?;
 
         // Place new order
-        let mut order = account
-            .new_order(&NewOrder {
-                identifiers: &[Identifier::Dns(domain.to_string())],
-            })
-            .await?;
+        let identifiers = [Identifier::Dns(domain.to_string())];
+        let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
 
         // Create a DB entry for tracking
         let req = CreateCertificate {
@@ -165,45 +176,59 @@ impl SslManager {
         let cert_row = self.db.create_certificate(req).await?;
         let cert_id = cert_row.id;
 
-        // Process HTTP-01 challenge
-        let authorizations = order.authorizations().await?;
-        for auth in &authorizations {
-            let challenge = auth
-                .challenges
-                .iter()
-                .find(|c| c.r#type == ChallengeType::Http01)
-                .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge available"))?;
+        // Process HTTP-01 challenges. `authorizations()` borrows the order
+        // mutably and yields one handle at a time, so the tokens are copied out
+        // here and used for cleanup once the order has been finalized.
+        let mut tokens: Vec<String> = Vec::new();
+        {
+            let mut authorizations = order.authorizations();
+            while let Some(authz) = authorizations.next().await {
+                let mut authz = authz?;
+                match authz.status {
+                    // Nothing to prove: this identifier is already authorized
+                    // for the account, so it has no challenge to answer.
+                    AuthorizationStatus::Valid => continue,
+                    AuthorizationStatus::Pending => {}
+                    other => anyhow::bail!("ACME authorization for {domain} is in state {other:?}, expected pending"),
+                }
 
-            let key_auth = order.key_authorization(challenge);
-            self.challenges
-                .set(challenge.token.clone(), key_auth.as_str().to_string());
+                let mut challenge = authz
+                    .challenge(ChallengeType::Http01)
+                    .ok_or_else(|| anyhow::anyhow!("No HTTP-01 challenge available"))?;
 
-            order.set_challenge_ready(&challenge.url).await?;
+                let key_auth = challenge.key_authorization();
+                let token = challenge.token.clone();
+                self.challenges.set(token.clone(), key_auth.as_str().to_string());
+                tokens.push(token);
+
+                challenge.set_ready().await?;
+            }
         }
 
-        // Wait for order to become ready (poll up to 60s)
-        let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
-        loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let state = order.refresh().await?;
-            match state.status {
-                OrderStatus::Ready | OrderStatus::Valid => break,
-                OrderStatus::Invalid => {
-                    let _ = self
-                        .db
-                        .update_certificate_status(cert_id, "error", Some("ACME validation failed"))
-                        .await;
-                    anyhow::bail!("ACME order invalid for domain {domain}");
-                }
-                _ => {}
-            }
-            if tokio::time::Instant::now() > deadline {
+        // Wait for the order to become ready. `poll_ready` backs off
+        // exponentially and honours the CA's Retry-After, returning either
+        // `Ready`/`Invalid` or `Error::Timeout` once the policy expires.
+        let retry = RetryPolicy::default()
+            .initial_delay(Duration::from_secs(2))
+            .timeout(Duration::from_mins(1));
+
+        let status = match order.poll_ready(&retry).await {
+            Ok(status) => status,
+            Err(e) => {
                 let _ = self
                     .db
-                    .update_certificate_status(cert_id, "error", Some("ACME validation timeout"))
+                    .update_certificate_status(cert_id, "error", Some("ACME validation failed"))
                     .await;
-                anyhow::bail!("ACME validation timed out for domain {domain}");
+                return Err(anyhow::Error::new(e).context(format!("ACME validation failed for domain {domain}")));
             }
+        };
+
+        if status != OrderStatus::Ready {
+            let _ = self
+                .db
+                .update_certificate_status(cert_id, "error", Some("ACME validation failed"))
+                .await;
+            anyhow::bail!("ACME order for domain {domain} ended in state {status:?}, expected ready");
         }
 
         // Generate key pair and CSR
@@ -211,23 +236,21 @@ impl SslManager {
         let csr_params = CertificateParams::new(vec![domain.to_string()])?;
         let csr = csr_params.serialize_request(&key_pair)?;
 
-        // Finalize and download certificate
-        order.finalize(csr.der()).await?;
+        // Finalize and download certificate. Without a deadline a stalled ACME
+        // server could hang this task indefinitely, so the same retry policy
+        // caps the download too.
+        order.finalize_csr(csr.der()).await?;
 
-        // Wait for the certificate to be available (poll up to 60s). Without a
-        // deadline a stalled ACME server could hang this task indefinitely.
-        let download_deadline = tokio::time::Instant::now() + Duration::from_mins(1);
-        let cert_chain = loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Some(chain) = order.certificate().await? {
-                break chain;
-            }
-            if tokio::time::Instant::now() > download_deadline {
+        let cert_chain = match order.poll_certificate(&retry).await {
+            Ok(chain) => chain,
+            Err(e) => {
                 let _ = self
                     .db
-                    .update_certificate_status(cert_id, "error", Some("ACME certificate download timeout"))
+                    .update_certificate_status(cert_id, "error", Some("ACME certificate download failed"))
                     .await;
-                anyhow::bail!("ACME certificate download timed out for domain {domain}");
+                return Err(
+                    anyhow::Error::new(e).context(format!("ACME certificate download failed for domain {domain}"))
+                );
             }
         };
 
@@ -250,10 +273,8 @@ impl SslManager {
             .await?;
 
         // Clean up challenges
-        for auth in &authorizations {
-            if let Some(c) = auth.challenges.iter().find(|c| c.r#type == ChallengeType::Http01) {
-                self.challenges.remove(&c.token);
-            }
+        for token in &tokens {
+            self.challenges.remove(token);
         }
 
         info!(
@@ -337,6 +358,19 @@ mod tests {
         assert_eq!(store.get("token123"), Some("keyauth456".to_string()));
         store.remove("token123");
         assert_eq!(store.get("token123"), None);
+    }
+
+    #[test]
+    fn test_acme_directory_url_honours_staging_flag() {
+        let staging = SslManager::acme_directory_url(true);
+        let production = SslManager::acme_directory_url(false);
+
+        assert!(staging.contains("staging"), "staging directory URL was {staging}");
+        assert!(
+            !production.contains("staging"),
+            "production directory URL was {production}"
+        );
+        assert_ne!(staging, production);
     }
 
     #[test]
