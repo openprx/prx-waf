@@ -179,6 +179,34 @@ static DESER_XXE_STRONG_STRUCTURE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     .ok()
 });
 
+/// Bytes of a decode inspected by the printable-ratio gate. The candidate is
+/// already capped by the per-field input budget; this bounds the gate itself.
+const PRINTABLE_SCAN_BYTES: usize = 4096;
+
+/// Printable-ASCII percentage a decode must reach to count as text.
+const PRINTABLE_RATIO_PCT: usize = 85;
+
+/// Whether decoded bytes are **text at all** — the first tier of the blind-decode
+/// gate, split out so the other consumer of a blind base64 / hex decode
+/// ([`crate::checks::sensitive`]) applies the identical bar rather than inventing
+/// a second one.
+///
+/// Real payloads are text; a random high-entropy token that happens to be valid
+/// base64 decodes to bytes that are not. An empty decode is not text either.
+pub(crate) fn looks_textual(decoded: &str) -> bool {
+    if decoded.is_empty() {
+        return false;
+    }
+    // Bounded scan over a prefix.
+    let scanned = decoded.len().min(PRINTABLE_SCAN_BYTES);
+    let printable = decoded
+        .bytes()
+        .take(scanned)
+        .filter(|&b| b == b'\t' || b == b'\n' || b == b'\r' || (0x20..=0x7e).contains(&b))
+        .count();
+    printable * 100 >= scanned * PRINTABLE_RATIO_PCT
+}
+
 /// Whether decoded bytes look like a real (SQL-ish) payload rather than random
 /// noise — the gate that keeps blind base64 / hex decoding from emitting a view
 /// for every high-entropy token (plan §7.2, codex A-4).
@@ -186,7 +214,8 @@ static DESER_XXE_STRONG_STRUCTURE: LazyLock<Option<Regex>> = LazyLock::new(|| {
 /// A lone punctuation mark (`;`, `--`, `/*`) is **not** sufficient — random
 /// decoded bytes contain an ASCII `;` with high probability. The gate is layered
 /// (codex A-4.6.2):
-///   1. a high printable-ASCII ratio (real payloads are text, random bytes are not); then
+///   1. a high printable-ASCII ratio ([`looks_textual`] — real payloads are text,
+///      random bytes are not); then
 ///   2. a single **strong** structural marker ([`STRONG_STRUCTURE`]) passes on its
 ///      own — these are complete high-confidence attack structures; else
 ///   3. two distinct SQL **keyword** markers (structural evidence), or one keyword
@@ -215,19 +244,8 @@ fn looks_structural(decoded: &str) -> bool {
     // Weak punctuation markers — only count alongside a keyword.
     const PUNCT: &[&str] = &["--", "/*", "' or", ";"];
 
-    if decoded.is_empty() {
-        return false;
-    }
-    // 1) Printable-ratio gate: reject high-entropy binary. Bounded scan over a
-    //    prefix (the candidate is already capped by the per-field input budget).
-    let scanned = decoded.len().min(4096);
-    let printable = decoded
-        .bytes()
-        .take(scanned)
-        .filter(|&b| b == b'\t' || b == b'\n' || b == b'\r' || (0x20..=0x7e).contains(&b))
-        .count();
-    // Require ≥ 85% printable ASCII.
-    if printable * 100 < scanned * 85 {
+    // 1) Printable-ratio gate: reject high-entropy binary.
+    if !looks_textual(decoded) {
         return false;
     }
 
@@ -312,7 +330,7 @@ fn decode_one_entity(entity: &str) -> Option<char> {
 
 /// Decode HTML entities in `s`. Returns `Some(decoded)` only when at least one
 /// entity was actually decoded (so a benign field never produces a view).
-fn html_entity_decode(s: &str) -> Option<String> {
+pub(crate) fn html_entity_decode(s: &str) -> Option<String> {
     if !s.contains('&') {
         return None;
     }
@@ -466,7 +484,7 @@ const MAX_BLIND_CANDIDATES: usize = 8;
 
 /// Try to base64-decode a single candidate token across the standard and
 /// URL-safe alphabets (padded and unpadded). Returns the decoded text.
-fn base64_decode_token(candidate: &str) -> Option<String> {
+pub(crate) fn base64_decode_token(candidate: &str) -> Option<String> {
     let bytes = STANDARD_NO_PAD
         .decode(candidate)
         .or_else(|_| STANDARD.decode(candidate))
@@ -482,6 +500,24 @@ fn base64_decode_token(candidate: &str) -> Option<String> {
 /// alphabet includes base64url (`-`/`_`). The produced view is always tagged
 /// [`Provenance::BlindDecoded`] (never hard-veto).
 fn best_base64_candidate(s: &str) -> Option<String> {
+    for candidate in base64_candidate_tokens(s) {
+        if let Some(decoded) = base64_decode_token(candidate)
+            && looks_structural(&decoded)
+        {
+            return Some(decoded);
+        }
+    }
+    None
+}
+
+/// The base64-shaped tokens of `s`, longest first and capped at
+/// [`MAX_BLIND_CANDIDATES`], so a long benign token cannot mask a shorter
+/// malicious one (codex A-4). The alphabet includes base64url (`-`/`_`).
+///
+/// Shared with [`crate::checks::sensitive`] so both blind decoders tokenise a
+/// field the same way; only the gate applied to the *decoded* bytes differs
+/// (structural evidence there, [`looks_textual`] here).
+pub(crate) fn base64_candidate_tokens(s: &str) -> Vec<&str> {
     let mut candidates: Vec<&str> = s
         .split(is_field_delim)
         .filter(|t| {
@@ -492,14 +528,8 @@ fn best_base64_candidate(s: &str) -> Option<String> {
         .collect();
     // Longest-first, then bounded — inspect several candidates, not just one.
     candidates.sort_unstable_by_key(|t| std::cmp::Reverse(t.len()));
-    for candidate in candidates.into_iter().take(MAX_BLIND_CANDIDATES) {
-        if let Some(decoded) = base64_decode_token(candidate)
-            && looks_structural(&decoded)
-        {
-            return Some(decoded);
-        }
-    }
-    None
+    candidates.truncate(MAX_BLIND_CANDIDATES);
+    candidates
 }
 
 /// Blind-decode the first **structural** hex token in `s` (optionally

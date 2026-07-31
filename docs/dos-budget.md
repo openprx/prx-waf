@@ -199,6 +199,36 @@ never examined by the Lane 1 target collector. This is a permanent coverage
 boundary, not a threshold that can be exceeded — worth knowing because it is
 invisible in the metrics.
 
+The **sensitive-data check does not share that allowlist.** It scans every
+request header, because the whole point of it is noticing credential material
+wherever it travels and an exfiltration header is not going to be named
+`user-agent`. Its bounds are its own, hardcoded in
+`crates/waf-engine/src/checks/sensitive.rs`, and none of them is configurable:
+
+| Bound | Value | What it limits |
+|---|---|---|
+| `MAX_HEADERS_SCANNED` | 64 | Header names inspected per request |
+| `MAX_HEADER_VALUE_BYTES` | 16 KiB | One header value; a larger one is **skipped**, not truncated |
+| `MAX_HEADER_SCAN_BYTES` | 64 KiB | All header bytes inspected per request |
+| `MAX_DECODE_DEPTH` | 3 | Decode layers unwrapped below the field as it arrived |
+| `MAX_DERIVED_VIEWS` | 48 | Decoded texts produced per request, across every field |
+| `MAX_DERIVED_BYTES` | 128 KiB | Decoded bytes produced per request |
+| `MAX_BASE64_CANDIDATES_PER_TEXT` | 4 | Base64-shaped tokens decoded per text |
+| `MAX_BODY_DECODE_BYTES` | 8 KiB | Body preview size at or below which the body is decoded at all |
+
+Header names are walked in sorted order, so which values the first three bounds
+cut is deterministic rather than a function of `HashMap` iteration order. Two of
+these are coverage boundaries rather than thresholds, in the §1.4 sense: a
+percent/entity/base64 wrapping deeper than three layers is not unwrapped, and a
+body preview over 8 KiB is scanned raw only (its cost tracks upload size, which
+is the term §2.2 exists to keep off a single-threaded proxy). Neither is
+counted; both are permanent.
+
+The three decoders are all **non-expanding** — percent-decoding turns 3 bytes
+into 1, an entity 4+ into 1, base64 4 into 3 — so no depth here can produce a
+decompression bomb. What grows with depth is the branch count, and that is what
+`MAX_DERIVED_VIEWS` and `MAX_DERIVED_BYTES` bound.
+
 ---
 
 ## 2. The configurable budgets

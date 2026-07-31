@@ -25,6 +25,7 @@ use tracing;
 use waf_common::{DetectionResult, Phase, RequestCtx};
 
 use super::Check;
+use super::content_security::preprocess;
 
 // ── Built-in sensitive data patterns ─────────────────────────────────────────
 
@@ -152,10 +153,161 @@ fn header_label(name: &str) -> String {
 /// Which pattern set may be applied to a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PatternTier {
-    /// [`BUILTIN_PATTERNS`] only — see [`CREDENTIAL_HEADERS`].
+    /// [`BUILTIN_PATTERNS`] only — see [`CREDENTIAL_HEADERS`] and
+    /// [`decode_children`].
     BuiltinOnly,
     /// Built-ins plus the host's configured word list.
     Full,
+}
+
+impl PatternTier {
+    /// The stricter of two tiers. Used to propagate a blind decode's
+    /// restriction down its descendants: a child of a guessed decode is at
+    /// least as restricted as its parent, never less.
+    const fn narrow(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Full, Self::Full) => Self::Full,
+            _ => Self::BuiltinOnly,
+        }
+    }
+}
+
+// ── Bounded decoding ─────────────────────────────────────────────────────────
+
+/// How many decode layers are unwrapped below the field as it arrived.
+///
+/// Each layer is one encoding an attacker deliberately applied. Real evasions
+/// stack one, occasionally two (`base64` inside a percent-encoded parameter);
+/// three leaves a layer of headroom and stops there. It is not an arbitrary
+/// number in the way a recursion limit usually is, because the transforms here
+/// are all **strictly non-expanding** — percent-decoding turns 3 bytes into 1,
+/// an entity turns 4+ into 1, base64 turns 4 into 3 — so no depth can produce a
+/// decompression bomb. What grows with depth is the **branch count**: each text
+/// yields up to 1 + 1 + [`MAX_BASE64_CANDIDATES_PER_TEXT`] children, so an
+/// unbounded walk is a CPU amplifier even though it is not a memory one. That
+/// is what [`DecodeBudget`] bounds, and the depth cap bounds the shape.
+///
+/// URL decoding counts as **one** layer even though it unwraps up to
+/// [`super::MAX_DECODE_PASSES`] nested percent-encodings: it is a fixed-point
+/// iteration that terminates on its own with its own cap, and charging
+/// `%25252541` three of the three available layers would spend the budget on the
+/// one transform that cannot branch.
+const MAX_DECODE_DEPTH: u8 = 3;
+
+/// Decoded texts produced per request, across every field.
+///
+/// The branch bound. 48 is far above what real traffic reaches — most header
+/// values contain no `%`, no `&…;` and no base64-shaped token, and so yield no
+/// children at all — and far below the `1 + 6 + 36 + 216` a single field could
+/// otherwise reach at depth 3.
+const MAX_DERIVED_VIEWS: usize = 48;
+
+/// Decoded bytes produced per request, across every field.
+///
+/// The cost bound, and the one that actually binds: every derived byte is a byte
+/// two Aho-Corasick automata must walk. 128 KiB is twice the header scan budget
+/// and sits in the same family as the copies `super::request_targets` already
+/// makes of a 64 KiB body.
+const MAX_DERIVED_BYTES: usize = 128 * 1024;
+
+/// Base64-shaped tokens decoded per text.
+const MAX_BASE64_CANDIDATES_PER_TEXT: usize = 4;
+
+/// Body preview size at or below which the body joins the decode walk.
+///
+/// Above it the body is scanned raw, exactly as before. The asymmetry is
+/// deliberate: header, path and query values are bounded at 16 KiB each and are
+/// the surface that was not inspected at all, whereas the body preview arrives
+/// in windows of up to 68 KiB and its cost is the term
+/// [`super::Lane1BodyBudget`] exists to keep off a single-threaded proxy.
+/// 8 KiB comfortably holds the material this check looks for — a PEM private key
+/// is 1.7–3.2 KiB, an AWS credentials file well under 1 KiB — so the decode walk
+/// covers the realistic exfiltration shape without re-introducing a cost that
+/// tracks upload size.
+const MAX_BODY_DECODE_BYTES: usize = 8 * 1024;
+
+/// Per-request allowance for derived (decoded) texts.
+struct DecodeBudget {
+    views_left: usize,
+    bytes_left: usize,
+}
+
+impl DecodeBudget {
+    const fn new() -> Self {
+        Self {
+            views_left: MAX_DERIVED_VIEWS,
+            bytes_left: MAX_DERIVED_BYTES,
+        }
+    }
+
+    /// Charge one derived text of `len` bytes. `false` when either cap is
+    /// reached, at which point the walk stops rather than continuing to
+    /// generate work it cannot pay for.
+    const fn admit(&mut self, len: usize) -> bool {
+        let Some(views) = self.views_left.checked_sub(1) else {
+            return false;
+        };
+        let Some(bytes) = self.bytes_left.checked_sub(len) else {
+            return false;
+        };
+        self.views_left = views;
+        self.bytes_left = bytes;
+        true
+    }
+}
+
+/// One decode layer of `text`: every transform that fires, each paired with the
+/// pattern tier its result may be scanned with.
+///
+/// The tier is the point. Percent-decoding and HTML-entity decoding are
+/// **self-announcing**: `%2D` and `&#45;` say what they are, the transform is
+/// exact, and its output is what the backend would have seen — so the operator's
+/// word list applies to it as it applies to the raw field.
+///
+/// A base64 decode is a **guess**. Any token of the right alphabet and length
+/// decodes to something, and a session id or an `ETag` decodes to bytes that
+/// happen to be printable often enough to matter. Against the built-in patterns
+/// that costs nothing: a 31-byte PEM banner does not appear in decode noise. But
+/// a per-host pattern can be a short word, and matching one in guessed bytes
+/// would block a request over a coincidence. So a blind base64 child is scanned
+/// with the built-ins only, and [`PatternTier::narrow`] carries that restriction
+/// to its own descendants — the same rule the Lane 2 preprocessor encodes as
+/// `Provenance::BlindDecoded` never being hard-veto-capable while
+/// `Provenance::HtmlEntityDecoded` is.
+///
+/// A transform that produces its input unchanged yields no child, so a field
+/// with nothing to decode costs one comparison and allocates nothing.
+fn decode_children(text: &str) -> Vec<(String, PatternTier)> {
+    let mut out = Vec::new();
+
+    // Percent-decoding, iterated to its fixed point (one layer, see
+    // MAX_DECODE_DEPTH).
+    let url = super::url_decode_recursive(text);
+    if url != text {
+        out.push((url, PatternTier::Full));
+    }
+
+    // HTML entities. Fires only when an entity actually decoded.
+    if let Some(entities) = preprocess::html_entity_decode(text)
+        && entities != text
+    {
+        out.push((entities, PatternTier::Full));
+    }
+
+    // Blind base64, gated on the decode looking like text at all.
+    for token in preprocess::base64_candidate_tokens(text)
+        .into_iter()
+        .take(MAX_BASE64_CANDIDATES_PER_TEXT)
+    {
+        if let Some(decoded) = preprocess::base64_decode_token(token)
+            && preprocess::looks_textual(&decoded)
+            && decoded != text
+        {
+            out.push((decoded, PatternTier::BuiltinOnly));
+        }
+    }
+
+    out
 }
 
 /// The identity of a matched pattern, rendered for a detection detail.
@@ -297,6 +449,52 @@ impl SensitiveCheck {
         None
     }
 
+    /// Scan `text` as it arrived and every bounded decoding of it.
+    ///
+    /// Breadth-first, so a payload one layer down is found before the budget is
+    /// spent chasing a deep chain of nothing. The raw field is scanned before
+    /// anything is allocated: a request with no encoding pays exactly what it
+    /// paid before this walk existed.
+    fn scan_decoded(
+        &self,
+        text: &str,
+        host_code: &str,
+        tier: PatternTier,
+        budget: &mut DecodeBudget,
+    ) -> Option<PatternHit> {
+        if let Some(hit) = self.scan(text, host_code, tier) {
+            return Some(hit);
+        }
+
+        let mut pending: Vec<(String, PatternTier)> = decode_children(text)
+            .into_iter()
+            .map(|(t, child_tier)| (t, tier.narrow(child_tier)))
+            .collect();
+
+        for depth in 1..=MAX_DECODE_DEPTH {
+            let mut frontier: Vec<(String, PatternTier)> = Vec::new();
+            for (child, child_tier) in pending {
+                if !budget.admit(child.len()) {
+                    return None;
+                }
+                if let Some(hit) = self.scan(&child, host_code, child_tier) {
+                    return Some(hit);
+                }
+                frontier.push((child, child_tier));
+            }
+            if depth == MAX_DECODE_DEPTH || frontier.is_empty() {
+                return None;
+            }
+            pending = Vec::new();
+            for (parent, parent_tier) in &frontier {
+                for (child, child_tier) in decode_children(parent) {
+                    pending.push((child, parent_tier.narrow(child_tier)));
+                }
+            }
+        }
+        None
+    }
+
     /// Scan every request header, cheapest surface first.
     ///
     /// Header names are inspected in **sorted order**, not `HashMap` order. That
@@ -307,7 +505,7 @@ impl SensitiveCheck {
     /// be non-deterministic. A security control that answers differently on
     /// identical input cannot be regression-tested, and `tests/lane2/baseline.json`
     /// is a zero-tolerance ratchet.
-    fn scan_headers(&self, ctx: &RequestCtx, host_code: &str) -> Option<DetectionResult> {
+    fn scan_headers(&self, ctx: &RequestCtx, host_code: &str, budget: &mut DecodeBudget) -> Option<DetectionResult> {
         if ctx.headers.is_empty() {
             return None;
         }
@@ -332,7 +530,7 @@ impl SensitiveCheck {
             } else {
                 PatternTier::Full
             };
-            if let Some(hit) = self.scan(value, host_code, tier) {
+            if let Some(hit) = self.scan_decoded(value, host_code, tier, budget) {
                 return Some(Self::result(&hit, &header_label(name)));
             }
         }
@@ -365,23 +563,33 @@ impl Check for SensitiveCheck {
 
         let host_code = &ctx.host_config.code;
         let targets = [("path", ctx.path.as_str()), ("query", ctx.query.as_str())];
+        // One allowance for the whole request, so a wide request cannot buy more
+        // decoding by spreading its payload across more fields.
+        let mut budget = DecodeBudget::new();
 
         for (location, text) in &targets {
-            if let Some(hit) = self.scan(text, host_code, PatternTier::Full) {
+            if let Some(hit) = self.scan_decoded(text, host_code, PatternTier::Full, &mut budget) {
                 return Some(Self::result(&hit, location));
             }
         }
 
         // Headers before the body: bounded at 64 KiB total by construction,
         // where a body preview is up to 68 KiB per window on its own.
-        if let Some(result) = self.scan_headers(ctx, host_code) {
+        if let Some(result) = self.scan_headers(ctx, host_code, &mut budget) {
             return Some(result);
         }
 
-        // Scan body preview
+        // Scan body preview. Decoding is applied only to a body small enough for
+        // it to be free — see MAX_BODY_DECODE_BYTES; a larger body is scanned raw,
+        // byte for byte as before.
         if !ctx.body_preview.is_empty() {
             let body = String::from_utf8_lossy(&ctx.body_preview);
-            if let Some(hit) = self.scan(&body, host_code, PatternTier::Full) {
+            let hit = if body.len() <= MAX_BODY_DECODE_BYTES {
+                self.scan_decoded(&body, host_code, PatternTier::Full, &mut budget)
+            } else {
+                self.scan(&body, host_code, PatternTier::Full)
+            };
+            if let Some(hit) = hit {
                 return Some(Self::result(&hit, "body"));
             }
         }
@@ -393,8 +601,10 @@ impl Check for SensitiveCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use bytes::Bytes;
     use std::collections::HashMap;
+    use std::fmt::Write as _;
     use std::sync::Arc;
     use waf_common::{DefenseConfig, HostConfig};
 
@@ -609,6 +819,188 @@ mod tests {
         let ctx = make_ctx("/", PEM.as_bytes());
         let detail = checker.check(&ctx).expect("builtin hit").detail;
         assert_eq!(detail, format!("Sensitive pattern '{PEM}' found in body"));
+    }
+
+    // ── Decoding ─────────────────────────────────────────────────────────────
+
+    fn b64(s: &str) -> String {
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(s.as_bytes())
+    }
+
+    /// Percent-encode every byte, the crudest and most common evasion form.
+    fn pct(s: &str) -> String {
+        s.bytes().fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "%{b:02X}");
+            acc
+        })
+    }
+
+    /// Numeric HTML character references for every character.
+    fn entities(s: &str) -> String {
+        s.chars().fold(String::new(), |mut acc, c| {
+            let _ = write!(acc, "&#{};", c as u32);
+            acc
+        })
+    }
+
+    #[test]
+    fn url_encoded_payload_is_decoded_in_every_scope() {
+        let checker = SensitiveCheck::new();
+        let encoded = pct(PEM);
+
+        for ctx in [
+            make_ctx(&format!("/upload/{encoded}"), b""),
+            make_ctx_with_headers("/", b"", &[("x-note", &encoded)]),
+            make_ctx("/", encoded.as_bytes()),
+        ] {
+            assert!(checker.check(&ctx).is_some(), "missed {encoded}");
+        }
+    }
+
+    #[test]
+    fn double_url_encoding_is_one_decode_layer() {
+        // `url_decode_recursive` runs to its fixed point, so a re-encoded `%`
+        // does not cost a second layer of the depth budget.
+        let checker = SensitiveCheck::new();
+        let once = pct(PEM);
+        let twice = once.replace('%', "%25");
+        let ctx = make_ctx_with_headers("/", b"", &[("x-note", &twice)]);
+        assert!(checker.check(&ctx).is_some());
+    }
+
+    #[test]
+    fn html_entity_encoded_payload_is_decoded() {
+        let checker = SensitiveCheck::new();
+        let encoded = entities(PEM);
+        let ctx = make_ctx_with_headers("/", b"", &[("x-note", &encoded)]);
+        assert!(checker.check(&ctx).is_some());
+    }
+
+    #[test]
+    fn base64_wrapped_payload_is_decoded() {
+        let checker = SensitiveCheck::new();
+        let ctx = make_ctx_with_headers("/", b"", &[("x-note", &b64(PEM))]);
+        assert!(checker.check(&ctx).is_some());
+    }
+
+    #[test]
+    fn base64_inside_url_encoding_is_decoded() {
+        // The realistic two-layer evasion: a base64 blob in a percent-encoded
+        // query parameter.
+        let checker = SensitiveCheck::new();
+        let mut ctx = make_ctx("/upload", b"");
+        ctx.query = format!("blob={}", b64(PEM).replace('+', "%2B"));
+        assert!(checker.check(&ctx).is_some());
+    }
+
+    #[test]
+    fn decode_depth_cap_stops_the_walk() {
+        let checker = SensitiveCheck::new();
+
+        // Three nested base64 wrappers = three decode layers = the cap, found.
+        let at_cap = b64(&b64(&b64(PEM)));
+        let ctx = make_ctx_with_headers("/", b"", &[("x-note", &at_cap)]);
+        assert!(
+            checker.check(&ctx).is_some(),
+            "depth {MAX_DECODE_DEPTH} must be reached"
+        );
+
+        // One more wrapper is past the cap.
+        let past_cap = b64(&at_cap);
+        let ctx = make_ctx_with_headers("/", b"", &[("x-note", &past_cap)]);
+        assert!(checker.check(&ctx).is_none(), "depth cap must bound the walk");
+    }
+
+    #[test]
+    fn decode_view_budget_is_shared_across_the_request() {
+        // Enough decodable-but-clean headers to exhaust MAX_DERIVED_VIEWS before
+        // the (later-sorting) encoded payload is reached.
+        let checker = SensitiveCheck::new();
+        let noise = b64("the quick brown fox jumps over the lazy dog");
+        let mut owned: Vec<(String, String)> = (0..MAX_DERIVED_VIEWS)
+            .map(|i| (format!("x-pad-{i:04}"), noise.clone()))
+            .collect();
+        owned.push(("zzz-payload".to_string(), b64(PEM)));
+        let borrowed: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let ctx = make_ctx_with_headers("/", b"", &borrowed);
+        assert!(checker.check(&ctx).is_none());
+
+        // The same payload alone, with the budget intact, is found.
+        let ctx = make_ctx_with_headers("/", b"", &[("zzz-payload", &b64(PEM))]);
+        assert!(checker.check(&ctx).is_some());
+    }
+
+    #[test]
+    fn a_blind_base64_decode_is_not_scanned_with_the_operator_word_list() {
+        // A base64 decode is a guess; a per-host pattern can be a short word.
+        // Matching one in guessed bytes would block over a coincidence, so the
+        // word list is not applied below a blind decode — while the built-ins,
+        // which are 20+ byte literals, still are.
+        let checker = SensitiveCheck::new();
+        checker.load_host("test", &["internal-only".to_string()]);
+
+        let hidden = make_ctx_with_headers("/", b"", &[("x-note", &b64("internal-only marker"))]);
+        assert!(checker.check(&hidden).is_none());
+
+        // Same word, not blind-decoded: found.
+        let plain = make_ctx_with_headers("/", b"", &[("x-note", "internal-only marker")]);
+        assert!(checker.check(&plain).is_some());
+
+        // Same word behind a percent-encoding, which is self-announcing and
+        // therefore keeps the full tier: found.
+        let url = make_ctx_with_headers("/", b"", &[("x-note", "internal%2Donly marker")]);
+        assert!(checker.check(&url).is_some());
+
+        // A built-in behind the same blind decode: still found.
+        let builtin = make_ctx_with_headers("/", b"", &[("x-note", &b64(PEM))]);
+        assert!(checker.check(&builtin).is_some());
+    }
+
+    #[test]
+    fn oversized_body_is_scanned_raw_only() {
+        let checker = SensitiveCheck::new();
+        let encoded = pct(PEM);
+
+        // Under the decode cap: the encoding is unwrapped.
+        let small = format!("{}{encoded}", " ".repeat(64));
+        assert!(small.len() <= MAX_BODY_DECODE_BYTES);
+        assert!(checker.check(&make_ctx("/", small.as_bytes())).is_some());
+
+        // Over it: raw scan only, so the encoded form is missed and the plain
+        // form is still caught.
+        let big = format!("{}{encoded}", " ".repeat(MAX_BODY_DECODE_BYTES));
+        assert!(checker.check(&make_ctx("/", big.as_bytes())).is_none());
+        let big_plain = format!("{}{PEM}", " ".repeat(MAX_BODY_DECODE_BYTES));
+        assert!(checker.check(&make_ctx("/", big_plain.as_bytes())).is_some());
+    }
+
+    #[test]
+    fn decoding_does_not_flag_ordinary_traffic() {
+        let checker = SensitiveCheck::new();
+        checker.load_host("test", &["secret".to_string(), "token".to_string()]);
+        let mut ctx = make_ctx_with_headers(
+            "/search",
+            b"{\"q\":\"caf\\u00e9\",\"page\":2}",
+            &[
+                ("authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.7QK1"),
+                (
+                    "cookie",
+                    "sid=Zm9vYmFyYmF6cXV1eA; theme=dark; _ga=GA1.2.1234567890.1600000000",
+                ),
+                ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"),
+                ("accept", "text/html,application/xhtml+xml;q=0.9"),
+                ("referer", "https://example.com/list?q=caf%C3%A9&sort=desc"),
+                ("if-none-match", "W/\"6c9a1f2b4d8e0a3c5f7b9d1e3a5c7f90\""),
+                ("x-request-id", "b3f1c2d4-5e6a-7b8c-9d0e-1f2a3b4c5d6e"),
+                ("x-amzn-trace-id", "Root=1-5759e988-bd862e3fe1be46a994272793"),
+            ],
+        );
+        ctx.query = "q=caf%C3%A9&sort=desc&page=2".to_string();
+        assert!(
+            checker.check(&ctx).is_none(),
+            "{:?}",
+            checker.check(&ctx).map(|r| r.detail)
+        );
     }
 
     #[test]

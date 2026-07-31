@@ -84,6 +84,26 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   `Lane1BodyBudget` already applies to an over-budget body). Names are
   inspected in sorted order so the caps cut deterministically.
 
+- **Sensitive-data detection decodes what it scans.** It matched raw bytes only,
+  so percent-encoding, an HTML character reference or a base64 wrapper was
+  enough to walk a private key past it. It now scans the field as it arrived
+  plus up to three decode layers below it — percent-decoding (iterated to its
+  fixed point, counting as one layer), HTML entities, and base64 tokens gated on
+  the decode looking like text — reusing the Lane 2 preprocessor's decoders
+  rather than growing a second copy.
+
+  A blind base64 decode is a **guess**, so its result is scanned with the
+  built-in patterns only, never with the operator's word list: a short word
+  matching in guessed bytes would block a request over a coincidence. This is
+  the same distinction the Lane 2 preprocessor draws between
+  `Provenance::BlindDecoded` and `Provenance::HtmlEntityDecoded`.
+
+  Bounded at 3 layers, 48 decoded texts and 128 KiB of decoded bytes per
+  request. All three decoders shrink their input, so depth cannot bomb; the
+  branch count is what the budgets hold. A body preview over 8 KiB is scanned
+  raw, exactly as before — decoding it would re-introduce the cost that tracks
+  upload size. Recorded in `docs/dos-budget.md` §1.4.
+
 - **The eighteen code-decided Lane 2 rules have prices.** `docs/lane2-rule-pricing.md`
   gains a section for them: fifteen priced by taking each away from the shipped
   posture, three by switching each on. Baseline shadow 139/10/2, enforce 75/2/2,
