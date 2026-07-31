@@ -15,8 +15,29 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # Everything else in this file reads Rust source or Cargo metadata. A
+  # CHANGELOG.md carrying eighty lines of unresolved conflict markers therefore
+  # passed every gate and reached main, and was noticed by accident days later.
+  # This job reads the whole tree instead, needs no toolchain and no cache, and
+  # finishes in seconds. It gates the others so that a conflicted tree costs one
+  # runner-minute rather than thirty.
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Conflict markers
+        run: scripts/check-conflict-markers.sh
+      # A malformed fragment is only discovered when someone tries to cut a
+      # release, which is the worst moment to find out. python3 is on the
+      # runner image; the script imports nothing outside the standard library.
+      - name: Changelog fragments
+        run: scripts/changelog.py check
+
   lint:
     name: Lint
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -144,6 +165,7 @@ jobs:
   # because it shares nothing with them and finishes in seconds.
   admin-ui:
     name: Admin UI (typecheck)
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

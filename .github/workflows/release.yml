@@ -67,6 +67,14 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
+      # ci.yml triggers on branches, not tags, so a tag can in principle point
+      # at a commit this repository's CI never saw. The cheapest gate runs
+      # first here too. CHANGELOG.md ships inside every release tarball and is
+      # the source of the release notes, which makes a conflicted one a
+      # published artifact rather than an internal embarrassment.
+      - name: Conflict markers
+        run: scripts/check-conflict-markers.sh
+
       - name: Download admin UI dist
         uses: actions/download-artifact@v8
         with:

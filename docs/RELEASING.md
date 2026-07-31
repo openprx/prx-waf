@@ -23,6 +23,8 @@ git status --porcelain   # must be empty
 # is gitignored, so nothing below compiles until you build the frontend once.
 (cd web/admin-ui && npm ci && npm run build)
 
+scripts/check-conflict-markers.sh
+scripts/changelog.py check
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo check --all-features
@@ -71,40 +73,39 @@ The release pipeline **fails the build** if the tag does not match
 
 ---
 
-## 3. Write the CHANGELOG entry
+## 3. Assemble the CHANGELOG entry
 
 `CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 The release job extracts the section whose heading starts with
 `## [<version>]` and uses it verbatim as the release body, so the heading must
 match the tag exactly.
 
-Rename the `## [Unreleased]` heading to the release heading and open a fresh
-empty `## [Unreleased]` above it:
+You do not write that section by hand. Entries arrive during the cycle as one
+file per change in `changelog.d/` (see [CONTRIBUTING.md](../CONTRIBUTING.md));
+this step turns them into the version section and deletes them.
 
-```markdown
-## [Unreleased]
-
-## [0.2.28] — 2026-08-01
-
-### Security
-
-- **(H-12)** Fix … (GHSA-xxxx-xxxx-xxxx / CVE-2026-XXXXX). Reported by @handle.
-
-### Added
-### Changed
-### Fixed
-### Breaking Changes
+```bash
+scripts/changelog.py render          # read it first — this is the release body
+scripts/changelog.py release 0.2.28  # splice it in, delete and stage fragments
 ```
 
-Rules for the entry:
+`release` refuses to run if any fragment is malformed, if the version already
+has a section, or if `changelog.d/` is empty. All three fail here, on your
+terminal, before a tag exists. Nothing in `.github/workflows/release.yml`
+assembles anything — a release that has begun publishing must not be able to
+discover that its notes will not build.
 
-- `### Security` goes **first** and names the advisory or CVE ID and the
+Then read the result and edit `CHANGELOG.md` directly if the assembled section
+needs a lead paragraph or reordering within a subsection. What the script gives
+you is the raw material, not the finished page. Check that:
+
+- `### Security` comes first and names the advisory or CVE ID and the
   reporter's credit. This is the section operators grep for when deciding
-  whether to page someone.
-- Every `### Breaking Changes` bullet must state what an operator has to *do*,
-  not just what changed. "Startup now refuses X — set `y.z = true` to keep the
-  old behaviour" is useful; "hardened X" is not.
-- Drop empty subsections before committing.
+  whether to page someone. Order is by category, so this holds automatically as
+  long as the fragments were filed under `security-*`.
+- Every `### Breaking Changes` bullet states what an operator has to *do*, not
+  just what changed. "Startup now refuses X — set `y.z = true` to keep the old
+  behaviour" is useful; "hardened X" is not.
 
 If no matching section exists the pipeline emits a warning and falls back to
 GitHub's auto-generated commit notes. That is a degraded release — fix the
@@ -113,7 +114,7 @@ CHANGELOG instead of shipping it.
 Commit the bump:
 
 ```bash
-git add Cargo.toml Cargo.lock CHANGELOG.md
+git add Cargo.toml Cargo.lock CHANGELOG.md changelog.d
 git commit -m "chore: release 0.2.28"
 git push origin main
 ```
