@@ -104,6 +104,17 @@ Version numbers follow [Semantic Versioning](https://semver.org/).
   raw, exactly as before — decoding it would re-introduce the cost that tracks
   upload size. Recorded in `docs/dos-budget.md` §1.4.
 
+  **Neither corpus baseline moved, and neither file was touched.** Both
+  harnesses configure `sensitive = false` (`tests/lane2/run.sh:375`,
+  `tests/ftw/run.sh:318`) so that a hit is attributable to exactly one engine,
+  which makes this a structural guarantee rather than luck — but it was replayed
+  rather than argued. On `56c23e1f`: Lane 2 shadow 141 detected / 10 FP / 2
+  block-FP and enforce 75 / 2 / 2, with the named `fp-block` and `fp-log` rows
+  unchanged; go-ftw log **and** cloud at PL1/PL2/PL4, all six cells identical to
+  the committed numbers down to every bucket, `over-block` included. Writing a
+  new `recorded_from` onto numbers that did not change is how that field came to
+  point at the wrong tree twice, so it still names the run that produced them.
+
 - **The eighteen code-decided Lane 2 rules have prices.** `docs/lane2-rule-pricing.md`
   gains a section for them: fifteen priced by taking each away from the shipped
   posture, three by switching each on. Baseline shadow 139/10/2, enforce 75/2/2,
