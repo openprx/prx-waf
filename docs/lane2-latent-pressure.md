@@ -105,7 +105,7 @@ what the rule is carrying today.
 | `rce_ast.cmd_subst` | `rce` | 78 | **5** | 2 | +0 | +0 | already in the FP count |
 | `traversal.sensitive_abs` | `traversal` | 68 | **2** | 2 | +11 | +0 | already in the FP count |
 | `sql.union_null` | `sql_injection` | 78 | **1** | 1 | +0 | +2 | already in the FP count |
-| `sql.union_select` | `sql_injection` | 72 | **1** | 1 | +1 | +0 | already in the FP count |
+| `sql.union_select` | `sql_injection` | 72 | **1** (→ 2, [below](#two-rules-the-table-understates-and-nothing-else)) | 1 (→ 2) | +1 | +0 | already in the FP count |
 | `rce.shell_exec_flag` | `rce` | 82 | **1** | 1 | +1 | +0 | already in the FP count |
 | `rce.cmd_subst` | `rce` | 80 | **1** | 1 | +1 | +0 | already in the FP count |
 | `rce.piped_shell` | `rce` | 78 | **1** | 1 | +0 | +0 | already in the FP count |
@@ -117,7 +117,7 @@ what the rule is carrying today.
 | `rce.reverse_shell` | `rce` | 92 | 0 | 0 | +1 | +2 | clean |
 | `rce_ast.reverse_shell` | `rce` | 90 | 0 | 0 | +0 | +1 | clean |
 | `rce_ast.heredoc_interp` | `rce` | 82 | 0 | 0 | +0 | +0 | clean |
-| `rce_ast.interp_exec_flag` | `rce` | 82 | 0 | 0 | +0 | +0 | clean |
+| `rce_ast.interp_exec_flag` | `rce` | 82 | 0 (→ 1, [below](#two-rules-the-table-understates-and-nothing-else)) | 0 (→ 1) | +0 | +0 | clean |
 | `rce_ast.cmd_chain_injection` | `rce` | 80 | 0 | 0 | +2 | +0 | clean |
 | `rce_ast.pipe_to_interp` | `rce` | 80 | 0 | 0 | +0 | +0 | clean |
 | `rce.fetch_exec` | `rce` | 75 | 0 | 0 | +0 | +0 | clean |
@@ -169,6 +169,33 @@ what the rule is carrying today.
 | `deser.php_phar` | `deserialization` | 85 | 0 | 0 | +1 | +1 | clean |
 | `deser.php_object_injection` | `deserialization` | 60 | 0 | 0 | +2 | +0 | clean |
 
+### Two rules the table understates, and nothing else
+
+The isolation sweep in
+[`lane2-rule-pricing.md`](lane2-rule-pricing.md#which-zeros-are-masking)
+re-derived every `touched` count above with each rule's own detector cleared of
+everything that could outrank it. **Sixty-four of the sixty-six are exact.** Two
+are not, and neither moves a bucket:
+
+* **`sql.union_select` touches 2 benign rows, not 1.** It also fires on
+  `content-059`, where `sql.union_null` (78) outranks it (72) in the single
+  `struct_rule` detector. `content-059` is already a false positive on
+  `sql.union_null` and `traversal.sensitive_abs`, so the row was counted; the
+  attribution was not.
+* **`rce_ast.interp_exec_flag` touches 1 benign row, not 0** — `content-033`,
+  and this one is not a rule outranking a rule. `content-033` exhausts the Lane 2
+  work budget, exactly as the caveat at the end of this document warns, and the
+  shell-AST detector never reaches the view. Taking the SQL AST layer away frees
+  the shared attempt budget and the signal appears. `content-033` is already a
+  false positive on `rce.shell_exec_flag`.
+
+So the nine rules with benign contact become nine rules and **fifteen** rows
+rather than fourteen, twelve of them already over a threshold rather than
+eleven, and the hidden population is still **three rows on one rule**. The
+`over` split, the false-positive attribution, and the **0 latent** row of the
+classification are all unchanged: both corrections land on rows that are already
+false positives.
+
 ### The table is confirmed twice
 
 `touched` can also be read straight out of the baseline run: the observation
@@ -194,11 +221,11 @@ contributor and not the cause.
 | `content-100` | 88 | `xpath.func_axis` | **clean** — sole cause, and this is the other blocking FP |
 | `content-031` | 79 | `rce.cmd_subst`, `rce_ast.cmd_subst`, `traversal.sensitive_abs` | 68 / 68 / 79 — **no single removal clears it** |
 | `content-029` | 78 | `rce.piped_shell`, `rce_ast.cmd_subst` | 39 / 39 — **either removal clears it**, to sub-threshold |
-| `content-059` | 68 | `sql.union_null`, `traversal.sensitive_abs`, `xss.script_tag` | 68 / 45 / n-a — **no single removal clears it** |
+| `content-059` | 68 | `sql.union_null`, `traversal.sensitive_abs`, `xss.script_tag` (+ `sql.union_select`, masked) | 68 / 45 / n-a — **no single removal clears it**, and taking `sql.union_null` away exposes `sql.union_select` on the same field |
 | `content-005` | 45 | `xss.script_tag` | not switchable by this run's binary — **clean**, measured at `v0.2.192` |
 | `content-010` | 45 | `xss.script_tag` | not switchable by this run's binary — **clean**, measured at `v0.2.192` |
 | `content-011` | 43 | `xss.event_handler` | not switchable by this run's binary — **clean**, measured at `v0.2.192` |
-| `content-033` | 41 | `rce.shell_exec_flag` | **clean** — sole cause |
+| `content-033` | 41 | `rce.shell_exec_flag` (+ `rce_ast.interp_exec_flag`, budget-masked) | **clean** — sole cause at the shipped budget; the second rule is on a view the row never reaches |
 | `content-044` | 36 | `sql.union_select` | **clean** — sole cause |
 
 Five of the ten have a single named rule whose removal returns the row to
@@ -388,9 +415,14 @@ Two limits on the `touched` numbers specifically:
   reports the same four rows of benign contact this run saw from outside, so the
   two agree, and it adds one classification this document could not: **a rule can
   read as zero because a stronger construct on the same field outranks it, not
-  because it found nothing.** `xss.base_href` is the worked example. Nothing in
-  the sixty-six rows above was checked for that, so any `touched = 0` in this
-  document's table carries the same ambiguity.
+  because it found nothing.** `xss.base_href` is the worked example.
+  **Every row of the table above has since been checked for it.**
+  [`lane2-rule-pricing.md`](lane2-rule-pricing.md#which-zeros-are-masking) ran
+  all 115 rules in isolation — each with every other rule of its own detector
+  switched off — and the sixty-six survive with one correction, immediately
+  below. Two limits remain and neither is a rule outranking a rule: the Lane 2
+  work budget (the bullet above, and it hides one more row — see below), and the
+  four view-and-field construction paths no rule switch reaches.
 
 `docs/lane2-blind-spots.md` remains the attack-side companion; this document
 says nothing about what Lane 2 misses.

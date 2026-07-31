@@ -741,6 +741,305 @@ Nothing else moved. Thirty of the thirty-one prices above stand as recorded.
 
 ---
 
+# Which zeros are masking
+
+`xss.base_href` reads `touched = 0` on a corpus that contains its exact shape.
+`traversal.plain_dotdot` stopped appearing on `trav-005` when a stronger
+traversal rule went default-on. Both are the same effect — a rule that matched
+and was never named — and until now the only answer to "how many more are there"
+was a caveat saying nobody had looked. This section is the look.
+
+It is not a rule-by-rule retry. The pipeline decides where masking can happen,
+and the shipped baseline report decides which rows can be hiding what, so the
+candidate set falls out of the two rather than out of a hunch.
+
+## Masking happens in exactly one place
+
+`SemanticDetector::detect` returns `Option<DetectionFinding>`
+(`crates/waf-engine/src/checks/content_security/preprocess.rs:656`). **One rule
+key per detector per view, and that is the whole of it.** Everything downstream
+keeps every signal it is handed:
+
+* `mod.rs:424` runs every detector on every view and pushes every finding —
+  no dedup, no cap, no `break`;
+* `scoring.rs:655` copies the signal slice into the verdict verbatim, and
+  `engine.rs:817` serialises that slice into the `semantic_observations` row the
+  corpus harness reads as `rule_keys_fired`;
+* the `canonical` arg-max at `scoring.rs:470` collapses `(scope, field, attack,
+  detector)` for the **score**, and `Group::best` / `best_specific` / the
+  request roll-up / `reattribute_shared_construct` pick the single `rule_id` an
+  operator sees on the event — none of them removes a signal from the list.
+
+So a rule is invisible on a row if and only if one of its **own detector's**
+rules took the slot it wanted, on the same view. Cross-detector cannot mask
+(`xss.script_tag` and `xss.js_sink` are different detectors and both appear on
+`xss-016`), and cross-view cannot mask (`rule_keys_fired` is a set over every
+view, so a rule beaten on the raw view still shows if it wins on the
+base64-decoded one).
+
+## Where inside a detector the choice is made
+
+Twelve sites, and they are all the same shape — propose every candidate, keep
+one:
+
+| site | file:line | what competes | winner |
+|---|---|---|---|
+| `best_match` | `detectors.rs:499` | every compiled row of one regex table | highest confidence, incumbent on a tie |
+| `keep_stronger` | `xss_dom.rs:530` | the nine XSS DOM constructs | highest confidence, incumbent on a tie |
+| dangling-tag fallback | `xss_dom.rs:846` | `xss.dangling_open_tag` vs any parsed construct | anything else at all — a hard `best.is_none()` gate, not a comparison |
+| `classify_context` | `xss_js.rs:111` | `xss.js_exfil` vs `xss.js_sink` | exfil, falling back to sink when exfil is off |
+| cross-context arg-max | `xss_js.rs:167` | the winners of every JS context on the view | highest confidence |
+| `max_by_key` | `detectors.rs:3835` | every key the shell-AST walk fired | highest confidence, **last** on a tie |
+| `walk.fire` | `detectors.rs:4288` | `rce_ast.cmd_subst` vs `rce_ast.cmd_subst_any` | whether the substitution's inner text is dangerous — mutually exclusive per substitution |
+| `classify_statements` | `detectors.rs:2812` | `ast.stacked` vs everything else | stacked, and the other statements are never classified |
+| `SetExpr::SetOperation` | `detectors.rs:2829` | `ast.union` vs the selects inside the union | union, and with union off the arm reports nothing |
+| `classify_set_expr` | `detectors.rs:2836` | `ast.dangerous_fn` / `ast.tautology` / `ast.subquery` | an if/else-if chain in confidence order, over an `AstFlags` that holds all three |
+| regex-vs-pickle | `detectors.rs:2403` | the deser regex table's winner vs the pickle walker's grade | highest confidence, regex on a tie |
+| pickle grade | `detectors.rs:2440` | `deser.py_pickle_reduce_exec` vs `deser.py_pickle_dangerous_global` | reduce, falling back to the named grade when reduce is off |
+
+`best_match` is called by all nine regex-table detectors
+(`detectors.rs:663 897 1056 1206 1393 1658 1866 2067 2400`), which is why one
+function covers seventy-nine of the hundred and fifteen keys.
+
+Every one of these consults the operator's `RuleToggles` before it keeps a
+candidate, which is the property that makes unmasking possible at all: take the
+winner away in `rules_disabled` and the next-strongest enabled rule takes the
+slot.
+
+## What that makes provable, and where it stops
+
+The winner outranks the loser on confidence at ten of the twelve sites, and at
+the two `xss_*` fallbacks the loser is reported instead. So:
+
+> A rule `B` can be missing from row `X` only if `X`'s `rule_keys_fired`
+> contains a key of `B`'s own detector whose confidence is `>=` `B`'s.
+
+That is a filter over the shipped baseline report, and it is what the candidate
+set below is computed from. **Two sites break the confidence half of it, both
+inside the SQL AST detector**, so `ast` is filtered on detector presence alone:
+
+* `detectors.rs:2968` tries the numeric wrapper first and the single-quote
+  breakout wrapper only `or_else` — so an `ast.subquery` (78) found under the
+  numeric wrapper hides an `ast.dangerous_fn` (85) the quoted wrapper would have
+  found;
+* `detectors.rs:2982` **relabels**: on a view still carrying a comment marker the
+  structural key is replaced by `ast.comment_obfusc`, at the structure's own
+  confidence. The structure's key does not appear alongside it — it does not
+  appear at all. `ast.comment_obfusc` is also the one key that is deliberately
+  not switchable (`NON_SWITCHABLE_KEYS`, `detectors.rs:234`), so no
+  `rules_disabled` can take the relabel away.
+
+## Masking that is not a rule at all
+
+Four more places lose a rule's chance to fire, and none of them is reachable
+from `rules_enabled` / `rules_disabled` — they run identically in every sweep in
+these two documents, so they are a standing limit on every number here rather
+than an error in any particular one:
+
+* **one blind decode per text.** `best_base64_candidate`
+  (`preprocess.rs:484`) and `best_hex_candidate` (`preprocess.rs:509`) return the
+  **first** structural candidate. A field carrying two base64 tokens yields one
+  `BlindDecoded` view, and whatever the second one decodes to is never inspected.
+* **one body extractor per request.** `extract_body_fields`
+  (`struct_extract.rs:138`) dispatches multipart → JSON → GraphQL → XML → sniff
+  in an if/else-if chain. A body that is two of those at once yields one
+  extractor's leaves.
+* **field and view caps.** The JSON/XML/GraphQL/multipart walks `break` at
+  `max_fields`, and the per-field view cap drops frontier texts past
+  `max_views`. The view cap records a miss and marks the request `degraded`; the
+  field caps do not.
+* **the XSS token detector depends on the DOM detector having run.**
+  `XssDomDetector::detect` clears the JS-context stash before every early return
+  (`xss_dom.rs:782`), so when the HTML parse budget or the input-size backstop
+  declines a view, `xss.js_exfil` and `xss.js_sink` cannot fire on it — masked by
+  a *different* detector, with no key of their own detector on the row to show
+  for it.
+
+## Where the candidates are, and why the sweep did not need them
+
+The rule above cuts the problem down to almost nothing. **Thirteen of the 220
+benign rows carry any Lane 2 signal at all in the shipped baseline** —
+`content-005 -010 -011 -029 -030 -031 -033 -038 -040 -044 -059 -099 -100`, and
+the other 207 name no rule of any detector. A benign `touched = 0` can only be
+masking on one of those thirteen, and only for a rule of the detector that won
+there: `ldap_struct` on `content-099`, `xpath_struct` on `content-100`,
+`struct_rule` on `-044` and `-059`, `traversal` on `-031` and `-059`, `rce` on
+`-029 -031 -033`, `rce_ast` on `-029 -030 -031 -038 -040`, and `xss_dom` on
+`-005 -010 -011 -059`. **Six detectors — `ast`, `deser_struct`, `nosql_struct`,
+`ssti_struct`, `xxe_struct`, `xss_js` — fire on no benign row anywhere**, so
+every one of their rules is unmaskable on the benign half by construction, and
+that is forty-eight of the hundred and fifteen keys before a single run.
+
+That argument is worth having and it is not what the numbers below rest on. One
+corpus replay in shadow mode takes twenty seconds, the whole inventory is a
+hundred and fifteen rules, and a filter that has to be right is worse than a
+sweep that does not have to be. **Every rule was run, not just the candidates.**
+
+## The sweep
+
+`tests/lane2/unmask.sh`, one run per rule: the rule enabled, **every other rule
+of its own detector disabled**, every other detector left exactly as it ships.
+Nothing of that detector is left to outrank it, so every row it matches names
+it. 115 solo runs, 34 more for the default-off rules — a default-on rule is
+named in the baseline already, a default-off one needs the run its price was
+taken in — and the baseline, all shadow-only, because `rule_keys_fired` comes
+from the `semantic_observations` rows and only shadow mode writes them.
+
+```bash
+tests/lane2/unmask.sh                          # every rule
+tests/lane2/unmask.sh xss.base_href            # or just some
+python3 tests/lane2/unmask.py --dir "$WORK/runs"
+```
+
+Isolating one rule rather than peeling the strongest away and re-running is
+deliberate. A peel has to argue about tie-breaks — `best_match` keeps the
+incumbent, the shell-AST walker's `max_by_key` keeps the *last* — and about how
+deep is deep enough. Isolation leaves nothing to argue about.
+
+**Recorded from `4fcb6d0b` (`v0.2.198`)**, release build, ports `185xx`,
+Postgres on `15809`. The baseline run reproduces `tests/lane2/baseline.json`
+exactly — shadow **139 / 10 / 2**, enforce **75 / 2 / 2** — and the shipped
+posture's benign contact reproduces both documents' `touched` columns on the
+nose: `rce_ast.cmd_subst` 5, `xss.script_tag` 3, `traversal.sensitive_abs` 2,
+and one row each for `xss.event_handler`, `rce.piped_shell`, `rce.cmd_subst`,
+`rce.shell_exec_flag`, `sql.union_select`, `sql.union_null`,
+`ldap.filter_break_known_attr` and `xpath.func_axis`. `configs/default.toml`,
+the corpus, `baseline.json` and every rule's `default_on` are untouched: the
+sweep points `SRC` at a symlink mirror whose only real directory is `configs/`.
+`NORMALISED_STRONG_STRUCTURE` reads the compiled-in `default_on` and not these
+toggles (`detectors.rs:4314`), so **every run in this sweep sees the same views**
+and the only thing that varies is which rule gets to name one.
+
+## The answer: ten of the hundred and fifteen, and all ten are already priced
+
+**105 of the 115 rules fire on exactly the benign rows they are recorded as
+firing on.** Not one rule lost contact when it was isolated. The ten that gained
+any gained **one row each**:
+
+| rule | conf | recorded | true | the row | the rule that was covering it |
+|---|--:|--:|--:|---|---|
+| `xss.base_href` | 80 | 0 | **1** | `content-010` | `xss.script_tag` (90) |
+| `ldap.filter_break_any_attr` | 60 | 0 | **1** | `content-099` | `ldap.filter_break_known_attr` (88) |
+| `ldap.filter_group` | 35 | 0 | **1** | `content-099` | `ldap.filter_break_known_attr` (88) |
+| `ldap.paren_adjacency` | 25 | 1 | **2** | `content-099` | `ldap.filter_break_known_attr` (88) |
+| `ldap.bare_logical` | 20 | 71 | **72** | `content-099` | `ldap.filter_break_known_attr` (88) |
+| `rce.backtick_cmd` | 78 | 5 | **6** | `content-031` | `rce.cmd_subst` (80) |
+| `rce_ast.cmd_subst_any` | 50 | 14 | **15** | `content-031` | `rce_ast.cmd_subst` (78) |
+| `sql.union_select` | 72 | 1 | **2** | `content-059` | `sql.union_null` (78) |
+| `traversal.plain_dotdot` | 50 | 2 | **3** | `content-059` | `traversal.sensitive_abs` (68) |
+| `xpath.bare_func` | 20 | 3 | **4** | `content-100` | `xpath.func_axis` (88) |
+
+**Every one of the ten lands on a row that is already a false positive.**
+`content-010` (45), `content-031` (79), `content-059` (68), `content-099` (88)
+and `content-100` (88) are five of the ten false positives the baseline already
+counts. **No masked rule touches a clean benign row, and none touches one of the
+three `sub-threshold` rows.** So:
+
+* the false-positive count of 10 cannot move, in either direction, from any of
+  this;
+* no rule's **clean** verdict changes — a rule recorded as touching nothing is
+  touching nothing, in all 105 cases;
+* `lane2-latent-pressure.md`'s classification — 70 clean, **0 latent**, 11
+  already in the false-positive count — survives unchanged. The one default-on
+  rule in the table, `sql.union_select`, was already in the bottom row for
+  `content-044`; `content-059` puts it there twice.
+
+The masking is real and it is uninteresting, which is the useful result. A
+rule hidden under a stronger one is hidden on a row the stronger one has already
+made expensive, so it adds no cost that is not already being paid — and it
+starts costing the instant the rule covering it is switched off. The
+`xss.base_href` warning in the section on the three default-off XSS constructs
+is the general case: **switching off `ldap.filter_break_known_attr` to clear
+`content-099` does not clear it if `ldap.bare_logical` is on**, and the same
+holds for the other four pairs.
+
+## The eleventh, which is not a rule at all
+
+One more zero is masked, and no rule is doing it. **`rce_ast.interp_exec_flag`
+(conf 82, default on) is recorded as touching nothing, and it matches
+`content-033`** — a CI pipeline definition whose job steps are literal shell
+invocations. The solo sweep cannot see it, because what hides it is the Lane 2
+work budget: `content-033` is one of the nine rows that exhaust it, and the
+shell-AST detector never reaches the view.
+
+Measured rather than argued. Disabling the five SQL AST structures — the other
+consumer of the shared AST attempt budget (`detectors.rs:2639` and `3820` take
+from the same counters) — takes the degraded observation rows from **9 to 6**,
+and exactly two rows gain a key:
+
+| row | | gains |
+|---|---|---|
+| `content-033` | benign, already an `fp-log` at 41 | `rce_ast.interp_exec_flag` |
+| `rce-017` | attack, already `detected` at 41 | `rce_ast.interp_exec_flag` |
+
+Freeing every other budget-consuming detector as well (the XSS DOM parse, the
+pickle walker) adds nothing further on the benign half and leaves the degraded
+count at 6, so **on this corpus the budget hides exactly one benign rule-row
+pair**, and the row it hides on is — again — already a false positive.
+
+## The attack half, where masking is pervasive and the prices still hold
+
+**35 of the 115 rules match attack rows they are not named on: 125 rule-row
+pairs across 63 distinct attack rows.** That is a much bigger number than the
+benign half's ten, and it changes nothing about any price. `det` and `blocked`
+are bucket deltas — a row moving into `detected` — and a bucket delta is
+computed correctly whether or not the rule that moved it is the one the report
+names. What the masking does change is the **"attack rows it fires on"** column,
+which is contact and not value, and three claims made in prose:
+
+* **`traversal.plain_dotdot` fires on 17 attack rows, not one.** Its recorded
+  `+1` detection (`trav-016`) stands — everything else it matches is a row the
+  traversal family already scores higher on, `traversal.sensitive_abs` (68) and
+  `traversal.sensitive_abs_brace` (68) both outranking it. Its bill is unchanged
+  and its footprint is fifteen times what the table shows.
+* **`xpath.bare_double_slash` reaches 30 attack rows** (26 recorded) and
+  `ldap.bare_logical` **44** (36 recorded), on top of 94 and 72 benign rows. The
+  verdict "pure noise with no upside whatsoever" is if anything understated.
+* **Five of the eleven rules called "the eleven that do nothing whatsoever" do
+  something.** `ldap.filter_break_any_attr` matches `content-099` and eight LDAP
+  attacks; `ldap.filter_group` matches `content-099` and six; `ssti.py_class`
+  matches `ssti-003`; `deser.java_pkg_generic` matches `deser-013`;
+  `deser.php_array` matches `deser-015`. Every one is outranked by a default-on
+  rule of its own detector on every row, which is why the enable sweep saw
+  nothing. **Six of the eleven really do match nothing**, isolated or not:
+  `deser.dotnet_formatter_name`, `deser.py_reduce`, `rce.mkfifo_revshell`,
+  `sql.chr_freq`, `ssti.getclass`, `ssti.hash_delim`.
+
+`deser.py_pickle_dangerous_global` gets its own correction. The section above
+says it "has never been observed firing" and reads its zero as no information.
+**It fires on `deser-007` and `deser-009`** the moment
+`deser.py_pickle_reduce_exec` is off — which is the fallback
+`pickle_finding` (`detectors.rs:2440`) documents, working exactly as its comment
+says. The honest reading is not "the stack model never declines to model a
+reduction"; it is that on this corpus it never declines *and is never asked to
+report it*, because the stronger grade is always available. Its false-positive
+surface is still unmeasured — the benign half contains no pickle — so the
+"no information" verdict holds for the benign half and is now wrong for the
+attack half.
+
+`xss.data_html_url` goes the other way and is now settled rather than inferred.
+With every other XSS DOM construct switched off it **still fires on nothing**,
+including `xss-010`, which confirms the reading already given: the rule wants a
+`data:text/html` URL in a real URL attribute of parsed HTML, and the corpus puts
+it in a query parameter. That zero is absence, not masking, and it is the only
+one of the eighteen code-decided rules for which that had been argued rather
+than tested.
+
+**Twenty of the 115 rules fire on nothing at all, isolated, on either half** —
+`deser.dotnet_formatter_name`, `deser.php_object_gadget`, `deser.py_reduce`,
+`ldap.null_byte_truncation`, `rce.mkfifo_revshell`, `rce.sensitive_read_brace`,
+`rce_ast.heredoc_interp`, `rce_ast.proc_subst`, `rce_ast.cond_sensitive_path`,
+`rce_ast.param_indirect`, `sql.chr_freq`, `sql.version_comment`,
+`ssti.getclass`, `ssti.hash_delim`, `ssti.java_reflect_forname`,
+`ssti.javax_script_engine`, `ssti.jinja_statement_sink`,
+`traversal.sensitive_abs_brace`, `xpath.predicate_close_logic`,
+`xss.data_html_url`. For those twenty the corpus says nothing, and now says so
+with the masking excluded rather than confounded with it.
+`rce_ast.interp_exec_flag` was the twenty-first until the budget run above took
+it out.
+
+---
+
 # What this document does not establish
 
 * **Three combinations were measured, out of every set anyone might ship.**
@@ -766,14 +1065,22 @@ Nothing else moved. Thirty of the thirty-one prices above stand as recorded.
   better reading of "found nothing to fire on" and it is still 220 requests, not
   a traffic sample. For the eleven default-off rules and the two code-decided
   rules that moved no column at all it is the whole of what is known about them.
-* **A `touched = 0` can also be a masked rule, not an absent one.** Every
-  detector reports one construct per view — the strongest one enabled — so a
-  weaker rule that matches the same field as a stronger one is invisible in the
-  shipped posture. `xss.base_href` reads as zero on a corpus that contains its
-  exact shape, and only an experiment with the masking rule switched off says so.
-  The three XSS constructs are the ones this was checked for; **no equivalent
-  unmasking run was done for any other rule in the inventory**, so any other
-  zero in this document may be masking as well.
+* **A `touched = 0` can be a masked rule, and eleven of them are — all of them
+  named.** Every detector reports one construct per view, so a weaker rule
+  matching the same view as a stronger one is invisible in the shipped posture.
+  [Every rule in the inventory has now been run in isolation](#which-zeros-are-masking):
+  105 of 115 reproduce their recorded benign contact exactly, ten gain one
+  already-false-positive row each, and one more (`rce_ast.interp_exec_flag`) is
+  hidden by the work budget rather than by a rule. **Every benign `touched`
+  number in this document and in `lane2-latent-pressure.md` is therefore either
+  confirmed or corrected above**, and no rule recorded as touching nothing turned
+  out to be touching a clean row. What is *not* settled by that sweep is
+  everything a rule switch cannot reach: the `ast.comment_obfusc` relabel, the
+  `SetOperation` arm, the shell walk's `cmd_subst`/`cmd_subst_any` choice, and
+  the four view-and-field construction limits — one blind decode per text, one
+  body extractor per request, the field caps, and the XSS token detector's
+  dependence on the DOM detector. Those apply identically to every number here
+  and are unmeasured by anything in either document.
 * **No threshold, weight or scope change was measured.** Several verdicts above
   say a rule would be worth having under a different threshold or on a narrower
   route. None of those alternatives was run; each carries its own cost to the
