@@ -62,3 +62,38 @@ phi_dead              = 12.0
 [cluster.health]
 check_interval_secs   = 5
 max_missed_heartbeats = 3
+
+# ── Lane 2 Semantic Content-Security Engine — Main only ───────────────────────
+#
+# Deliberately present on node-a and ABSENT from node-b / node-c. That asymmetry
+# is the point: Lane 2 config has no database table, so a worker's only other
+# source for it would be its own file, and neither worker has one. What they run
+# is whatever the Main publishes into the cluster rule registry at startup
+# (`publish_semantic_config_if_main`) — without that they fall back to the
+# compiled default, `enabled = false`, and perform no semantic detection at all.
+#
+# `enforce` with a full-width canary because a demonstration that cannot change
+# an observable verdict demonstrates nothing. `breaker.window_secs` is 15 rather
+# than the shipped 300 for the same reason: it doubles as the restart shadow
+# latch, so a node cannot enforce anything for that long after it starts.
+[content_security]
+enabled          = true
+enforcement_mode = "enforce"
+dialect          = "generic"
+hpp              = false
+rollout_bps      = 10000
+rollout_salt     = "cluster-demo"
+
+[content_security.breaker]
+window_secs            = 15
+min_samples            = 200
+anomaly_rate_threshold = 0.05
+cooldown_secs          = 900
+
+[content_security.attacks.ssti]
+enabled             = true
+log_threshold       = 40
+block_threshold     = 80
+hard_veto_allowlist = []
+[content_security.attacks.ssti.weights]
+ssti_struct = 1.0

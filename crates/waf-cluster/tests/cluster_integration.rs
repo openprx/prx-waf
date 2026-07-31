@@ -410,6 +410,96 @@ async fn synced_rule_from_main_takes_effect_on_worker_request_path() {
     );
 }
 
+/// End-to-end proof for the Lane 2 config: a semantic posture set on the Main
+/// arrives at a worker that has no configuration of its own.
+///
+/// The same three steps as the block-IP proof above, over the same wire, but for
+/// the one piece of detection config that has no database row behind it. Before
+/// `SyncedKind::Semantic` existed there was no step 1 to take: the Main's
+/// `[content_security]` never left its own process, so a worker whose file
+/// omitted the section ran the compiled default — `enabled = false`, no semantic
+/// detection at all — with no way to change that short of editing a file on the
+/// worker and restarting it.
+#[tokio::test]
+async fn synced_semantic_config_from_main_reaches_a_worker_with_none_of_its_own() {
+    // ── Main: publish its Lane 2 posture (as `publish_semantic_config_if_main`
+    //    does at startup) ──────────────────────────────────────────────────────
+    let published = waf_common::content_security_config::ContentSecurityConfig {
+        enabled: true,
+        enforcement_mode: "enforce".to_string(),
+        rollout_bps: 10_000,
+        rules_disabled: vec!["xss.script_tag".to_string()],
+        ..waf_common::content_security_config::ContentSecurityConfig::default()
+    };
+    let rule = cluster_sync::semantic_config_to_rule(&published).expect("encode semantic config");
+    let rule_id = rule.id.clone();
+
+    let main_state = make_node_state("main-sem", minimal_config(random_loopback_addr()));
+    main_state
+        .record_rule_change(ChangeOp::Upsert, rule_id.clone(), Some(rule))
+        .await;
+
+    // ── Wire: full snapshot, exactly as a joining worker would receive ────────
+    let rules: Vec<Rule> = {
+        let reg = main_state.rule_registry.read();
+        reg.rules.values().cloned().collect()
+    };
+    let response = waf_cluster::protocol::RuleSyncResponse {
+        version: 1,
+        sync_type: SyncType::Full,
+        changes: vec![],
+        snapshot_lz4: waf_cluster::sync::rules::snapshot_rules(&rules).expect("snapshot"),
+    };
+
+    // ── Worker: apply, rebuild, and read the posture it is now running ───────
+    let mut worker_registry = RuleRegistry::new();
+    apply_sync_response(response, &mut worker_registry, &NoopReloader)
+        .await
+        .expect("apply sync");
+
+    let store = SyncedRuleStore::from_registry(&worker_registry);
+    let got = store
+        .semantic
+        .expect("the worker must have received the Main's Lane 2 config");
+    assert!(
+        got.compiled.enabled,
+        "a worker with no [content_security] of its own must end up running the Main's lane, \
+         not the compiled default of off"
+    );
+    assert_eq!(got.compiled.rollout_bps, 10_000);
+    assert!(got.compiled.rule_toggles.forced_off().contains(&"xss.script_tag"));
+
+    // ── And a later change to that posture propagates the same way ───────────
+    let narrowed = waf_common::content_security_config::ContentSecurityConfig {
+        rollout_bps: 0,
+        ..published
+    };
+    let rule = cluster_sync::semantic_config_to_rule(&narrowed).expect("encode semantic config");
+    main_state
+        .record_rule_change(ChangeOp::Upsert, rule_id, Some(rule))
+        .await;
+    let rules: Vec<Rule> = {
+        let reg = main_state.rule_registry.read();
+        reg.rules.values().cloned().collect()
+    };
+    let response = waf_cluster::protocol::RuleSyncResponse {
+        version: 2,
+        sync_type: SyncType::Full,
+        changes: vec![],
+        snapshot_lz4: waf_cluster::sync::rules::snapshot_rules(&rules).expect("snapshot"),
+    };
+    apply_sync_response(response, &mut worker_registry, &NoopReloader)
+        .await
+        .expect("apply sync");
+    assert_eq!(
+        SyncedRuleStore::from_registry(&worker_registry)
+            .semantic
+            .map(|c| c.compiled.rollout_bps),
+        Some(0),
+        "narrowing the canary on the Main must reach the worker"
+    );
+}
+
 /// When a worker is too far behind the changelog ring buffer it receives a full
 /// snapshot rather than stale incremental changes.
 #[tokio::test]
