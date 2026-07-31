@@ -3925,6 +3925,7 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
             Ok(state) => {
                 let state = Arc::new(state);
                 engine.attach_synced_registry(Arc::clone(&state.rule_registry));
+                publish_semantic_config_if_main(&state, &config.content_security).await;
                 api_state.cluster_state = Some(Arc::clone(&state));
                 info!("Cluster node state shared with API layer and data plane");
                 Some(state)
@@ -3964,6 +3965,52 @@ async fn init_async(config: &AppConfig) -> anyhow::Result<InitResult> {
         guards,
         cluster_node_state,
     ))
+}
+
+/// Publish this node's Lane 2 semantic config to the cluster, when it is the Main.
+///
+/// Lane 2 config has no database representation, so unlike the six rule kinds
+/// there is no admin write for the sync hook to fire on — the Main's own config
+/// file *is* the authoritative copy, and this is the point at which it becomes
+/// visible to anyone else. Publishing it into the rule registry both makes it
+/// available to workers pulling a snapshot and broadcasts it to those already
+/// connected; a worker whose own file says nothing about `[content_security]`
+/// then runs the Main's posture instead of the compiled default of "lane off".
+///
+/// Main-only, and the role check is the whole safety argument. A worker that
+/// published here would seed its registry with its own local config, which the
+/// Main's incremental pushes would never overwrite — so the node would keep
+/// enforcing a posture nobody in the cluster asked for, exactly the divergence
+/// this is meant to end. A worker later promoted to Main re-publishes on its
+/// next start; until then it serves what it last pulled.
+async fn publish_semantic_config_if_main(
+    state: &waf_cluster::NodeState,
+    cfg: &waf_common::content_security_config::ContentSecurityConfig,
+) {
+    if state.current_role().await != waf_cluster::NodeRole::Main {
+        return;
+    }
+    match waf_engine::cluster_sync::semantic_config_to_rule(cfg) {
+        Ok(rule) => {
+            let id = rule.id.clone();
+            state
+                .record_rule_change(waf_cluster::ChangeOp::Upsert, id, Some(rule))
+                .await;
+            info!(
+                enabled = cfg.enabled,
+                enforcement_mode = %cfg.enforcement_mode,
+                rollout_bps = cfg.rollout_bps,
+                "Published Lane 2 semantic config to the cluster"
+            );
+        }
+        // Unreachable short of a serde bug — every field of the struct is a
+        // plain scalar, map or vec — but the alternative to saying so is a
+        // cluster that silently never learns its semantic posture, which is the
+        // failure this function exists to fix.
+        Err(e) => tracing::error!(
+            "Failed to encode Lane 2 semantic config for cluster sync: {e}; workers will keep their own posture"
+        ),
+    }
 }
 
 /// Spawn background sync tasks for the configured threat-intelligence IP feeds.

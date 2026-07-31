@@ -12,7 +12,7 @@ pub mod transport;
 
 pub use cluster_forward::PendingForwards;
 pub use node::{NodeState, PeerInfo, StorageMode};
-pub use protocol::ClusterMessage;
+pub use protocol::{ChangeOp, ClusterMessage};
 pub use sync::{ApiForwardHandler, NoopRuleReloader};
 pub use waf_common::config::{ClusterConfig, NodeRole};
 pub use waf_engine::RuleReloader;

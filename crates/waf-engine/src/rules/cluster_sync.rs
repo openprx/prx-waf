@@ -330,7 +330,26 @@ pub struct SyncedRuleStore {
     /// 2", and the consumer must leave the node's own configured posture alone.
     /// Treating the two as the same would let a Main built before this feature
     /// existed silently disable the semantic lane on every worker that joins it.
-    pub semantic: Option<RuntimeContentSecurityConfig>,
+    pub semantic: Option<SyncedSemanticConfig>,
+}
+
+/// A cluster-synced Lane 2 config, with the payload it was decoded from.
+pub struct SyncedSemanticConfig {
+    /// The exact JSON the Main published.
+    ///
+    /// Kept as the *identity* of this config, because the store around it is
+    /// rebuilt on every sync tick — every five seconds, changes or not — and the
+    /// consumer has to be able to tell "the Main republished what I already run"
+    /// from "the Main changed something". Getting that wrong is not a
+    /// performance question: rebuilding the subsystem re-anchors state that is
+    /// measured in minutes, so a rebuild every five seconds would keep the
+    /// semantic lane permanently inside its warmup window.
+    ///
+    /// A string rather than a hash: it is a few hundred bytes, the comparison is
+    /// exact, and there is no collision to reason about.
+    pub payload: String,
+    /// The same config compiled and validated for the request path.
+    pub compiled: RuntimeContentSecurityConfig,
 }
 
 impl SyncedRuleStore {
@@ -439,7 +458,12 @@ impl SyncedRuleStore {
                     // detector set on every worker.
                     match serde_json::from_str::<ContentSecurityConfig>(payload) {
                         Ok(cfg) => match RuntimeContentSecurityConfig::compile(&cfg) {
-                            Ok(compiled) => semantic = Some(compiled),
+                            Ok(compiled) => {
+                                semantic = Some(SyncedSemanticConfig {
+                                    payload: payload.clone(),
+                                    compiled,
+                                });
+                            }
                             Err(e) => warn!(
                                 "rejecting synced Lane 2 config {}: {e}; keeping the locally configured posture",
                                 rule.id
@@ -611,18 +635,20 @@ mod tests {
 
     #[test]
     fn semantic_config_roundtrips_through_the_registry() {
-        let mut cfg = ContentSecurityConfig::default();
-        cfg.enabled = true;
-        cfg.enforcement_mode = "enforce".to_string();
-        cfg.rollout_bps = 7500;
-        cfg.rollout_salt = "s".to_string();
-        cfg.rules_disabled = vec!["xss.script_tag".to_string()];
+        let cfg = ContentSecurityConfig {
+            enabled: true,
+            enforcement_mode: "enforce".to_string(),
+            rollout_bps: 7500,
+            rollout_salt: "s".to_string(),
+            rules_disabled: vec!["xss.script_tag".to_string()],
+            ..ContentSecurityConfig::default()
+        };
 
         let mut registry = RuleRegistry::new();
         registry.insert(semantic_config_to_rule(&cfg).expect("encode"));
 
         let store = SyncedRuleStore::from_registry(&registry);
-        let got = store.semantic.expect("synced Lane 2 config must be decoded");
+        let got = store.semantic.expect("synced Lane 2 config must be decoded").compiled;
         assert!(got.enabled);
         assert_eq!(got.enforcement_mode, EnforcementMode::Enforce);
         assert_eq!(got.rollout_bps, 7500);
@@ -652,9 +678,11 @@ mod tests {
 
     #[test]
     fn republishing_the_semantic_config_replaces_it_in_place() {
-        let mut cfg = ContentSecurityConfig::default();
-        cfg.enabled = true;
-        cfg.rollout_bps = 100;
+        let mut cfg = ContentSecurityConfig {
+            enabled: true,
+            rollout_bps: 100,
+            ..ContentSecurityConfig::default()
+        };
         let mut registry = RuleRegistry::new();
         registry.insert(semantic_config_to_rule(&cfg).expect("encode"));
 
@@ -668,7 +696,7 @@ mod tests {
             "the Lane 2 config is a singleton; a second publish must overwrite, not accumulate"
         );
         let store = SyncedRuleStore::from_registry(&registry);
-        assert_eq!(store.semantic.map(|c| c.rollout_bps), Some(10_000));
+        assert_eq!(store.semantic.map(|c| c.compiled.rollout_bps), Some(10_000));
     }
 
     #[test]
@@ -684,8 +712,10 @@ mod tests {
         );
 
         // Parses, but fails validation (`rollout_bps` is capped at 10000).
-        let mut cfg = ContentSecurityConfig::default();
-        cfg.rollout_bps = 99_999;
+        let cfg = ContentSecurityConfig {
+            rollout_bps: 99_999,
+            ..ContentSecurityConfig::default()
+        };
         let mut invalid = semantic_config_to_rule(&cfg).expect("encode");
         invalid.metadata.insert(
             "payload".to_string(),
@@ -746,10 +776,12 @@ mod tests {
         // of this very `Rule`. If the carrier did not survive that round trip the
         // registry test above would still pass and the cluster would still not
         // work, so exercise the same encoding the wire uses.
-        let mut cfg = ContentSecurityConfig::default();
-        cfg.enabled = true;
-        cfg.enforcement_mode = "enforce".to_string();
-        cfg.rollout_bps = 10_000;
+        let cfg = ContentSecurityConfig {
+            enabled: true,
+            enforcement_mode: "enforce".to_string(),
+            rollout_bps: 10_000,
+            ..ContentSecurityConfig::default()
+        };
 
         let rule = semantic_config_to_rule(&cfg).expect("encode");
         let wire = serde_json::to_value(&rule).expect("to_value");
@@ -759,7 +791,8 @@ mod tests {
         registry.insert(back);
         let got = SyncedRuleStore::from_registry(&registry)
             .semantic
-            .expect("config must survive the wire encoding");
+            .expect("config must survive the wire encoding")
+            .compiled;
         assert!(got.enabled);
         assert_eq!(got.enforcement_mode, EnforcementMode::Enforce);
         assert_eq!(got.rollout_bps, 10_000);

@@ -129,6 +129,34 @@ impl CircuitBreaker {
         self.state
     }
 
+    /// Rebuild under a new [`BreakerConfig`], carrying the current trip state
+    /// forward.
+    ///
+    /// Used when a cluster-synced Lane 2 config replaces the live one. A plain
+    /// [`Self::new`] there would hand every config push the power to clear an
+    /// `Open` breaker and resume blocking immediately, which turns a routine
+    /// config write into a way around the one control that exists to stop a
+    /// misfiring detector — so `state` and `opened_at` survive, and the cooldown
+    /// keeps running from when the breaker actually tripped.
+    ///
+    /// The window counters do **not** survive. `samples` and `anomalies` are only
+    /// meaningful against the `min_samples` and `anomaly_rate_threshold` they were
+    /// accumulated under; carrying them across a threshold change would compare
+    /// numbers to a bar that did not exist when they were counted. Starting the
+    /// window fresh costs at most one window of observations, and an `Open`
+    /// breaker ignores them until its cooldown elapses anyway.
+    #[must_use]
+    pub const fn reconfigured(&self, cfg: BreakerConfig, now: Instant) -> Self {
+        Self {
+            cfg,
+            state: self.state,
+            window_start: now,
+            samples: 0,
+            anomalies: 0,
+            opened_at: self.opened_at,
+        }
+    }
+
     fn roll_window(&mut self, now: Instant) {
         if now.duration_since(self.window_start) >= self.cfg.window {
             self.window_start = now;

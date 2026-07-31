@@ -1,9 +1,9 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use parking_lot::RwLock as ParkingRwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use waf_common::metrics;
@@ -28,7 +28,7 @@ use crate::detection_sink::{
     spawn_worker_if_runtime as spawn_detection_worker_if_runtime,
 };
 use crate::geoip::GeoIpService;
-use crate::rules::cluster_sync::SyncedRuleStore;
+use crate::rules::cluster_sync::{SyncedRuleStore, SyncedSemanticConfig};
 use crate::rules::engine::{CustomRuleMatch, CustomRulesEngine, RuleAction, from_db_rule};
 use crate::rules::registry::RuleRegistry;
 use crate::semantic_sink::{
@@ -98,7 +98,21 @@ pub struct WafEngine {
     /// former `content_checkers` vector; invoked once per content phase (header
     /// and body) via [`ContentSecuritySubsystem::evaluate`], preserving the
     /// original same-order first-match-wins short-circuit and side effects.
-    content_security: ContentSecuritySubsystem,
+    /// Swappable because a cluster worker learns its Lane 2 posture from the
+    /// Main rather than from its own TOML — see [`Self::refresh_synced_rules`].
+    /// On a standalone node this is written once at construction and read for
+    /// the life of the process, so the load is an uncontended atomic pointer
+    /// read on a path that already does several.
+    content_security: ArcSwap<ContentSecuritySubsystem>,
+    /// The exact JSON payload behind the currently-live `content_security`, when
+    /// it came from the cluster. `None` means the live config is the one this
+    /// node compiled from its own config file.
+    ///
+    /// This is what makes the rebuild in [`Self::refresh_synced_rules`]
+    /// conditional. It has to be: that function runs on every sync tick, and the
+    /// subsystem it would otherwise rebuild anchors the restart shadow latch and
+    /// the circuit breaker, both measured in minutes.
+    semantic_payload: ArcSwapOption<String>,
     owasp: Arc<OWASPCheck>,
     /// GeoIP-based access control check (Phase 17).
     geo_check: Arc<GeoCheck>,
@@ -252,7 +266,8 @@ impl WafEngine {
             cc_check,
             bot_check,
             header_checkers,
-            content_security,
+            content_security: ArcSwap::from_pointee(content_security),
+            semantic_payload: ArcSwapOption::empty(),
             owasp,
             geo_check,
             crowdsec_checker: OnceLock::new(),
@@ -510,7 +525,58 @@ impl WafEngine {
             let guard = registry.read();
             SyncedRuleStore::from_registry(&guard)
         };
+        self.apply_synced_semantic_config(store.semantic.as_ref());
         self.synced.store(Some(Arc::new(store)));
+    }
+
+    /// Adopt a cluster-synced Lane 2 config, if the Main sent one and it differs
+    /// from what is already live.
+    ///
+    /// Unlike the rule buckets around it, the semantic config cannot simply be
+    /// republished on every sync tick. Rebuilding the subsystem re-anchors the
+    /// restart shadow latch and the circuit breaker — state measured in minutes,
+    /// against a sync loop that runs every five seconds — so an unconditional
+    /// rebuild would leave the lane permanently warming up and never enforcing,
+    /// while every log line claimed otherwise. Hence the payload comparison, and
+    /// hence [`ContentSecuritySubsystem::reconfigured`] rather than a fresh
+    /// build even when the config really did change.
+    ///
+    /// `None` means the Main published no Lane 2 config: this node keeps the
+    /// posture it compiled from its own config file. That is deliberately *not*
+    /// the same as being sent a disabled lane, because a Main built before this
+    /// feature existed sends nothing, and reading that as "turn Lane 2 off"
+    /// would silently disable semantic detection across a mixed-version cluster.
+    fn apply_synced_semantic_config(&self, incoming: Option<&SyncedSemanticConfig>) {
+        let Some(incoming) = incoming else {
+            return;
+        };
+        if self
+            .semantic_payload
+            .load()
+            .as_deref()
+            .is_some_and(|live| live.as_str() == incoming.payload)
+        {
+            return;
+        }
+        let next = self.content_security.load().reconfigured(incoming.compiled.clone());
+        info!(
+            enabled = next.config().enabled,
+            rollout_bps = next.config().rollout_bps,
+            "adopting cluster-synced Lane 2 semantic config"
+        );
+        self.content_security.store(Arc::new(next));
+        self.semantic_payload.store(Some(Arc::new(incoming.payload.clone())));
+    }
+
+    /// The Lane 2 config the request path is currently running, and whether it
+    /// came from the cluster. Exists so a test — and `cluster/status` — can read
+    /// the *live* posture rather than the one this node started with.
+    #[must_use]
+    pub fn live_semantic_config(&self) -> (RuntimeContentSecurityConfig, bool) {
+        (
+            self.content_security.load().config().clone(),
+            self.semantic_payload.load().is_some(),
+        )
     }
 
     /// Clear the request-path [`SyncedRuleStore`] (Worker→Main promotion).
@@ -596,7 +662,7 @@ impl WafEngine {
         // posture it always returns `None`, so control falls through to the
         // unchanged suffix — byte-for-byte the pre-E0 behaviour. `None` falls
         // through unchanged.
-        match self.content_security.evaluate_scoped(ctx, scope, state) {
+        match self.content_security.load().evaluate_scoped(ctx, scope, state) {
             ContentVerdict::LegacyVeto { result } => {
                 return Some(self.record_block(ctx, result, true));
             }
@@ -777,7 +843,7 @@ impl WafEngine {
         //   addresses, for about a day — the same churn an IPv4 DHCP lease has
         //   always given this bucketing.
         let request_key = ctx.client_ip.to_string();
-        let effective = self.content_security.resolve_enforced_action(
+        let effective = self.content_security.load().resolve_enforced_action(
             verdict.recommendation,
             family,
             verdict.enforce_safe,
@@ -952,8 +1018,8 @@ impl WafEngine {
     /// compiled budget. HTTP/1.1 stores this in `GatewayCtx` (shared across the
     /// header and body phases); HTTP/3 keeps a local instance (plan §12.3).
     #[must_use]
-    pub const fn new_content_inspection_state(&self) -> ContentInspectionState {
-        ContentInspectionState::new(self.content_security.config().budget)
+    pub fn new_content_inspection_state(&self) -> ContentInspectionState {
+        ContentInspectionState::new(self.content_security.load().config().budget)
     }
 
     /// Header-phase inspection sharing a caller-owned Lane 2 budget `state`

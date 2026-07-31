@@ -34,7 +34,7 @@ pub use engine::{WafEngine, WafEngineConfig};
 pub use geoip::{GeoIpService, cache_policy_from_str};
 pub use geoip_updater::{UpdateResult, XdbUpdater, spawn_auto_updater};
 pub use plugins::{PluginAction, PluginInfo, PluginManager, WasmPlugin};
-pub use rules::cluster_sync::{self, SyncedRuleStore};
+pub use rules::cluster_sync::{self, SyncedRuleStore, SyncedSemanticConfig};
 pub use rules::engine::{CustomRule, CustomRulesEngine};
 pub use rules::formats::{ExportFormat, RuleFormat, ValidationError, export_registry};
 pub use rules::ip_feed::{IpFeedFormat, IpFeedSource, spawn_ip_feed_sync};

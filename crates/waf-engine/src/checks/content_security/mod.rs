@@ -328,6 +328,40 @@ impl ContentSecuritySubsystem {
         &self.config
     }
 
+    /// Build a replacement subsystem running `config`, carrying this one's
+    /// runtime safety state forward.
+    ///
+    /// This is how a cluster-synced Lane 2 config becomes live on a worker
+    /// without restarting the process. Two pieces of state deliberately survive
+    /// the swap, and both would be actively dangerous to reset:
+    ///
+    /// * **`created_at`**, the anchor of the restart shadow latch. It measures
+    ///   time since the *process* came up, not time since the last config write.
+    ///   Re-anchoring it here would mean a worker pulling config from its Main
+    ///   spends another `breaker.window` in shadow every time — and since the
+    ///   Main republishes on a timer, a cluster could sit permanently inside the
+    ///   warmup window and never enforce at all, while every log line said
+    ///   `enforce`.
+    /// * **the breaker's trip state**, via [`CircuitBreaker::reconfigured`] — see
+    ///   there for why.
+    ///
+    /// Everything else is rebuilt from scratch, because everything else *is* the
+    /// config: the detector set, its compiled regexes and the per-rule toggles
+    /// resolved against it.
+    #[must_use]
+    pub fn reconfigured(&self, config: RuntimeContentSecurityConfig) -> Self {
+        let next = Self::with_config(config);
+        let breaker_cfg = next.config.breaker;
+        let carried = self.breaker.lock().reconfigured(breaker_cfg, Instant::now());
+        Self {
+            legacy_checkers: next.legacy_checkers,
+            config: next.config,
+            detectors: next.detectors,
+            breaker: Mutex::new(carried),
+            created_at: self.created_at,
+        }
+    }
+
     /// Lane 1 `legacy_veto` **only** — the frozen G1 behaviour. Runs the four
     /// detectors in order and returns the first hit, else `None`. Zero side
     /// effects. Used where Lane 2 is not wired (e.g. the G0/G1 parity tests).
@@ -751,6 +785,68 @@ mod tests {
         assert_eq!(
             fired_rule_keys(&req, InspectionScope::Body),
             vec!["nosql.comparison_operator"]
+        );
+    }
+
+    #[test]
+    fn reconfigured_adopts_the_new_config() {
+        let sub = ContentSecuritySubsystem::new();
+        assert!(!sub.config().enabled, "compiled default is lane-off");
+
+        let next = sub.reconfigured(enabled_enforce_cfg());
+        assert!(next.config().enabled);
+        assert_eq!(next.config().rollout_bps, 10_000);
+    }
+
+    #[test]
+    fn reconfigured_keeps_the_restart_warmup_anchor() {
+        // The invariant that makes cluster config sync safe. `created_at` measures
+        // time since the *process* started; a config push must not re-arm it.
+        // The Main republishes on a timer, so re-anchoring here would keep a
+        // worker permanently inside its warmup window — configured to enforce,
+        // logging that it enforces, and never actually blocking.
+        let sub = ContentSecuritySubsystem::with_config(enabled_enforce_cfg());
+        let next = sub.reconfigured(enabled_enforce_cfg());
+        assert_eq!(
+            next.created_at, sub.created_at,
+            "a config swap must not restart the warmup latch"
+        );
+
+        // Concretely: a subsystem that was already warm stays warm across the swap.
+        let mut warmed = ContentSecuritySubsystem::with_config(enabled_enforce_cfg());
+        warmed.detectors.push(Box::new(MockSqliDetector { confidence: 100 }));
+        let warm_instant = warmed.created_at + Duration::from_secs(301);
+        assert!(warmed.enforcement_warmed_up(warm_instant));
+        let swapped = warmed.reconfigured(enabled_enforce_cfg());
+        assert!(
+            swapped.enforcement_warmed_up(warm_instant),
+            "the node was past warmup before the push and must still be after it"
+        );
+    }
+
+    #[test]
+    fn reconfigured_cannot_clear_a_tripped_breaker() {
+        // Otherwise a config write is a way around the one control that stops a
+        // misfiring detector: push any config, breaker back to Closed, blocking
+        // resumes immediately.
+        let sub = ContentSecuritySubsystem::with_config(enabled_enforce_cfg());
+        let now = Instant::now();
+        let tripped = {
+            // Drive it Open: every sample an anomaly, past min_samples.
+            let mut br = sub.breaker.lock();
+            for _ in 0..1000 {
+                br.record(true, now);
+            }
+            br.state()
+        };
+        assert_eq!(tripped, BreakerState::Open, "test setup: breaker must be Open");
+
+        let next = sub.reconfigured(enabled_enforce_cfg());
+        let carried = next.breaker.lock().state();
+        assert_eq!(
+            carried,
+            BreakerState::Open,
+            "a config push must not reset a tripped breaker"
         );
     }
 
