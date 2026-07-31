@@ -55,6 +55,20 @@ impl ChallengeStore {
     pub fn remove(&self, token: &str) {
         self.inner.write().remove(token);
     }
+
+    /// The HTTP-01 response body for `path`, or `None` if this is not a
+    /// challenge URL or the token is not one we are waiting on.
+    ///
+    /// The whole of RFC 8555 §8.3 on our side: the CA fetches
+    /// `/.well-known/acme-challenge/{token}` over plain HTTP and the body must
+    /// be the key authorization, exactly. Owned by the store rather than
+    /// written inline in the proxy so that the prefix and the lookup are one
+    /// thing, testable without a Pingora session — the end-to-end test answers
+    /// Pebble with this function, so a mismatch between what a real CA asks for
+    /// and what the proxy answers cannot hide behind a re-implementation.
+    pub fn response_for_path(&self, path: &str) -> Option<String> {
+        self.get(path.strip_prefix("/.well-known/acme-challenge/")?)
+    }
 }
 
 // ── CertInfo ──────────────────────────────────────────────────────────────────
@@ -108,7 +122,7 @@ impl SslManager {
     /// Two independent knobs, because a private CA needs both and a public one
     /// needs neither:
     ///
-    ///   - `directory_url` overrides the endpoint, which is what makes ZeroSSL,
+    ///   - `directory_url` overrides the endpoint, which is what makes `ZeroSSL`,
     ///     Buypass, an in-house step-ca or a Pebble test server reachable at
     ///     all. When it is `None` the `staging` flag keeps choosing between the
     ///     two Let's Encrypt directories, unchanged.
@@ -175,7 +189,7 @@ impl SslManager {
     /// rule is testable without a database handle. An override that silently
     /// lost to the staging flag would send a deployment that believes it is
     /// talking to its own CA to Let's Encrypt instead.
-    fn resolve_directory_url(override_url: Option<&str>, staging: bool) -> &str {
+    const fn resolve_directory_url(override_url: Option<&str>, staging: bool) -> &str {
         match override_url {
             Some(url) => url,
             None => Self::lets_encrypt_directory_url(staging),
@@ -412,6 +426,25 @@ mod tests {
         assert_eq!(store.get("token123"), Some("keyauth456".to_string()));
         store.remove("token123");
         assert_eq!(store.get("token123"), None);
+    }
+
+    #[test]
+    fn test_response_for_path_answers_only_challenge_urls() {
+        let store = ChallengeStore::new();
+        store.set("tok".into(), "tok.thumbprint".into());
+
+        assert_eq!(
+            store.response_for_path("/.well-known/acme-challenge/tok"),
+            Some("tok.thumbprint".to_string())
+        );
+
+        // A token we are not waiting on, and paths that merely resemble the
+        // challenge URL, fall through to normal routing rather than answering.
+        assert_eq!(store.response_for_path("/.well-known/acme-challenge/other"), None);
+        assert_eq!(store.response_for_path("/.well-known/acme-challenge/"), None);
+        assert_eq!(store.response_for_path("/.well-known/acme-challenge"), None);
+        assert_eq!(store.response_for_path("/acme-challenge/tok"), None);
+        assert_eq!(store.response_for_path("/tok"), None);
     }
 
     #[test]

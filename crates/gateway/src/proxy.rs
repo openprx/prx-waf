@@ -511,14 +511,11 @@ impl ProxyHttp for WafProxy {
         // Answer Let's Encrypt validation probes before any host routing or WAF
         // inspection. Reads only the raw request path from the session and is
         // fully decoupled from `ctx.request_ctx`.
-        let challenge_token = {
+        let key_authorization = {
             let path = session.req_header().uri.path();
-            path.strip_prefix("/.well-known/acme-challenge/")
-                .map(std::string::ToString::to_string)
+            self.acme_challenges.response_for_path(path)
         };
-        if let Some(token) = challenge_token
-            && let Some(key_auth) = self.acme_challenges.get(&token)
-        {
+        if let Some(key_auth) = key_authorization {
             let mut response = pingora_http::ResponseHeader::build(200, None)?;
             response.insert_header("content-type", "text/plain")?;
             session.write_response_header(Box::new(response), false).await?;

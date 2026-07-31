@@ -568,7 +568,7 @@ pub struct AcmeConfig {
     /// in seconds. Default: 86400 (24h).
     #[serde(default = "default_acme_renewal_interval")]
     pub renewal_check_interval_secs: u64,
-    /// Directory URL of an ACME server other than Let's Encrypt — ZeroSSL,
+    /// Directory URL of an ACME server other than Let's Encrypt — `ZeroSSL`,
     /// Buypass, an in-house step-ca, or a Pebble test server. Set, it overrides
     /// `staging`, which only chooses between the two Let's Encrypt endpoints.
     /// Default: unset (Let's Encrypt).
