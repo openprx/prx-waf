@@ -1,4 +1,22 @@
-FROM debian:bookworm-slim
+# Development image for a binary you compiled yourself: COPY below takes
+# target/release/prx-waf straight from the working tree, so this base image has
+# to satisfy whatever glibc your *host* toolchain linked against, not the other
+# way round. glibc guarantees backward compatibility only.
+#
+# bookworm ships glibc 2.36 and any build on a current Debian/Ubuntu host needs
+# more than that: a release binary built here on trixie (glibc 2.41) pulls in
+# fmod, fmodf, __isoc23_sscanf and __isoc23_strtol at GLIBC_2.38, and running it
+# under debian:bookworm-slim dies before main with "version `GLIBC_2.38' not
+# found (required by ...)" against both libc.so.6 and libm.so.6. That made the
+# documented local-dev path — docker-compose.build.yml, and all four services in
+# docker-compose.cluster.yml — unrunnable on the machines most likely to use it;
+# docker-compose.firedrill.yml had already worked around it by forking its own
+# trixie copy of this file rather than fixing it here.
+#
+# trixie-slim is the same base Dockerfile.release uses, for the mirror-image
+# reason: it has to tolerate the glibc of the CI runner that produced the
+# artifact. Raise this in step with the oldest host you expect to build on.
+FROM debian:trixie-slim
 
 WORKDIR /app
 

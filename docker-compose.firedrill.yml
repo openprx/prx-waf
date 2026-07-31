@@ -36,9 +36,10 @@ services:
   prx-waf:
     build:
       context: .
-      # trixie-slim (not the repo's default bookworm-slim) — this host is
-      # Debian 13 (glibc 2.41) and a locally-built binary against bookworm's
-      # glibc 2.36 fails to start ("GLIBC_2.38 not found").
+      # This file forked off Dockerfile.prebuilt only to get a trixie-slim base,
+      # because a locally built binary needs glibc newer than bookworm's 2.36.
+      # Dockerfile.prebuilt is on trixie-slim now too, so the two are once again
+      # identical and this one should be folded back into it.
       dockerfile: Dockerfile.firedrill
     container_name: prx-waf-fd
     restart: unless-stopped

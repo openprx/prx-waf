@@ -21,8 +21,16 @@ cargo build --release
 
 ## Docker
 ```bash
-podman-compose down && podman-compose up -d --build
-# Uses Dockerfile.prebuilt (local binary, fast)
+# Published image. docker-compose.yml alone has no build: section, so --build
+# here builds nothing and the tag is whatever PRX_WAF_VERSION points at.
+podman-compose down && podman-compose up -d
+
+# Your own build. Dockerfile.prebuilt copies target/release/prx-waf out of the
+# working tree, so compile first; both -f files are required, the second is what
+# swaps the ghcr image for the local one.
+cargo build --release
+podman-compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+
 # Ports: 16880 (HTTP), 16843 (HTTPS), 16827 (API/Admin UI)
 # Admin UI: http://localhost:16827/ui/  (admin / admin123)
 ```
