@@ -92,6 +92,50 @@ jobs:
           DATABASE_URL: postgresql://prx_waf:prx_waf@127.0.0.1:15432/prx_waf
         run: cargo test -p waf-storage -- --ignored --nocapture --test-threads=1
 
+  # ACME issuance is the one production path that cannot be tested without a CA,
+  # and so was never tested at all — while the instant-acme 0.8 upgrade rewrote
+  # every line of it. Pebble is Let's Encrypt's own test server: it signs with a
+  # throwaway CA it mints at startup, needs no public domain and no rate-limit
+  # budget, and deliberately misbehaves (5% of good nonces rejected, challenges
+  # reordered) so a client that got the protocol subtly wrong fails here.
+  #
+  # It is here rather than left to a manual script because the next dependency
+  # bump would otherwise be as blind as the last one. It earns the ~40 seconds:
+  # everything is local — no external CA, no DNS, no public domain — and the one
+  # source of randomness, Pebble's nonce rejection, is answered by instant-acme's
+  # three badNonce retries, which puts a run's failure odds near 0.1%. Thirty of
+  # those seconds are one test whose whole subject is a timeout.
+  acme-e2e:
+    name: ACME issuance (Pebble)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: prx_waf
+          POSTGRES_PASSWORD: prx_waf
+          POSTGRES_DB: prx_waf
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U prx_waf"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Issue a certificate against a real ACME server
+        env:
+          # Set, so the harness uses the service above instead of starting a
+          # second Postgres of its own.
+          DATABASE_URL: postgresql://prx_waf:prx_waf@127.0.0.1:15432/prx_waf
+          RUNTIME: docker
+        run: ./tests/e2e-acme-pebble.sh
+
   # The admin UI is TypeScript that nothing ever typechecked: `vite build`
   # transpiles and strips types without reading them, so a whole class of bug
   # shipped silently — a view reading `auth.token` off a store that only ever

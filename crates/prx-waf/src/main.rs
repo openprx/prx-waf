@@ -4061,21 +4061,30 @@ async fn setup_acme(config: &AppConfig, db: Arc<Database>, router: Arc<HostRoute
         tracing::warn!("ACME is enabled but [acme].email is empty; certificate issuance will fail");
     }
 
-    let manager = Arc::new(SslManager::new(
-        Arc::clone(&db),
-        config.acme.email.clone(),
-        config.acme.staging,
-    ));
+    let manager = Arc::new(
+        SslManager::new(Arc::clone(&db), config.acme.email.clone(), config.acme.staging).with_directory(
+            config.acme.directory_url.clone(),
+            config.acme.ca_root_pem.as_ref().map(std::path::PathBuf::from),
+        ),
+    );
     let challenges = Arc::clone(&manager.challenges);
 
     // Periodic renewal task (interval clamped to a sane minimum).
     let interval = std::time::Duration::from_secs(config.acme.renewal_check_interval_secs.max(60));
     let renewal_handle = Arc::clone(&manager).spawn_renewal_task(interval);
     std::mem::forget(renewal_handle);
+    // Name the endpoint rather than the flag: once `directory_url` is set the
+    // staging boolean says nothing, and "which CA is this process about to
+    // spend rate limits at" is the one fact worth having in the log.
+    let endpoint = config.acme.directory_url.as_deref().unwrap_or(if config.acme.staging {
+        "Let's Encrypt staging"
+    } else {
+        "Let's Encrypt production"
+    });
     info!(
-        "ACME auto-renewal task spawned (check interval: {}s, staging: {})",
+        "ACME auto-renewal task spawned (check interval: {}s, directory: {})",
         interval.as_secs(),
-        config.acme.staging
+        endpoint
     );
 
     // One-time issuance for SSL hosts that have no active certificate yet.

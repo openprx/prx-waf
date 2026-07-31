@@ -14,6 +14,7 @@
 //! `GET /.well-known/acme-challenge/{token}`
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,6 +55,20 @@ impl ChallengeStore {
     pub fn remove(&self, token: &str) {
         self.inner.write().remove(token);
     }
+
+    /// The HTTP-01 response body for `path`, or `None` if this is not a
+    /// challenge URL or the token is not one we are waiting on.
+    ///
+    /// The whole of RFC 8555 §8.3 on our side: the CA fetches
+    /// `/.well-known/acme-challenge/{token}` over plain HTTP and the body must
+    /// be the key authorization, exactly. Owned by the store rather than
+    /// written inline in the proxy so that the prefix and the lookup are one
+    /// thing, testable without a Pingora session — the end-to-end test answers
+    /// Pebble with this function, so a mismatch between what a real CA asks for
+    /// and what the proxy answers cannot hide behind a re-implementation.
+    pub fn response_for_path(&self, path: &str) -> Option<String> {
+        self.get(path.strip_prefix("/.well-known/acme-challenge/")?)
+    }
 }
 
 // ── CertInfo ──────────────────────────────────────────────────────────────────
@@ -81,6 +96,13 @@ pub struct SslManager {
     acme_email: String,
     /// Use Let's Encrypt staging (true) or production (false)
     acme_staging: bool,
+    /// Directory URL of an ACME server that is not Let's Encrypt. `None` means
+    /// the `acme_staging` flag selects between the two Let's Encrypt endpoints.
+    acme_directory_url: Option<String>,
+    /// PEM file holding the root certificate to trust for the ACME server's own
+    /// HTTPS endpoint. `None` means the platform trust store, which is what any
+    /// publicly trusted CA needs.
+    acme_root_pem: Option<PathBuf>,
 }
 
 impl SslManager {
@@ -90,7 +112,35 @@ impl SslManager {
             challenges: Arc::new(ChallengeStore::new()),
             acme_email: acme_email.into(),
             acme_staging,
+            acme_directory_url: None,
+            acme_root_pem: None,
         }
+    }
+
+    /// Point issuance at an ACME server other than Let's Encrypt.
+    ///
+    /// Two independent knobs, because a private CA needs both and a public one
+    /// needs neither:
+    ///
+    ///   - `directory_url` overrides the endpoint, which is what makes `ZeroSSL`,
+    ///     Buypass, an in-house step-ca or a Pebble test server reachable at
+    ///     all. When it is `None` the `staging` flag keeps choosing between the
+    ///     two Let's Encrypt directories, unchanged.
+    ///   - `root_pem` adds the root that signed the ACME server's *own* TLS
+    ///     certificate. A private CA is by definition absent from the platform
+    ///     trust store, so without this the client cannot even fetch the
+    ///     directory. It never affects which certificates this manager issues,
+    ///     only which server it is willing to talk to.
+    ///
+    /// This is also the seam the Pebble end-to-end test drives
+    /// (`crates/gateway/tests/acme_pebble_e2e.rs`): issuance is not something
+    /// that can be rehearsed against the real Let's Encrypt without spending
+    /// rate limits and owning a public domain.
+    #[must_use]
+    pub fn with_directory(mut self, directory_url: Option<String>, root_pem: Option<PathBuf>) -> Self {
+        self.acme_directory_url = directory_url;
+        self.acme_root_pem = root_pem;
+        self
     }
 
     /// Upload a certificate manually (from file or API).
@@ -118,17 +168,31 @@ impl SslManager {
         Ok(cert.id)
     }
 
-    /// The ACME directory URL this manager issues against.
+    /// The Let's Encrypt directory URL the `staging` flag selects.
     ///
     /// Split out of `request_certificate` so the staging/production choice can
     /// be asserted without a database or a network round trip. Getting it
     /// backwards is not a cosmetic mistake: it spends Let's Encrypt production
     /// rate limits on what was meant to be a rehearsal.
-    const fn acme_directory_url(staging: bool) -> &'static str {
+    const fn lets_encrypt_directory_url(staging: bool) -> &'static str {
         if staging {
             instant_acme::LetsEncrypt::Staging.url()
         } else {
             instant_acme::LetsEncrypt::Production.url()
+        }
+    }
+
+    /// The ACME directory URL to issue against: an explicit override if one was
+    /// configured, otherwise Let's Encrypt per the staging flag.
+    ///
+    /// Pure, and takes its inputs rather than reading `self`, so the precedence
+    /// rule is testable without a database handle. An override that silently
+    /// lost to the staging flag would send a deployment that believes it is
+    /// talking to its own CA to Let's Encrypt instead.
+    const fn resolve_directory_url(override_url: Option<&str>, staging: bool) -> &str {
+        match override_url {
+            Some(url) => url,
+            None => Self::lets_encrypt_directory_url(staging),
         }
     }
 
@@ -145,10 +209,14 @@ impl SslManager {
         info!("Requesting ACME certificate for domain: {}", domain);
 
         // Create or restore ACME account
-        let server_url = Self::acme_directory_url(self.acme_staging);
+        let server_url = Self::resolve_directory_url(self.acme_directory_url.as_deref(), self.acme_staging);
 
         let contact = format!("mailto:{}", self.acme_email);
-        let (account, _credentials) = Account::builder()?
+        let builder = match &self.acme_root_pem {
+            Some(path) => Account::builder_with_root(path)?,
+            None => Account::builder()?,
+        };
+        let (account, _credentials) = builder
             .create(
                 &NewAccount {
                     contact: &[&contact],
@@ -256,8 +324,54 @@ impl SslManager {
 
         let cert_pem = cert_chain;
         let key_pem = key_pair.serialize_pem();
-        let now = chrono::Utc::now();
-        let not_after = now + chrono::Duration::days(90); // typical LE validity
+
+        // Read the certificate rather than assume it. The row used to record
+        // `now`, `now + 90 days` and the literal "Let's Encrypt" whatever came
+        // back, and `list_certificates_due_renewal` filters on exactly that
+        // `not_after`. A CA that disagrees — Let's Encrypt itself is moving to
+        // shorter lifetimes, and `[acme] directory_url` can now point anywhere —
+        // makes the renewal window fire after the certificate on the wire has
+        // already expired, silently, since every other column still looks right.
+        //
+        // A certificate we cannot parse is not one we can serve either, so it
+        // fails the row instead of being stored with invented dates.
+        let facts = match crate::tls_listener::inspect(&cert_pem) {
+            Ok(facts) => facts,
+            Err(e) => {
+                let _ = self
+                    .db
+                    .update_certificate_status(cert_id, "error", Some("issued certificate could not be parsed"))
+                    .await;
+                return Err(e.context(format!(
+                    "the CA returned a certificate for {domain} that cannot be read"
+                )));
+            }
+        };
+
+        // The same pairing check the manual upload endpoint runs. Here it guards
+        // a narrower thing: `finalize_csr` sends a CSR over the key generated
+        // above, and `finalize` — which we do not call — would have generated
+        // its own. If those ever swap, the store ends up holding a certificate
+        // and a key that are not a pair, and the first sign of it is a TLS
+        // listener that refuses to start.
+        if let Err(e) = crate::tls_listener::validate(&cert_pem, &key_pem) {
+            let _ = self
+                .db
+                .update_certificate_status(cert_id, "error", Some("issued certificate does not match our key"))
+                .await;
+            return Err(e.context(format!(
+                "the certificate issued for {domain} does not match the key we generated"
+            )));
+        }
+
+        // A publicly trusted certificate carries its names in the SAN and often
+        // leaves the subject empty; the domain is the more useful label when it
+        // does.
+        let subject = if facts.subject.is_empty() {
+            domain
+        } else {
+            facts.subject.as_str()
+        };
 
         self.db
             .update_certificate_pem(&waf_storage::models::UpdateCertificatePem {
@@ -265,10 +379,10 @@ impl SslManager {
                 cert_pem: &cert_pem,
                 key_pem: &key_pem,
                 chain_pem: None,
-                not_before: now,
-                not_after,
-                issuer: "Let's Encrypt",
-                subject: domain,
+                not_before: facts.not_before,
+                not_after: facts.not_after,
+                issuer: &facts.issuer,
+                subject,
             })
             .await?;
 
@@ -278,8 +392,8 @@ impl SslManager {
         }
 
         info!(
-            "Certificate issued for domain {} (id={}), valid until {}",
-            domain, cert_id, not_after
+            "Certificate issued for domain {} (id={}) by {}, valid until {}",
+            domain, cert_id, facts.issuer, facts.not_after
         );
         Ok(cert_id)
     }
@@ -361,9 +475,28 @@ mod tests {
     }
 
     #[test]
+    fn test_response_for_path_answers_only_challenge_urls() {
+        let store = ChallengeStore::new();
+        store.set("tok".into(), "tok.thumbprint".into());
+
+        assert_eq!(
+            store.response_for_path("/.well-known/acme-challenge/tok"),
+            Some("tok.thumbprint".to_string())
+        );
+
+        // A token we are not waiting on, and paths that merely resemble the
+        // challenge URL, fall through to normal routing rather than answering.
+        assert_eq!(store.response_for_path("/.well-known/acme-challenge/other"), None);
+        assert_eq!(store.response_for_path("/.well-known/acme-challenge/"), None);
+        assert_eq!(store.response_for_path("/.well-known/acme-challenge"), None);
+        assert_eq!(store.response_for_path("/acme-challenge/tok"), None);
+        assert_eq!(store.response_for_path("/tok"), None);
+    }
+
+    #[test]
     fn test_acme_directory_url_honours_staging_flag() {
-        let staging = SslManager::acme_directory_url(true);
-        let production = SslManager::acme_directory_url(false);
+        let staging = SslManager::lets_encrypt_directory_url(true);
+        let production = SslManager::lets_encrypt_directory_url(false);
 
         assert!(staging.contains("staging"), "staging directory URL was {staging}");
         assert!(
@@ -371,6 +504,27 @@ mod tests {
             "production directory URL was {production}"
         );
         assert_ne!(staging, production);
+    }
+
+    #[test]
+    fn test_directory_override_beats_the_staging_flag() {
+        let custom = "https://ca.internal.example/acme/directory";
+
+        // An override wins whichever way the staging flag is set: the flag only
+        // chooses between the two Let's Encrypt endpoints, and once an operator
+        // has named a different CA neither of them is the right answer.
+        assert_eq!(SslManager::resolve_directory_url(Some(custom), false), custom);
+        assert_eq!(SslManager::resolve_directory_url(Some(custom), true), custom);
+
+        // Without one, nothing about the previous behaviour changes.
+        assert_eq!(
+            SslManager::resolve_directory_url(None, true),
+            SslManager::lets_encrypt_directory_url(true)
+        );
+        assert_eq!(
+            SslManager::resolve_directory_url(None, false),
+            SslManager::lets_encrypt_directory_url(false)
+        );
     }
 
     #[test]
