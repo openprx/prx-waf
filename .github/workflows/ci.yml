@@ -29,6 +29,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Conflict markers
         run: scripts/check-conflict-markers.sh
+      # A malformed fragment is only discovered when someone tries to cut a
+      # release, which is the worst moment to find out. python3 is on the
+      # runner image; the script imports nothing outside the standard library.
+      - name: Changelog fragments
+        run: scripts/changelog.py check
 
   lint:
     name: Lint
