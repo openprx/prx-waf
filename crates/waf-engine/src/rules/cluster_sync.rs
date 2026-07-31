@@ -28,14 +28,33 @@
 //! | block / allow IP  | `cluster-block-ip` …  | CIDR      | `host_code`                                 |
 //! | block / allow URL | `cluster-block-url` … | URL       | `host_code`, `match_type`                   |
 //! | sensitive         | `cluster-sensitive`   | pattern   | `host_code`, `check_request`                |
+//! | Lane 2 config     | `cluster-semantic`    | —         | `payload` = JSON of `ContentSecurityConfig` |
+//!
+//! # Why the Lane 2 config travels on the *rule* channel
+//!
+//! The cluster has a second, nominally config-shaped channel
+//! (`ClusterMessage::ConfigSync`), but `ConfigSyncer::apply_sync` only records the
+//! version number it was handed and drops `config_toml` on the floor — nothing
+//! downstream of it reaches the data plane. The rule registry is the only synced
+//! state that a worker actually *applies*: it lands in `NodeState.rule_registry`
+//! and `RuleReloader::on_rules_updated` rebuilds the request-path store from it.
+//!
+//! Lane 2's configuration has no database representation at all (there is no
+//! `content_security` table; `semantic_observations` stores detections, not
+//! settings), so before this existed the only way a node could learn its Lane 2
+//! posture was its own local TOML file. A worker whose TOML omits
+//! `[content_security]` — which is every node in `docker-compose.cluster.yml` —
+//! silently ran the compiled default, `enabled = false`: no semantic detection at
+//! all, no matter what the Main was configured to do.
 
 use std::collections::HashMap;
 
 use tracing::warn;
 use uuid::Uuid;
+use waf_common::content_security_config::ContentSecurityConfig;
 use waf_storage::models::{AllowIp, AllowUrl, BlockIp, BlockUrl, CustomRule as DbCustomRule, SensitivePattern};
 
-use crate::checks::SensitiveCheck;
+use crate::checks::{RuntimeContentSecurityConfig, SensitiveCheck};
 use crate::rules::engine::{CustomRulesEngine, from_db_rule};
 use crate::rules::registry::{Rule, RuleRegistry};
 use crate::rules::{IpRuleSet, UrlMatchType, UrlRule, UrlRuleSet};
@@ -50,12 +69,31 @@ pub const CAT_ALLOW_IP: &str = "cluster-allow-ip";
 pub const CAT_BLOCK_URL: &str = "cluster-block-url";
 pub const CAT_ALLOW_URL: &str = "cluster-allow-url";
 pub const CAT_SENSITIVE: &str = "cluster-sensitive";
+pub const CAT_SEMANTIC: &str = "cluster-semantic";
+
+/// `action` stamped on the Lane 2 config carrier.
+///
+/// The other six kinds map onto a real per-request verdict (`allow` / `block` /
+/// whatever the custom rule row says). This one decides nothing by itself — it
+/// carries the settings that govern how the semantic lane decides — so it gets
+/// its own word rather than borrowing one that would misdescribe it.
+pub const ACTION_CONFIG: &str = "config";
 
 /// The kind of detection-affecting entity carried by a synced [`Rule`].
 ///
 /// Used by the trigger side (`waf-api`) to build the stable registry id so that
 /// a later delete refers to exactly the same entry even though only the row id
 /// is known at delete time.
+///
+/// # Wire compatibility
+///
+/// This enum is **not** serialised. It exists only to produce the `category`
+/// string and the registry id; what crosses the QUIC link is a [`Rule`], whose
+/// `category` is a plain `String`. Adding a variant therefore cannot break the
+/// frame decode on a peer built before it — an older node deserialises the
+/// `Rule` fine and drops it on the catch-all arm of
+/// [`SyncedRuleStore::from_registry`], exactly as it already does for any
+/// category it does not recognise. See `unknown_categories_are_ignored`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncedKind {
     Custom,
@@ -64,6 +102,13 @@ pub enum SyncedKind {
     BlockUrl,
     AllowUrl,
     Sensitive,
+    /// The cluster-wide Lane 2 (semantic content-security) configuration.
+    ///
+    /// Unlike the other six this is a **singleton**, not a database row: Lane 2
+    /// config is one process-wide value, so it is keyed by [`Uuid::nil`] and
+    /// there is exactly one such entry in the registry at a time. An upsert
+    /// replaces it; see [`semantic_registry_id`].
+    Semantic,
 }
 
 impl SyncedKind {
@@ -75,6 +120,7 @@ impl SyncedKind {
             Self::BlockUrl => CAT_BLOCK_URL,
             Self::AllowUrl => CAT_ALLOW_URL,
             Self::Sensitive => CAT_SENSITIVE,
+            Self::Semantic => CAT_SEMANTIC,
         }
     }
 }
@@ -212,6 +258,57 @@ pub fn sensitive_to_rule(row: &SensitivePattern) -> Rule {
     }
 }
 
+/// The registry id of the cluster-wide Lane 2 config entry.
+///
+/// A singleton keyed by the nil UUID, so re-publishing overwrites in place and a
+/// worker never accumulates stale copies of a config it has already applied.
+#[must_use]
+pub fn semantic_registry_id() -> String {
+    registry_id(SyncedKind::Semantic, Uuid::nil())
+}
+
+/// Encode the cluster-wide Lane 2 config into a synced [`Rule`].
+///
+/// The whole `ContentSecurityConfig` is embedded as JSON rather than being
+/// spread over `pattern` / `metadata` fields, for the same reason
+/// [`custom_rule_to_rule`] does it: the struct has a dozen fields including two
+/// nested maps and two rule-key lists, and any hand-rolled projection of it
+/// would be a second schema to keep in step with the first. `#[serde(default)]`
+/// on every field of that struct means a node running an older or newer build
+/// still decodes what it understands and defaults the rest.
+///
+/// # Errors
+///
+/// Returns the `serde_json` error if the config cannot be serialised. This is
+/// deliberately not swallowed the way `custom_rule_to_rule` warns-and-continues:
+/// a custom rule that loses its payload is one rule missing, but a Lane 2 config
+/// carrier with no payload would be published to the whole cluster as an entry
+/// every worker then declines to apply — a silent cluster-wide no-op, which is
+/// the failure mode this task exists to remove.
+pub fn semantic_config_to_rule(cfg: &ContentSecurityConfig) -> Result<Rule, serde_json::Error> {
+    let mut metadata = HashMap::new();
+    metadata.insert("payload".to_string(), serde_json::to_string(cfg)?);
+    Ok(Rule {
+        id: semantic_registry_id(),
+        name: "cluster semantic config".to_string(),
+        description: Some(format!(
+            "Lane 2 content-security config (enabled={}, mode={}, rollout_bps={})",
+            cfg.enabled, cfg.enforcement_mode, cfg.rollout_bps
+        )),
+        category: CAT_SEMANTIC.to_string(),
+        source: SOURCE_CLUSTER.to_string(),
+        // Always `true`: this flags the *carrier* as live, not the lane. Whether
+        // Lane 2 runs is `payload.enabled`, and keeping one answer to that
+        // question in one place is why it is not mirrored here.
+        enabled: true,
+        action: ACTION_CONFIG.to_string(),
+        severity: None,
+        pattern: None,
+        tags: Vec::new(),
+        metadata,
+    })
+}
+
 // ─── Decode: synced RuleRegistry → typed request-path store (consume side) ───────
 
 /// Request-path stores rebuilt from the cluster-synced [`RuleRegistry`].
@@ -226,6 +323,14 @@ pub struct SyncedRuleStore {
     pub allow_urls: UrlRuleSet,
     pub block_urls: UrlRuleSet,
     pub sensitive: SensitiveCheck,
+    /// The cluster-wide Lane 2 config, already compiled and validated, or `None`
+    /// when the registry carries no `cluster-semantic` entry.
+    ///
+    /// `None` is not "Lane 2 off" — it is "the Main has said nothing about Lane
+    /// 2", and the consumer must leave the node's own configured posture alone.
+    /// Treating the two as the same would let a Main built before this feature
+    /// existed silently disable the semantic lane on every worker that joins it.
+    pub semantic: Option<RuntimeContentSecurityConfig>,
 }
 
 impl SyncedRuleStore {
@@ -242,6 +347,7 @@ impl SyncedRuleStore {
         let allow_urls = UrlRuleSet::new();
         let block_urls = UrlRuleSet::new();
         let sensitive = SensitiveCheck::new();
+        let mut semantic = None;
 
         // Group the typed payloads per host_code so each store bucket is loaded
         // exactly once (matching the DB reload path's grouping).
@@ -317,6 +423,31 @@ impl SyncedRuleStore {
                         sensitive_by_host.entry(host).or_default().push(pat.clone());
                     }
                 }
+                CAT_SEMANTIC => {
+                    let Some(payload) = rule.metadata.get("payload") else {
+                        warn!("cluster semantic config {} missing payload metadata", rule.id);
+                        continue;
+                    };
+                    // Two failure modes, both non-fatal by design: a payload this
+                    // build cannot parse, and one that parses but does not
+                    // validate (an `enforcement_mode` this build has never heard
+                    // of, a rule key it does not have, a weight set that does not
+                    // sum). Either way `semantic` stays `None` and the node keeps
+                    // running the posture it already had. Adopting a config we
+                    // could not fully compile is how a mixed-version cluster
+                    // would turn a Main-side typo into a silently degraded
+                    // detector set on every worker.
+                    match serde_json::from_str::<ContentSecurityConfig>(payload) {
+                        Ok(cfg) => match RuntimeContentSecurityConfig::compile(&cfg) {
+                            Ok(compiled) => semantic = Some(compiled),
+                            Err(e) => warn!(
+                                "rejecting synced Lane 2 config {}: {e}; keeping the locally configured posture",
+                                rule.id
+                            ),
+                        },
+                        Err(e) => warn!("failed to decode synced Lane 2 config {}: {e}", rule.id),
+                    }
+                }
                 _ => {}
             }
         }
@@ -347,6 +478,7 @@ impl SyncedRuleStore {
             allow_urls,
             block_urls,
             sensitive,
+            semantic,
         }
     }
 }
@@ -354,6 +486,7 @@ impl SyncedRuleStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checks::EnforcementMode;
     use bytes::Bytes;
     use chrono::Utc;
     use std::collections::HashMap as StdHashMap;
@@ -474,6 +607,162 @@ mod tests {
             store.block_urls.matches("h1", "/secret/data"),
             Some(registry_id(SyncedKind::BlockUrl, url_id))
         );
+    }
+
+    #[test]
+    fn semantic_config_roundtrips_through_the_registry() {
+        let mut cfg = ContentSecurityConfig::default();
+        cfg.enabled = true;
+        cfg.enforcement_mode = "enforce".to_string();
+        cfg.rollout_bps = 7500;
+        cfg.rollout_salt = "s".to_string();
+        cfg.rules_disabled = vec!["xss.script_tag".to_string()];
+
+        let mut registry = RuleRegistry::new();
+        registry.insert(semantic_config_to_rule(&cfg).expect("encode"));
+
+        let store = SyncedRuleStore::from_registry(&registry);
+        let got = store.semantic.expect("synced Lane 2 config must be decoded");
+        assert!(got.enabled);
+        assert_eq!(got.enforcement_mode, EnforcementMode::Enforce);
+        assert_eq!(got.rollout_bps, 7500);
+        assert_eq!(got.rollout_salt, "s");
+        assert!(
+            got.rule_toggles.forced_off().contains(&"xss.script_tag"),
+            "a per-rule switch set on the Main must survive the trip"
+        );
+    }
+
+    #[test]
+    fn a_registry_without_a_semantic_entry_yields_none_not_a_disabled_lane() {
+        // The distinction that keeps a pre-feature Main from silently switching
+        // Lane 2 off on every worker that joins it: saying nothing is not the
+        // same as saying "off".
+        let mut registry = RuleRegistry::new();
+        registry.insert(block_ip_to_rule(&BlockIp {
+            id: Uuid::new_v4(),
+            host_code: "h1".to_string(),
+            ip_cidr: "10.0.0.0/8".to_string(),
+            remarks: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }));
+        assert!(SyncedRuleStore::from_registry(&registry).semantic.is_none());
+    }
+
+    #[test]
+    fn republishing_the_semantic_config_replaces_it_in_place() {
+        let mut cfg = ContentSecurityConfig::default();
+        cfg.enabled = true;
+        cfg.rollout_bps = 100;
+        let mut registry = RuleRegistry::new();
+        registry.insert(semantic_config_to_rule(&cfg).expect("encode"));
+
+        cfg.rollout_bps = 10_000;
+        registry.insert(semantic_config_to_rule(&cfg).expect("encode"));
+
+        // Singleton id → one entry, carrying the newer value.
+        assert_eq!(
+            registry.rules.keys().filter(|k| k.starts_with(CAT_SEMANTIC)).count(),
+            1,
+            "the Lane 2 config is a singleton; a second publish must overwrite, not accumulate"
+        );
+        let store = SyncedRuleStore::from_registry(&registry);
+        assert_eq!(store.semantic.map(|c| c.rollout_bps), Some(10_000));
+    }
+
+    #[test]
+    fn an_undecodable_or_invalid_semantic_payload_leaves_the_local_posture_alone() {
+        // Garbage payload — what a peer speaking a future dialect might send.
+        let mut broken = semantic_config_to_rule(&ContentSecurityConfig::default()).expect("encode");
+        broken.metadata.insert("payload".to_string(), "{not json".to_string());
+        let mut registry = RuleRegistry::new();
+        registry.insert(broken);
+        assert!(
+            SyncedRuleStore::from_registry(&registry).semantic.is_none(),
+            "a payload we cannot parse must not be adopted"
+        );
+
+        // Parses, but fails validation (`rollout_bps` is capped at 10000).
+        let mut cfg = ContentSecurityConfig::default();
+        cfg.rollout_bps = 99_999;
+        let mut invalid = semantic_config_to_rule(&cfg).expect("encode");
+        invalid.metadata.insert(
+            "payload".to_string(),
+            serde_json::to_string(&cfg).expect("serialize invalid config"),
+        );
+        let mut registry = RuleRegistry::new();
+        registry.insert(invalid);
+        assert!(
+            SyncedRuleStore::from_registry(&registry).semantic.is_none(),
+            "a payload that does not compile must not be adopted"
+        );
+    }
+
+    #[test]
+    fn unknown_categories_are_ignored() {
+        // The backward-compatibility guarantee for adding a `SyncedKind` variant.
+        // `SyncedKind` never crosses the wire — a `Rule` does, and its `category`
+        // is a plain String — so this is what a node built *before* a new kind
+        // existed does when the Main sends one. It must be "nothing", not a
+        // decode failure that costs it the rest of the sync frame.
+        let mut registry = RuleRegistry::new();
+        registry.insert(Rule {
+            id: "cluster-from-the-future:1".to_string(),
+            name: "n".to_string(),
+            description: None,
+            category: "cluster-from-the-future".to_string(),
+            source: SOURCE_CLUSTER.to_string(),
+            enabled: true,
+            action: "block".to_string(),
+            severity: None,
+            pattern: Some("x".to_string()),
+            tags: Vec::new(),
+            metadata: HashMap::new(),
+        });
+        // A known-good rule alongside it must still be consumed: an unrecognised
+        // entry is skipped, it does not abort the rebuild.
+        registry.insert(block_ip_to_rule(&BlockIp {
+            id: Uuid::new_v4(),
+            host_code: "h1".to_string(),
+            ip_cidr: "10.0.0.0/8".to_string(),
+            remarks: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }));
+
+        let store = SyncedRuleStore::from_registry(&registry);
+        assert!(store.semantic.is_none());
+        assert!(
+            store.block_ips.matches("h1", "10.1.2.3".parse().expect("ip")),
+            "an unknown category must not cost us the rules we do understand"
+        );
+    }
+
+    #[test]
+    fn a_semantic_rule_survives_json_serialisation_the_way_the_wire_sends_it() {
+        // The transport is length-prefixed JSON (`transport/frame.rs`) carrying a
+        // `ClusterMessage` whose `RuleChange.rule_json` is `serde_json::to_value`
+        // of this very `Rule`. If the carrier did not survive that round trip the
+        // registry test above would still pass and the cluster would still not
+        // work, so exercise the same encoding the wire uses.
+        let mut cfg = ContentSecurityConfig::default();
+        cfg.enabled = true;
+        cfg.enforcement_mode = "enforce".to_string();
+        cfg.rollout_bps = 10_000;
+
+        let rule = semantic_config_to_rule(&cfg).expect("encode");
+        let wire = serde_json::to_value(&rule).expect("to_value");
+        let back: Rule = serde_json::from_value(wire).expect("from_value");
+
+        let mut registry = RuleRegistry::new();
+        registry.insert(back);
+        let got = SyncedRuleStore::from_registry(&registry)
+            .semantic
+            .expect("config must survive the wire encoding");
+        assert!(got.enabled);
+        assert_eq!(got.enforcement_mode, EnforcementMode::Enforce);
+        assert_eq!(got.rollout_bps, 10_000);
     }
 
     #[test]
