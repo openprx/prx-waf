@@ -1,0 +1,33 @@
+# Scratch overlay for the T13 cluster proof. Renames every container and
+# remaps every published port so this run cannot collide with another agent's
+# cluster on the same host. Not part of the shipped set — delete after use.
+services:
+  # Something for the proxy to actually forward to. Unrouted traffic is answered
+  # 404 before the WAF ever inspects it, so without a real host + upstream the
+  # detection path is not on the request path at all.
+  upstream:
+    image: docker.io/library/nginx:alpine
+    container_name: t13-upstream
+    networks:
+      - cluster_net
+
+  postgres:
+    container_name: t13-postgres
+  cluster-init:
+    container_name: t13-cluster-init
+  node-a:
+    container_name: t13-node-a
+    ports:
+      - "17880:80"
+      - "17843:443"
+      - "17827:9527"
+  node-b:
+    container_name: t13-node-b
+    ports:
+      - "17828:9527"
+      - "17881:80"
+  node-c:
+    container_name: t13-node-c
+    ports:
+      - "17829:9527"
+      - "17882:80"

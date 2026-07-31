@@ -82,11 +82,31 @@ impl RuleChangelog {
     }
 
     /// Return all changes with `version > from_version`, or `None` when the
-    /// worker is too far behind (its version precedes the oldest buffered entry).
+    /// worker cannot be brought up to date incrementally and needs a full
+    /// snapshot — either because it is behind the oldest buffered entry, or
+    /// because it is *ahead* of us.
     pub fn delta_since(&self, from_version: u64) -> Option<Vec<RuleChange>> {
         if self.changes.is_empty() {
             // No changes ever recorded; worker is already up to date.
             return Some(Vec::new());
+        }
+        if from_version > self.current_version {
+            // The worker claims a version we have never issued, which means it
+            // is carrying state from a previous incarnation of the Main: this
+            // changelog lives in memory and starts again at 0 on every restart,
+            // while the worker's counter does not.
+            //
+            // Read literally, "changes after version N" is the empty set here,
+            // and that is what this used to return — so a restarted Main could
+            // never correct a worker again. Everything it republished on the way
+            // up landed at versions the worker had already seen the numbers of,
+            // and the worker sat on the old state indefinitely while both sides
+            // reported a healthy, fully-caught-up sync.
+            //
+            // A full snapshot is the only honest answer: our registry, not the
+            // worker's, is authoritative, and the version it is quoting has no
+            // meaning against this changelog.
+            return None;
         }
         let first = self.changes.front().map_or(0, |(v, _)| *v);
         if from_version < first {
@@ -316,5 +336,73 @@ mod tests {
     #[test]
     fn short_blob_is_rejected() {
         assert!(decompress_snapshot(&[0u8; 2]).is_err());
+    }
+
+    fn test_rule(id: &str) -> Rule {
+        Rule {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            category: "cluster-custom".to_string(),
+            source: "cluster".to_string(),
+            enabled: true,
+            action: "block".to_string(),
+            severity: None,
+            pattern: None,
+            tags: Vec::new(),
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_worker_ahead_of_a_restarted_main_is_sent_a_full_snapshot() {
+        // The changelog is in memory and restarts at 0; the worker's registry
+        // version does not. So after a Main restart the worker asks for
+        // "everything after 7" while the Main has only ever issued version 1.
+        //
+        // Answering that literally — the empty set, which is what "changes after
+        // 7" is here — left the restarted Main permanently unable to correct the
+        // worker: everything it republished on the way up sat at versions the
+        // worker had already counted past, and both sides reported a healthy
+        // sync while the worker served state from the Main's previous life.
+        let mut changelog = RuleChangelog::new(16);
+        let rule = test_rule("cluster-semantic:00000000-0000-0000-0000-000000000000");
+        changelog.record_change(ChangeOp::Upsert, rule.id.clone(), Some(&rule));
+        assert_eq!(changelog.current_version(), 1);
+
+        assert!(
+            changelog.delta_since(7).is_none(),
+            "a worker ahead of the changelog cannot be reconciled incrementally"
+        );
+        let response = handle_sync_request(&changelog, &RuleSyncRequest { current_version: 7 }, &[rule.clone()])
+            .expect("handle_sync_request");
+        assert!(matches!(response.sync_type, SyncType::Full));
+        assert_eq!(
+            response.version, 1,
+            "the Main's own version is authoritative, not the worker's"
+        );
+        let restored = restore_snapshot(&response.snapshot_lz4).expect("restore");
+        assert_eq!(restored.first().map(|r| r.id.as_str()), Some(rule.id.as_str()));
+
+        // And the worker converges in exactly one extra round trip: applying the
+        // snapshot stamps version 1 onto its registry, which is what the next
+        // pull quotes, so this does not become a full-snapshot loop.
+        assert_eq!(
+            changelog.delta_since(1).map(|c| c.len()),
+            Some(0),
+            "once caught up the worker is answered incrementally again"
+        );
+    }
+
+    #[test]
+    fn a_worker_exactly_level_with_the_main_still_gets_an_empty_delta() {
+        let mut changelog = RuleChangelog::new(16);
+        let rule = test_rule("r1");
+        changelog.record_change(ChangeOp::Upsert, rule.id.clone(), Some(&rule));
+        assert_eq!(
+            changelog.delta_since(1).map(|c| c.len()),
+            Some(0),
+            "being level is not being ahead; it must not force a snapshot"
+        );
     }
 }
