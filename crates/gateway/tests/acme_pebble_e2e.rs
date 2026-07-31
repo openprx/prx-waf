@@ -395,6 +395,16 @@ async fn acme_http01_issues_a_certificate_for_the_key_we_stored() {
         "challenge store still holds a token after issuance"
     );
 
+    // Hand the row's two PEMs to the harness, which re-derives both public keys
+    // with openssl. The assertion above compares a key parsed by rcgen against a
+    // certificate parsed by x509-parser; an unrelated tool agreeing takes both
+    // crates out of the argument.
+    if let Ok(dir) = std::env::var("ACME_E2E_ARTIFACT_DIR") {
+        let dir = PathBuf::from(dir);
+        std::fs::write(dir.join("issued-cert.pem"), cert_pem).expect("write issued-cert.pem");
+        std::fs::write(dir.join("issued-key.pem"), key_pem).expect("write issued-key.pem");
+    }
+
     println!("issued for {domain}: issuer={issuer} subject={}", leaf.subject());
     println!(
         "  validity: {} .. {}",

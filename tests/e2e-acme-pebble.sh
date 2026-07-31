@@ -30,7 +30,7 @@
 # key from the stored PEMs with openssl, so the key-match claim does not rest on
 # the same library that produced the key.
 #
-# Prerequisites: podman (or docker), psql, openssl, cargo.
+# Prerequisites: podman (or docker), curl, openssl, cargo.
 #
 # Usage:
 #   ./tests/e2e-acme-pebble.sh
@@ -69,7 +69,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for tool in "$RUNTIME" psql openssl cargo; do
+for tool in "$RUNTIME" curl openssl cargo; do
     command -v "$tool" >/dev/null || { echo "ERROR: $tool not found" >&2; exit 1; }
 done
 
@@ -107,9 +107,18 @@ write_pebble_config "$WORK/pebble.json" "$ACME_PORT" "$ACME_MGMT_PORT" "$HTTP01_
 echo "── starting Postgres and Pebble ──"
 $RUNTIME rm -f "${PREFIX}-pebble" "${PREFIX}-postgres" >/dev/null 2>&1 || true
 
-$RUNTIME run -d --name "${PREFIX}-postgres" \
-    -e POSTGRES_USER=prx_waf -e POSTGRES_PASSWORD=prx_waf -e POSTGRES_DB=prx_waf \
-    -p "${PG_PORT}:5432" "$POSTGRES_IMAGE" >/dev/null
+# A DATABASE_URL from the environment wins: CI already has a Postgres service
+# and does not need a second one, while a bare local run wants one provided.
+if [ -n "${DATABASE_URL:-}" ]; then
+    echo "using the DATABASE_URL already in the environment"
+    STARTED_POSTGRES=0
+else
+    $RUNTIME run -d --name "${PREFIX}-postgres" \
+        -e POSTGRES_USER=prx_waf -e POSTGRES_PASSWORD=prx_waf -e POSTGRES_DB=prx_waf \
+        -p "${PG_PORT}:5432" "$POSTGRES_IMAGE" >/dev/null
+    export DATABASE_URL="postgresql://prx_waf:prx_waf@127.0.0.1:${PG_PORT}/prx_waf"
+    STARTED_POSTGRES=1
+fi
 
 # --add-host is what makes $DOMAIN resolve to this host inside Pebble; Pebble
 # uses the system resolver unless told otherwise, and Go's resolver reads
@@ -133,18 +142,22 @@ for _ in $(seq 1 60); do
     echo -n "."; sleep 1
 done
 
-export DATABASE_URL="postgresql://prx_waf:prx_waf@127.0.0.1:${PG_PORT}/prx_waf"
-echo -n "waiting for Postgres"
-for _ in $(seq 1 60); do
-    if psql "$DATABASE_URL" -c 'SELECT 1' >/dev/null 2>&1; then echo " up"; break; fi
-    echo -n "."; sleep 1
-done
+if [ "$STARTED_POSTGRES" = "1" ]; then
+    echo -n "waiting for Postgres"
+    for _ in $(seq 1 60); do
+        if $RUNTIME exec "${PREFIX}-postgres" pg_isready -U prx_waf >/dev/null 2>&1; then echo " up"; break; fi
+        echo -n "."; sleep 1
+    done
+fi
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 export PEBBLE_DIRECTORY_URL="https://127.0.0.1:${ACME_PORT}/dir"
 export PEBBLE_ROOT_PEM="$WORK/pebble.minica.pem"
 export PEBBLE_HTTP01_PORT="$HTTP01_PORT"
 export PEBBLE_TEST_DOMAIN="$DOMAIN"
+# Where the issuing test drops the two PEMs it asserted on, for the openssl
+# cross-check below.
+export ACME_E2E_ARTIFACT_DIR="$WORK"
 
 echo "── cargo test -p gateway --test acme_pebble_e2e ──"
 # --test-threads=1: the tests bind the same challenge ports and share one CA.
@@ -155,22 +168,19 @@ cargo test --manifest-path "$ROOT/Cargo.toml" -p gateway --test acme_pebble_e2e 
     --ignored --nocapture --test-threads=1 || RUST_STATUS=$?
 
 # ── Independent check of the key match ────────────────────────────────────────
-# The Rust assertion compares the certificate's SubjectPublicKeyInfo with one
-# derived by rcgen, the same crate that generated the key. openssl deriving the
-# same answer from the stored PEMs removes that crate from the argument.
+# The Rust assertion compares a key parsed by rcgen against a certificate parsed
+# by x509-parser. openssl deriving the same public key from the same two PEMs —
+# the ones the test read back out of the certificates row — takes both crates
+# out of the argument.
 echo
 echo "── openssl cross-check of the stored certificate and key ──"
-psql "$DATABASE_URL" -At -c \
-    "SELECT cert_pem FROM certificates WHERE host_code LIKE 'acme-ok-%' AND status='active' ORDER BY created_at DESC LIMIT 1" \
-    >"$WORK/cert.pem"
-psql "$DATABASE_URL" -At -c \
-    "SELECT key_pem FROM certificates WHERE host_code LIKE 'acme-ok-%' AND status='active' ORDER BY created_at DESC LIMIT 1" \
-    >"$WORK/key.pem"
+cert="$WORK/issued-cert.pem"
+key="$WORK/issued-key.pem"
 
-if [ -s "$WORK/cert.pem" ] && [ -s "$WORK/key.pem" ]; then
-    openssl x509 -in "$WORK/cert.pem" -noout -subject -issuer -dates -ext subjectAltName
-    cert_pub="$(openssl x509 -in "$WORK/cert.pem" -noout -pubkey)"
-    key_pub="$(openssl pkey -in "$WORK/key.pem" -pubout)"
+if [ -s "$cert" ] && [ -s "$key" ]; then
+    openssl x509 -in "$cert" -noout -subject -issuer -dates -ext subjectAltName
+    cert_pub="$(openssl x509 -in "$cert" -noout -pubkey)"
+    key_pub="$(openssl pkey -in "$key" -pubout)"
     if [ "$cert_pub" = "$key_pub" ]; then
         echo "  PASS: certificate public key == public key of the stored private key"
         echo "$cert_pub"
@@ -179,7 +189,7 @@ if [ -s "$WORK/cert.pem" ] && [ -s "$WORK/key.pem" ]; then
         RUST_STATUS=1
     fi
 else
-    echo "  FAIL: no active certificate row to cross-check" >&2
+    echo "  FAIL: the issuing test produced no certificate to cross-check" >&2
     RUST_STATUS=1
 fi
 
