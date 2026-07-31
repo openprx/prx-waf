@@ -741,6 +741,122 @@ Nothing else moved. Thirty of the thirty-one prices above stand as recorded.
 
 ---
 
+# Which zeros are masking
+
+`xss.base_href` reads `touched = 0` on a corpus that contains its exact shape.
+`traversal.plain_dotdot` stopped appearing on `trav-005` when a stronger
+traversal rule went default-on. Both are the same effect — a rule that matched
+and was never named — and until now the only answer to "how many more are there"
+was a caveat saying nobody had looked. This section is the look.
+
+It is not a rule-by-rule retry. The pipeline decides where masking can happen,
+and the shipped baseline report decides which rows can be hiding what, so the
+candidate set falls out of the two rather than out of a hunch.
+
+## Masking happens in exactly one place
+
+`SemanticDetector::detect` returns `Option<DetectionFinding>`
+(`crates/waf-engine/src/checks/content_security/preprocess.rs:656`). **One rule
+key per detector per view, and that is the whole of it.** Everything downstream
+keeps every signal it is handed:
+
+* `mod.rs:424` runs every detector on every view and pushes every finding —
+  no dedup, no cap, no `break`;
+* `scoring.rs:655` copies the signal slice into the verdict verbatim, and
+  `engine.rs:817` serialises that slice into the `semantic_observations` row the
+  corpus harness reads as `rule_keys_fired`;
+* the `canonical` arg-max at `scoring.rs:470` collapses `(scope, field, attack,
+  detector)` for the **score**, and `Group::best` / `best_specific` / the
+  request roll-up / `reattribute_shared_construct` pick the single `rule_id` an
+  operator sees on the event — none of them removes a signal from the list.
+
+So a rule is invisible on a row if and only if one of its **own detector's**
+rules took the slot it wanted, on the same view. Cross-detector cannot mask
+(`xss.script_tag` and `xss.js_sink` are different detectors and both appear on
+`xss-016`), and cross-view cannot mask (`rule_keys_fired` is a set over every
+view, so a rule beaten on the raw view still shows if it wins on the
+base64-decoded one).
+
+## Where inside a detector the choice is made
+
+Twelve sites, and they are all the same shape — propose every candidate, keep
+one:
+
+| site | file:line | what competes | winner |
+|---|---|---|---|
+| `best_match` | `detectors.rs:499` | every compiled row of one regex table | highest confidence, incumbent on a tie |
+| `keep_stronger` | `xss_dom.rs:530` | the nine XSS DOM constructs | highest confidence, incumbent on a tie |
+| dangling-tag fallback | `xss_dom.rs:846` | `xss.dangling_open_tag` vs any parsed construct | anything else at all — a hard `best.is_none()` gate, not a comparison |
+| `classify_context` | `xss_js.rs:111` | `xss.js_exfil` vs `xss.js_sink` | exfil, falling back to sink when exfil is off |
+| cross-context arg-max | `xss_js.rs:167` | the winners of every JS context on the view | highest confidence |
+| `max_by_key` | `detectors.rs:3835` | every key the shell-AST walk fired | highest confidence, **last** on a tie |
+| `walk.fire` | `detectors.rs:4288` | `rce_ast.cmd_subst` vs `rce_ast.cmd_subst_any` | whether the substitution's inner text is dangerous — mutually exclusive per substitution |
+| `classify_statements` | `detectors.rs:2812` | `ast.stacked` vs everything else | stacked, and the other statements are never classified |
+| `SetExpr::SetOperation` | `detectors.rs:2829` | `ast.union` vs the selects inside the union | union, and with union off the arm reports nothing |
+| `classify_set_expr` | `detectors.rs:2836` | `ast.dangerous_fn` / `ast.tautology` / `ast.subquery` | an if/else-if chain in confidence order, over an `AstFlags` that holds all three |
+| regex-vs-pickle | `detectors.rs:2403` | the deser regex table's winner vs the pickle walker's grade | highest confidence, regex on a tie |
+| pickle grade | `detectors.rs:2440` | `deser.py_pickle_reduce_exec` vs `deser.py_pickle_dangerous_global` | reduce, falling back to the named grade when reduce is off |
+
+`best_match` is called by all nine regex-table detectors
+(`detectors.rs:663 897 1056 1206 1393 1658 1866 2067 2400`), which is why one
+function covers seventy-nine of the hundred and fifteen keys.
+
+Every one of these consults the operator's `RuleToggles` before it keeps a
+candidate, which is the property that makes unmasking possible at all: take the
+winner away in `rules_disabled` and the next-strongest enabled rule takes the
+slot.
+
+## What that makes provable, and where it stops
+
+The winner outranks the loser on confidence at ten of the twelve sites, and at
+the two `xss_*` fallbacks the loser is reported instead. So:
+
+> A rule `B` can be missing from row `X` only if `X`'s `rule_keys_fired`
+> contains a key of `B`'s own detector whose confidence is `>=` `B`'s.
+
+That is a filter over the shipped baseline report, and it is what the candidate
+set below is computed from. **Two sites break the confidence half of it, both
+inside the SQL AST detector**, so `ast` is filtered on detector presence alone:
+
+* `detectors.rs:2968` tries the numeric wrapper first and the single-quote
+  breakout wrapper only `or_else` — so an `ast.subquery` (78) found under the
+  numeric wrapper hides an `ast.dangerous_fn` (85) the quoted wrapper would have
+  found;
+* `detectors.rs:2982` **relabels**: on a view still carrying a comment marker the
+  structural key is replaced by `ast.comment_obfusc`, at the structure's own
+  confidence. The structure's key does not appear alongside it — it does not
+  appear at all. `ast.comment_obfusc` is also the one key that is deliberately
+  not switchable (`NON_SWITCHABLE_KEYS`, `detectors.rs:234`), so no
+  `rules_disabled` can take the relabel away.
+
+## Masking that is not a rule at all
+
+Four more places lose a rule's chance to fire, and none of them is reachable
+from `rules_enabled` / `rules_disabled` — they run identically in every sweep in
+these two documents, so they are a standing limit on every number here rather
+than an error in any particular one:
+
+* **one blind decode per text.** `best_base64_candidate`
+  (`preprocess.rs:484`) and `best_hex_candidate` (`preprocess.rs:509`) return the
+  **first** structural candidate. A field carrying two base64 tokens yields one
+  `BlindDecoded` view, and whatever the second one decodes to is never inspected.
+* **one body extractor per request.** `extract_body_fields`
+  (`struct_extract.rs:138`) dispatches multipart → JSON → GraphQL → XML → sniff
+  in an if/else-if chain. A body that is two of those at once yields one
+  extractor's leaves.
+* **field and view caps.** The JSON/XML/GraphQL/multipart walks `break` at
+  `max_fields`, and the per-field view cap drops frontier texts past
+  `max_views`. The view cap records a miss and marks the request `degraded`; the
+  field caps do not.
+* **the XSS token detector depends on the DOM detector having run.**
+  `XssDomDetector::detect` clears the JS-context stash before every early return
+  (`xss_dom.rs:782`), so when the HTML parse budget or the input-size backstop
+  declines a view, `xss.js_exfil` and `xss.js_sink` cannot fire on it — masked by
+  a *different* detector, with no key of their own detector on the row to show
+  for it.
+
+---
+
 # What this document does not establish
 
 * **Three combinations were measured, out of every set anyone might ship.**
