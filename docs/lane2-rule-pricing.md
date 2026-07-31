@@ -855,6 +855,61 @@ than an error in any particular one:
   a *different* detector, with no key of their own detector on the row to show
   for it.
 
+## Where the candidates are, and why the sweep did not need them
+
+The rule above cuts the problem down to almost nothing. **Thirteen of the 220
+benign rows carry any Lane 2 signal at all in the shipped baseline** —
+`content-005 -010 -011 -029 -030 -031 -033 -038 -040 -044 -059 -099 -100`, and
+the other 207 name no rule of any detector. A benign `touched = 0` can only be
+masking on one of those thirteen, and only for a rule of the detector that won
+there: `ldap_struct` on `content-099`, `xpath_struct` on `content-100`,
+`struct_rule` on `-044` and `-059`, `traversal` on `-031` and `-059`, `rce` on
+`-029 -031 -033`, `rce_ast` on `-029 -030 -031 -038 -040`, and `xss_dom` on
+`-005 -010 -011 -059`. **Six detectors — `ast`, `deser_struct`, `nosql_struct`,
+`ssti_struct`, `xxe_struct`, `xss_js` — fire on no benign row anywhere**, so
+every one of their rules is unmaskable on the benign half by construction, and
+that is forty-eight of the hundred and fifteen keys before a single run.
+
+That argument is worth having and it is not what the numbers below rest on. One
+corpus replay in shadow mode takes twenty seconds, the whole inventory is a
+hundred and fifteen rules, and a filter that has to be right is worse than a
+sweep that does not have to be. **Every rule was run, not just the candidates.**
+
+## The sweep
+
+`tests/lane2/unmask.sh`, one run per rule: the rule enabled, **every other rule
+of its own detector disabled**, every other detector left exactly as it ships.
+Nothing of that detector is left to outrank it, so every row it matches names
+it. 115 solo runs, 34 more for the default-off rules — a default-on rule is
+named in the baseline already, a default-off one needs the run its price was
+taken in — and the baseline, all shadow-only, because `rule_keys_fired` comes
+from the `semantic_observations` rows and only shadow mode writes them.
+
+```bash
+tests/lane2/unmask.sh                          # every rule
+tests/lane2/unmask.sh xss.base_href            # or just some
+python3 tests/lane2/unmask.py --dir "$WORK/runs"
+```
+
+Isolating one rule rather than peeling the strongest away and re-running is
+deliberate. A peel has to argue about tie-breaks — `best_match` keeps the
+incumbent, the shell-AST walker's `max_by_key` keeps the *last* — and about how
+deep is deep enough. Isolation leaves nothing to argue about.
+
+**Recorded from `4fcb6d0b` (`v0.2.198`)**, release build, ports `185xx`,
+Postgres on `15809`. The baseline run reproduces `tests/lane2/baseline.json`
+exactly — shadow **139 / 10 / 2**, enforce **75 / 2 / 2** — and the shipped
+posture's benign contact reproduces both documents' `touched` columns on the
+nose: `rce_ast.cmd_subst` 5, `xss.script_tag` 3, `traversal.sensitive_abs` 2,
+and one row each for `xss.event_handler`, `rce.piped_shell`, `rce.cmd_subst`,
+`rce.shell_exec_flag`, `sql.union_select`, `sql.union_null`,
+`ldap.filter_break_known_attr` and `xpath.func_axis`. `configs/default.toml`,
+the corpus, `baseline.json` and every rule's `default_on` are untouched: the
+sweep points `SRC` at a symlink mirror whose only real directory is `configs/`.
+`NORMALISED_STRONG_STRUCTURE` reads the compiled-in `default_on` and not these
+toggles (`detectors.rs:4314`), so **every run in this sweep sees the same views**
+and the only thing that varies is which rule gets to name one.
+
 ---
 
 # What this document does not establish

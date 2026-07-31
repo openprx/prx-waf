@@ -142,6 +142,14 @@ sixty-six that were switchable before them. Between the three sweeps every one
 of the 115 keys `prx-waf rules semantic` lists has a number, except
 `ast.comment_obfusc`, which is a label rather than a rule and has no switch.
 
+Neither direction can see a rule that **matched and was not named**. A detector
+returns one finding per view, so a weaker rule sharing a view with a stronger
+one is absent from `rule_keys_fired` and therefore from every column
+`price-rules.py` computes. `unmask.sh` is the third instrument: one run per
+rule, with every other rule of that rule's own detector switched off, so nothing
+is left to outrank it. Read it with `unmask.py`, and read the result in
+[`docs/lane2-rule-pricing.md`](../../docs/lane2-rule-pricing.md#which-zeros-are-masking).
+
 The single most useful number they produce for this table: `xss.script_tag`
 carries eight of the eighteen XSS detections **and** two of the ten false
 positives, at an identical score of 45 on both, so 90.0% and 4.55% are the same
