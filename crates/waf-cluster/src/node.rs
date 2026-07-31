@@ -448,6 +448,28 @@ impl NodeState {
         self.used_join_tokens.lock().claim(claims, node_id, now_ms)
     }
 
+    /// Forget the rule version we hold, so the next pull is answered with a full
+    /// snapshot.
+    ///
+    /// Called when a join handshake is accepted. A rule version is issued by one
+    /// Main's in-memory changelog and means nothing against another's — or
+    /// against the same Main after a restart, whose counter begins again at 1
+    /// and can therefore *collide* with the version the worker already holds. A
+    /// collision is worse than a gap: "changes after version 1" is honestly
+    /// empty, so the worker keeps the previous incarnation's state while both
+    /// sides report a healthy sync.
+    ///
+    /// Only the registry version is cleared, not the rules. The rules stay live
+    /// on the request path until the snapshot replaces them, so re-joining never
+    /// opens a window where this node is enforcing nothing.
+    ///
+    /// The `rules_version` telemetry counter is deliberately left alone: it is
+    /// documented as monotonic, it is what `cluster/status` reports, and the
+    /// snapshot that follows will carry it forward anyway.
+    pub fn reset_rules_version_for_new_main(&self) {
+        self.rule_registry.write().version = 0;
+    }
+
     /// Returns `true` when `id` is the recorded authenticated Main identity.
     ///
     /// Used to gate acceptance of rule/config pushes so a worker only ever
@@ -528,6 +550,45 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn joining_forgets_the_rule_version_but_keeps_the_rules() {
+        let node = NodeState::new(test_config("worker-1", "worker"), StorageMode::ForwardOnly).expect("NodeState::new");
+
+        // State carried over from the Main we were talking to before.
+        {
+            let mut reg = node.rule_registry.write();
+            reg.insert(Rule {
+                id: "cluster-semantic:00000000-0000-0000-0000-000000000000".to_string(),
+                name: "carried".to_string(),
+                description: None,
+                category: "cluster-semantic".to_string(),
+                source: "cluster".to_string(),
+                enabled: true,
+                action: "config".to_string(),
+                severity: None,
+                pattern: None,
+                tags: Vec::new(),
+                metadata: std::collections::HashMap::new(),
+            });
+            reg.version = 1;
+        }
+
+        node.reset_rules_version_for_new_main();
+
+        let reg = node.rule_registry.read();
+        assert_eq!(
+            reg.version, 0,
+            "the version must not survive a join: a restarted Main reissues version 1, \
+             and a collision reads as 'already caught up' forever"
+        );
+        assert_eq!(
+            reg.rules.len(),
+            1,
+            "the rules themselves must stay live until the snapshot replaces them — \
+             re-joining must never leave this node enforcing nothing"
+        );
     }
 
     fn test_peer(node_id: &str, last_seen_ms: u64) -> PeerInfo {

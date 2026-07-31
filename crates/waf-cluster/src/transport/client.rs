@@ -303,6 +303,31 @@ async fn dispatch_incoming(msg: ClusterMessage, node_state: &NodeState, auth_id:
                     .set_main_node_id(resp.cluster_state.main_node_id.clone())
                     .await;
 
+                // Invalidate our rule version against the Main we just joined.
+                //
+                // Rule versions are issued by the Main's changelog, which lives
+                // in memory and starts again at 0 with the process — so they are
+                // only comparable within one incarnation of one Main. Ours was
+                // issued by whoever we were talking to before this handshake,
+                // and carrying it across is how a worker ends up quoting a
+                // number that means something entirely different to the node
+                // answering it.
+                //
+                // The damaging case is a Main restart, because the versions do
+                // not just drift, they *collide*: the Main republishes its
+                // startup state at version 1, the worker is already at version 1
+                // from the previous incarnation, and "changes after version 1"
+                // is legitimately empty. Both sides then report a healthy,
+                // caught-up sync while the worker serves the old Main's state
+                // indefinitely. That is unbounded for the Lane 2 config in
+                // particular, whose only publication point is Main startup —
+                // restarting the Main is the only way to change it, and it was
+                // exactly the operation that could not propagate.
+                //
+                // Zero costs one full snapshot per join and cannot collide with
+                // anything, because the Main's first issued version is 1.
+                node_state.reset_rules_version_for_new_main();
+
                 // Store encrypted CA key for failover if the main provided one.
                 if let Some(enc_b64) = resp.encrypted_ca_key_b64 {
                     match base64::engine::general_purpose::STANDARD.decode(&enc_b64) {
