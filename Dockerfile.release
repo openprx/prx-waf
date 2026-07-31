@@ -25,7 +25,8 @@ ARG TARGETARCH
 
 # The binary links only libc, libgcc and libm (no openssl-sys, no aws-lc-sys in
 # the dependency tree), so the runtime needs nothing beyond the base image plus
-# root certificates for outbound TLS and curl for HEALTHCHECK.
+# root certificates for outbound TLS. curl is here for the health check the
+# orchestrator runs *inside* this container — see the note above CMD.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -49,7 +50,23 @@ COPY migrations/ /app/migrations/
 
 EXPOSE 80 443 9527
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -fsS http://localhost:9527/health || exit 1
+# There is deliberately no HEALTHCHECK. This file carried one until it was
+# checked against a published image: HEALTHCHECK is a Docker extension, the OCI
+# image configuration only *reserves* the `Healthcheck` key without defining it,
+# and buildkit exports OCI media types for every image result by default. The
+# manifest at ghcr.io/openprx/prx-waf is an
+# application/vnd.oci.image.index.v1+json and no config under it has ever held a
+# healthcheck; podman says the same thing out loud ("HEALTHCHECK is not
+# supported for OCI image format and will be ignored"). The one escape hatch,
+# oci-mediatypes=false, is mutually exclusive with the annotations this release
+# attaches — buildkit fails the export with "cannot export annotations with
+# oci-mediatypes=false" — so keeping the instruction would trade a verifiable
+# annotated index for a field that most runtimes ignore anyway.
+#
+# Health checking therefore belongs to whatever starts the container.
+# docker-compose.yml and docker-compose.firedrill.yml each define one that
+# curls /health, and Kubernetes uses its own probes regardless of what an image
+# declares. A bare `docker run` gets no check unless it passes --health-cmd;
+# docs/RELEASING.md spells that out.
 
 CMD ["/usr/local/bin/prx-waf", "--config", "/app/configs/default.toml", "run"]

@@ -70,6 +70,13 @@ docker compose up -d          # pulls ghcr.io/openprx/prx-waf:latest
 The clone is for the compose file, `configs/` and `rules/`, which the compose
 file bind-mounts; the WAF itself comes from the registry.
 
+The compose file defines the container's health check itself. The image does not
+carry one — a registry stores it as an OCI image, and the OCI image
+configuration has no field a `HEALTHCHECK` could go in. If you run the image
+with a bare `docker run`, pass
+`--health-cmd 'curl -fsS http://localhost:9527/health'` to get the same
+behaviour.
+
 `latest` tracks the newest stable release and never a pre-release. Pin an exact
 version in production:
 

@@ -194,6 +194,21 @@ pushed to the registry as an OCI referrer. The job's only credential is the
 run-scoped `GITHUB_TOKEN`; there is still no repository secret anywhere in this
 pipeline.
 
+The image declares no `HEALTHCHECK`, and that is deliberate. `HEALTHCHECK` is a
+Docker extension: the OCI image configuration reserves the `Healthcheck` key
+without defining it, buildkit exports OCI media types for every image result,
+and the field is dropped on the way out. `v0.2.119` was published from a
+`Dockerfile.release` that declared one, and the config under its
+`application/vnd.oci.image.index.v1+json` has no healthcheck anywhere in it.
+The only way to keep the instruction is `oci-mediatypes=false`, which buildkit
+refuses for an annotated image — `cannot export annotations with
+"oci-mediatypes=false"` — so keeping it would cost the annotated OCI index the
+release's supply-chain metadata rides on, in exchange for a field Kubernetes
+ignores in favour of its own probes. Health checking is therefore the
+orchestrator's job: `docker-compose.yml` and `docker-compose.firedrill.yml`
+each define one against `/health`, and a bare `docker run` that wants the same
+behaviour passes `--health-cmd 'curl -fsS http://localhost:9527/health'`.
+
 Emulation note: QEMU is set up because the image's `apt-get` layer runs
 target-architecture code. Nothing else in the build does — the binary is copied
 in, never executed — so arm64 costs one short emulated layer, not a compile.
@@ -301,6 +316,10 @@ docker run --rm "ghcr.io/openprx/prx-waf:v${VERSION}" /usr/local/bin/prx-waf --v
 docker buildx imagetools inspect ghcr.io/openprx/prx-waf:latest --format '{{.Manifest.Digest}}'
 ```
 
+The manifest must be an image *index* with both platforms under it, and the
+config must contain no healthcheck — see [the container image](#the-container-image)
+for why the second one is expected rather than a defect.
+
 ---
 
 ## 7. When something goes wrong
@@ -376,5 +395,10 @@ constraint as above.
 - On the **first** release after this pipeline changed: check that the GHCR
   package exists and is public (a package created by a workflow push is private
   until an owner flips it), and that `docker pull` works from a logged-out
-  client. Nothing in the workflow can assert that for you.
+  client. Nothing in the workflow can assert that for you. Done once, against
+  `v0.2.119`: the package is public, an anonymous pull succeeds, the manifest is
+  a real `application/vnd.oci.image.index.v1+json` carrying `linux/amd64` and
+  `linux/arm64`, and `CMD` survives intact. Two things nobody has checked yet:
+  that the arm64 image runs on arm64 hardware, and that `latest` is withheld
+  from a `-rc` tag — no pre-release has ever been cut.
 - Close the milestone and thank external reporters credited in the CHANGELOG.
