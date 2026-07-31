@@ -104,9 +104,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      # Vite 8 declares engines ^20.19.0 || >=22.12.0. Bare '20' would still
+      # resolve to a 20.19.x that satisfies it, but Node 20 is out of support
+      # and 22 is what the upgrade was verified on locally.
       - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
           cache-dependency-path: web/admin-ui/package-lock.json
       # `-p tsconfig.app.json` (in the npm script) is load-bearing: the root
@@ -134,7 +137,7 @@ jobs:
       # admin UI, so build the frontend before cargo.
       - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
           cache-dependency-path: web/admin-ui/package-lock.json
       - name: Build admin UI
