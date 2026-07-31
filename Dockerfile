@@ -40,10 +40,13 @@ FROM debian:bookworm-slim AS runtime
 
 WORKDIR /app
 
-# Runtime dependencies
+# Runtime dependencies. curl is not optional here: the HEALTHCHECK below shells
+# out to it, and debian:bookworm-slim ships without it, so the check could only
+# ever exit 127 and pin the container at `unhealthy` forever.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary
@@ -58,7 +61,14 @@ RUN chmod +x /usr/local/bin/prx-waf
 
 EXPOSE 80 443 9527
 
-# Health check
+# Kept, unlike in Dockerfile.release. That file dropped the instruction because
+# a *published* image cannot carry it — buildkit exports OCI media types and the
+# OCI image config only reserves the `Healthcheck` key without defining it. Here
+# the instruction is the only health signal there is: no compose file builds
+# this Dockerfile, so `docker build .` followed by `docker run` is its whole
+# audience, and a classic docker build writes a Docker-format config that does
+# carry the field. `podman build` discards it unless given --format docker, and
+# says so on stderr when it does.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:9527/health || exit 1
 

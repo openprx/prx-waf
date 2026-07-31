@@ -19,6 +19,19 @@ RUN chmod +x /usr/local/bin/prx-waf
 
 EXPOSE 80 443 9527
 
+# Kept, unlike in Dockerfile.release. That file dropped the instruction because
+# a *published* image cannot carry it — buildkit exports OCI media types and the
+# OCI image config only reserves the `Healthcheck` key without defining it. This
+# image is never published: a classic `docker build` writes a Docker-format
+# config that does carry the field, so `docker run` of this image self-reports
+# health with no extra flags.
+#
+# podman is the exception. Its default output is OCI and it discards the
+# instruction out loud ("HEALTHCHECK is not supported for OCI image format and
+# will be ignored"); `podman build --format docker` keeps it. Nothing is lost
+# there either, because docker-compose.firedrill.yml — the only file that builds
+# this Dockerfile — declares its own service-level healthcheck against the same
+# /health endpoint.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:9527/health || exit 1
 
