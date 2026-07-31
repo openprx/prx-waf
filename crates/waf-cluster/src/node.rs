@@ -577,15 +577,17 @@ mod tests {
 
         node.reset_rules_version_for_new_main();
 
-        let reg = node.rule_registry.read();
+        let (version, rule_count) = {
+            let reg = node.rule_registry.read();
+            (reg.version, reg.rules.len())
+        };
         assert_eq!(
-            reg.version, 0,
+            version, 0,
             "the version must not survive a join: a restarted Main reissues version 1, \
              and a collision reads as 'already caught up' forever"
         );
         assert_eq!(
-            reg.rules.len(),
-            1,
+            rule_count, 1,
             "the rules themselves must stay live until the snapshot replaces them — \
              re-joining must never leave this node enforcing nothing"
         );

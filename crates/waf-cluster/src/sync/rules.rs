@@ -374,8 +374,12 @@ mod tests {
             changelog.delta_since(7).is_none(),
             "a worker ahead of the changelog cannot be reconciled incrementally"
         );
-        let response = handle_sync_request(&changelog, &RuleSyncRequest { current_version: 7 }, &[rule.clone()])
-            .expect("handle_sync_request");
+        let response = handle_sync_request(
+            &changelog,
+            &RuleSyncRequest { current_version: 7 },
+            std::slice::from_ref(&rule),
+        )
+        .expect("handle_sync_request");
         assert!(matches!(response.sync_type, SyncType::Full));
         assert_eq!(
             response.version, 1,
