@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import re
 import shutil
@@ -74,6 +75,29 @@ def cpu_model() -> str:
         return platform.processor() or "unknown"
     m = re.search(r"^model name\s*:\s*(.+)$", text, re.MULTILINE)
     return m.group(1).strip() if m else (platform.processor() or "unknown")
+
+
+def affinity_spec() -> str:
+    """The CPUs run.sh itself was allowed on, as a compact range list.
+
+    Load-bearing when the WAF is pinned to physical cores rather than to a
+    contiguous range: the harness shell, its awk/jq children and the RSS sampler
+    all inherit this mask, and if it overlaps the subject's cores they are a
+    contaminant the pinning arguments do not describe.
+    """
+    cpus = sorted(os.sched_getaffinity(0))
+    if not cpus:
+        return "unknown"
+    parts, start, prev = [], cpus[0], cpus[0]
+    for cpu in cpus[1:] + [None]:
+        if cpu == prev + 1:
+            prev = cpu
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        if cpu is None:
+            break
+        start = prev = cpu
+    return ",".join(parts)
 
 
 def mem_total_gib() -> float:
@@ -135,6 +159,13 @@ def reduce_rounds(records: list[dict]) -> dict:
         "requests": chosen["requests"],
         "rounds": len(ordered),
         "rps_spread_pct": round(spread, 1),
+        # In round order, not RPS order: the point of keeping it per round is to
+        # let a reader line a suspicious round up against the load the host was
+        # carrying while it ran.
+        "loadavg_1min_per_round": [
+            r["load1"] for r in sorted(records, key=lambda r: r["round"])
+            if "load1" in r
+        ],
     }
 
 
@@ -180,6 +211,12 @@ def main() -> int:
     if not records:
         print("no records in", args.raw)
         return 1
+
+    loads = [r["load1"] for r in records if "load1" in r]
+    round_loads = {
+        "min": min(loads), "median": round(statistics.median(loads), 2),
+        "max": max(loads), "rounds": len(loads),
+    } if loads else None
 
     grouped: dict[tuple[str, str], list[dict]] = {}
     for rec in records:
@@ -271,7 +308,13 @@ def main() -> int:
         },
         "environment": {
             "cpu": cpu_model(),
-            "cpus": len(__import__("os").sched_getaffinity(0)),
+            # The machine's logical CPU count, not the harness's affinity mask.
+            # These differ whenever run.sh is itself pinned away from the
+            # subject's cores, and reporting the mask here put "12 cpus" next to
+            # a CPU model with 16 of them — a table that contradicts itself.
+            # The mask is worth recording, so it is recorded as what it is.
+            "cpus": os.cpu_count(),
+            "harness_cpu_affinity": affinity_spec(),
             "memory_gib": mem_total_gib(),
             "kernel": platform.release(),
             "os": " ".join(platform.uname()[:1]) + " " + platform.version(),
@@ -280,6 +323,9 @@ def main() -> int:
             # to be able to tell which they are holding.
             "loadavg_1min_at_start": args.load_before,
             "loadavg_1min_at_end": args.load_after,
+            # Every measured round's own reading, reduced. A start/end pair can
+            # bracket a spike without showing it; this cannot.
+            "loadavg_1min_over_rounds": round_loads,
         },
         "method": {
             "generator": f"oha {args.oha}",
@@ -330,6 +376,10 @@ def main() -> int:
               f"{'on' if args.pin == '1' else 'off'}")
     md.append(f"tree `{args.tree[:12]}` ({args.dirty}) · host loadavg "
               f"{args.load_before} → {args.load_after}")
+    if round_loads:
+        md.append(f"per-round loadavg over {round_loads['rounds']} rounds: "
+                  f"{round_loads['min']} … {round_loads['max']} "
+                  f"(median {round_loads['median']})")
     md.append("")
 
     for workload in workloads:
