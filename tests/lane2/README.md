@@ -30,7 +30,7 @@ deliberately; this is the same instrument pointed at the other lane.
 
 ## Where we stand
 
-Recorded on 2026-07-30 from the corpus in `corpus/`, at the shipped
+Recorded on 2026-07-31 from the corpus in `corpus/`, at the shipped
 `configs/default.toml` posture. The same numbers are the CI gate in
 `baseline.json`, which is the authority — this table is transcribed from it.
 
@@ -43,12 +43,12 @@ The shipped `log_only` posture, verbatim. Verdicts come from the
 
 | | attack (170) | benign (220) |
 |---|---|---|
-| **detected / false positive** | **139 (81.76%)** | **10 (4.55%)** |
+| **detected / false positive** | **141 (82.94%)** | **10 (4.55%)** |
 | of which would block | — | **2 (0.91%)** |
 | clean | — | 207 |
 | sub-threshold | 1 | 3 |
 | misattributed / wrong-family | 2 / 2 | — |
-| blind | 28 | — |
+| blind | 26 | — |
 
 ### enforce mode — the blocking decision
 
@@ -70,13 +70,13 @@ codes. This is what actually happens to traffic.
 | `traversal` | 20 | 19 (95.0%) | 2 (10.0%) | 2 | 0 |
 | `xss` | 20 | 18 (90.0%) | 3 (15.0%) | 4 | 0 |
 | `xxe` | 15 | 13 (86.7%) | 12 (80.0%) | 0 | 0 |
-| `nosql_injection` | 15 | 13 (86.7%) | 6 (40.0%) | 0 | 0 |
+| `nosql_injection` | 15 | 15 (100%) | 6 (40.0%) | 0 | 0 |
 | `ssti` | 15 | 5 (33.3%) | 5 (33.3%) | 0 | 0 |
 | `ldap_injection` | 15 | 12 (80.0%) | 12 (80.0%) | 1 | **1** |
 | `xpath_injection` | 15 | 13 (86.7%) | 13 (86.7%) | 1 | **1** |
 | `deserialization` | 15 | 15 (100%) | 13 (86.7%) | 0 | 0 |
 
-Detection is flat across difficulty — canonical 84.1%, evasive 83.3%, hard
+Detection is flat across difficulty — canonical 84.1%, evasive 87.5%, hard
 73.5% — which is not the shape a keyword matcher produces and is the clearest
 single piece of evidence that the AST layers are doing real work. The corpus was
 written blind (see [Independence](#independence)), so the evasive and hard tiers
@@ -84,7 +84,7 @@ were not tuned to what the engine happens to catch.
 
 ## The three things this measurement says
 
-**1. Detected and blocked are two very different numbers.** 81.76% versus
+**1. Detected and blocked are two very different numbers.** 82.94% versus
 44.12%. Most of the gap is the two-detector families: `block_threshold = 80`
 with two 0.5 weights needs *both* detectors to agree on the same field, and the
 A2 blind guard holds back a Block carried only by a decoded view. So SQLi drops
@@ -93,7 +93,7 @@ A2 blind guard holds back a Block carried only by a decoded view. So SQLi drops
 The rest of the gap is confidence. A single-detector family runs at weight 1.0,
 so its request score *is* the winning rule's confidence, and it blocks at its
 shadow rate only while every rule that fires is over 80. Since v0.2.187 that is
-no longer true of three of them: NoSQL 86.7% → 40.0%, deserialization 100% →
+no longer true of three of them: NoSQL 100% → 40.0%, deserialization 100% →
 86.7%, XXE 86.7% → 80.0%, because the rules turned on in that release carry 45
 to 75. Those rows are detections that are deliberately not blocks.
 
@@ -123,7 +123,15 @@ switched on and nothing else changed, and
 [`docs/lane2-rule-pricing.md`](../../docs/lane2-rule-pricing.md) is the resulting
 bill for all 38. It says the trade is not one trade. The four NoSQL operator
 rules touch **zero** of the 220 benign rows, so v0.2.187 ships them on and that
-row is now 86.7%. The bare SSTI delimiters flag benign content at the *same
+row went to 86.7%. It is 100% since v0.2.208, and the last two rows were not a
+rule gap at all: the five operator rules are anchored to a whole leaf, and until
+then only a JSON object key ever became one, so `?user[$ne]=1` and
+`password[$ne]=x` — the bracket syntax Express/qs, PHP and Rails parse into the
+identical nested object — were invisible to rules that could already name `$ne`.
+Splitting a urlencoded parameter name into its key segments feeds those same
+five rules, and the benign column did not move because only an allowlisted
+`$`-operator becomes a leaf: `filter[name]` and `items[0]` add no field at all.
+The bare SSTI delimiters flag benign content at the *same
 score* as the attack they catch — `{{7*7}}` and a security article explaining
 `{{7*7}}` both score 45 — so no threshold separates them, they stay off, and
 33.3% is what SSTI costs to keep the FP column at 10. And
