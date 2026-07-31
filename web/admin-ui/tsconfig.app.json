@@ -9,7 +9,7 @@
     "moduleResolution": "Bundler",
     "lib": ["ES2020", "DOM", "DOM.Iterable"],
     "jsx": "preserve",
-    "strict": false,
+    "strict": true,
     "noEmit": true,
     "baseUrl": ".",
     "paths": {
