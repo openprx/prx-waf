@@ -11,8 +11,17 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.206"
+version = "0.2.207"
 edition = "2024"
+# Not a policy number, a measurement. The dependency graph refuses anything
+# older: wasmtime 47, cranelift 0.134 and sqlx 0.9 each declare rustc 1.94.0, so
+# `cargo check` under 1.93 stops at resolution. 1.94.0 then checks the whole
+# workspace, all targets and all features, clean. Edition 2024 puts a lower
+# floor of 1.85 under that, which nothing has been near for some time.
+#
+# Raise this when a dependency bump raises it, not on a calendar. Verify the
+# same way: `cargo +<new>` checks clean and `cargo +<new minus one>` does not.
+rust-version = "1.94"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
 description = "Pingora-based web application firewall with YAML rules engine"

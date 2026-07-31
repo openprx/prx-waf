@@ -111,7 +111,13 @@ override the matching TOML fields.
 
 ### Manual Build
 
-**Prerequisites:** Rust 1.86+, PostgreSQL 16+
+**Prerequisites:** Rust 1.94+, PostgreSQL 16+
+
+The Rust floor is `rust-version` in the workspace manifest, so `cargo` names it
+before it compiles anything rather than failing somewhere in the dependency
+graph. Building the admin UI as well needs Node 20+ and `npm ci && npm run
+build` in `web/admin-ui`; `crates/waf-api` embeds `web/admin-ui/dist` into the
+binary at compile time, and a checkout ships that directory empty.
 
 ```bash
 # Clone
