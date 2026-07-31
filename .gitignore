@@ -1,4 +1,18 @@
 /target
+# Filled-in secrets. README walks users through `cp .env.example .env` and then
+# writing JWT_SECRET and MASTER_KEY into it, so a stray `git add -A` would have
+# committed the signing key and the at-rest encryption key. `.env.*` also covers
+# .env.local / .env.production; the negation keeps the tracked template, which
+# docker-compose and the README both reference by name.
+.env
+.env.*
+!.env.example
+# Private key material. Every documented cert path (cert-init --output-dir,
+# the cluster TOMLs, the e2e scripts' mktemp dirs) lands outside the worktree,
+# but `cert-init` takes an arbitrary output dir and TLS config is hand-edited,
+# so a relative path is one typo away. No tracked file matches either glob.
+*.pem
+*.key
 *.swp
 *.swo
 .DS_Store
