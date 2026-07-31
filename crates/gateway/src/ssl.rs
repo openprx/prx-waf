@@ -324,8 +324,54 @@ impl SslManager {
 
         let cert_pem = cert_chain;
         let key_pem = key_pair.serialize_pem();
-        let now = chrono::Utc::now();
-        let not_after = now + chrono::Duration::days(90); // typical LE validity
+
+        // Read the certificate rather than assume it. The row used to record
+        // `now`, `now + 90 days` and the literal "Let's Encrypt" whatever came
+        // back, and `list_certificates_due_renewal` filters on exactly that
+        // `not_after`. A CA that disagrees — Let's Encrypt itself is moving to
+        // shorter lifetimes, and `[acme] directory_url` can now point anywhere —
+        // makes the renewal window fire after the certificate on the wire has
+        // already expired, silently, since every other column still looks right.
+        //
+        // A certificate we cannot parse is not one we can serve either, so it
+        // fails the row instead of being stored with invented dates.
+        let facts = match crate::tls_listener::inspect(&cert_pem) {
+            Ok(facts) => facts,
+            Err(e) => {
+                let _ = self
+                    .db
+                    .update_certificate_status(cert_id, "error", Some("issued certificate could not be parsed"))
+                    .await;
+                return Err(e.context(format!(
+                    "the CA returned a certificate for {domain} that cannot be read"
+                )));
+            }
+        };
+
+        // The same pairing check the manual upload endpoint runs. Here it guards
+        // a narrower thing: `finalize_csr` sends a CSR over the key generated
+        // above, and `finalize` — which we do not call — would have generated
+        // its own. If those ever swap, the store ends up holding a certificate
+        // and a key that are not a pair, and the first sign of it is a TLS
+        // listener that refuses to start.
+        if let Err(e) = crate::tls_listener::validate(&cert_pem, &key_pem) {
+            let _ = self
+                .db
+                .update_certificate_status(cert_id, "error", Some("issued certificate does not match our key"))
+                .await;
+            return Err(e.context(format!(
+                "the certificate issued for {domain} does not match the key we generated"
+            )));
+        }
+
+        // A publicly trusted certificate carries its names in the SAN and often
+        // leaves the subject empty; the domain is the more useful label when it
+        // does.
+        let subject = if facts.subject.is_empty() {
+            domain
+        } else {
+            facts.subject.as_str()
+        };
 
         self.db
             .update_certificate_pem(&waf_storage::models::UpdateCertificatePem {
@@ -333,10 +379,10 @@ impl SslManager {
                 cert_pem: &cert_pem,
                 key_pem: &key_pem,
                 chain_pem: None,
-                not_before: now,
-                not_after,
-                issuer: "Let's Encrypt",
-                subject: domain,
+                not_before: facts.not_before,
+                not_after: facts.not_after,
+                issuer: &facts.issuer,
+                subject,
             })
             .await?;
 
@@ -346,8 +392,8 @@ impl SslManager {
         }
 
         info!(
-            "Certificate issued for domain {} (id={}), valid until {}",
-            domain, cert_id, not_after
+            "Certificate issued for domain {} (id={}) by {}, valid until {}",
+            domain, cert_id, facts.issuer, facts.not_after
         );
         Ok(cert_id)
     }

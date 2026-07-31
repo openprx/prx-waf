@@ -365,6 +365,28 @@ async fn acme_http01_issues_a_certificate_for_the_key_we_stored() {
         "certificate public key bits do not match the stored private key"
     );
 
+    // 4b. The row describes the certificate it holds, rather than what a
+    //     certificate was assumed to look like. The renewal worklist is a
+    //     `not_after` comparison and nothing else, so a row that overstates the
+    //     window renews after the certificate on the wire has already expired —
+    //     with every other column still looking correct. Pebble is configured
+    //     with a 30-day validity precisely because the old code hardcoded 90.
+    assert_eq!(
+        row.not_after.map(|t| t.timestamp()),
+        Some(leaf.validity().not_after.timestamp()),
+        "stored not_after is not the certificate's notAfter"
+    );
+    assert_eq!(
+        row.not_before.map(|t| t.timestamp()),
+        Some(leaf.validity().not_before.timestamp()),
+        "stored not_before is not the certificate's notBefore"
+    );
+    assert_eq!(
+        row.issuer.as_deref(),
+        Some(issuer.as_str()),
+        "stored issuer is not the certificate's issuer"
+    );
+
     // 5. Nothing left behind to serve.
     assert!(
         ssl.challenges
