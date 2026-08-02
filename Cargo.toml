@@ -90,7 +90,7 @@ http = "1"
 # Only for `geteuid`, which the graceful-upgrade socket's directory check needs
 # and std does not expose. Already in the tree under pingora, and taken here in
 # preference to a raw `libc` call because the workspace denies `unsafe_code`.
-nix = { version = "0.24", features = ["user"] }
+nix = { version = "0.31", features = ["user"] }
 
 # Phase 3 additions
 rhai = { version = "1", features = ["sync"] }
