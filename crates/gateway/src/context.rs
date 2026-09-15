@@ -455,6 +455,12 @@ pub struct GatewayCtx {
     pub upstream_addr: Option<String>,
     /// Matched host config
     pub host_config: Option<Arc<HostConfig>>,
+    /// The authority `request_filter` routed on — `Host`, or the absolute-form
+    /// target's authority when the client sent no `Host`. Read again in
+    /// `upstream_request_filter`, which is where the upstream request gets
+    /// its `Host` if the client's absolute-form target was the only source.
+    /// `None` until routing has happened.
+    pub routed_authority: Option<String>,
     /// Streaming request-body inspector: buffers the body window by window and
     /// releases each window to the upstream only after it has been scanned.
     pub body_inspector: BodyInspector,

@@ -28,10 +28,14 @@
 //!
 //! 1. only `Host` → route on `Host` (unchanged);
 //! 2. only a target authority (absolute-form, no `Host`) → route on it;
-//! 3. both, and not byte-equal → refuse; same status, log and counter as the
-//!    h2/h3 contradiction. Pingora 0.9 already refuses this pair one layer
-//!    down, with the same byte-exact comparison, so this branch is the
-//!    defence that stays if that check moves;
+//! 3. both, and not byte-equal — or a `Host` that is present but empty or not
+//!    UTF-8, which equals no authority — → refuse; same status, log and
+//!    counter as the h2/h3 contradiction. Pingora 0.9 already refuses this
+//!    pair one layer down, with the same byte-exact comparison, on HTTP/1.1
+//!    (`read_request`) and on h2 (stream accept), so **no request on the wire
+//!    reaches this arm today**; it is defence in depth for the day that check
+//!    moves, and it is pinned by unit test (`proxy::authority_verdict`), not
+//!    by E2E;
 //! 4. any other target Pingora lets through — authority-form outside CONNECT,
 //!    an absolute-form with a non-HTTP scheme, an opaque `scheme:rest` — is
 //!    refused. Pingora would forward the bytes to the origin unchanged while
@@ -39,6 +43,12 @@
 //!    and the origin disagree about is not one this WAF can vouch for.
 //!    CONNECT itself never reaches this resolver: `pingora-proxy` answers it
 //!    405 unless `allow_connect_method_proxying` is set, and it is not.
+//! 5. on the way out, an absolute-form target is rewritten to origin-form and
+//!    the upstream request is given `Host` = the routed authority when the
+//!    client sent none ([`rewrite_absolute_form_to_origin`], called from
+//!    `upstream_request_filter`), so the origin receives exactly the path the
+//!    detectors inspected rather than the bytes Pingora would otherwise write
+//!    verbatim.
 //!
 //! The tests under `pingora_boundary` pin what Pingora hands this module —
 //! which forms parse, where the authority ends up, what `read_request` refuses
@@ -180,26 +190,78 @@ pub fn route_request_authority(head: &RequestHeader) -> RequestAuthority<'_> {
     }
 }
 
+/// Rewrite an absolute-form request target to origin-form before it is written
+/// to the origin, and give the upstream request a `Host` when the client sent
+/// none. Returns whether a rewrite happened.
+///
+/// Pingora writes `raw_path()` to an HTTP/1.1 origin verbatim
+/// (`pingora-core-0.9.0/src/protocols/http/v1/client.rs:917-925`), so without
+/// this the origin would receive `GET http://a.example/x HTTP/1.1` while the
+/// detectors had inspected `uri.path()` = `/x`. A compliant origin resolves
+/// both to the same resource (RFC 9112 §3.2.2); one that treats the whole
+/// target as a path — a framework that never expected a proxy in front of it,
+/// a `path.startswith("/admin")` guard — would serve a different request from
+/// the one the WAF vouched for. Rewriting makes what the origin receives
+/// identical to what was inspected. The `Host` insertion is needed because
+/// Pingora's own egress fills `Host` only while the target still carries an
+/// authority (`pingora-proxy-0.9.0/src/proxy_h1.rs:100-104`), and a
+/// Host-less HTTP/1.1 request is one an origin may refuse.
+///
+/// Origin-form, asterisk-form and h2 requests are left untouched.
+pub fn rewrite_absolute_form_to_origin(req: &mut RequestHeader, routed_authority: &str) -> pingora_core::Result<bool> {
+    if !matches!(classify_request_target(req.raw_path()), RequestTarget::Absolute(_)) {
+        return Ok(false);
+    }
+    // `parse_request_target` put the path component in the URI and anchored a
+    // target with no path at `/`, so `path_and_query` is the origin-form target.
+    let origin_form = req
+        .uri
+        .path_and_query()
+        .map_or_else(|| "/".to_owned(), |pq| pq.as_str().to_owned());
+    req.set_raw_path(origin_form.as_bytes())?;
+    if !req.headers.contains_key(http::header::HOST) {
+        req.insert_header(http::header::HOST, routed_authority)?;
+    }
+    Ok(true)
+}
+
+/// The `Host` field as the resolver sees it: absent, present but unusable, or
+/// a value that can be compared and routed on. The middle state exists because
+/// Pingora's ingress check compares `Host` bytes against the target authority
+/// without first asking whether they are usable: an empty or non-UTF-8 `Host`
+/// beside an authority is a byte-unequal pair there, and this resolver must
+/// not be wider than the layer in front of it.
+enum HostField<'a> {
+    Absent,
+    Unusable,
+    Usable(&'a str),
+}
+
 /// First `Host` line only, which is all the h2/h3 decoders compare too. A
 /// request carrying more than one `Host` is refused before this point
 /// (`FoldedHeaders::duplicate_host`).
-fn first_host(headers: &http::HeaderMap) -> Option<&str> {
+fn first_host(headers: &http::HeaderMap) -> HostField<'_> {
     headers
         .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .filter(|h| !h.is_empty())
+        .map_or(HostField::Absent, |value| match value.to_str() {
+            Ok(host) if !host.is_empty() => HostField::Usable(host),
+            _ => HostField::Unusable,
+        })
 }
 
 /// The one rule set, applied to whichever pair of sources a protocol offers.
-fn decide<'a>(authority: Option<&'a str>, host: Option<&'a str>) -> RouteAuthority<'a> {
+fn decide<'a>(authority: Option<&'a str>, host: HostField<'a>) -> RouteAuthority<'a> {
     match (authority, host) {
         // Byte-exact, matching the decoders' own comparison and Pingora 0.9's
         // ingress check: `a.com` and `a.com:443` are different authorities and
         // may hold different policy.
-        (Some(a), Some(h)) if a != h => RouteAuthority::Contradicted,
-        (Some(a), _) => RouteAuthority::Found(a),
-        (None, Some(h)) => RouteAuthority::Found(h),
-        (None, None) => RouteAuthority::Missing,
+        (Some(a), HostField::Usable(h)) if a != h => RouteAuthority::Contradicted,
+        // A `Host` that is present but empty or not UTF-8 equals no authority;
+        // Pingora's byte comparison refuses the pair, and so does this.
+        (Some(_), HostField::Unusable) => RouteAuthority::Contradicted,
+        (Some(a), HostField::Absent | HostField::Usable(_)) => RouteAuthority::Found(a),
+        (None, HostField::Usable(h)) => RouteAuthority::Found(h),
+        (None, HostField::Absent | HostField::Unusable) => RouteAuthority::Missing,
     }
 }
 
@@ -301,10 +363,12 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_host_is_no_host_at_all() {
+    fn an_empty_host_alone_is_missing_and_beside_an_authority_is_a_contradiction() {
         assert_eq!(resolve("/x", &[""]), Verdict::Missing);
-        // ... and it does not contradict an authority that is present.
-        assert_eq!(resolve("https://a.example/x", &[""]), found("a.example"));
+        // Present but empty equals no authority. Pingora's ingress check
+        // compares the bytes and refuses the pair; this resolver must not be
+        // wider than the layer in front of it.
+        assert_eq!(resolve("https://a.example/x", &[""]), Verdict::Contradicted);
     }
 
     #[test]
@@ -346,8 +410,74 @@ mod tests {
         );
         // A target with no path component is still addressed to its authority.
         assert_eq!(resolve_http1(b"http://a.example", &[]), found("a.example"));
-        // An empty `Host` line is no `Host` at all, here as on h2.
-        assert_eq!(resolve_http1(b"http://a.example/x", &[""]), found("a.example"));
+    }
+
+    #[test]
+    fn http1_rule_3_an_unusable_host_beside_an_authority_is_refused() {
+        // Present but empty, and present but not UTF-8: neither can equal the
+        // authority, and Pingora's byte comparison refuses both pairs before
+        // this resolver runs. The resolver agrees rather than routing on the
+        // authority as if no `Host` had been sent.
+        assert_eq!(resolve_http1(b"http://a.example/x", &[""]), Verdict::Contradicted);
+        let mut head = http1("GET", b"http://a.example/x", &[]);
+        head.append_header(
+            http::header::HOST,
+            http::HeaderValue::from_bytes(b"a.\xff.example").expect("valid header value bytes"),
+        )
+        .expect("a header value appends");
+        assert_eq!(Verdict::from(route_request_authority(&head)), Verdict::Contradicted);
+    }
+
+    #[test]
+    fn absolute_form_is_rewritten_to_origin_form_for_the_upstream() {
+        // Agreeing pair: the target is rewritten, the client's own Host stays.
+        let mut req = http1("GET", b"http://a.example:8080/x?q=1#frag", &["a.example:8080"]);
+        assert!(rewrite_absolute_form_to_origin(&mut req, "a.example:8080").expect("rewrite succeeds"));
+        assert_eq!(req.raw_path(), b"/x?q=1");
+        assert_eq!(req.uri.path(), "/x");
+        assert_eq!(req.headers.get_all(http::header::HOST).iter().count(), 1);
+        assert_eq!(
+            req.headers.get(http::header::HOST).map(http::HeaderValue::as_bytes),
+            Some(&b"a.example:8080"[..])
+        );
+
+        // No Host: the routed authority becomes the upstream Host.
+        let mut req = http1("GET", b"http://a.example/x", &[]);
+        assert!(rewrite_absolute_form_to_origin(&mut req, "a.example").expect("rewrite succeeds"));
+        assert_eq!(req.raw_path(), b"/x");
+        assert_eq!(
+            req.headers.get(http::header::HOST).map(http::HeaderValue::as_bytes),
+            Some(&b"a.example"[..])
+        );
+
+        // No path component: anchored at the root, as Pingora's parser did.
+        let mut req = http1("GET", b"http://a.example", &[]);
+        assert!(rewrite_absolute_form_to_origin(&mut req, "a.example").expect("rewrite succeeds"));
+        assert_eq!(req.raw_path(), b"/");
+    }
+
+    #[test]
+    fn other_request_targets_are_not_rewritten() {
+        for (target, hosts) in [
+            (&b"/x?q=1"[..], &["a.example"][..]),
+            (b"*", &["a.example"]),
+            (b"/x", &[][..]),
+        ] {
+            let mut req = http1("GET", target, hosts);
+            assert!(!rewrite_absolute_form_to_origin(&mut req, "routed.example").expect("no-op succeeds"));
+            assert_eq!(req.raw_path(), target, "{}", String::from_utf8_lossy(target));
+            // A Host is never invented for a request that is not rewritten.
+            assert_eq!(req.headers.contains_key(http::header::HOST), !hosts.is_empty());
+        }
+        // An h2 request: `:authority` in the URI, `:path` as the raw target.
+        let request = http::Request::builder()
+            .uri("https://a.example/x")
+            .body(())
+            .expect("test URI is valid");
+        let mut head = RequestHeader::from(request.into_parts().0);
+        assert!(!rewrite_absolute_form_to_origin(&mut head, "a.example").expect("no-op succeeds"));
+        assert_eq!(head.raw_path(), b"/x");
+        assert!(!head.headers.contains_key(http::header::HOST));
     }
 
     #[test]

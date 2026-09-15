@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use pingora_core::upstreams::peer::HttpPeer;
+use pingora_http::RequestHeader;
 use pingora_proxy::{ProxyHttp, Session};
 
 use waf_common::metrics::{self, BudgetEvent, RequestAction};
@@ -14,7 +15,7 @@ use waf_common::{HostConfig, RequestCtx, WafAction};
 use waf_engine::WafEngine;
 use waf_engine::checks::ResponseCheckSet;
 
-use crate::authority::{RequestAuthority, RouteAuthority, route_request_authority};
+use crate::authority::{RequestAuthority, RouteAuthority, rewrite_absolute_form_to_origin, route_request_authority};
 use crate::cache::ResponseCache;
 use crate::context::{
     CACHE_BODY_LIMIT, FoldedHeaders, GatewayCtx, MAX_HEADER_VALUES_PER_NAME, body_inspection_policy,
@@ -74,6 +75,27 @@ pub struct WafProxy {
     /// without writing to the peer and no timer is armed. See
     /// [`crate::upstream_timeout`] and `[proxy.upstream_timeouts]`.
     pub upstream_timeouts: UpstreamTimeouts,
+}
+
+/// Which authority `request_filter` routes on, or which refusal it owes.
+///
+/// Pure, so the wiring from [`route_request_authority`] to the two refusals is
+/// a unit-tested fact rather than something only an E2E run can reach. Rule 3's
+/// contradiction is answered by Pingora one layer down on both HTTP/1.1
+/// (`read_request`) and h2 (stream accept), so no request on the wire
+/// exercises the `Contradicted` arm today; the defence in depth it provides
+/// is pinned by the tests on this function instead.
+///
+/// `Ok("")` is the unroutable case: routed with an empty authority so it lands
+/// on exactly the same 404 as an unknown host — never a default config, never
+/// a forward.
+pub(crate) fn authority_verdict(head: &RequestHeader) -> Result<String, BudgetEvent> {
+    match route_request_authority(head) {
+        RequestAuthority::Resolved(RouteAuthority::Found(a)) => Ok(a.to_owned()),
+        RequestAuthority::Resolved(RouteAuthority::Missing) => Ok(String::new()),
+        RequestAuthority::Resolved(RouteAuthority::Contradicted) => Err(BudgetEvent::ContradictedAuthority),
+        RequestAuthority::UnsupportedTarget => Err(BudgetEvent::UnsupportedRequestTarget),
+    }
 }
 
 impl WafProxy {
@@ -598,19 +620,7 @@ impl ProxyHttp for WafProxy {
         // altogether. The resolver reads both places and applies one rule set
         // (see `crate::authority`); a target form this proxy does not serve is
         // its own refusal, distinct from a contradiction.
-        let resolved = {
-            let head = session.req_header();
-            match route_request_authority(head) {
-                RequestAuthority::Resolved(RouteAuthority::Found(a)) => Ok(a.to_string()),
-                // Unroutable. Routed with an empty authority so this lands on
-                // exactly the same 404 as an unknown host — never a default
-                // config, never a forward.
-                RequestAuthority::Resolved(RouteAuthority::Missing) => Ok(String::new()),
-                RequestAuthority::Resolved(RouteAuthority::Contradicted) => Err(BudgetEvent::ContradictedAuthority),
-                RequestAuthority::UnsupportedTarget => Err(BudgetEvent::UnsupportedRequestTarget),
-            }
-        };
-        let host_header = match resolved {
+        let host_header = match authority_verdict(session.req_header()) {
             Ok(host_header) => host_header,
             Err(refusal) => {
                 // Either way the request is not one this WAF can vouch for, and
@@ -652,6 +662,7 @@ impl ProxyHttp for WafProxy {
         if !host_header.is_empty() {
             headers.entry("host".to_string()).or_insert_with(|| host_header.clone());
         }
+        ctx.routed_authority = Some(host_header.clone());
 
         debug!("Routing request for host: {}", host_header);
 
@@ -830,6 +841,27 @@ impl ProxyHttp for WafProxy {
     /// its payload no longer bypasses body detection. Bodies larger than the
     /// policy's inspected-byte ceiling are refused with `413` by default (see
     /// [`crate::context::BodyInspectionPolicy`]).
+    /// Make the origin's request the request the detectors inspected.
+    ///
+    /// An absolute-form HTTP/1.1 target is rewritten to origin-form here and,
+    /// when the client sent no `Host`, the upstream request is given the
+    /// routed authority as its `Host` — see
+    /// [`crate::authority::rewrite_absolute_form_to_origin`]. Every other
+    /// request passes through unchanged.
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut GatewayCtx,
+    ) -> pingora_core::Result<()> {
+        if let Some(authority) = ctx.routed_authority.as_deref()
+            && rewrite_absolute_form_to_origin(upstream_request, authority)?
+        {
+            debug!("Rewrote an absolute-form request target to origin-form for the upstream: host={authority}");
+        }
+        Ok(())
+    }
+
     async fn request_body_filter(
         &self,
         session: &mut Session,
@@ -1225,6 +1257,74 @@ impl ProxyHttp for WafProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The request exactly as `pingora-core`'s HTTP/1.1 server builds it.
+    fn http1(target: &[u8], host_lines: &[&str]) -> RequestHeader {
+        let mut head = RequestHeader::build("GET", target, None).expect("BUG: this request target parses");
+        for line in host_lines {
+            head.append_header(http::header::HOST, *line)
+                .expect("a test Host line is a valid header value");
+        }
+        head
+    }
+
+    // ── `authority_verdict`: the four verdicts, wired to what request_filter does ──
+
+    #[test]
+    fn verdict_routes_on_host_alone() {
+        assert_eq!(
+            authority_verdict(&http1(b"/x", &["a.example"])).as_deref(),
+            Ok("a.example")
+        );
+    }
+
+    #[test]
+    fn verdict_routes_on_the_target_authority_alone() {
+        // Reading only `uri.authority()` — the Pingora 0.8 wiring — answers ""
+        // here and 404s a request Pingora 0.9 delivers with a routable target.
+        assert_eq!(
+            authority_verdict(&http1(b"http://a.example/x", &[])).as_deref(),
+            Ok("a.example")
+        );
+        assert_eq!(
+            authority_verdict(&http1(b"http://a.example/x", &["a.example"])).as_deref(),
+            Ok("a.example")
+        );
+    }
+
+    #[test]
+    fn verdict_for_no_authority_at_all_is_the_empty_string() {
+        // Routed with an empty authority so it lands on the unknown-host 404.
+        assert_eq!(authority_verdict(&http1(b"/x", &[])).as_deref(), Ok(""));
+    }
+
+    #[test]
+    fn verdict_for_a_contradicted_pair_is_the_contradiction_refusal() {
+        // Pingora 0.9 refuses this pair in read_request, so no wire request
+        // reaches this arm; this test is what keeps the arm honest.
+        assert_eq!(
+            authority_verdict(&http1(b"http://a.example/x", &["b.example"])),
+            Err(BudgetEvent::ContradictedAuthority)
+        );
+        assert_eq!(
+            authority_verdict(&http1(b"http://a.example/x", &[""])),
+            Err(BudgetEvent::ContradictedAuthority)
+        );
+    }
+
+    #[test]
+    fn verdict_for_an_unsupported_target_is_its_own_refusal() {
+        // Not "" (a 404 with no counter) and never a route: Pingora would
+        // forward `GET a.example:443 HTTP/1.1` verbatim.
+        for target in [&b"a.example:443"[..], b"foo:bar", b"ftp://a.example/x"] {
+            assert_eq!(
+                authority_verdict(&http1(target, &["a.example"])),
+                Err(BudgetEvent::UnsupportedRequestTarget),
+                "{}",
+                String::from_utf8_lossy(target)
+            );
+        }
+    }
 
     /// Pingora reads `None` as "downstream body finished". A chunk that is only
     /// being held back for inspection must therefore be an empty `Bytes`,

@@ -96,8 +96,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self):
-        body = ("ORIGIN-REACHED\nhost-header=%s\npath=%s\n"
-                % (self.headers.get("Host"), self.path)).encode()
+        body = ("ORIGIN-REACHED\nhost-header=%s\npath=%s\nrequestline=%s\n"
+                % (self.headers.get("Host"), self.path, self.requestline)).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
@@ -267,20 +267,30 @@ echo "    origin-form + Host                 -> $out"
     && pass "HTTP/1.1 Host alone routes to the configured origin" \
     || fail "the HTTP/1.1 control request did not route"
 
-# Rules 2 and 3: an absolute-form target that agrees with Host routes, and the
-# origin receives the request line as sent.
+# Rules 2 and 3: an absolute-form target that agrees with Host routes. The
+# origin must receive the request in origin-form — the path the detectors
+# inspected, not the absolute-form bytes Pingora would otherwise write
+# verbatim — with the client's own Host.
 out="$(h1 GET "http://$h1_authority/h1-abs-agree" "Host: $h1_authority")"
 echo "    absolute-form + agreeing Host      -> $out"
 [ "${out%%|*}" = "200" ] && echo "$out" | grep -q "host-header=$h1_authority" \
     && pass "absolute-form agreeing with Host routes on the agreed authority" \
     || fail "an agreeing absolute-form request was not routed"
+echo "$out" | grep -q "requestline=GET /h1-abs-agree HTTP/1.1" \
+    && pass "the origin received the agreeing request in origin-form" \
+    || fail "the origin's request line was not origin-form: $out"
 
-# Rule 2: the target authority alone routes, and the origin sees it as Host.
+# Rule 2: the target authority alone routes; the origin sees it as Host (the
+# WAF supplies the header, since the client sent none) and the request line
+# is origin-form.
 out="$(h1 GET "http://$h1_authority/h1-abs-no-host")"
 echo "    absolute-form, no Host             -> $out"
 [ "${out%%|*}" = "200" ] && echo "$out" | grep -q "host-header=$h1_authority" \
-    && pass "absolute-form without Host routes on the target authority" \
+    && pass "absolute-form without Host routes on the target authority, and the origin got Host = that authority" \
     || fail "an absolute-form request without Host was not routed on its authority"
+echo "$out" | grep -q "requestline=GET /h1-abs-no-host HTTP/1.1" \
+    && pass "the origin received the Host-less request in origin-form" \
+    || fail "the origin's request line was not origin-form: $out"
 after="$(origin_hits)"
 [ "$((after - before))" -eq 3 ] \
     && pass "the three routed requests each reached the origin exactly once" \

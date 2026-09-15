@@ -62,7 +62,9 @@ normally made by Pingora itself — `validate_request_authority` inside
 — which answers 400 and returns before `request_filter` and `logging()` run. Such
 a request therefore appears in **neither** `requests_total` nor the process log;
 the two rows above describe the WAF's own second layer, which moves only when
-Pingora's check does not fire. `tests/e2e-log-metric-alignment.sh` and
+Pingora's check does not fire — today it never does on the wire, so those two
+counters are defence in depth pinned by unit test (`proxy::authority_verdict`),
+not by E2E. `tests/e2e-log-metric-alignment.sh` and
 `tests/e2e-tls-h2.sh` pin which layer answers.
 | **body over inspection ceiling → 413** | `requests_total{action="block"}` (`proxy.rs:756`) + `{subsystem="request_body",limit="inspect_ceiling_reject"}` (`:755`) | `proxy.rs:762` `"WAF rejected request body over the N byte inspection ceiling: …"` | **NO** — "rejected" |
 | clean request forwarded | `requests_total{action="allow"}` — the default at `proxy.rs:1054` | `proxy.rs:1103` DEBUG `"Request completed: …"` | **partial** — DEBUG-only and carries no action word; acceptable, since an allow is the absence of a decision |

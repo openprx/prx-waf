@@ -1013,6 +1013,17 @@ cardinality budget and the rest of what is exported.
 | Duplicate `Host` (400) | reject | `request_headers` | `duplicate_host` |
 | Authority contradicts `Host` (400) | reject | `request_headers` | `contradicted_authority` |
 | Request target neither origin-form nor absolute-form (400) | reject | `request_headers` | `unsupported_request_target` |
+
+Since Pingora 0.9 parses absolute-form request targets (`GET http://host/x
+HTTP/1.1`), the two rows above are the refusals of one rule set that also
+routes: `Host` alone routes, an absolute-form authority alone routes, a
+byte-unequal pair is refused (Pingora refuses it first, in `read_request`; the
+WAF's row is defence in depth and is pinned by unit test, since no request on
+the wire reaches it today), and any other target form is refused. A routed
+absolute-form request is rewritten to origin-form before it is written to the
+origin, and the upstream request is given `Host` = the routed authority when
+the client sent none, so the origin receives exactly the path the detectors
+inspected (`crates/gateway/src/authority.rs`, `rewrite_absolute_form_to_origin`).
 | `MAX_INSPECTED_BODY_BYTES`, `OVERFLOW=reject` (413) | reject | `request_body` | `inspect_ceiling_reject` |
 | `MAX_INSPECTED_BODY_BYTES`, `OVERFLOW=log` | **skip** | `request_body` | `inspect_ceiling_forward` |
 | `MAX_H3_REQUEST_BODY` (413) | reject | `http3_body` | `buffer_ceiling` |
