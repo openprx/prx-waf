@@ -1596,19 +1596,14 @@ fn contains_marker(bytes: &[u8], first: u8, second: u8) -> bool {
 
     let firsts = u64::from_ne_bytes([first; 8]);
     let seconds = u64::from_ne_bytes([second; 8]);
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        let Ok(lanes) = <[u8; 8]>::try_from(chunk) else {
-            // `chunks_exact(8)` yields nothing but 8-byte chunks; fall back to
-            // the byte scan rather than assume it.
-            return bytes.iter().any(|&b| b == first || b == second);
-        };
-        let word = u64::from_ne_bytes(lanes);
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    for lanes in chunks {
+        let word = u64::from_ne_bytes(*lanes);
         if has_zero_lane(word ^ firsts) || has_zero_lane(word ^ seconds) {
             return true;
         }
     }
-    chunks.remainder().iter().any(|&b| b == first || b == second)
+    remainder.iter().any(|&b| b == first || b == second)
 }
 
 /// `true` when percent-decoding `bytes` could possibly change them.

@@ -1013,10 +1013,12 @@ fn utf16_bom_transcode(bytes: &[u8]) -> Option<String> {
         [0xFE, 0xFF, rest @ ..] => (false, rest),
         _ => return None,
     };
-    let units = rest.chunks_exact(2).filter_map(|pair| match pair {
-        [a, b] if little_endian => Some(u16::from_le_bytes([*a, *b])),
-        [a, b] => Some(u16::from_be_bytes([*a, *b])),
-        _ => None,
+    let units = rest.as_chunks::<2>().0.iter().map(|&pair| {
+        if little_endian {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
     });
     Some(char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')).collect())
 }
@@ -1403,7 +1405,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use base64::Engine as _;
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use bytes::Bytes;
     use waf_common::HostConfig;

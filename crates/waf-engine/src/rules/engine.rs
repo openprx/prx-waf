@@ -327,12 +327,11 @@ impl CustomRulesEngine {
             (Operator::NotInList, ConditionValue::List(l)) => !l.iter().any(|v| v == fstr),
             (Operator::CidrMatch, ConditionValue::Str(cidr)) => cidr
                 .parse::<ipnet::IpNet>()
-                .ok()
-                .is_some_and(|net| net.contains(&ctx.client_ip)),
-            (Operator::Gt, ConditionValue::Number(n)) => fstr.parse::<i64>().ok().is_some_and(|v| v > *n),
-            (Operator::Lt, ConditionValue::Number(n)) => fstr.parse::<i64>().ok().is_some_and(|v| v < *n),
-            (Operator::Gte, ConditionValue::Number(n)) => fstr.parse::<i64>().ok().is_some_and(|v| v >= *n),
-            (Operator::Lte, ConditionValue::Number(n)) => fstr.parse::<i64>().ok().is_some_and(|v| v <= *n),
+                .is_ok_and(|net| net.contains(&ctx.client_ip)),
+            (Operator::Gt, ConditionValue::Number(n)) => fstr.parse::<i64>().is_ok_and(|v| v > *n),
+            (Operator::Lt, ConditionValue::Number(n)) => fstr.parse::<i64>().is_ok_and(|v| v < *n),
+            (Operator::Gte, ConditionValue::Number(n)) => fstr.parse::<i64>().is_ok_and(|v| v >= *n),
+            (Operator::Lte, ConditionValue::Number(n)) => fstr.parse::<i64>().is_ok_and(|v| v <= *n),
             _ => false,
         }
     }

@@ -345,14 +345,20 @@ mod tests {
     }
 
     impl SemanticSinkWriter for MockWriter {
-        async fn write_observation(&self, _obs: CreateSemanticObservation) -> Result<(), StorageError> {
+        fn write_observation(
+            &self,
+            _obs: CreateSemanticObservation,
+        ) -> impl std::future::Future<Output = Result<(), StorageError>> + Send {
             self.obs.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            std::future::ready(Ok(()))
         }
 
-        async fn write_event(&self, _event: CreateSecurityEvent) -> Result<(), StorageError> {
+        fn write_event(
+            &self,
+            _event: CreateSecurityEvent,
+        ) -> impl std::future::Future<Output = Result<(), StorageError>> + Send {
             self.events.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 

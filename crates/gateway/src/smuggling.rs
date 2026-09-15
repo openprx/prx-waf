@@ -153,13 +153,13 @@ pub fn detect(headers: &HeaderMap) -> Vec<SmugglingIndicator> {
 /// embedded control bytes, etc. — is treated as obfuscated. Under the log-only
 /// posture a rare false positive (e.g. a legitimate `gzip, chunked`) only
 /// produces a log line, never a block; tightening this is a tuning knob.
-fn is_canonical_chunked(value: &[u8]) -> bool {
+const fn is_canonical_chunked(value: &[u8]) -> bool {
     let trimmed = trim_ascii_ws(value);
     trimmed.eq_ignore_ascii_case(b"chunked")
 }
 
 /// Trim leading/trailing ASCII spaces and horizontal tabs without allocating.
-fn trim_ascii_ws(mut bytes: &[u8]) -> &[u8] {
+const fn trim_ascii_ws(mut bytes: &[u8]) -> &[u8] {
     while let [first, rest @ ..] = bytes {
         if *first == b' ' || *first == b'\t' {
             bytes = rest;

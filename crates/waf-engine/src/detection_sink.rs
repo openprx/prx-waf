@@ -429,16 +429,22 @@ mod tests {
     }
 
     impl DetectionSinkWriter for Arc<MockWriter> {
-        async fn write_attack_logs(&self, logs: Vec<AttackLog>) -> Result<(), StorageError> {
+        fn write_attack_logs(
+            &self,
+            logs: Vec<AttackLog>,
+        ) -> impl std::future::Future<Output = Result<(), StorageError>> + Send {
             self.attack_rows.fetch_add(logs.len() as u64, Ordering::Relaxed);
             self.attack_batches.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            std::future::ready(Ok(()))
         }
 
-        async fn write_security_events(&self, events: Vec<CreateSecurityEvent>) -> Result<(), StorageError> {
+        fn write_security_events(
+            &self,
+            events: Vec<CreateSecurityEvent>,
+        ) -> impl std::future::Future<Output = Result<(), StorageError>> + Send {
             self.event_rows.fetch_add(events.len() as u64, Ordering::Relaxed);
             self.event_batches.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 
