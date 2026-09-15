@@ -65,32 +65,47 @@ unsound = "workspace"
 #       needs no reachability argument. The HS256-only property it described is
 #       still true and still enforced, in `waf-api/src/auth.rs` — see the
 #       comment on `validate_access_token`.
+#
+# Removed on 2026-09-15 with the pingora 0.8.1 -> 0.9.0 upgrade, because the
+# crates left the graph:
+#   RUSTSEC-2024-0437 (protobuf 2.28.0, recursive-parsing crash) — pingora-core
+#       0.9.0 no longer depends on prometheus; that integration moved to the
+#       separate, optional pingora-prometheus crate, which this workspace does
+#       not take. `cargo tree -i protobuf` and `cargo tree -i prometheus` both
+#       report "did not match any packages".
+#   RUSTSEC-2025-0069 (daemonize 0.5.0, unmaintained) — pingora-core 0.9.0
+#       replaced it with daemonix 0.1.0; `cargo tree -i daemonize` reports "did
+#       not match any packages" (and suggests `daemonix`).
+# The two entries that remain from the same family were re-checked against
+# the 0.9.0 tree the same day; the evidence is in each entry below.
 ignore = [
-    # protobuf 2.28.0 recursive-parsing stack overflow — path: prometheus 0.13.4 -> protobuf v2,
-    # pulled by pingora-core 0.8.0. protobuf v2 has no fix; pingora 0.8 pins prometheus 0.13.
-    # No safe pingora release yet (main has moved off it, but no 0.9.x published). Verified present.
-    # review-by: 2026-10-01
-    # remove-when: pingora publishes a release that no longer pins prometheus 0.13 / protobuf v2.
-    { id = "RUSTSEC-2024-0437", reason = "protobuf v2: transitive via pingora 0.8 -> prometheus 0.13; no fixed release, pingora-locked" },
-    # daemonize 0.5.0 unmaintained — path: pingora-core 0.8.0. Only used by pingora's daemon-mode
-    # process forking; no maintained replacement until pingora drops it. Verified present.
-    # review-by: 2026-10-01
-    # remove-when: pingora-core drops the daemonize dependency, or daemonize is adopted again.
-    { id = "RUSTSEC-2025-0069", reason = "daemonize: unmaintained, pingora 0.8 transitive; no replacement until pingora upgrades" },
-    # derivative 2.2.0 unmaintained — path: pingora-core 0.8.0. Build-time derive macro only,
-    # not part of the shipped runtime. Verified present.
-    # review-by: 2026-10-01
+    # derivative 2.2.0 unmaintained — path: pingora-core. Build-time derive macro only,
+    # not part of the shipped runtime.
+    # 2026-09-15 re-check against pingora-core 0.9.0: still present. pingora-core 0.9.0's
+    # manifest declares `derivative = "2.2.0"` unconditionally, and
+    # `cargo tree -i derivative --all-features` reports exactly one path:
+    #   derivative v2.2.0 (proc-macro)
+    #   └── pingora-core v0.9.0
+    # review-by: 2026-12-01
     # remove-when: pingora-core migrates off derivative (e.g. to derive-where / educe).
-    { id = "RUSTSEC-2024-0388", reason = "derivative: unmaintained build-time derive macro, pingora 0.8 transitive" },
+    { id = "RUSTSEC-2024-0388", reason = "derivative: unmaintained build-time derive macro, pingora-core 0.9.0 transitive" },
     # rustls-pemfile 2.2.0 unmaintained (repository archived August 2025) — arrived on
     # 2026-07-29 with `pingora-core/rustls`, the feature that makes the proxy able to
-    # terminate TLS at all. Two paths, both inside pingora-rustls 0.8.1:
-    #   pingora-rustls 0.8.1 -> rustls-pemfile 2.2.0            (direct)
-    #   pingora-rustls 0.8.1 -> rustls-native-certs 0.7.3 -> rustls-pemfile 2.2.0
-    # cargo-deny reports "Solution: No safe upgrade is available!" — pingora-rustls
-    # 0.8.1's manifest pins `rustls-pemfile = "2.1.2"` and there is no 3.x to move to;
+    # terminate TLS at all. Two paths, both inside pingora-rustls:
+    #   pingora-rustls -> rustls-pemfile 2.2.0            (direct)
+    #   pingora-rustls -> rustls-native-certs 0.7.3 -> rustls-pemfile 2.2.0
+    # cargo-deny reports "Solution: No safe upgrade is available!" — pingora-rustls's
+    # manifest pins `rustls-pemfile = "2.1.2"` and there is no 3.x to move to;
     # the crate was archived rather than superseded, its functionality having been
     # folded into rustls-pki-types' PemObject trait.
+    # 2026-09-15 re-check against pingora-rustls 0.9.0 (the pingora 0.9.0 upgrade): still
+    # present, same two paths. pingora-rustls 0.9.0's manifest still declares
+    # `rustls-pemfile = "2.1.2"` and `rustls-native-certs = "0.7.1"`, and
+    # `cargo tree -i rustls-pemfile --all-features --depth 1` reports:
+    #   rustls-pemfile v2.2.0
+    #   ├── pingora-rustls v0.9.0
+    #   └── rustls-native-certs v0.7.3
+    # (rustls-native-certs 0.7.3 is itself reached only through pingora-rustls 0.9.0.)
     #
     # This is an unmaintained advisory, not a vulnerability: no CVE, no known defect,
     # no attacker-reachable claim. The code is a PEM tokenizer that pingora runs once
@@ -114,11 +129,11 @@ ignore = [
     #      REJECTED: `[sources] unknown-git = "deny"` and vendoring a Cloudflare crate
     #      to carry a one-line manifest change is a larger and more permanent supply
     #      chain liability than one archived PEM parser.
-    # review-by: 2026-10-01
+    # review-by: 2026-12-01
     # remove-when: pingora-rustls drops rustls-pemfile for rustls-pki-types' PemObject
     #              (upstream tracking issue rustls/pemfile#61), or pingora publishes a
     #              release whose rustls backend no longer depends on it.
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: unmaintained (archived), pingora-rustls 0.8.1 transitive with no upgrade path; parses only files this process wrote, never network input; the alternative backends are banned by [bans] in this file" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: unmaintained (archived), pingora-rustls 0.9.0 transitive with no upgrade path; parses only files this process wrote, never network input; the alternative backends are banned by [bans] in this file" },
     # smartstring 1.0.1 unmaintained (repository archived 2026-05-03; last release
     # 2022-03-24) — arrived in the advisory database after 2026-07-31. One path:
     #   rhai 1.26.1 -> smartstring 1.0.1
