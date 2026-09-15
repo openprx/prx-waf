@@ -119,6 +119,38 @@ ignore = [
     #              (upstream tracking issue rustls/pemfile#61), or pingora publishes a
     #              release whose rustls backend no longer depends on it.
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: unmaintained (archived), pingora-rustls 0.8.1 transitive with no upgrade path; parses only files this process wrote, never network input; the alternative backends are banned by [bans] in this file" },
+    # smartstring 1.0.1 unmaintained (repository archived 2026-05-03; last release
+    # 2022-03-24) — arrived in the advisory database after 2026-07-31. One path:
+    #   rhai 1.26.1 -> smartstring 1.0.1
+    # rhai is the sandboxed expression language behind custom rules
+    # (`crates/waf-engine/src/rules/engine.rs`, `CustomRulesEngine::eval_script`);
+    # rhai's `ImmutableString` is a `SmartString`, so request-derived values pushed
+    # into the script scope (path, query, user-agent, ...) do pass through it.
+    #
+    # What the advisory is and is not: RUSTSEC-2026-0249 is an unmaintained notice,
+    # not a vulnerability; cargo-deny with `unsound = "workspace"` raises nothing
+    # else for the crate. The one known defect is bodil/smartstring#49 (open since
+    # 2023-08-26): Miri reports a Stacked Borrows violation in
+    # `From<String> for BoxedString` when a heap string is re-allocated through
+    # `Allocator::grow`. It is a provenance rule violation with no known
+    # miscompilation on stable rustc and no attacker-controlled input beyond the
+    # string bytes themselves; it is tracked upstream in rhaiscript/rhai#816.
+    #
+    # Removal paths evaluated & rejected on 2026-09-15:
+    #   1. Upgrade rhai — REJECTED as unavailable: 1.26.1 is the newest release,
+    #      its manifest lists `smartstring = "1.0.0"` unconditionally (no feature
+    #      turns it off), and rhai `main` still carries the same line.
+    #   2. `[patch.crates-io]` smartstring to a fork with the PR-34 fix — REJECTED
+    #      for the same reason as the pingora-rustls option above: `[sources]
+    #      unknown-git = "deny"`, and carrying a fork of an unsafe-heavy string
+    #      crate is a larger supply-chain liability than the notice it silences.
+    #   3. Replace rhai — REJECTED for this release: custom-rule scripts are a
+    #      documented operator-facing feature and no drop-in engine exists; this
+    #      is a product change, not a lockfile change.
+    # review-by: 2026-12-01
+    # remove-when: rhai ships a release that drops smartstring (rhaiscript/rhai#816),
+    #              or smartstring is adopted again and RUSTSEC-2026-0249 is withdrawn.
+    { id = "RUSTSEC-2026-0249", reason = "smartstring: unmaintained, rhai 1.26.1 transitive with no upgrade path; unmaintained notice only, not a vulnerability; forking is barred by [sources] in this file" },
 ]
 
 [licenses]
