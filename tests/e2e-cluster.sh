@@ -68,10 +68,32 @@ wait_healthy() {
     return 1
 }
 
-get_cluster_role() {
+# The admin password the nodes are seeded with. docker-compose.cluster.yml
+# passes ADMIN_PASSWORD through to every node; left empty, the daemon generates
+# a random one and nothing below can log in.
+export ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin123}"
+TOKEN=""
+
+# Log in to one node and print its access token. `/api/cluster/status` sits
+# behind the same authentication as every other read on the admin API, so an
+# unauthenticated probe reads 401 as "unknown" and every role assertion below
+# fails for a reason that has nothing to do with the cluster.
+login() {
     local url="$1"
-    curl -sf --max-time 5 "$url/api/cluster/status" 2>/dev/null \
-        | grep -o '"role":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "unknown"
+    curl -sf --max-time 10 \
+        -X POST "$url/api/auth/login" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" 2>/dev/null \
+        | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4 || true
+}
+
+cluster_status() {
+    local url="$1"
+    curl -sf --max-time 5 -H "Authorization: Bearer $TOKEN" "$url/api/cluster/status" 2>/dev/null || echo "{}"
+}
+
+get_cluster_role() {
+    cluster_status "$1" | grep -o '"role":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "unknown"
 }
 
 cleanup() {
@@ -116,7 +138,15 @@ log ""
 # ── Step 3: Verify cluster API responds ──────────────────────────────────────
 
 log "Step 3: Verifying cluster status API..."
-STATUS_A=$(curl -sf --max-time 5 "$NODE_A_API/api/cluster/status" 2>/dev/null || echo "{}")
+# One token for the whole run: the three nodes share the JWT secret, so a token
+# minted by node-a is accepted by node-b and node-c after node-a is stopped.
+TOKEN="$(login "$NODE_A_API")"
+if [ -n "$TOKEN" ]; then
+    pass "logged in to node-a as admin"
+else
+    fail "could not log in to node-a as admin (ADMIN_PASSWORD=$ADMIN_PASSWORD); every role assertion below will read 'unknown'"
+fi
+STATUS_A=$(cluster_status "$NODE_A_API")
 if echo "$STATUS_A" | grep -q '"node_id"'; then
     pass "node-a cluster status API responds"
 else
@@ -140,56 +170,15 @@ log ""
 
 log "Step 5: Testing rule sync (create rule on main, verify on workers)..."
 
-# Login to get a JWT token from node-a
-TOKEN=$(curl -sf --max-time 10 \
-    -X POST "$NODE_A_API/api/v1/auth/login" \
-    -H "Content-Type: application/json" \
-    -d '{"username":"admin","password":"admin123"}' 2>/dev/null \
-    | grep -o '"token":"[^"]*"' | cut -d'"' -f4 || echo "")
-
-if [ -z "$TOKEN" ]; then
-    log "  Note: Could not get auth token (admin user may not be seeded yet)"
-    log "  Skipping rule sync test — verify manually via Admin UI at $NODE_A_API/ui/"
-else
-    # Create a test rule via the main node API
-    RULE_ID="E2E-TEST-$(date +%s)"
-    CREATE_RESP=$(curl -sf --max-time 10 \
-        -X POST "$NODE_A_API/api/v1/rules" \
-        -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $TOKEN" \
-        -d "{\"id\":\"$RULE_ID\",\"name\":\"E2E Test Rule\",\"category\":\"custom\",\"action\":\"log\",\"pattern\":\"e2e-test-pattern\"}" \
-        2>/dev/null || echo "")
-
-    if echo "$CREATE_RESP" | grep -q "$RULE_ID"; then
-        pass "Rule '$RULE_ID' created on node-a"
-
-        # Wait for sync (rules_interval_secs = 10 in config)
-        log "  Waiting 15s for rule sync to propagate to workers..."
-        sleep 15
-
-        # Check rule exists on node-b
-        RULES_B=$(curl -sf --max-time 10 \
-            -H "Authorization: Bearer $TOKEN" \
-            "$NODE_B_API/api/v1/rules" 2>/dev/null || echo "[]")
-        if echo "$RULES_B" | grep -q "$RULE_ID"; then
-            pass "Rule '$RULE_ID' synced to node-b"
-        else
-            fail "Rule '$RULE_ID' NOT found on node-b after 15s"
-        fi
-
-        # Check rule exists on node-c
-        RULES_C=$(curl -sf --max-time 10 \
-            -H "Authorization: Bearer $TOKEN" \
-            "$NODE_C_API/api/v1/rules" 2>/dev/null || echo "[]")
-        if echo "$RULES_C" | grep -q "$RULE_ID"; then
-            pass "Rule '$RULE_ID' synced to node-c"
-        else
-            fail "Rule '$RULE_ID' NOT found on node-c after 15s"
-        fi
-    else
-        fail "Could not create test rule on node-a"
-    fi
-fi
+# Not exercised. This step was written against `/api/v1/auth/login` and
+# `/api/v1/rules`, neither of which the admin API has; the custom-rule API is
+# `POST /api/custom-rules` with a `CreateCustomRule` body, and all three nodes
+# in docker-compose.cluster.yml share one Postgres, so "the rule is visible on
+# node-b" would be true with or without cluster sync. A rule-sync assertion
+# needs to read the workers' engine state (rules_version in
+# `/api/cluster/status`, or a request that the rule blocks) and is a separate
+# piece of work. Left as a visible note rather than a PASS.
+log "  Not exercised: the rule-sync step targets endpoints that do not exist (/api/v1/rules); see the comment in this script"
 log ""
 
 # ── Step 6: Election test ─────────────────────────────────────────────────────
