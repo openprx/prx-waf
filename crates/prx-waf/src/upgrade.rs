@@ -2,9 +2,9 @@
 //!
 //! Pingora already owns both halves of the mechanism: the outgoing process
 //! sends its listening file descriptors over a Unix socket when it takes
-//! `SIGQUIT` (`pingora-core-0.8.1/src/server/mod.rs:283`), and the incoming
+//! `SIGQUIT` (`pingora-core-0.9.0/src/server/mod.rs:276`), and the incoming
 //! process picks them up during `bootstrap()` — but only when its `Opt.upgrade`
-//! is set (`pingora-core-0.8.1/src/server/bootstrap_services.rs:172`). prx-waf
+//! is set (`pingora-core-0.9.0/src/server/bootstrap_services.rs:246-250`). prx-waf
 //! passed `None` for the options, so the receiving half was never armed and a
 //! `SIGQUIT` was a plain shutdown with a five-second stall in it.
 //!
@@ -37,7 +37,7 @@ const SYSTEM_RUNTIME_DIR: &str = "/run/prx-waf";
 /// How long the outgoing process is given to answer, in seconds.
 ///
 /// Pingora's own default is five attempts at one second apart on both sides
-/// (`transfer_fd/mod.rs:196`), which forces an operator to send `SIGQUIT`
+/// (`transfer_fd/mod.rs:243-245`, `MAX_RETRY` and `RETRY_INTERVAL`), which forces an operator to send `SIGQUIT`
 /// within five seconds of starting the incoming process or watch it exit. That
 /// is a stopwatch, not a procedure. A minute is long enough to paste a second
 /// command, and it only ever elapses on a handover that has already failed.

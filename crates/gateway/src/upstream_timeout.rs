@@ -3,7 +3,7 @@
 //! Pingora arms no upstream timer of its own: `HttpPeer::new()` builds
 //! `PeerOptions` with `connection_timeout`, `total_connection_timeout`,
 //! `read_timeout`, `write_timeout` and `idle_timeout` all `None`
-//! (`pingora-core-0.8.1/src/upstreams/peer.rs:471-478`), and `None` is
+//! (`pingora-core-0.9.0/src/upstreams/peer.rs:574-581`), and `None` is
 //! *forever*. Combined with the single-threaded proxy data path, one wedged
 //! upstream is enough to stop serving.
 //!
@@ -75,7 +75,7 @@ impl UpstreamTimeouts {
     /// `stream_exempt` is on, `read` / `write` are left unarmed for this one
     /// request: those two are per-I/O inactivity timers and Pingora applies
     /// them to upgraded and streaming bodies alike
-    /// (`pingora-proxy-0.8.1/src/proxy_h1.rs:39-40`), which would cut a
+    /// (`pingora-proxy-0.9.0/src/proxy_h1.rs:43-44`), which would cut a
     /// long-idle WebSocket or SSE feed. Connection setup and pool residency
     /// are never exempted — neither is a streaming activity.
     pub const fn apply(&self, peer: &mut HttpPeer, streaming: bool) {
@@ -256,7 +256,7 @@ const fn millis(ms: u64) -> Option<Duration> {
 ///
 /// * `Upgrade` — the WebSocket / h2c / generic upgrade handshake. Same header
 ///   Pingora keys its own `is_upgrade_req` on
-///   (`pingora-core-0.8.1/src/protocols/http/v1/common.rs:178-180`).
+///   (`pingora-core-0.9.0/src/protocols/http/v1/common.rs:190-192`).
 /// * `Accept: text/event-stream` — the SSE content negotiation from
 ///   `EventSource`, matched as a substring because the header is a list and may
 ///   carry q-values.

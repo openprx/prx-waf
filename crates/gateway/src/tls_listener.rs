@@ -6,11 +6,11 @@
 //! bookkeeping, so issuance and renewal formed a closed circuit that never
 //! terminated a connection. This is the wire from that store to the listener.
 //!
-//! Two things about Pingora 0.8.1's rustls backend shape everything below.
+//! Two things about Pingora 0.9.0's rustls backend shape everything below.
 //!
 //! **It takes paths, not PEM.** `TlsSettings::intermediate` stores a
 //! `cert_path`/`key_path` pair and `build()` loads them with
-//! `load_certs_and_key_files` (`pingora-core-0.8.1/src/listeners/tls/rustls/mod.rs:31-33,54`).
+//! `load_certs_and_key_files` (`pingora-core-0.9.0/src/listeners/tls/rustls/mod.rs:24,78`).
 //! A certificate that lives in Postgres therefore has to be written out before
 //! the listener can be built, which [`materialize`] does into a directory the
 //! caller has already vetted as private.

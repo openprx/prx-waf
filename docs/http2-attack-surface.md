@@ -20,23 +20,37 @@ can actually see the frames — the WAF request path never runs on a stream that
 ## Where HTTP/2 lives in this proxy
 
 There is no HTTP/2 code in this repository. ALPN negotiation, the frame codec,
-HPACK, flow control, and every abuse guard below belong to `h2` 0.4.15, which
-Pingora 0.8.1 drives:
+HPACK, flow control, and every abuse guard below belong to `h2` 0.4 (0.4.19 in
+the lockfile), which Pingora 0.9.0 drives:
 
 - `enable_h2()` sets ALPN to `h2` then `http/1.1`
-  (`crates/prx-waf/src/main.rs:2511`, doc block at 2490-2503).
+  (`crates/prx-waf/src/main.rs`, `add_tls_endpoint` and its doc block).
 - Pingora's accept loop peeks ALPN and, on `h2`, calls
   `server::handshake(stream, h2_options)`
-  (`pingora-core-0.8.1/src/apps/mod.rs:213-225`). The connection's
-  `conn.accept().await` at `.../protocols/http/v2/server.rs:148-149` is what
-  drives every frame; each accepted stream is then spawned as its own task
-  (`apps/mod.rs:256-261`) into `process_new_http`, which is where WAF
-  `request_filter` eventually runs (`crates/gateway/src/proxy.rs:500`).
-- `h2_options` is `None` in this build, so `apps/mod.rs:224` +
-  `pingora-core-0.8.1/src/protocols/http/v2/server.rs:66` fall back to
-  `default_h2_options()` (`.../v2/server.rs:53-58`): 64 KiB
-  `max_header_list_size`, 100 `max_concurrent_streams`. Everything else keeps
-  `h2::server::Builder::new()`'s defaults (`h2-0.4.15/src/server.rs:650-661`).
+  (`pingora-core-0.9.0/src/apps/mod.rs:309-310`) and then hands the
+  connection to `server::accept_downstream_sessions` (`apps/mod.rs:324-332`).
+  That loop's `conn.accept().await`
+  (`.../protocols/http/v2/server.rs:431-432`) is what drives every frame;
+  each accepted stream is spawned as its own task into `process_new_http`,
+  which is where WAF `request_filter` eventually runs
+  (`crates/gateway/src/proxy.rs`, `request_filter`).
+- `h2_options` is `None` in this build when `[proxy.http2]` is left at its
+  defaults, so `handshake` falls back to `default_h2_options()`
+  (`.../v2/server.rs:69-73`): 64 KiB `max_header_list_size`, 100
+  `max_concurrent_streams` — the same two values as under Pingora 0.8.1.
+  Everything else keeps `h2::server::Builder::new()`'s defaults.
+- New in Pingora 0.9, and not configurable from `[proxy.http2]`: streams the
+  accept loop rejects before they become sessions (a forbidden byte in
+  `:path`, an unreconcilable `content-length`, a duplicated `Host` or a
+  `Host` that contradicts `:authority`, an absolute-form `:path`) are
+  answered per stream — a headers-only 400 or `RST_STREAM(PROTOCOL_ERROR)` —
+  and counted against a per-connection budget of 32
+  (`MAX_MALFORMED_STREAMS_PER_CONN`, `v2/server.rs:64`); the 33rd tears the
+  connection down. Those rejections never reach `request_filter`, so they
+  appear in neither `prxwaf_requests_total` nor the WAF log. An optional
+  per-connection idle timeout (`HttpServerOptions::h2_idle_timeout`,
+  `apps/mod.rs:91`) also arrived; it defaults to `None` and this build leaves
+  it there.
 
 The consequence that matters for all three sections below: a frame-level guard
 in `h2` fires **inside `conn.accept()`**, i.e. before Pingora pops a stream and

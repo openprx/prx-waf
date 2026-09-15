@@ -2329,14 +2329,14 @@ fn run_server(config: &AppConfig, taking_over: bool) -> anyhow::Result<()> {
     // The thread count is global to the server rather than set per service:
     // Pingora resolves each service's runtime as
     // `service.threads().unwrap_or(conf.threads)`
-    // (`pingora-core-0.8.1/src/server/mod.rs:705`), so leaving every service's
+    // (`pingora-core-0.9.0/src/server/mod.rs:727`), so leaving every service's
     // own override at `None` keeps one lever for the whole data plane instead
     // of a per-listener count that has to be kept in sync.
     //
     // `Opt.upgrade` is the entire receiving half of the zero-downtime handover:
-    // `Bootstrap::new` copies it (`bootstrap_services.rs:95`) and `load_fds`
+    // `Bootstrap::new` copies it (`bootstrap_services.rs:120`) and `load_fds`
     // reads the listening descriptors off the socket only when it is set
-    // (`bootstrap_services.rs:172`). Passing `None` here, as this did, left the
+    // (`bootstrap_services.rs:247-250`). Passing `None` here, as this did, left the
     // outgoing process's SIGQUIT handler sending file descriptors that nothing
     // was ever going to collect.
     let mut server = Server::new_with_opt_and_conf(
@@ -2557,8 +2557,8 @@ impl TlsListener {
                 if !material.unserved_domains.is_empty() {
                     lines.push(BroadcastLine::warn(format!(
                         "One certificate serves this port and {} other active certificate(s) in the store will NOT be \
-                         presented: {}. Pingora 0.8.1's rustls backend has one certificate per endpoint and no SNI \
-                         callback, so clients asking for those names get a certificate-name mismatch. Cover them with \
+                         presented: {}. This TLS listener has one certificate per endpoint and no SNI selection, so \
+                         clients asking for those names get a certificate-name mismatch. Cover them with \
                          one SAN or wildcard certificate, pin the right one with [proxy] tls_cert_pem / tls_key_pem, \
                          or terminate their TLS elsewhere.",
                         material.unserved_domains.len(),
@@ -2652,18 +2652,20 @@ async fn resolve_tls_listener(proxy: &waf_common::config::ProxyConfig, db: &Data
 ///
 /// **ALPN advertises `h2` then `http/1.1`.** That order is server preference —
 /// rustls picks the first entry of *this* list that the client also offered
-/// (`enable_h2` sets `ALPN::H2H1`, `pingora-core-0.8.1/src/protocols/tls/mod.rs:182`)
+/// (`enable_h2` sets `ALPN::H2H1`, `pingora-core-0.9.0/src/protocols/tls/mod.rs:182`)
 /// — so a browser gets HTTP/2 and a client that only speaks HTTP/1.1 still gets
 /// served rather than refused.
 ///
 /// This could not be switched on until routing was shared. Pingora's h2 server
 /// hands the request up with `:authority` in `RequestHeader::uri` and the field
-/// map untouched (`pingora-core-0.8.1/src/protocols/http/v2/server.rs:154-157`),
+/// map untouched (`pingora-core-0.9.0/src/protocols/http/v2/server.rs:441-442`),
 /// so while host routing read `session.get_header("host")` every compliant h2
 /// request routed on the empty string and got a 404 — the same defect HTTP/3
 /// shipped with. `gateway::authority::route_authority` now answers that
 /// question for all three protocols, including the case an `:authority`
-/// contradicting a `Host` creates, which `h2` 0.4.15 does not check for itself.
+/// contradicting a `Host` creates, which `h2` 0.4 does not check for itself and
+/// which Pingora 0.9 also refuses at stream accept (`v2/server.rs:476`), one
+/// layer below the resolver.
 fn add_tls_endpoint<SV>(service: &mut pingora_core::services::listening::Service<SV>, listener: &TlsListener) {
     let TlsListener::Ready { addr, material } = listener else {
         return;
@@ -2972,20 +2974,20 @@ fn handover_startup_broadcast(
 ///
 /// This exists so the worker-thread count has somewhere to be written. The
 /// previous `Server::new(None)` silently took `ServerConf::default()`, whose
-/// `threads: 1` (`pingora-core-0.8.1/src/server/configuration/mod.rs:137`) is
+/// `threads: 1` (`pingora-core-0.9.0/src/server/configuration/mod.rs:236`) is
 /// what pinned the whole data plane to one core regardless of the machine.
 /// `ServerConf::new()` is the same conf `Server::new(None)` would have built,
 /// so nothing else about the server changes.
 ///
 /// `handover_sock` is the second thing written here. Pingora reads the socket
 /// path off this conf on both sides of an upgrade — the outgoing process at
-/// `server/mod.rs:283`, the incoming one at `bootstrap_services.rs:98` — so
+/// `server/mod.rs:290`, the incoming one at `bootstrap_services.rs:116` — so
 /// leaving it at the shipped `/tmp/pingora_upgrade.sock` would have put the
 /// handover in a world-writable directory. `None` leaves the default in place
 /// but nothing ever asks for the handover, since the flag that arms the
 /// receiving side is refused in the same breath.
 /// `drain_secs` is the third. Left unset, Pingora sleeps its own
-/// `EXIT_TIMEOUT` — 300 seconds (`server/mod.rs:56`, applied at `:775`) — after
+/// `EXIT_TIMEOUT` — 300 seconds (`server/mod.rs:63`, applied at `:804-811`) — after
 /// every graceful stop, unconditionally, whether or not a single connection is
 /// still open. That is five minutes of two live processes holding two database
 /// pools and two sets of management ports after a handover whose data plane
@@ -5303,7 +5305,7 @@ mod tests {
     /// The thread count must reach Pingora, not merely land in the WAF's own
     /// config struct: `ServerConf::threads` is the single field the proxy
     /// service's runtime is sized from
-    /// (`pingora-core-0.8.1/src/server/mod.rs:705`).
+    /// (`pingora-core-0.9.0/src/server/mod.rs:727`).
     #[test]
     fn proxy_server_conf_carries_the_worker_thread_count() {
         let conf = proxy_server_conf(12, None, 30).expect("default Pingora conf must build");

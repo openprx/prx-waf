@@ -5,7 +5,7 @@
 //! A response status line cannot be taken back. Pingora's proxy loop pulls
 //! upstream `HttpTask`s in batches, runs `response_filter` over each one and
 //! then hands the batch straight to `write_response_tasks`
-//! (`pingora-proxy-0.8.0/src/proxy_h1.rs`, the `task = rx.recv()` arm). A
+//! (`pingora-proxy-0.9.0/src/proxy_h1.rs:644`, the `task = rx.recv()` arm). A
 //! `HttpTask::Header` therefore reaches the downstream socket in the same turn
 //! it is filtered, and **no `ProxyHttp` hook can suppress or defer it** — the
 //! header is already on the wire before `upstream_response_body_filter` sees

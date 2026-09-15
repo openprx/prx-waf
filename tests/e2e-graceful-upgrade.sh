@@ -22,7 +22,7 @@
 #      at all and no way back, because the threads that failed are gone by the
 #      time the ports free up.
 #   6. the outgoing process leaves within the configured drain, not Pingora's
-#      unconditional five minutes (`server/mod.rs:56`, applied at `:775`). The
+#      unconditional five minutes (`server/mod.rs:63`, applied at `:804-811`). The
 #      departure is asserted as a RANGE, so both a drain that is ignored and one
 #      that is inherited from upstream fail the test.
 #

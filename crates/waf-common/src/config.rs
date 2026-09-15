@@ -780,12 +780,11 @@ pub struct ProxyConfig {
     /// When neither yields a certificate the address is not bound and the
     /// reason is logged at WARN; the plaintext listener is unaffected.
     ///
-    /// **One certificate, no SNI.** Pingora 0.8.1's rustls backend builds each
-    /// endpoint's acceptor with `with_single_cert`
-    /// (`pingora-core-0.8.1/src/listeners/tls/rustls/mod.rs:70`) and its
-    /// `TlsSettings` exposes no certificate callback — `with_callbacks` there
-    /// returns "Certificate callbacks are not supported with feature
-    /// \"rustls\"" (:114-118) — so one certificate serves every hostname that
+    /// **One certificate, no SNI.** This listener builds its acceptor with
+    /// `with_single_cert` (`pingora-core-0.9.0/src/listeners/tls/rustls/mod.rs:87`).
+    /// Pingora 0.9's rustls backend does expose a per-ClientHello hook —
+    /// `TlsSettings::set_cert_resolver` (`:127`) — but prx-waf does not wire
+    /// one, so one certificate serves every hostname that
     /// arrives on this port. Hosts not covered by it get a name-mismatch
     /// failure in the client. Cover several names with one SAN or wildcard
     /// certificate, or terminate their TLS elsewhere.
@@ -875,11 +874,11 @@ pub struct ProxyConfig {
     ///
     /// It is a **fixed wait, not a drain detector**. Pingora sleeps the whole
     /// period whether or not anything is still in flight
-    /// (`pingora-core-0.8.1/src/server/mod.rs:777`) and then gives the runtimes
+    /// (`pingora-core-0.9.0/src/server/mod.rs:811`) and then gives the runtimes
     /// five more seconds before cutting them, so this is the exact cost of
     /// every stop and every upgrade, not a worst case. Pingora's own default —
     /// applied when this is left unset, which is what prx-waf used to do — is
-    /// **300 seconds** (`server/mod.rs:56`): five minutes of two processes, two
+    /// **300 seconds** (`server/mod.rs:63`): five minutes of two processes, two
     /// database pools, and no management API, after a handover that finished in
     /// two seconds.
     ///
@@ -935,7 +934,7 @@ impl Default for ProxyConfig {
 pub struct Http2Config {
     /// `SETTINGS_MAX_CONCURRENT_STREAMS` advertised to clients: the most
     /// request streams one connection may have open at once. Default 100
-    /// (`pingora-core-0.8.1`'s `default_h2_options`). Lower it to cap the
+    /// (`pingora-core-0.9.0`'s `default_h2_options`). Lower it to cap the
     /// per-connection fan-out an attacker can hold; too low throttles
     /// legitimate multiplexing clients.
     #[serde(default = "default_h2_max_concurrent_streams")]
@@ -957,14 +956,14 @@ pub struct Http2Config {
 }
 
 /// See [`Http2Config::max_concurrent_streams`]. Matches
-/// `pingora-core-0.8.1/src/protocols/http/v2/server.rs`'s
+/// `pingora-core-0.9.0/src/protocols/http/v2/server.rs`'s
 /// `DEFAULT_MAX_CONCURRENT_STREAMS`.
 const fn default_h2_max_concurrent_streams() -> u32 {
     100
 }
 
 /// See [`Http2Config::max_header_list_size_bytes`]. Matches
-/// `pingora-core-0.8.1`'s `DEFAULT_MAX_HEADER_LIST_SIZE`.
+/// `pingora-core-0.9.0`'s `DEFAULT_MAX_HEADER_LIST_SIZE`.
 const fn default_h2_max_header_list_size() -> u32 {
     64 * 1024
 }
@@ -1077,7 +1076,7 @@ impl ProxyConfig {
 /// done: `HttpPeer::new()` leaves `PeerOptions::connection_timeout`,
 /// `total_connection_timeout`, `read_timeout`, `write_timeout` and
 /// `idle_timeout` at `None`, and `None` means *wait forever*
-/// (`pingora-core-0.8.1/src/upstreams/peer.rs:471-478`). An install that sets
+/// (`pingora-core-0.9.0/src/upstreams/peer.rs:574-581`). An install that sets
 /// none of these keys is byte-for-byte the old behaviour: no timer is armed and
 /// the peer options are never written.
 ///

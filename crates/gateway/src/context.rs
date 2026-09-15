@@ -506,7 +506,7 @@ pub struct GatewayCtx {
     /// be decided in the header phase and again per body window. `logging` is
     /// called exactly once per request on every Pingora path — including the
     /// short-circuit where `request_filter` already wrote the response
-    /// (`pingora-proxy-0.8.1/src/lib.rs:786`) and the error path (`:968`) — so
+    /// (`pingora-proxy-0.9.0/src/lib.rs:1193`) and the error path (`:1387`) — so
     /// it is the only place an exactly-once request counter can live.
     pub metric_action: Option<RequestAction>,
     /// Armed response-body inspector, or `None` when this response is not

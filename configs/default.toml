@@ -22,9 +22,10 @@ listen_addr = "0.0.0.0:80"
 # at WARN. HTTPS clients get connection refused; the plaintext listener above is
 # unaffected. Every launch logs one line about this port whichever way it goes.
 #
-# ONE CERTIFICATE, NO SNI. Pingora 0.8.1's rustls backend gives an endpoint a
-# single certificate and offers no hook to choose one per client hostname, so
-# whatever is resolved here is presented to every connection on this port.
+# ONE CERTIFICATE, NO SNI. This listener gives an endpoint a single certificate
+# and does not choose one per client hostname (Pingora 0.9 has a resolver hook
+# for that; prx-waf does not wire it), so whatever is resolved here is
+# presented to every connection on this port.
 # Hosts it does not cover fail with a certificate-name mismatch in the client.
 # Cover several names with one SAN or wildcard certificate, pin a specific one
 # with tls_cert_pem below, or terminate their TLS elsewhere. When the store
@@ -155,7 +156,7 @@ drain_timeout_secs = 30
 
 # ── Upstream timeouts — ALL OFF BY DEFAULT (0 = no timeout) ───────────────────
 # Pingora arms no upstream timer on its own: HttpPeer::new() leaves every stage
-# of PeerOptions at None (pingora-core-0.8.1/src/upstreams/peer.rs:471-478) and
+# of PeerOptions at None (pingora-core-0.9.0/src/upstreams/peer.rs:574-581) and
 # None means wait forever. So an upstream that accepts a connection and then
 # goes silent holds a worker thread until the client gives up — and there are
 # only `worker_threads` of those, so enough such connections stall the data
