@@ -94,7 +94,7 @@ what is inside the fold; naming it is what the bound exists to prevent.
 | `prxwaf_detections_total` | 26 phases × 3 actions | 1 | 78 |
 | `prxwaf_degraded_requests_total` | — | 1 | 1 |
 | `prxwaf_inspection_duration_seconds` | 3 lanes | 21 (18 buckets + `+Inf` + sum + count) | 63 |
-| `prxwaf_budget_events_total` | 46 `(subsystem, limit)` pairs | 1 | 46 |
+| `prxwaf_budget_events_total` | 52 `(subsystem, limit)` pairs | 1 | 52 |
 | `prxwaf_queue_depth` | 5 queues | 1 | 5 |
 | `prxwaf_db_pool` | 2 states | 1 | 2 |
 

@@ -697,7 +697,7 @@ Only the notification limiter enforces its cap at insert
 Pingora arms no upstream timer of its own. `PeerOptions::new()` leaves
 `connection_timeout`, `total_connection_timeout`, `read_timeout`,
 `write_timeout` and `idle_timeout` all `None`
-(`pingora-core-0.8.1/src/upstreams/peer.rs:471-478`), and `None` means *no
+(`pingora-core-0.9.0/src/upstreams/peer.rs:574-581`), and `None` means *no
 timeout*. The proxy used to accept those defaults silently.
 
 There is now a config key per stage —
@@ -845,7 +845,7 @@ budget, not against AppSec's typical response time.
 
 `crates/prx-waf/src/main.rs` used to call `Server::new(None)`, so Pingora fell
 back to `ServerConf::default()`, which sets **`threads: 1`**
-(`pingora-core-0.8.1/src/server/configuration/mod.rs:137`), and the proxy
+(`pingora-core-0.9.0/src/server/configuration/mod.rs:236`), and the proxy
 service was added with a bare `add_tcp` and no thread override. The data path
 therefore ran on a single worker thread on every machine, with no configuration
 key to change it: measured under saturation, the process held 13 OS threads and
@@ -1012,6 +1012,7 @@ cardinality budget and the rest of what is exported.
 | `MAX_FOLDED_HEADER_BYTES` (431) | reject | `request_headers` | `folded_bytes` |
 | Duplicate `Host` (400) | reject | `request_headers` | `duplicate_host` |
 | Authority contradicts `Host` (400) | reject | `request_headers` | `contradicted_authority` |
+| Request target neither origin-form nor absolute-form (400) | reject | `request_headers` | `unsupported_request_target` |
 | `MAX_INSPECTED_BODY_BYTES`, `OVERFLOW=reject` (413) | reject | `request_body` | `inspect_ceiling_reject` |
 | `MAX_INSPECTED_BODY_BYTES`, `OVERFLOW=log` | **skip** | `request_body` | `inspect_ceiling_forward` |
 | `MAX_H3_REQUEST_BODY` (413) | reject | `http3_body` | `buffer_ceiling` |

@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.228"
+version = "0.2.229"
 edition = "2024"
 # Not a policy number, a measurement. The dependency graph refuses anything
 # older: wasmtime 47, cranelift 0.134 and sqlx 0.9 each declare rustc 1.94.0, so
@@ -35,10 +35,10 @@ tokio = { version = "1", features = ["full"] }
 #
 # `rustls` is not decoration: pingora-core's default feature set is empty, and
 # with no TLS backend selected `crate::tls` resolves to
-# `protocols::tls::noop_tls` (pingora-core-0.8.1/src/lib.rs:121-122), whose
+# `protocols::tls::noop_tls` (pingora-core-0.9.0/src/lib.rs:122-123), whose
 # listener acceptor is `unimplemented!("No tls feature was specified")`
-# (noop_tls/mod.rs:95) and whose *upstream* connector hands back a stream that
-# reads instant EOF and swallows every write (noop_tls/mod.rs:128-152). So the
+# (noop_tls/mod.rs:102) and whose *upstream* connector hands back a stream that
+# reads instant EOF and swallows every write (noop_tls/mod.rs:138-151, `poll_read`/`poll_write`). So the
 # feature buys two separate things: the ability to terminate TLS on
 # `[proxy] listen_addr_tls` at all, and an origin dialled over real TLS when a
 # site sets `ssl`/`upstream_ssl` — which until now was a silent black hole that
@@ -51,10 +51,10 @@ tokio = { version = "1", features = ["full"] }
 # entry: pingora-rustls takes tokio-rustls and rustls at default features, so
 # aws-lc-rs returns to the graph and rustls-pemfile arrives unmaintained. The
 # process still pins `ring` explicitly at startup (crates/prx-waf/src/main.rs).
-pingora-core = { version = "0.8", features = ["rustls"] }
-pingora-proxy = { version = "0.8", features = ["rustls"] }
-pingora-http = { version = "0.8" }
-pingora-timeout = { version = "0.8" }
+pingora-core = { version = "0.9", features = ["rustls"] }
+pingora-proxy = { version = "0.9", features = ["rustls"] }
+pingora-http = { version = "0.9" }
+pingora-timeout = { version = "0.9" }
 
 # API framework
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
@@ -90,7 +90,7 @@ http = "1"
 # Only for `geteuid`, which the graceful-upgrade socket's directory check needs
 # and std does not expose. Already in the tree under pingora, and taken here in
 # preference to a raw `libc` call because the workspace denies `unsafe_code`.
-nix = { version = "0.24", features = ["user"] }
+nix = { version = "0.31", features = ["user"] }
 
 # Phase 3 additions
 rhai = { version = "1", features = ["sync"] }

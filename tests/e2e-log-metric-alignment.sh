@@ -17,7 +17,8 @@
 #   2        | SQLi in the query              | requests_total{action="block"}            | action="block" + phase="sql_injection"
 #   2        | host matching no route → 404   | requests_total{action="block"}            | action="block"
 #   1        | site closed is NOT exercised   | —                                        | —
-#   1        | duplicate Host → 400           | requests_total{action="block"}            | action="block"
+#   1        | duplicate Host → 400           | (none — Pingora 0.9 answers it in       | (none)
+#            |                                |  read_request, below the WAF; see below) |
 #   1        | body over the ceiling → 413    | requests_total{action="block"}            | action="block"
 #   1        | oversize header fold → 431     | requests_total{action="block"}            | action="block"
 #
@@ -232,16 +233,18 @@ done
 echo "  duplicate Host x1"
 # curl folds a `-H Host:` into the one it derives from the URL, so two Host
 # lines have to be written onto the socket directly.
-python3 - "$FOLD_HOST_1" "$HTTP_PORT" <<'PY' || true
+dup_status="$(python3 - "$FOLD_HOST_1" "$HTTP_PORT" <<'PY' || true
 import socket, sys
 host, port = sys.argv[1], int(sys.argv[2])
 req = (f"GET /dup HTTP/1.1\r\nHost: {host}\r\nHost: evil.invalid\r\n"
        f"Connection: close\r\n\r\n").encode()
 s = socket.create_connection(("127.0.0.1", port), timeout=10)
 s.sendall(req)
-print("   ", s.recv(64).split(b"\r\n")[0].decode(errors="replace"))
+print(s.recv(64).split(b"\r\n")[0].decode(errors="replace"))
 s.close()
 PY
+)"
+echo "    $dup_status"
 
 echo "  over-ceiling body x1"
 head -c $((INSPECT_CAP * 4)) /dev/zero | tr '\0' 'A' > "$WORK/big.txt"
@@ -309,10 +312,27 @@ else
     fail "sql_injection phase disagrees ($metric_sqli vs $log_sqli)"
 fi
 
+# The duplicate-Host request is still refused with 400, but since Pingora 0.9
+# that refusal is Pingora's own (`validate_request_authority`, inside
+# `read_request`): it returns before `request_filter` and `logging()` run, so
+# the request appears in neither the block counter nor the log, and the
+# reconciliation above is unaffected by it. The WAF's own duplicate-Host
+# refusal stays as the second layer. Pinned both ways: the status proves the
+# request was refused, and the unmoved counter proves which layer did it — a
+# Pingora release that stops checking shows up here as the counter moving.
+echo "$dup_status" | grep -q ' 400 ' \
+    && pass "duplicate Host is refused with 400" \
+    || fail "duplicate Host was answered '$dup_status', not 400"
+d="$(delta 'prxwaf_budget_events_total' '{subsystem="request_headers",limit="duplicate_host"}')"
+if [ "$d" -eq 0 ]; then
+    pass "duplicate Host was refused below the WAF (duplicate_host counter unmoved; Pingora 0.9 answers it in read_request)"
+else
+    fail "duplicate_host moved by $d: Pingora no longer refuses a duplicated Host before request_filter — re-check which layer answers"
+fi
+
 # Budget counters that the refusals must also have moved, each named by the
 # `(subsystem, limit)` pair `docs/dos-budget.md` documents.
 for pair in \
-    'request_headers|duplicate_host' \
     'request_headers|folded_bytes' \
     'request_body|inspect_ceiling_reject'
 do

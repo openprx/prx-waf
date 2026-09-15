@@ -54,6 +54,16 @@ outcome writes.
 | **duplicate `Host` → 400** | `requests_total{action="block"}` (`proxy.rs:544`) + `budget_events_total{subsystem="request_headers",limit="duplicate_host"}` (`:543`) | `proxy.rs:545` `"Rejecting request with duplicate Host headers: ip=…"` | **NO** — "rejecting", not "block" |
 | **header fold over limit → 431** | `requests_total{action="block"}` (`proxy.rs:570`) + `{subsystem="request_headers", limit="values_per_name"\|"folded_bytes"}` (`:563-569`) | `proxy.rs:571` `"Rejecting request: header '…' exceeds the fold limits: ip=…"` | **NO**, and the log cannot distinguish the two limits the metric splits |
 | **authority contradicts `Host` → 400** | `requests_total{action="block"}` (`proxy.rs:620`) + `budget_events_total{subsystem="request_headers",limit="contradicted_authority"}` (`:619`) | `proxy.rs:621` `"Rejecting request whose Host disagrees with the request authority: ip=…"` | **YES** — added after the fix below, so it carries `action = "block"` as a field from the start |
+| **request target neither origin-form nor absolute-form → 400** | `requests_total{action="block"}` + `budget_events_total{subsystem="request_headers",limit="unsupported_request_target"}` (same block as the row above) | `"Rejecting request whose target is neither origin-form nor absolute-form: ip=…"` | **YES**, same construction |
+
+Since Pingora 0.9 the duplicate-`Host` and contradicted-authority refusals are
+normally made by Pingora itself — `validate_request_authority` inside
+`read_request` on HTTP/1.1, `invalid_request_authority` at stream accept on h2
+— which answers 400 and returns before `request_filter` and `logging()` run. Such
+a request therefore appears in **neither** `requests_total` nor the process log;
+the two rows above describe the WAF's own second layer, which moves only when
+Pingora's check does not fire. `tests/e2e-log-metric-alignment.sh` and
+`tests/e2e-tls-h2.sh` pin which layer answers.
 | **body over inspection ceiling → 413** | `requests_total{action="block"}` (`proxy.rs:756`) + `{subsystem="request_body",limit="inspect_ceiling_reject"}` (`:755`) | `proxy.rs:762` `"WAF rejected request body over the N byte inspection ceiling: …"` | **NO** — "rejected" |
 | clean request forwarded | `requests_total{action="allow"}` — the default at `proxy.rs:1054` | `proxy.rs:1103` DEBUG `"Request completed: …"` | **partial** — DEBUG-only and carries no action word; acceptable, since an allow is the absence of a decision |
 

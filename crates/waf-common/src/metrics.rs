@@ -313,16 +313,30 @@ pub enum BudgetEvent {
     HeaderValueCountExceeded,
     /// A folded header name over 32 KiB — 431, request refused.
     HeaderFoldBytesExceeded,
-    /// More than one `Host` line — 400, request refused as unroutable.
+    /// More than one `Host` line — 400, request refused as unroutable. Since
+    /// Pingora 0.9 that request is normally answered 400 by Pingora itself
+    /// (`validate_request_authority`, inside `read_request`) before
+    /// `request_filter` runs, so this counter moves only if that check is
+    /// bypassed; the WAF's own refusal stays as the layer that does not depend
+    /// on it.
     DuplicateHost,
     /// A request target's authority disagreed with its `Host` field — 400,
-    /// request refused as unroutable. Reachable on h2, where the client sends
-    /// `:authority` and may send a `Host` beside it and neither `h2` nor
-    /// Pingora compares the two; not reachable on HTTP/1.1, whose request
-    /// targets never carry an authority. **Any non-zero value is an attempted
-    /// request desync**, not a tuning signal: the sender asked this WAF and the
-    /// origin to disagree about which site the request addressed.
+    /// request refused as unroutable. Reachable on h2 (`:authority` beside a
+    /// `Host`) and, since Pingora 0.9 parses absolute-form request targets, on
+    /// HTTP/1.1 too. Pingora 0.9 refuses the pair at ingress with the same
+    /// byte-exact comparison on both protocols, so this counter is the second
+    /// layer and moves only if that one stops. **Any non-zero value is an
+    /// attempted request desync**, not a tuning signal: the sender asked this
+    /// WAF and the origin to disagree about which site the request addressed.
     ContradictedAuthority,
+    /// A request target Pingora 0.9 parses but this proxy does not serve — 400,
+    /// request refused. Authority-form outside CONNECT (`GET a.example:443`),
+    /// absolute-form with a non-HTTP scheme, or an opaque `scheme:rest`.
+    /// Pingora roots the `Uri` at `/` for these and would write the original
+    /// bytes to the origin verbatim, so the detectors would have inspected a
+    /// different request from the one the origin serves. Like the row above,
+    /// a non-zero value is a probe, not a tuning signal.
+    UnsupportedRequestTarget,
     /// Request body over the inspection ceiling with the default
     /// `PRXWAF_BODY_INSPECT_OVERFLOW=reject` — 413.
     RequestBodyRejected,
@@ -495,11 +509,12 @@ impl BudgetEvent {
     /// Every variant, in declaration order. The exposition walks this, so a new
     /// variant appears in `/metrics` (at zero) the moment it is added — a
     /// counter an operator has never seen fire still has to be graphable.
-    const ALL: [Self; 51] = [
+    const ALL: [Self; 52] = [
         Self::HeaderValueCountExceeded,
         Self::HeaderFoldBytesExceeded,
         Self::DuplicateHost,
         Self::ContradictedAuthority,
+        Self::UnsupportedRequestTarget,
         Self::RequestBodyRejected,
         Self::RequestBodyForwardedUninspected,
         Self::Http3BodyRejected,
@@ -576,6 +591,7 @@ impl BudgetEvent {
             Self::HeaderFoldBytesExceeded => ("request_headers", "folded_bytes"),
             Self::DuplicateHost => ("request_headers", "duplicate_host"),
             Self::ContradictedAuthority => ("request_headers", "contradicted_authority"),
+            Self::UnsupportedRequestTarget => ("request_headers", "unsupported_request_target"),
             Self::RequestBodyRejected => ("request_body", "inspect_ceiling_reject"),
             Self::RequestBodyForwardedUninspected => ("request_body", "inspect_ceiling_forward"),
             Self::Http3BodyRejected => ("http3_body", "buffer_ceiling"),

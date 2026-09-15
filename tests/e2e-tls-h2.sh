@@ -27,19 +27,24 @@
 #      that header — CRS-920350, "Host header is a numeric IP address" — fires
 #      on h2 for a request that carries no `Host` field at all.
 #   5. `:authority` and `Host` disagreeing is REFUSED with 400, not resolved.
-#      Neither `h2` 0.4.15 nor Pingora compares the two, so this is the only
-#      thing between a mismatched pair and a request routed under one name and
-#      served under the other. Agreement routes; disagreement is refused;
-#      a second `Host` line is refused; and the refusal moves
-#      `budget_events_total{subsystem="request_headers",limit="contradicted_authority"}`.
+#      `h2` 0.4 does not compare the two. Pingora 0.9 does, at stream accept
+#      (`invalid_request_authority`), and answers a headers-only 400 before the
+#      stream becomes a session; the WAF's `route_authority` is the second
+#      layer, and the only one when Pingora's check is not there. Agreement
+#      routes; disagreement is refused; a second `Host` line is refused; and
+#      the layer that answered is pinned — Pingora's leaves
+#      `budget_events_total{subsystem="request_headers",limit="contradicted_authority"}`
+#      unmoved and writes no WAF log line, the WAF's moves it by one.
 #
 # Assertion 5 needs a client that will send a `Host` field beside `:authority`,
 # which curl and every other well-behaved client refuse to do — they build one
 # from the other. `h2raw.py` is that client: it speaks the wire directly, so it
 # can send the pair no library will. It reads the verdict off the DATA frames
-# rather than the HEADERS, which avoids needing an HPACK *decoder* for a test
-# whose answers are already distinguishable by body: `Bad Request`,
-# `Not Found`, `ORIGIN-REACHED`.
+# where there are any — `Bad Request`, `Not Found`, `ORIGIN-REACHED` — and off
+# the first HPACK field of the HEADERS frame where there are none, which is
+# enough to name a `:status` without carrying a full HPACK decoder: the h2
+# crate emits the common statuses as static-table references and the rest as
+# a literal with the `:status` name index.
 #
 # Prerequisites:
 #   - cargo build -p prx-waf   (or --release; set BIN=)
@@ -188,7 +193,7 @@ def main():
     sock.sendall(out)
 
     sock.settimeout(10)
-    buf, data, rst = b"", b"", None
+    buf, data, rst, status = b"", b"", None, None
     try:
         while True:
             chunk = sock.recv(65536)
@@ -204,6 +209,8 @@ def main():
                 buf = buf[9 + length:]
                 if kind == 0x0:                       # DATA
                     data += payload
+                elif kind == 0x1 and status is None:  # HEADERS
+                    status = status_of(payload, flags)
                 elif kind == 0x3:                     # RST_STREAM
                     rst = int.from_bytes(payload[:4], "big")
                 elif kind == 0x7:                     # GOAWAY
@@ -218,9 +225,53 @@ def main():
         except OSError:
             pass
 
+    if status is not None:
+        print("STATUS=%s" % status)
     if rst is not None:
         print("RESET=%d" % rst)
     print("DATA=%s" % data.decode("utf-8", "replace").replace("\n", "\\n"))
+
+
+# RFC 7541 Appendix A: the static-table rows that are a complete `:status`.
+STATIC_STATUS = {8: "200", 9: "204", 10: "206", 11: "304", 12: "400", 13: "404", 14: "500"}
+# RFC 7541 Appendix B, the digits only: (code, bit length).
+HUFFMAN_DIGITS = {(0b00000, 5): "0", (0b00001, 5): "1", (0b00010, 5): "2",
+                  (0b011001, 6): "3", (0b011010, 6): "4", (0b011011, 6): "5",
+                  (0b011100, 6): "6", (0b011101, 6): "7", (0b011110, 6): "8",
+                  (0b011111, 6): "9"}
+
+
+def status_of(payload, flags):
+    """The `:status` named by the first field of a HEADERS payload, or None."""
+    start = 0
+    if flags & 0x8:                                   # PADDED
+        start = 1
+    if flags & 0x20:                                  # PRIORITY
+        start += 5
+    if start >= len(payload):
+        return None
+    first = payload[start]
+    if first & 0x80:                                  # indexed field
+        return STATIC_STATUS.get(first & 0x7f)
+    # Literal (with or without indexing) naming static index 8 = :status.
+    name_index = first & (0x3f if first & 0x40 else 0x0f)
+    if name_index != 8 or start + 1 >= len(payload):
+        return None
+    huffman, length = payload[start + 1] & 0x80, payload[start + 1] & 0x7f
+    value = payload[start + 2:start + 2 + length]
+    if not huffman:
+        return value.decode("ascii", "replace")
+    bits = "".join(format(b, "08b") for b in value)
+    out, code, size = "", 0, 0
+    for bit in bits:
+        code, size = (code << 1) | int(bit), size + 1
+        if (code, size) in HUFFMAN_DIGITS:
+            out, code, size = out + HUFFMAN_DIGITS[(code, size)], 0, 0
+        elif size > 6:
+            # Either the EOS padding (all ones, under 8 bits) or a symbol that
+            # is not a digit, which no `:status` contains.
+            return out if code == (1 << size) - 1 and size < 8 else None
+    return out or None
 
 
 main()
@@ -540,28 +591,34 @@ after="$(origin_hits)"
 budget_after="$(budget request_headers contradicted_authority)"
 echo "    :authority + disagreeing host   -> $out"
 echo "    contradicted_authority $budget_before -> $budget_after, origin hits $before -> $after"
-echo "$out" | grep -q 'Bad Request' \
-    && pass "a disagreeing :authority/Host pair is refused with 400 Bad Request" \
+echo "$out" | grep -q 'STATUS=400' \
+    && pass "a disagreeing :authority/Host pair is refused with 400" \
     || fail "the disagreeing pair was not refused"
 [ "$before" = "$after" ] \
     && pass "the refused request never reached the origin under either name" \
     || fail "the refused request was forwarded anyway"
-[ "$((budget_after - budget_before))" -eq 1 ] \
-    && pass "budget_events_total{request_headers,contradicted_authority} moved by exactly 1" \
-    || fail "the contradiction counter moved by $((budget_after - budget_before)), not 1"
-grep -q 'Rejecting request whose Host disagrees with the request authority' "$WORK/waf.log" \
-    && pass "the refusal wrote a log line naming the disagreement" \
-    || fail "the refusal is invisible in the log"
-grep 'Rejecting request whose Host disagrees' "$WORK/waf.log" | grep -q 'action="block"' \
-    && pass "the log line spells the metric's own action label" \
-    || fail "the log line does not carry action=\"block\""
+# Which layer refused it. Pingora 0.9 answers at stream accept with a
+# headers-only 400 and never builds a session, so the WAF's counter and log
+# stay still; the WAF's own refusal carries a `Bad Request` body and moves the
+# counter by one. Either is a refusal; only one is the current boundary, and a
+# silent move between them is what this pins.
+moved=$((budget_after - budget_before))
+if ! echo "$out" | grep -q 'DATA=Bad Request' && [ "$moved" -eq 0 ] \
+    && ! grep -q 'Rejecting request whose Host disagrees' "$WORK/waf.log"; then
+    pass "Pingora refused the pair at stream accept (no body, contradicted_authority unmoved, no WAF log line)"
+elif echo "$out" | grep -q 'DATA=Bad Request' && [ "$moved" -eq 1 ] \
+    && grep 'Rejecting request whose Host disagrees' "$WORK/waf.log" | grep -q 'action="block"'; then
+    fail "the WAF's own layer answered: Pingora no longer compares :authority with Host at accept — re-check the boundary"
+else
+    fail "the refusal came from neither layer cleanly (counter moved by $moved; output '$out')"
+fi
 
 # Not the same defect, and it must not be swallowed by the new one: two `Host`
 # lines are unroutable regardless of what `:authority` says, and that refusal
-# runs first.
+# runs first — in Pingora 0.9 at stream accept, headers-only, like the pair.
 out="$(h2raw "$(req "$authority" "host=$authority" "host=$authority")")"
 echo "    :authority + two host lines     -> $out"
-echo "$out" | grep -q 'Bad Request' \
+echo "$out" | grep -q 'STATUS=400' \
     && pass "a second Host line is still refused with 400" \
     || fail "a duplicated Host line was accepted"
 

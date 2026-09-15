@@ -10,24 +10,40 @@
 //!
 //! ## What each protocol actually delivers
 //!
-//! | | authority in `Uri` | `Host` field | duplicate `Host` possible | conflict rejected below us |
+//! | | authority in `Uri` | authority elsewhere | `Host` field | conflict rejected below us |
 //! |---|---|---|---|---|
-//! | HTTP/1.1 | **never** — `pingora_http::RequestHeader::set_raw_path` builds the URI with `Uri::builder().path_and_query(..)` only (`pingora-http-0.8.1/src/lib.rs:259-278`), and the h1 server feeds it the raw request target verbatim (`pingora-core-0.8.1/src/protocols/http/v1/server.rs:229-234`) | yes, the only source | yes — repeated header lines survive parsing | n/a |
-//! | h2 | yes — `:authority` is folded into `Uri` and the field map is passed through untouched (`h2-0.4.15/src/server.rs:1669-1738`, `pingora-core-0.8.1/src/protocols/http/v2/server.rs:154-157`) | optional, and compliant clients omit it | yes — HPACK may carry two `host` fields | **no** |
-//! | h3 | yes — `:authority`, same folding | absent on every compliant client (RFC 9114 §4.3.1) | yes, in principle | yes (`h3` 0.0.8 `HeaderError::ContradictedAuthority`) |
+//! | HTTP/1.1 | **never** — `pingora_http::RequestHeader::set_raw_path` deliberately leaves scheme and authority off the `Uri` for every request-target form (`pingora-http-0.9.0/src/lib.rs:746-782`, `parse_request_target`) | **yes, since Pingora 0.9** — an absolute-form target (`GET http://a.example/x`) parses, its path lands in the `Uri` and the whole target is kept verbatim behind [`pingora_http::RequestHeader::raw_path`]; the same is true of authority-form and any opaque `scheme:rest` target, whose `Uri` is `/` | yes | partly — `validate_request_authority` (`pingora-core-0.9.0/src/protocols/http/authority.rs:53-95`) runs inside `read_request` and answers 400 to a duplicated `Host`, to userinfo, to an ambiguous absolute-form and to an absolute-form authority that differs **byte-for-byte** from `Host`. It accepts absolute-form with no `Host`, and it accepts a non-CONNECT authority-form target, which the h1 client then writes to the origin verbatim (`v1/client.rs:917-925`) |
+//! | h2 | yes — `:authority` is folded into `Uri` and the field map is passed through untouched | no — `raw_path()` is the `:path`; an absolute-form `:path` is refused at accept (`v2/server.rs:354-364`) | optional, and compliant clients omit it | yes, since 0.9 — `invalid_request_authority` (`v2/server.rs:328`) answers a headers-only 400 to a duplicated `Host` and to a `Host` that differs from `:authority`, before the stream becomes a session |
+//! | h3 | yes — `:authority`, same folding | no | absent on every compliant client (RFC 9114 §4.3.1) | yes (`h3` 0.0.8 `HeaderError::ContradictedAuthority`) |
 //!
-//! The HTTP/1.1 row is the load-bearing one, because it is what makes sharing
-//! this resolver with HTTP/1.1 free. Pingora builds the HTTP/1.1 URI out of
-//! `path_and_query` alone, which means the two request-target forms that carry
-//! an authority do not merely lose it — they fail to parse: `GET
-//! http://a.example/x HTTP/1.1` and `CONNECT a.example:443 HTTP/1.1` both come
-//! back `InvalidHTTPHeader` and never reach `request_filter`. So on HTTP/1.1
-//! [`route_authority`] can only ever take the `Host` branch, which is exactly
-//! what the routing code read before. Behaviour preserving by construction, not
-//! by argument — and
-//! `no_http1_request_target_carries_a_uri_authority_under_pingora` pins the
-//! construction so a Pingora upgrade that starts accepting either form has to
-//! fail a test before it can change HTTP/1.1 routing.
+//! The HTTP/1.1 row is the load-bearing one, and it changed with Pingora 0.9.
+//! Under 0.8 the two request-target forms that carry an authority failed to
+//! parse, so HTTP/1.1 could only ever take the `Host` branch. Under 0.9 they
+//! parse, the authority is *not* in the `Uri`, and so a resolver that only reads
+//! `uri.authority()` would route an absolute-form request on `Host` while the
+//! origin, receiving the absolute-form request line, resolves its vhost from
+//! the target (RFC 9112 §3.2.2 tells it to). That is exactly the desync the h2
+//! branch already refuses. [`route_request_authority`] therefore reads the raw
+//! target through Pingora's own classifier and applies one rule set:
+//!
+//! 1. only `Host` → route on `Host` (unchanged);
+//! 2. only a target authority (absolute-form, no `Host`) → route on it;
+//! 3. both, and not byte-equal → refuse; same status, log and counter as the
+//!    h2/h3 contradiction. Pingora 0.9 already refuses this pair one layer
+//!    down, with the same byte-exact comparison, so this branch is the
+//!    defence that stays if that check moves;
+//! 4. any other target Pingora lets through — authority-form outside CONNECT,
+//!    an absolute-form with a non-HTTP scheme, an opaque `scheme:rest` — is
+//!    refused. Pingora would forward the bytes to the origin unchanged while
+//!    this proxy had inspected a `Uri` of `/`; a request whose path the WAF
+//!    and the origin disagree about is not one this WAF can vouch for.
+//!    CONNECT itself never reaches this resolver: `pingora-proxy` answers it
+//!    405 unless `allow_connect_method_proxying` is set, and it is not.
+//!
+//! The tests under `pingora_boundary` pin what Pingora hands this module —
+//! which forms parse, where the authority ends up, what `read_request` refuses
+//! — so a Pingora upgrade that moves the boundary again fails a test before it
+//! can change routing.
 //!
 //! ## What is deliberately *not* unified
 //!
@@ -36,16 +52,21 @@
 //!   request carrying two `Host` values is unroutable no matter which field the
 //!   authority came from. Keeping it upstream of here is what lets this
 //!   function read the first `Host` line only, exactly as the h2/h3 decoders do.
+//!   Since Pingora 0.9 that refusal is normally made by `read_request` itself
+//!   (HTTP/1.1) or at h2 stream accept, before `request_filter` runs; the fold
+//!   check remains as the layer that does not depend on it.
 //! * **Framing-header smuggling.** `Content-Length`/`Transfer-Encoding` desync
 //!   is [`crate::smuggling`] and stays per-protocol: h2 and h3 reject
-//!   connection-specific fields at decode time (`h2-0.4.15/src/frame/headers.rs:915-928`)
-//!   and validate `content-length` against the DATA frames
-//!   (`h2-0.4.15/src/proto/streams/recv.rs:175-192, 695-705`), so the indicators
-//!   this proxy looks for are reachable on HTTP/1.1 and mostly unreachable
-//!   above it. Same detector, different reachability — not the same question.
+//!   connection-specific fields at decode time and validate `content-length`
+//!   against the DATA frames, so the indicators this proxy looks for are
+//!   reachable on HTTP/1.1 and mostly unreachable above it. Same detector,
+//!   different reachability — not the same question.
 //! * **What an unroutable request costs.** Each protocol writes its own 400 /
 //!   404 with its own body and its own metric bookkeeping; this module only
 //!   decides, it never responds.
+
+use pingora_http::RequestHeader;
+use pingora_http::authority::{RawTargetAuthority, is_http_family_scheme, raw_target_authority};
 
 /// Outcome of deciding which authority a request must be routed on.
 pub enum RouteAuthority<'a> {
@@ -57,40 +78,124 @@ pub enum RouteAuthority<'a> {
     Missing,
 }
 
+/// Outcome of routing a request Pingora handed to `request_filter`, which is
+/// [`RouteAuthority`] plus the one verdict only a raw request target can earn.
+pub enum RequestAuthority<'a> {
+    /// The request target was a form this proxy serves; here is the verdict.
+    Resolved(RouteAuthority<'a>),
+    /// The request target was a form Pingora accepts and this proxy refuses:
+    /// authority-form outside CONNECT, absolute-form with a non-HTTP scheme, or
+    /// an opaque `scheme:rest`. See rule 4 in the module documentation.
+    UnsupportedTarget,
+}
+
+/// The syntactic form of a request target as Pingora delivers it.
+///
+/// Classified from [`RequestHeader::raw_path`], because that is the only place
+/// an HTTP/1.1 authority survives parsing, and because Pingora writes exactly
+/// these bytes to an HTTP/1.1 origin: whatever this classifier says about the
+/// target is what the origin will be asked to interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestTarget<'a> {
+    /// origin-form (RFC 9112 §3.2.1): a path, including the protocol-relative
+    /// spelling `//host/x`, which is a path and not an authority.
+    Origin,
+    /// asterisk-form (§3.2.4): `*`.
+    Asterisk,
+    /// absolute-form (§3.2.2) with an `http`/`https`/`ws`/`wss` scheme; carries
+    /// the authority exactly as Pingora's own classifier delimits it.
+    Absolute(&'a str),
+    /// Anything else Pingora lets through — see [`RequestAuthority::UnsupportedTarget`].
+    Unsupported,
+}
+
+/// Classify a raw request target. See [`RequestTarget`].
+#[must_use]
+pub fn classify_request_target(raw: &[u8]) -> RequestTarget<'_> {
+    if raw.first() == Some(&b'/') {
+        return RequestTarget::Origin;
+    }
+    if raw == b"*" {
+        return RequestTarget::Asterisk;
+    }
+    // Pingora's classifier, not a second parser: the authority boundary this
+    // proxy routes on has to be the one Pingora validated against `Host` and
+    // the one it will write to the origin. `RawTargetAuthority::Absolute` is
+    // also returned for `ftp://` and friends, whose authority means nothing to
+    // an HTTP origin, hence the scheme check.
+    match raw_target_authority(raw) {
+        RawTargetAuthority::Absolute { scheme, authority, .. } if is_http_family_scheme(scheme) => {
+            match std::str::from_utf8(authority) {
+                Ok(authority) if !authority.is_empty() => RequestTarget::Absolute(authority),
+                _ => RequestTarget::Unsupported,
+            }
+        }
+        RawTargetAuthority::Absolute { .. } | RawTargetAuthority::None | RawTargetAuthority::AmbiguousAuthority => {
+            RequestTarget::Unsupported
+        }
+    }
+}
+
 /// Decide the authority a request is routed on, from its URI and header map.
 ///
 /// The URI is the authoritative source and the `Host` field is the fallback.
 /// That order is what HTTP/2 (RFC 9113 §8.3.1) and HTTP/3 (RFC 9114 §4.3.1)
-/// both require — a request carrying `:authority` is addressed by `:authority`
-/// — and it costs HTTP/1.1 nothing because Pingora hands this function a URI
-/// with no authority in it (see the module table).
+/// both require — a request carrying `:authority` is addressed by `:authority`.
+/// This is the h2/h3 entry point; a request Pingora hands to `request_filter`
+/// goes through [`route_request_authority`], which reads the raw target first
+/// and then lands here.
 ///
 /// The disagreement case is refused rather than resolved. Silently picking one
 /// side is a desync primitive: this WAF would apply the policy of authority A
 /// while the origin resolves its vhost from the field carrying B. `h3` 0.0.8
-/// already rejects the contradiction at decode time, but `h2` 0.4.15 does
-/// **not** — `server.rs:1669-1738` copies `:authority` into the URI and the
-/// field map into the request without ever comparing the two — so on h2 this
-/// branch is the only thing standing between a mismatched pair and a routed
-/// request. One `!=` is a cheap price for making the choice a property of this
-/// function instead of an assumption about a dependency.
+/// rejects the contradiction at decode time and Pingora 0.9 rejects it at h2
+/// stream accept, but neither of those is a property of this function, and
+/// this branch is what holds if either moves. One `!=` is a cheap price for
+/// making the choice a property of this function instead of an assumption
+/// about a dependency.
 #[must_use]
 pub fn route_authority<'a>(uri: &'a http::Uri, headers: &'a http::HeaderMap) -> RouteAuthority<'a> {
     let authority = uri
         .authority()
         .map(http::uri::Authority::as_str)
         .filter(|a| !a.is_empty());
-    // First line only, which is all the h2/h3 decoders compare too. A request
-    // carrying more than one `Host` is refused before this point
-    // (`FoldedHeaders::duplicate_host`).
-    let host = headers
+    decide(authority, first_host(headers))
+}
+
+/// Decide the authority for a request Pingora handed to `request_filter`,
+/// HTTP/1.1 or h2 — the form of the raw target is read first, because on
+/// HTTP/1.1 it is the only place an authority can be.
+#[must_use]
+pub fn route_request_authority(head: &RequestHeader) -> RequestAuthority<'_> {
+    match classify_request_target(head.raw_path()) {
+        // No authority in the target. The URI still may carry one — that is
+        // how h2 delivers `:authority` — and the shared resolver reads it.
+        RequestTarget::Origin | RequestTarget::Asterisk => {
+            RequestAuthority::Resolved(route_authority(&head.uri, &head.headers))
+        }
+        RequestTarget::Absolute(authority) => {
+            RequestAuthority::Resolved(decide(Some(authority), first_host(&head.headers)))
+        }
+        RequestTarget::Unsupported => RequestAuthority::UnsupportedTarget,
+    }
+}
+
+/// First `Host` line only, which is all the h2/h3 decoders compare too. A
+/// request carrying more than one `Host` is refused before this point
+/// (`FoldedHeaders::duplicate_host`).
+fn first_host(headers: &http::HeaderMap) -> Option<&str> {
+    headers
         .get(http::header::HOST)
         .and_then(|v| v.to_str().ok())
-        .filter(|h| !h.is_empty());
+        .filter(|h| !h.is_empty())
+}
 
+/// The one rule set, applied to whichever pair of sources a protocol offers.
+fn decide<'a>(authority: Option<&'a str>, host: Option<&'a str>) -> RouteAuthority<'a> {
     match (authority, host) {
-        // Byte-exact, matching the decoders' own comparison: `a.com` and
-        // `a.com:443` are different authorities and may hold different policy.
+        // Byte-exact, matching the decoders' own comparison and Pingora 0.9's
+        // ingress check: `a.com` and `a.com:443` are different authorities and
+        // may hold different policy.
         (Some(a), Some(h)) if a != h => RouteAuthority::Contradicted,
         (Some(a), _) => RouteAuthority::Found(a),
         (None, Some(h)) => RouteAuthority::Found(h),
@@ -109,14 +214,34 @@ mod tests {
         Found(String),
         Contradicted,
         Missing,
+        UnsupportedTarget,
     }
 
     fn found(authority: &str) -> Verdict {
         Verdict::Found(authority.to_string())
     }
 
+    impl From<RouteAuthority<'_>> for Verdict {
+        fn from(route: RouteAuthority<'_>) -> Self {
+            match route {
+                RouteAuthority::Found(a) => Self::Found(a.to_string()),
+                RouteAuthority::Contradicted => Self::Contradicted,
+                RouteAuthority::Missing => Self::Missing,
+            }
+        }
+    }
+
+    impl From<RequestAuthority<'_>> for Verdict {
+        fn from(route: RequestAuthority<'_>) -> Self {
+            match route {
+                RequestAuthority::Resolved(r) => r.into(),
+                RequestAuthority::UnsupportedTarget => Self::UnsupportedTarget,
+            }
+        }
+    }
+
     /// Resolve a request built from a request target and zero or more `Host`
-    /// lines — the only two inputs the resolver reads.
+    /// lines — the only two inputs the shared resolver reads.
     fn resolve(target: &str, host_lines: &[&str]) -> Verdict {
         let uri: http::Uri = target.parse().unwrap_or_default();
         let mut headers = http::HeaderMap::new();
@@ -124,11 +249,24 @@ mod tests {
             let value = http::HeaderValue::from_str(line).expect("a test Host line is a valid header value");
             headers.append(http::header::HOST, value);
         }
-        match route_authority(&uri, &headers) {
-            RouteAuthority::Found(a) => Verdict::Found(a.to_string()),
-            RouteAuthority::Contradicted => Verdict::Contradicted,
-            RouteAuthority::Missing => Verdict::Missing,
+        route_authority(&uri, &headers).into()
+    }
+
+    /// Build the request exactly the way `pingora-core`'s HTTP/1.1 server does:
+    /// the raw request-target bytes through `RequestHeader::build`, then the
+    /// header lines. What this returns is what `request_filter` sees.
+    fn http1(method: &str, target: &[u8], host_lines: &[&str]) -> RequestHeader {
+        let mut head = RequestHeader::build(method, target, None).expect("BUG: this request target parses");
+        for line in host_lines {
+            head.append_header(http::header::HOST, *line)
+                .expect("a test Host line is a valid header value");
         }
+        head
+    }
+
+    /// Resolve an HTTP/1.1 request as `request_filter` would.
+    fn resolve_http1(target: &[u8], host_lines: &[&str]) -> Verdict {
+        route_request_authority(&http1("GET", target, host_lines)).into()
     }
 
     #[test]
@@ -186,44 +324,229 @@ mod tests {
         assert_eq!(resolve("/x", &["a.example", "b.example"]), found("a.example"));
     }
 
-    /// The HTTP/1.1 half of the module table, pinned.
+    // ── The HTTP/1.1 rule set (module documentation, rules 1-4) ───────────────
+
+    #[test]
+    fn http1_rule_1_host_alone_routes_on_host() {
+        assert_eq!(resolve_http1(b"/x", &["a.example"]), found("a.example"));
+        assert_eq!(resolve_http1(b"/x", &["a.example:8080"]), found("a.example:8080"));
+        // asterisk-form (`OPTIONS *`) carries no authority either.
+        assert_eq!(resolve_http1(b"*", &["a.example"]), found("a.example"));
+        // A protocol-relative target is a path, not an authority: the origin
+        // would serve `//evil.example/x` from `a.example`'s document root.
+        assert_eq!(resolve_http1(b"//evil.example/x", &["a.example"]), found("a.example"));
+    }
+
+    #[test]
+    fn http1_rule_2_absolute_form_without_host_routes_on_the_target_authority() {
+        assert_eq!(resolve_http1(b"http://a.example/x", &[]), found("a.example"));
+        assert_eq!(
+            resolve_http1(b"https://a.example:8443/x?q=1", &[]),
+            found("a.example:8443")
+        );
+        // A target with no path component is still addressed to its authority.
+        assert_eq!(resolve_http1(b"http://a.example", &[]), found("a.example"));
+        // An empty `Host` line is no `Host` at all, here as on h2.
+        assert_eq!(resolve_http1(b"http://a.example/x", &[""]), found("a.example"));
+    }
+
+    #[test]
+    fn http1_rule_2_and_3_an_agreeing_pair_routes_on_the_agreed_value() {
+        assert_eq!(resolve_http1(b"http://a.example/x", &["a.example"]), found("a.example"));
+        assert_eq!(
+            resolve_http1(b"http://a.example:8080/x", &["a.example:8080"]),
+            found("a.example:8080")
+        );
+    }
+
+    #[test]
+    fn http1_rule_3_a_contradicting_pair_is_refused() {
+        assert_eq!(
+            resolve_http1(b"http://a.example/x", &["b.example"]),
+            Verdict::Contradicted
+        );
+        // Byte-exact, as on h2/h3 and as in Pingora's own ingress check: the
+        // default-port spelling and the case of the host are both differences.
+        assert_eq!(
+            resolve_http1(b"http://a.example:80/x", &["a.example"]),
+            Verdict::Contradicted
+        );
+        assert_eq!(
+            resolve_http1(b"http://A.example/x", &["a.example"]),
+            Verdict::Contradicted
+        );
+    }
+
+    #[test]
+    fn http1_rule_4_authority_form_outside_connect_is_refused() {
+        // Pingora accepts this, roots the URI at `/`, and would write
+        // `GET evil.example:443 HTTP/1.1` to the origin. The WAF has inspected
+        // a path of `/`; the origin is asked to interpret something else.
+        assert_eq!(
+            resolve_http1(b"evil.example:443", &["a.example"]),
+            Verdict::UnsupportedTarget
+        );
+        assert_eq!(resolve_http1(b"evil.example:443", &[]), Verdict::UnsupportedTarget);
+    }
+
+    #[test]
+    fn http1_rule_4_non_http_targets_are_refused() {
+        for target in [
+            // absolute-form with a scheme no HTTP origin resolves a vhost from
+            &b"ftp://a.example/x"[..],
+            b"file:///etc/passwd",
+            // opaque `scheme:rest`, which Pingora roots at `/` and forwards verbatim
+            b"mailto:root@a.example",
+            b"foo:bar",
+            // an authority that is not UTF-8 cannot be matched against any route
+            b"http://a.\xff.example/x",
+        ] {
+            assert_eq!(
+                resolve_http1(target, &["a.example"]),
+                Verdict::UnsupportedTarget,
+                "{}",
+                String::from_utf8_lossy(target)
+            );
+        }
+    }
+
+    #[test]
+    fn classification_matches_the_rules() {
+        assert_eq!(classify_request_target(b"/x?q=1"), RequestTarget::Origin);
+        assert_eq!(classify_request_target(b"//a.example/x"), RequestTarget::Origin);
+        assert_eq!(classify_request_target(b"*"), RequestTarget::Asterisk);
+        assert_eq!(
+            classify_request_target(b"http://a.example:8080/x"),
+            RequestTarget::Absolute("a.example:8080")
+        );
+        assert_eq!(
+            classify_request_target(b"WSS://a.example/x"),
+            RequestTarget::Absolute("a.example")
+        );
+        assert_eq!(classify_request_target(b"a.example:443"), RequestTarget::Unsupported);
+        assert_eq!(
+            classify_request_target(b"ftp://a.example/x"),
+            RequestTarget::Unsupported
+        );
+        assert_eq!(classify_request_target(b"?q=1"), RequestTarget::Unsupported);
+        assert_eq!(classify_request_target(b""), RequestTarget::Unsupported);
+    }
+
+    #[test]
+    fn an_h2_style_uri_authority_still_routes_through_the_shared_resolver() {
+        // Pingora's h2 server delivers `:authority` inside the URI and the
+        // `:path` as the raw target, so the raw target is origin-form and the
+        // URI branch decides. The three verdicts must be the h2 ones.
+        let h2 = |uri: &str, host: Option<&str>| -> Verdict {
+            let mut request = http::Request::builder().uri(uri).body(()).expect("test URI is valid");
+            if let Some(host) = host {
+                request
+                    .headers_mut()
+                    .insert(http::header::HOST, http::HeaderValue::from_str(host).expect("valid"));
+            }
+            let head = RequestHeader::from(request.into_parts().0);
+            assert_eq!(head.raw_path(), b"/x", "h2 raw target is the :path");
+            route_request_authority(&head).into()
+        };
+        assert_eq!(h2("https://a.example/x", None), found("a.example"));
+        assert_eq!(h2("https://a.example/x", Some("a.example")), found("a.example"));
+        assert_eq!(h2("https://a.example/x", Some("b.example")), Verdict::Contradicted);
+    }
+
+    /// What Pingora 0.9 hands this module, pinned.
     ///
     /// `RequestHeader::build` is exactly what `pingora-core`'s HTTP/1.1 server
-    /// calls with the raw request target, so this asserts the property that
-    /// makes sharing this resolver with HTTP/1.1 a no-op: no request target
-    /// that survives parsing produces a URI authority, and the two forms that
-    /// syntactically carry one — absolute-form and authority-form — do not
-    /// survive parsing at all. Every HTTP/1.1 request therefore takes the
-    /// `Host` branch, which is the only thing the routing code read before this
-    /// resolver was shared with it. If a Pingora upgrade starts accepting
-    /// either form, this test fails and the HTTP/1.1 routing change gets
-    /// reviewed instead of shipped.
-    #[test]
-    fn no_http1_request_target_carries_a_uri_authority_under_pingora() {
-        let target = |t: &[u8]| pingora_http::RequestHeader::build("GET", t, None);
+    /// calls with the raw request target, and `validate_request_authority` is
+    /// what `read_request` then runs before `request_filter` can see the
+    /// request. Together they fix the boundary the rules above are written
+    /// against: which forms arrive, where the authority is, and which pairs
+    /// Pingora has already refused. If a Pingora upgrade moves any of it, one
+    /// of these fails and the HTTP/1.1 routing change gets reviewed instead of
+    /// shipped — the same job the 0.8 tripwire did when 0.9 arrived.
+    mod pingora_boundary {
+        use super::*;
+        use pingora_core::protocols::http::authority::validate_request_authority;
 
-        // `Uri::builder().path_and_query(..)` is all pingora-http builds
-        // (`pingora-http-0.8.1/src/lib.rs:259-278`), and it refuses both forms.
-        // The request fails to parse and never reaches `request_filter`, so it
-        // cannot route on a target authority.
-        assert!(target(b"http://evil.example/x").is_err(), "absolute-form was accepted");
-        assert!(target(b"evil.example:443").is_err(), "authority-form was accepted");
-
-        // The forms that are accepted keep the whole target in the path.
-        for (raw, path) in [
-            (&b"/x"[..], "/x"),
-            (b"*", "*"),
-            // A protocol-relative target looks like an authority and is not one.
-            (b"//evil.example/x", "//evil.example/x"),
-        ] {
-            let head = target(raw).expect("BUG: this request target parses");
+        #[test]
+        fn absolute_form_parses_with_the_authority_kept_out_of_the_uri() {
+            let head = http1("GET", b"http://evil.example/x?q=1", &[]);
             assert!(
                 head.uri.authority().is_none(),
-                "pingora parsed an authority out of {:?}: {:?}",
-                String::from_utf8_lossy(raw),
+                "authority leaked into the Uri: {:?}",
                 head.uri
             );
-            assert_eq!(head.uri.path(), path);
+            assert_eq!(head.uri.path(), "/x");
+            assert_eq!(head.uri.query(), Some("q=1"));
+            // ... and the whole target survives for the origin's request line.
+            assert_eq!(head.raw_path(), b"http://evil.example/x?q=1");
+            assert!(head.raw_path_is_utf8());
+        }
+
+        #[test]
+        fn authority_form_parses_with_a_root_uri() {
+            // Under 0.8 this failed to parse. Under 0.9 the request reaches
+            // `request_filter` looking like `GET /`, while the origin would be
+            // sent the authority-form line — rule 4 exists because of this row.
+            let head = http1("GET", b"evil.example:443", &[]);
+            assert_eq!(head.uri.path(), "/");
+            assert!(head.uri.authority().is_none());
+            assert_eq!(head.raw_path(), b"evil.example:443");
+        }
+
+        #[test]
+        fn origin_and_asterisk_forms_round_trip_through_the_uri() {
+            for (raw, path) in [
+                (&b"/x"[..], "/x"),
+                (b"*", "*"),
+                (b"//evil.example/x", "//evil.example/x"),
+            ] {
+                let head = http1("GET", raw, &[]);
+                assert!(
+                    head.uri.authority().is_none(),
+                    "authority parsed out of {raw:?}: {:?}",
+                    head.uri
+                );
+                assert_eq!(head.uri.path(), path);
+                assert_eq!(head.raw_path(), raw);
+            }
+        }
+
+        #[test]
+        fn ingress_refuses_a_host_that_differs_from_the_target_authority() {
+            // Rule 3 is normally decided here, one layer below `request_filter`,
+            // with the same byte-exact comparison this module uses.
+            let refused =
+                |target: &[u8], host: &str| validate_request_authority(&http1("GET", target, &[host])).is_err();
+            assert!(refused(b"http://a.example/x", "b.example"));
+            assert!(refused(b"http://a.example:80/x", "a.example"));
+            assert!(refused(b"http://A.example/x", "a.example"));
+            assert!(!refused(b"http://a.example/x", "a.example"));
+        }
+
+        #[test]
+        fn ingress_lets_the_forms_this_module_decides_through() {
+            let admitted =
+                |target: &[u8], hosts: &[&str]| validate_request_authority(&http1("GET", target, hosts)).is_ok();
+            // Rule 2: absolute-form with no Host is Pingora's to admit and ours
+            // to route.
+            assert!(admitted(b"http://a.example/x", &[]));
+            // Rule 4: authority-form outside CONNECT passes Pingora's check —
+            // `raw_target_authority` sees no `://` and classifies it as carrying
+            // no authority — so the refusal has to be made here.
+            assert!(admitted(b"evil.example:443", &["a.example"]));
+            assert!(admitted(b"foo:bar", &["a.example"]));
+            // Rule 1, unchanged.
+            assert!(admitted(b"/x", &["a.example"]));
+        }
+
+        #[test]
+        fn ingress_refuses_a_duplicated_host_before_the_fold_check() {
+            // `FoldedHeaders::duplicate_host` stays as the layer that does not
+            // depend on this; the assertion records that under 0.9 it is the
+            // second line of defence, not the first, which is why the
+            // `duplicate_host` counter no longer moves for an HTTP/1.1 request.
+            assert!(validate_request_authority(&http1("GET", b"/x", &["a.example", "b.example"])).is_err());
+            assert!(validate_request_authority(&http1("GET", b"/x", &["a.example", "a.example"])).is_err());
         }
     }
 }
