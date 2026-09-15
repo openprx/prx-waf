@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.2.233"
+version = "0.2.234"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3636,7 +3636,7 @@ dependencies = [
 
 [[package]]
 name = "prx-waf"
-version = "0.2.233"
+version = "0.2.234"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5534,7 +5534,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waf-api"
-version = "0.2.233"
+version = "0.2.234"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5575,7 +5575,7 @@ dependencies = [
 
 [[package]]
 name = "waf-cluster"
-version = "0.2.233"
+version = "0.2.234"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5606,7 +5606,7 @@ dependencies = [
 
 [[package]]
 name = "waf-common"
-version = "0.2.233"
+version = "0.2.234"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5625,7 +5625,7 @@ dependencies = [
 
 [[package]]
 name = "waf-engine"
-version = "0.2.233"
+version = "0.2.234"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5670,7 +5670,7 @@ dependencies = [
 
 [[package]]
 name = "waf-storage"
-version = "0.2.233"
+version = "0.2.234"
 dependencies = [
  "chrono",
  "parking_lot",

@@ -9,11 +9,12 @@ carries the empirical evidence that it holds under attack.
 
 The short version: the three named HTTP/2 denial-of-service classes
 (Rapid Reset / CVE-2023-44487, CONTINUATION flood / CVE-2024-27316, and the
-control-frame floods) are all answered inside the `h2` crate (0.4.15) that
-Pingora hands the connection to, before a single request reaches WAF detection.
-Pingora starts from `default_h2_options()`, which is `h2::server::Builder`'s
-own defaults plus a 64 KiB header-list cap and a 100 concurrent-stream cap, and
-never disables any of the reset guards. So the defense exists at the layer that
+control-frame floods) are all answered inside the `h2` crate (0.4.19 in the
+lockfile) that Pingora hands the connection to, before a single request reaches
+WAF detection. This build's `build_h2_options` starts from Pingora's
+`default_h2_options()`, which is `h2::server::Builder`'s own defaults plus a
+64 KiB header-list cap and a 100 concurrent-stream cap, applies the three
+`[proxy.http2]` values over it, and never disables any of the reset guards. So the defense exists at the layer that
 can actually see the frames — the WAF request path never runs on a stream that
 `h2` has already refused.
 
@@ -34,18 +35,21 @@ the lockfile), which Pingora 0.9.0 drives:
   each accepted stream is spawned as its own task into `process_new_http`,
   which is where WAF `request_filter` eventually runs
   (`crates/gateway/src/proxy.rs`, `request_filter`).
-- `h2_options` is `None` in this build when `[proxy.http2]` is left at its
-  defaults, so `handshake` falls back to `default_h2_options()`
-  (`.../v2/server.rs:69-73`): 64 KiB `max_header_list_size`, 100
-  `max_concurrent_streams` — the same two values as under Pingora 0.8.1.
-  Everything else keeps `h2::server::Builder::new()`'s defaults.
+- `h2_options` is never `None` here: `crates/prx-waf/src/main.rs` always sets
+  `app.h2_options = Some(build_h2_options(&config.proxy.http2))`, and
+  `build_h2_options` starts from `default_h2_options()`
+  (`.../v2/server.rs:69-73`: 64 KiB `max_header_list_size`, 100
+  `max_concurrent_streams` — the same two values as under Pingora 0.8.1) and
+  then applies the three `[proxy.http2]` values, which at the shipped defaults
+  equal what they overwrite. Everything else keeps
+  `h2::server::Builder::new()`'s defaults.
 - New in Pingora 0.9, and not configurable from `[proxy.http2]`: streams the
   accept loop rejects before they become sessions (a forbidden byte in
   `:path`, an unreconcilable `content-length`, a duplicated `Host` or a
   `Host` that contradicts `:authority`, an absolute-form `:path`) are
   answered per stream — a headers-only 400 or `RST_STREAM(PROTOCOL_ERROR)` —
   and counted against a per-connection budget of 32
-  (`MAX_MALFORMED_STREAMS_PER_CONN`, `v2/server.rs:64`); the 33rd tears the
+  (`MAX_MALFORMED_STREAMS_PER_CONN`, `v2/server.rs:63`); the 33rd tears the
   connection down. Those rejections never reach `request_filter`, so they
   appear in neither `prxwaf_requests_total` nor the WAF log. An optional
   per-connection idle timeout (`HttpServerOptions::h2_idle_timeout`,
@@ -67,28 +71,28 @@ A naive server does the per-request work but never counts the stream against
 so the concurrency cap provides no backpressure and the attacker buys unbounded
 request work at near-zero cost.
 
-`h2` 0.4.15 carries the fix that was written in direct response to this CVE. A
+`h2` 0.4.19 carries the fix that was written in direct response to this CVE. A
 stream that the remote resets *while it is still waiting to be accepted by the
 application* is counted separately, and once too many such streams accumulate
 the whole connection is failed with `GOAWAY(ENHANCE_YOUR_CALM)`:
 
-- `recv_reset` (`h2-0.4.15/src/proto/streams/recv.rs:874-901`): when
+- `recv_reset` (`h2-0.4.19/src/proto/streams/recv.rs:897-925`): when
   `stream.is_pending_accept`, it calls `counts.can_inc_num_remote_reset_streams()`;
   if the limit is already reached it returns
   `Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_resets")`.
 - The cap is `max_remote_reset_streams`
-  (`h2-0.4.15/src/proto/streams/counts.rs:153-171`), seeded from
+  (`h2-0.4.19/src/proto/streams/counts.rs:219-244`), seeded from
   `pending_accept_reset_stream_max`, whose default is
-  `DEFAULT_REMOTE_RESET_STREAM_MAX = 20` (`h2-0.4.15/src/proto/mod.rs:34`,
-  `src/server.rs:654`).
+  `DEFAULT_REMOTE_RESET_STREAM_MAX = 20` (`h2-0.4.19/src/proto/mod.rs:34`,
+  `src/server.rs:659`).
 - The counter is only decremented once the application actually accepts the
-  stream (`h2-0.4.15/src/proto/streams/streams.rs:144-146`, in `next_incoming`),
+  stream (`h2-0.4.19/src/proto/streams/streams.rs:144-146`, in `next_incoming`),
   so a flood that resets faster than Pingora accepts drives the count straight
   to the ceiling.
 - A second, coarser ceiling covers streams this server itself resets on
   protocol errors: `local_max_error_reset_streams`, default
   `DEFAULT_LOCAL_RESET_COUNT_MAX = 1024` (`src/proto/mod.rs:35`,
-  `src/server.rs:659`, `counts.rs:79-96`).
+  `src/server.rs:663`, `counts.rs:146-162`).
 
 Pingora's `default_h2_options()` does not touch any of these, so the guard runs
 with `pending_accept_reset_stream_max = 20`. The GOAWAY is emitted by the single
@@ -115,10 +119,10 @@ CONTINUATION frames, forcing the server to accumulate header state forever
 without ever completing the request — and, in the vulnerable servers, without
 `max_header_list_size` being consulted until the header block finished.
 
-`h2` 0.4.15 enforces two independent bounds *during* accumulation:
+`h2` 0.4.19 enforces two independent bounds *during* accumulation:
 
 - A frame-count ceiling. `calc_max_continuation_frames`
-  (`h2-0.4.15/src/codec/framed_read.rs:110-117`) derives a per-header-block cap
+  (`h2-0.4.19/src/codec/framed_read.rs:110-117`) derives a per-header-block cap
   from `max_header_list_size / max_frame_size` (min 5); the decoder counts
   CONTINUATION frames and returns
   `GOAWAY(ENHANCE_YOUR_CALM, "too_many_continuations")` once the count is
@@ -147,18 +151,19 @@ that reads the socket — there is no queue an attacker can grow.
 - **SETTINGS flood.** The connection ACKs a received SETTINGS frame before it
   reads the next frame, and asserts there is never more than one outstanding:
   `assert!(self.remote.is_none())` on receipt
-  (`h2-0.4.15/src/proto/settings.rs:80-85`), with the ACK written in
-  `poll_send` (`src/proto/settings.rs:122-136`). No unbounded pending set; an
-  unexpected ACK is a `PROTOCOL_ERROR` GOAWAY (`settings.rs:73-78`).
+  (`h2-0.4.19/src/proto/settings.rs:84`), with the ACK written in
+  `poll_send` (`src/proto/settings.rs:111-129`). No unbounded pending set; an
+  unexpected ACK is a `PROTOCOL_ERROR` GOAWAY (`settings.rs:74-78`).
 - **PING flood.** A received PING stores exactly one pending pong
   (`self.pending_pong = Some(...)`,
-  `h2-0.4.15/src/proto/ping_pong.rs:132-134`), drained before the next read.
+  `h2-0.4.19/src/proto/ping_pong.rs:132`), drained by `send_pending_pong`
+  (`:138-149`) before the next read.
   One `Option`, not a queue.
 - **WINDOW_UPDATE.** Flow-control accounting only; increments are validated
   against `MAX_WINDOW_SIZE` and overflow is a protocol error. No allocation is
   driven by receiving them.
 - **HPACK dynamic table.** Bounded by `SETTINGS_HEADER_TABLE_SIZE`; the decoder
-  tracks it as its own limit (`h2-0.4.15/src/codec/framed_read.rs:97-107`,
+  tracks it as its own limit (`h2-0.4.19/src/codec/framed_read.rs:97-107`,
   `set_header_table_size`).
 
 Because a control-frame flood is naturally serialized behind the socket read
