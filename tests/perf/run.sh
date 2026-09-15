@@ -638,6 +638,15 @@ run_round() {                          # $1 posture, $2 workload, $3 round, $4 b
   t1="$(date +%s.%N)"
   elapsed="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.4f", b-a}')"
 
+  # The 1-minute load average read the instant the measured window closed. A
+  # run-level before/after pair cannot say which round was the noisy one, and
+  # "the host was quiet" is a claim about every round or it is not a claim. It
+  # is recorded, never asserted on — a round taken on a busy host is still a
+  # measurement, just a different kind, and the reader has to be able to see
+  # which one they are holding. Read AFTER the window so it covers it.
+  local load1
+  load1="$(awk '{print $1}' /proc/loadavg)"
+
   if [ -n "$subject_pid" ]; then
     cpu_after="$(cpu_ticks "$subject_pid")"
     threads="$(thread_count "$subject_pid")"
@@ -650,7 +659,8 @@ run_round() {                          # $1 posture, $2 workload, $3 round, $4 b
 
   jq -c --arg posture "$posture" --arg workload "$workload" --argjson round "$round" \
         --argjson cores "$cores" --argjson rss_kb "${rss_kb:-0}" \
-        --argjson threads "${threads:-0}" --argjson elapsed "$elapsed" '
+        --argjson threads "${threads:-0}" --argjson elapsed "$elapsed" \
+        --argjson load1 "$load1" '
     {
       posture: $posture, workload: $workload, round: $round,
       rps:      (.summary.requestsPerSec),
@@ -665,14 +675,15 @@ run_round() {                          # $1 posture, $2 workload, $3 round, $4 b
       max:      (.summary.slowest),
       status:   (.statusCodeDistribution),
       errors:   (.errorDistribution),
-      cpu_cores: $cores, rss_kb: $rss_kb, threads: $threads, elapsed_s: $elapsed
+      cpu_cores: $cores, rss_kb: $rss_kb, threads: $threads, elapsed_s: $elapsed,
+      load1: $load1
     }' "$jsonf" >>"$RESULTS"
 
   local rps p99 codes
   rps="$(jq -r '.summary.requestsPerSec | floor' "$jsonf")"
   p99="$(jq -r '(.latencyPercentiles."p99" * 1000) | floor' "$jsonf")"
   codes="$(jq -r '.statusCodeDistribution | to_entries | map("\(.key):\(.value)") | join(" ")' "$jsonf")"
-  log "    r$round  rps=$rps  p99=${p99}ms  cpu=${cores}c  rss=$((rss_kb / 1024))MiB  [$codes]"
+  log "    r$round  rps=$rps  p99=${p99}ms  cpu=${cores}c  rss=$((rss_kb / 1024))MiB  load=$load1  [$codes]"
 
   # A benign workload that is being blocked is not measuring what its name
   # says: a 403 short-circuits before the upstream, so the row would be faster
@@ -687,7 +698,10 @@ run_round() {                          # $1 posture, $2 workload, $3 round, $4 b
 }
 
 # ── 9. Drive every posture ───────────────────────────────────────────────────
-log "hardware: $(nproc) cpus, $(awk '/^model name/{sub(/^model name[ \t]*:[ \t]*/,""); print; exit}' /proc/cpuinfo)"
+# `nproc` is the harness's affinity mask, not the machine — they differ whenever
+# run.sh is itself pinned off the subject's cores, and reporting only the mask
+# reads as a smaller machine than the one being measured. Both, labelled.
+log "hardware: $(getconf _NPROCESSORS_ONLN) cpus (harness may use $(nproc)), $(awk '/^model name/{sub(/^model name[ \t]*:[ \t]*/,""); print; exit}' /proc/cpuinfo)"
 log "kernel:   $(uname -r)"
 log "plan:     postures=[$POSTURES] workloads=[$WORKLOADS] rounds=$ROUNDS duration=${DURATION}s conns=$CONNECTIONS pin=$PIN"
 log "pinning:  waf=$WAF_CPUS origin=$ORIGIN_CPUS generator=$LOAD_CPUS"
