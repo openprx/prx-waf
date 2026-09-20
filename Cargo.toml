@@ -174,7 +174,7 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "r
 # crypto provider in the tree (rustls/quinn/rcgen all build on it), and rcgen
 # mints the node keys through it, so the PKCS#8 encoding round-trips exactly.
 ring = "0.17"
-zstd = "0.13"
+zstd = "0.14"
 
 # X.509 parsing (cluster peer certificate SAN → node identity binding, H-9)
 #
