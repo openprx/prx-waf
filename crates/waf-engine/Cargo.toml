@@ -38,7 +38,7 @@ base64 = { workspace = true }
 # `recursive-protection` feature and its `psm` dependency (C build + unsafe),
 # keeping the supply chain zero-C/zero-unsafe; stack safety is enforced by our own
 # explicit pre-parse nesting-depth guard (see `detectors::AstSqlDetector`).
-sqlparser = { version = "0.62", default-features = false }
+sqlparser = { version = "0.63", default-features = false }
 # XSS DOM semantic detector (Lane 2, P-XSS-1). Servo html5ever core via scraper's
 # fragment parser + ego-tree walk. No C toolchain; our code is zero-unsafe.
 scraper = { workspace = true }
