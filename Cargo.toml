@@ -197,7 +197,7 @@ x509-parser = "0.18"
 # Lane 2 (semantic) structured-body field extraction (Lane B). All forbid unsafe
 # in their own code; each parser/walk is depth-bounded by our own guards.
 #   quick-xml >= 0.41 fixes RUSTSEC-2026-0194 + RUSTSEC-2026-0195 (two DoS advisories).
-quick-xml = "0.41"
+quick-xml = "0.42"
 async-graphql-parser = "7.2"
 async-graphql-value = "7.2"
 multer = "3.1"
